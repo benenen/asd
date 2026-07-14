@@ -1,0 +1,20 @@
+[package]
+name = "asd-cli"
+description = "asd single binary: client, stdio proxy, and embedded daemon (`asd daemon`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "asd"
+path = "src/main.rs"
+
+# Contract (spec §3): depending on iced/wgpu is forbidden.
+[dependencies]
+anyhow = { workspace = true }
+asd-daemon = { workspace = true }
+asd-proto = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true }

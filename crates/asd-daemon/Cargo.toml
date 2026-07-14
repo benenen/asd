@@ -1,0 +1,17 @@
+[package]
+name = "asd-daemon"
+description = "asd headless mux daemon (library): session keeping, UDS server; embedded by the `asd` CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Contract (spec §3): depending on iced/wgpu is forbidden (including transitively).
+[dependencies]
+anyhow = { workspace = true }
+asd-proto = { workspace = true }
+asd-vt = { workspace = true }
+nix = { workspace = true }
+portable-pty = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

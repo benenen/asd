@@ -1,0 +1,10 @@
+[package]
+name = "asd-vt"
+description = "VT backend trait + libghostty-vt implementation (escape-hatch boundary)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Contract (spec §3): depending on iced/wgpu, portable-pty, or asd-proto is forbidden.
+[dependencies]
+libghostty-vt = { workspace = true }

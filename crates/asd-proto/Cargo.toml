@@ -1,0 +1,16 @@
+[package]
+name = "asd-proto"
+description = "asd wire protocol: frame enum, postcard codec, framed reader/writer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Contract (spec §3): no dependency on any business crate besides the tokio runtime.
+[dependencies]
+postcard = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
