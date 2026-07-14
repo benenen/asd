@@ -2,17 +2,15 @@
 //!
 //! Unlike a dumb passthrough, this client keeps its own [`GhosttyVt`] terminal
 //! (fed the daemon's Snapshot + Output) and renders it to the screen itself.
-//! That local VT model is what lets a single Live view do all three at once:
+//! That local VT model gives a single Live view two things at once:
 //! - **detach restores the original screen** (we run on the alternate screen);
-//! - **wheel scrolls back through history** (we scroll our own viewport — a
-//!   client-local action that never disturbs other attached clients);
-//! - **drag-select copies** (we highlight the selection and write the system
-//!   clipboard via OSC 52, so the terminal's own selection is not needed and
-//!   mouse reporting can stay on to catch the wheel).
+//! - **scrollback into history** — a client-local action (Shift+PageUp/PageDown/
+//!   Home/End) that never disturbs other attached clients.
 //!
-//! When the session program is itself full-screen or grabbing the mouse (vim,
-//! htop), the wheel and clicks are forwarded to it instead — the client knows
-//! precisely from its VT model (`is_alt_screen` / `is_mouse_tracking`).
+//! We deliberately do **not** grab the mouse: no mouse-tracking modes are
+//! enabled, so the host terminal's own drag-to-select and copy keep working.
+//! (On the alternate screen the host's native scrollback is unavailable, which
+//! is why scrollback is driven from the keyboard here.)
 
 use std::io::Write as _;
 use std::os::fd::AsFd;
@@ -26,12 +24,10 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use crate::client::Client;
-use crate::render::{self, MouseKind, Selection};
+use crate::render;
 
 /// Detach key: Ctrl-\ (byte 0x1C in raw mode).
 const DETACH_BYTE: u8 = 0x1c;
-/// Lines moved per wheel tick.
-const WHEEL_LINES: usize = 3;
 
 /// Frames the socket-reader task forwards to the main loop.
 enum Ev {
@@ -76,12 +72,10 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     vt.feed(&first);
     let _ = vt.take_pty_responses(); // the daemon already answered any queries
 
-    // Scrollback view state.
-    let mut scroll = 0usize; // lines scrolled up from the live bottom
-    let mut selection: Option<Selection> = None;
-    let mut selecting = false;
+    // Lines scrolled up from the live bottom (0 = following live output).
+    let mut scroll = 0usize;
 
-    render_now(&mut vt, scroll, selection)?;
+    render_now(&mut vt, scroll)?;
 
     // Socket reader → Ev channel.
     let (ev_tx, mut ev_rx) = mpsc::channel::<Ev>(256);
@@ -144,14 +138,14 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                         }
                         // While scrolled up we keep the view frozen so reading
                         // history is not yanked around by live output.
-                        if scroll == 0 && render_now(&mut vt, scroll, selection).is_err() {
+                        if scroll == 0 && render_now(&mut vt, scroll).is_err() {
                             break Exit::DaemonGone;
                         }
                     }
                     Ev::Snapshot(dump) => {
                         vt.feed(&dump);
                         let _ = vt.take_pty_responses();
-                        if render_now(&mut vt, scroll, selection).is_err() {
+                        if render_now(&mut vt, scroll).is_err() {
                             break Exit::DaemonGone;
                         }
                     }
@@ -164,67 +158,33 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                     break Exit::Detached;
                 }
 
-                // If the app is full-screen or grabbing the mouse, everything
-                // (including the wheel) belongs to it.
-                let app_owns_mouse = vt.is_alt_screen() || vt.is_mouse_tracking();
-                let mouse = render::parse_mouse(&chunk);
-
-                if app_owns_mouse || mouse.is_empty() {
-                    // Typing (or app-owned mouse): forward verbatim. Typing
-                    // snaps the view back to the live bottom.
-                    if scroll != 0 && !is_only_mouse(&chunk) {
-                        scroll = 0;
-                        selection = None;
-                        let _ = render_now(&mut vt, scroll, selection);
-                    }
-                    if writer.write_frame(&Frame::Input { bytes: chunk }).await.is_err() {
-                        break Exit::DaemonGone;
+                // Scrollback keys (Shift+PageUp/PageDown/Home/End) drive our own
+                // viewport, since the host terminal's native scrollback is off
+                // on the alternate screen. Everything else is forwarded to the
+                // session (and snaps the view back to the live bottom).
+                if let Some(action) = parse_scroll_key(&chunk) {
+                    let max_scroll = vt.scrollback_rows();
+                    let page = usize::from(rows).saturating_sub(1).max(1);
+                    let new_scroll = match action {
+                        ScrollKey::Up => (scroll + page).min(max_scroll),
+                        ScrollKey::Down => scroll.saturating_sub(page),
+                        ScrollKey::Top => max_scroll,
+                        ScrollKey::Bottom => 0,
+                    };
+                    if new_scroll != scroll {
+                        scroll = new_scroll;
+                        if render_now(&mut vt, scroll).is_err() {
+                            break Exit::DaemonGone;
+                        }
                     }
                     continue;
                 }
 
-                // Shell prompt: the wheel scrolls our view, drags select+copy.
-                let mut dirty = false;
-                let max_scroll = vt.scrollback_rows();
-                for ev in mouse {
-                    match ev.kind {
-                        MouseKind::WheelUp => {
-                            scroll = (scroll + WHEEL_LINES).min(max_scroll);
-                            dirty = true;
-                        }
-                        MouseKind::WheelDown => {
-                            scroll = scroll.saturating_sub(WHEEL_LINES);
-                            dirty = true;
-                        }
-                        MouseKind::Press => {
-                            selecting = true;
-                            selection = Some(Selection { start: (ev.x, ev.y), end: (ev.x, ev.y) });
-                            dirty = true;
-                        }
-                        MouseKind::Drag => {
-                            if selecting && let Some(sel) = &mut selection {
-                                sel.end = (ev.x, ev.y);
-                                dirty = true;
-                            }
-                        }
-                        MouseKind::Release => {
-                            if selecting && let Some(sel) = selection {
-                                selecting = false;
-                                // Viewport is already positioned at `scroll`.
-                                let text = vt.selection_text(asd_vt::Selection {
-                                    start: sel.start,
-                                    end: sel.end,
-                                    block: false,
-                                });
-                                if !text.is_empty() {
-                                    let _ = write_stdout(&render::osc52_copy(&text));
-                                }
-                            }
-                        }
-                        MouseKind::Other => {}
-                    }
+                if scroll != 0 {
+                    scroll = 0;
+                    let _ = render_now(&mut vt, scroll);
                 }
-                if dirty && render_now(&mut vt, scroll, selection).is_err() {
+                if writer.write_frame(&Frame::Input { bytes: chunk }).await.is_err() {
                     break Exit::DaemonGone;
                 }
             }
@@ -235,7 +195,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                 if writer.write_frame(&Frame::Resize { cols, rows }).await.is_err() {
                     break Exit::DaemonGone;
                 }
-                let _ = render_now(&mut vt, scroll, selection);
+                let _ = render_now(&mut vt, scroll);
             }
         }
     };
@@ -254,17 +214,33 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
 }
 
 /// Position the viewport at `scroll` and paint one frame.
-fn render_now(vt: &mut GhosttyVt, scroll: usize, sel: Option<Selection>) -> std::io::Result<()> {
+fn render_now(vt: &mut GhosttyVt, scroll: usize) -> std::io::Result<()> {
     vt.set_scroll(scroll);
     let snap = vt.render_snapshot();
-    write_stdout(&render::render_frame(&snap, sel))
+    write_stdout(&render::render_frame(&snap))
 }
 
-/// Whether a chunk is entirely SGR mouse reports (so it should not be forwarded
-/// as typing when the app owns the mouse... actually used to avoid snapping the
-/// scroll to bottom on a stray mouse event).
-fn is_only_mouse(chunk: &[u8]) -> bool {
-    !chunk.is_empty() && chunk.starts_with(b"\x1b[<")
+/// A scrollback navigation key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollKey {
+    Up,
+    Down,
+    Top,
+    Bottom,
+}
+
+/// Recognize the Shift-modified paging keys that drive scrollback. Plain
+/// PageUp/Home/etc. are left for the session (returns `None`).
+fn parse_scroll_key(chunk: &[u8]) -> Option<ScrollKey> {
+    match chunk {
+        // Shift+PageUp / Shift+PageDown: CSI 5 ; 2 ~ / CSI 6 ; 2 ~
+        b"\x1b[5;2~" => Some(ScrollKey::Up),
+        b"\x1b[6;2~" => Some(ScrollKey::Down),
+        // Shift+Home / Shift+End: CSI 1 ; 2 H / CSI 1 ; 2 F
+        b"\x1b[1;2H" => Some(ScrollKey::Top),
+        b"\x1b[1;2F" => Some(ScrollKey::Bottom),
+        _ => None,
+    }
 }
 
 /// `--stdio` proxy: bidirectional raw byte copy between stdio and the UDS;
@@ -308,22 +284,22 @@ pub fn term_size() -> (u16, u16) {
     }
 }
 
-/// Alternate-screen + mouse-reporting guard. Enters the alternate screen (DEC
-/// 1049), enables button + SGR mouse reporting (1000/1006) so the wheel and
-/// drags arrive as events, and enables focus... on drop, undoes all of it and
-/// restores the primary screen with its previous contents.
+/// Alternate-screen guard. Enters the alternate screen (DEC 1049) so detach
+/// restores the caller's screen; on drop, leaves it and resets the cursor
+/// shape. Crucially it does **not** enable any mouse-tracking mode, so the host
+/// terminal's own drag-to-select and copy keep working.
 struct ScreenGuard;
 
 impl ScreenGuard {
     fn enter() -> std::io::Result<Self> {
-        write_stdout(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h")?;
+        write_stdout(b"\x1b[?1049h")?;
         Ok(Self)
     }
 }
 
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
-        let _ = write_stdout(b"\x1b[?1006l\x1b[?1000l\x1b[?1049l\x1b[0 q");
+        let _ = write_stdout(b"\x1b[?1049l\x1b[0 q");
     }
 }
 
@@ -349,5 +325,27 @@ impl Drop for RawGuard {
         use nix::sys::termios::{SetArg, tcsetattr};
         let stdin = std::io::stdin();
         let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &self.original);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shift_paging_keys_drive_scrollback() {
+        assert_eq!(parse_scroll_key(b"\x1b[5;2~"), Some(ScrollKey::Up));
+        assert_eq!(parse_scroll_key(b"\x1b[6;2~"), Some(ScrollKey::Down));
+        assert_eq!(parse_scroll_key(b"\x1b[1;2H"), Some(ScrollKey::Top));
+        assert_eq!(parse_scroll_key(b"\x1b[1;2F"), Some(ScrollKey::Bottom));
+    }
+
+    #[test]
+    fn plain_keys_are_left_for_the_session() {
+        // Plain PageUp/Home and ordinary typing are not scrollback keys.
+        assert_eq!(parse_scroll_key(b"\x1b[5~"), None);
+        assert_eq!(parse_scroll_key(b"\x1b[H"), None);
+        assert_eq!(parse_scroll_key(b"ls -la\r"), None);
+        assert_eq!(parse_scroll_key(b""), None);
     }
 }

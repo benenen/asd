@@ -35,7 +35,7 @@ cargo fmt --all
 
 手工冒烟：`cargo run -p asd-cli -- attach -A demo`（自动拉起 daemon + 创建 session；detach 键 Ctrl-\）。
 
-**`asd attach` 是 VT 渲染客户端（2026-07-14，对标 boo 的 `boo ui`）**，不是哑管道：客户端自带一份 `GhosttyVt`（asd-cli 因此依赖 asd-vt），把 daemon 的 Snapshot+Output 喂进去、自己渲染（`render.rs`：RenderSnapshot→ANSI）。这份本地 VT 模型让 **live 视图同时具备三件事**——① 交替屏 detach 恢复原屏；② 滚轮直接往回滚历史（滚自己的视口 `set_scroll`，**客户端本地、不影响其他 attach 的人**）；③ 鼠标拖选高亮 + 松开经 `selection_text` 取文本、**OSC52** 写系统剪贴板（不靠终端原生选区，所以鼠标上报可以全程开着截获滚轮）。当 session 程序自己在 alt 屏或要鼠标（vim/htop，客户端用 `is_alt_screen`/`is_mouse_tracking` 精确判断）时，滚轮和点击转发给它。
+**`asd attach` 是 VT 渲染客户端（2026-07-14，对标 boo 的 `boo ui`）**，不是哑管道：客户端自带一份 `GhosttyVt`（asd-cli 因此依赖 asd-vt），把 daemon 的 Snapshot+Output 喂进去、自己渲染（`render.rs`：RenderSnapshot→ANSI）。本地 VT 模型让 live 视图有两件事：① 交替屏（`1049h`）detach 恢复原屏；② 滚回历史（滚自己的视口 `set_scroll`，**客户端本地、不影响其他 attach 的人**）。**鼠标取舍（2026-07-14 定稿）**：客户端**绝不开任何鼠标上报模式**（不发 `1000/1002/1003/1006h`）——所以宿主终端自己的**拖选/复制原生可用**（这是用户要的）；代价是交替屏上宿主原生 scrollback 不可用，故滚回改由**键盘 `Shift+PageUp/PageDown/Home/End`** 驱动（`parse_scroll_key`）。滚回时（`scroll>0`）视图冻结、不被 live 输出打断，且渲染要点：`render_frame` 只在 `cursor.position` 有值时才 `?25h` 显示光标——滚出视口后 position=None，绝不能显示，否则右下角留光标残影（曾经的 bug）。副作用：session 程序（vim/htop）的鼠标事件在 CLI 下不再转发（宿主没开鼠标上报，收不到事件）；要完整鼠标交互走 asd-gui。
 
 多人 attach 语义：滚动/选区是各客户端本地的、互不影响；只有键盘输入（同一个 shell）和 pty 尺寸（最后 resize 者胜）是共享的。协议里的 `FetchHistory`/`History`/`Refresh`（v1）现在渲染客户端不再用（改用本地 scrollback），但保留给别的客户端/测试，e2e 仍直接测 daemon 的这几帧。`asd new` 也会自动拉起 daemon（tmux 语义）；`list`/`kill`/裸 `attach` 则要求 daemon 已在跑。`asd daemon` 可前台手动跑 daemon。`--socket`/`$ASD_SOCKET` 可把 socket 指到任意路径做隔离实验。注意 daemon 自带 tokio runtime，`main()` 必须在进入 `#[tokio::main]` 之前分发 `Cmd::Daemon`（不能嵌套 runtime）。
 
