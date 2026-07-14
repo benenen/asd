@@ -1,0 +1,22 @@
+[package]
+name = "asd-gui"
+description = "asd GPU terminal client (iced/wgpu): render, input, dial"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "asd-gui"
+path = "src/main.rs"
+
+# Contract (spec §3): NO portable-pty or any PTY/process management — this is
+# the basis of a viable Windows client. asd-vt (rendering) and asd-proto (the
+# connection) are allowed; asd-vt/asd-proto forbid iced/wgpu themselves.
+[dependencies]
+anyhow = { workspace = true }
+asd-proto = { workspace = true }
+asd-vt = { workspace = true }
+iced = { version = "0.14", features = ["canvas", "tokio"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

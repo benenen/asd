@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目定位
 
-`asd` = GPU 终端客户端 + headless mux daemon，定位 **shpool 而非 tmux**：一个 session 即一个 PTY，不做 pane/window 分屏。规格与里程碑文档在 Obsidian：`idea/spacs/gmux GPU 终端 Spec`、`idea/plans/gmux GPU 终端计划`（文档用 `gmux-*` 命名，本仓库对应为 `asd-*`）。当前完成 M0 的 asd-proto / asd-vt / asd-daemon / asd-cli 四个模块；`asd-gui`（iced/wgpu，M0 第 6 步）尚未创建。
+`asd` = GPU 终端客户端 + headless mux daemon，定位 **shpool 而非 tmux**：一个 session 即一个 PTY，不做 pane/window 分屏。规格与里程碑文档在 Obsidian：`idea/spacs/gmux GPU 终端 Spec`、`idea/plans/gmux GPU 终端计划`（文档用 `gmux-*` 命名，本仓库对应为 `asd-*`）。M0 五个模块 asd-proto / asd-vt / asd-daemon / asd-cli / asd-gui 均已落地。
 
 **单二进制分发（有意偏离 spec §2 的双二进制契约，用户决定）**：只产出一个 `asd` 可执行文件，daemon 以 `asd daemon` 子命令运行；asd-daemon 是 library crate，被 asd-cli 内嵌。自愈拉起 = re-exec `current_exe()` + `daemon` 参数。
 
@@ -20,7 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | asd-vt | `VtBackend` trait + libghostty-vt 实现（逃生门边界） | iced/wgpu、portable-pty、asd-proto |
 | asd-daemon（lib） | session 管理、UDS 服务 | iced/wgpu（含传递依赖） |
 | asd-cli（唯一 bin `asd`） | 调试客户端、`attach --stdio` 代理、内嵌 daemon（`asd daemon`） | iced/wgpu |
-| asd-gui（未建） | 渲染、输入、拨号 | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基） |
+| asd-gui（bin `asd-gui`，iced/wgpu） | 渲染、输入、拨号 | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基）；可依赖 asd-vt/asd-proto |
 
 ## 常用命令
 
@@ -52,3 +52,5 @@ cargo fmt --all
 **asd-vt 是逃生门边界**：libghostty-vt 0.2.x API 未稳定，所有直接调用收敛在 `crates/asd-vt/src/ghostty.rs`；daemon/GUI 只面向 `VtBackend` trait 和全 `Send` 的 `RenderSnapshot` 纯数据。两个跨层关键点：① `feed()` 期间终端对 DA/DSR 查询的应答积在 `take_pty_responses()`，session 线程必须取出回写 pty，否则 vim 类程序探测挂起；② `snapshot_vt()` 末尾手工补一个 CUP——上游 Formatter 在光标恢复序列之后才发 tabstops/滚动区序列（会挪光标），快照保真性测试（`asd-vt/tests/vt.rs`）钉死这个行为。
 
 **路径契约（spec §2）**：collected in `asd-proto::paths` —— socket 解析优先级 `$ASD_SOCKET` > `$XDG_RUNTIME_DIR/asd.sock` > `/tmp/asd-$UID/asd.sock`（0700），daemon 与所有客户端共用这一份实现；数据目录 `~/.local/share/asd/`（daemon 日志 `daemon.log` 在此，由 `asd attach -A` 拉起时重定向）。
+
+**asd-gui（spec §7，iced 0.14 + wgpu）**：`asd-gui [session]` 一个窗口一条 UDS 连接。三层线程/异步：① 一个 std **渲染线程**（`conn.rs`）自带 current_thread tokio runtime，独占 `!Send` 的 `GhosttyVt`（不能上 iced 的多线程 runtime），喂 Snapshot/Output、产 `RenderSnapshot` 出一条 channel、收 Key/Resize 进另一条；`encode_key` 用渲染终端自己的模式态，DECCKM 等天然同步（spec §7）。② iced `Subscription::run_with(ConnConfig, connection_worker)` 用 `iced::stream::channel` 桥接：把 cmd-Sender 交给 app、把渲染线程的事件转成 Message。**重连 = bump `ConnConfig.generation`**（它的 Hash 变了 iced 就重启 subscription，spec §7 的手动 `r` 重连即改这个）。③ `render.rs` 的 `canvas::Program` 把 `RenderSnapshot` 画到 iced canvas（等宽 `Font::MONOSPACE`，bg 矩形 + fg 字形 + 反显块光标；cell 尺寸按字号估算，M0 ASCII 正确即可，CJK/样式保真是 M1）。**GUI 靠人肉验收**（沙箱/CI 无显示器，只编译 + 跑纯函数单测：`key.rs` 键映射、`render.rs` 网格换算）。
