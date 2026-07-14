@@ -1,0 +1,311 @@
+//! Plain UI state for the session sidebar: the set of hosts (local + SSH
+//! remotes), each host's session list, and which session is selected. This is
+//! pure `Send` data owned by the iced app; the `!Send` terminal and the
+//! connections live in the worker threads (see [`crate::conn`]).
+
+use asd_proto::SessionInfo;
+
+/// Stable identifier for a host. `0` is always the local daemon.
+pub type HostId = u64;
+
+/// The local daemon's fixed id.
+pub const LOCAL_ID: HostId = 0;
+
+/// How to reach a host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostKind {
+    /// The local daemon over its Unix socket.
+    Local,
+    /// A remote daemon reached over SSH (`asd attach --stdio` on the far end).
+    Ssh(RemoteSpec),
+}
+
+/// Where and as whom to connect over SSH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSpec {
+    pub user: String,
+    pub host: String,
+    pub port: u16,
+}
+
+impl RemoteSpec {
+    /// Parse `user@host`, `user@host:port`, or `host` (user defaults to the
+    /// current login, port to 22). Returns `None` if the host part is empty.
+    pub fn parse(input: &str, default_user: &str) -> Option<Self> {
+        let input = input.trim();
+        if input.is_empty() {
+            return None;
+        }
+        let (user, rest) = match input.split_once('@') {
+            Some((u, r)) if !u.is_empty() => (u.to_string(), r),
+            _ => (default_user.to_string(), input),
+        };
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse().ok()?),
+            None => (rest, 22u16),
+        };
+        if host.is_empty() {
+            return None;
+        }
+        Some(Self {
+            user,
+            host: host.to_string(),
+            port,
+        })
+    }
+
+    /// `user@host`, hiding the port when it is the default.
+    pub fn label(&self) -> String {
+        if self.port == 22 {
+            format!("{}@{}", self.user, self.host)
+        } else {
+            format!("{}@{}:{}", self.user, self.host, self.port)
+        }
+    }
+
+    /// Short host name for the group header: the part before the first dot.
+    pub fn short_host(&self) -> &str {
+        self.host.split('.').next().unwrap_or(&self.host)
+    }
+}
+
+/// Connection state of a host, shown as its status dot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostState {
+    Connecting,
+    Up,
+    /// Failed or dropped, with a human-readable reason.
+    Down(String),
+}
+
+/// One host and its (last known) session list.
+#[derive(Debug, Clone)]
+pub struct Host {
+    pub id: HostId,
+    pub kind: HostKind,
+    pub state: HostState,
+    pub sessions: Vec<SessionInfo>,
+}
+
+impl Host {
+    pub fn is_remote(&self) -> bool {
+        matches!(self.kind, HostKind::Ssh(_))
+    }
+
+    /// Group-header label: `local`, or the remote's short host name.
+    pub fn label(&self) -> String {
+        match &self.kind {
+            HostKind::Local => "local".to_string(),
+            HostKind::Ssh(spec) => spec.short_host().to_string(),
+        }
+    }
+
+    /// Secondary line: the socket path (local) or `user@host` (remote).
+    pub fn sublabel(&self) -> String {
+        match &self.kind {
+            HostKind::Local => asd_proto::paths::socket_path().display().to_string(),
+            HostKind::Ssh(spec) => spec.label(),
+        }
+    }
+}
+
+/// The whole sidebar model plus the current selection.
+#[derive(Debug, Clone, Default)]
+pub struct Model {
+    pub hosts: Vec<Host>,
+    /// The session being viewed: `(host, name)`.
+    pub active: Option<(HostId, String)>,
+    next_id: HostId,
+}
+
+impl Model {
+    /// A fresh model with just the local host, in the connecting state.
+    pub fn with_local() -> Self {
+        Self {
+            hosts: vec![Host {
+                id: LOCAL_ID,
+                kind: HostKind::Local,
+                state: HostState::Connecting,
+                sessions: Vec::new(),
+            }],
+            active: None,
+            next_id: 1,
+        }
+    }
+
+    pub fn host(&self, id: HostId) -> Option<&Host> {
+        self.hosts.iter().find(|h| h.id == id)
+    }
+
+    fn host_mut(&mut self, id: HostId) -> Option<&mut Host> {
+        self.hosts.iter_mut().find(|h| h.id == id)
+    }
+
+    /// Add a remote host (or return the existing one with the same spec).
+    /// Returns the host id.
+    pub fn add_remote(&mut self, spec: RemoteSpec) -> HostId {
+        if let Some(h) = self
+            .hosts
+            .iter()
+            .find(|h| h.kind == HostKind::Ssh(spec.clone()))
+        {
+            return h.id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.hosts.push(Host {
+            id,
+            kind: HostKind::Ssh(spec),
+            state: HostState::Connecting,
+            sessions: Vec::new(),
+        });
+        id
+    }
+
+    pub fn remove_host(&mut self, id: HostId) {
+        if id == LOCAL_ID {
+            return; // the local host is permanent
+        }
+        self.hosts.retain(|h| h.id != id);
+        if self.active.as_ref().is_some_and(|(h, _)| *h == id) {
+            self.active = None;
+        }
+    }
+
+    pub fn set_state(&mut self, id: HostId, state: HostState) {
+        if let Some(h) = self.host_mut(id) {
+            h.state = state;
+        }
+    }
+
+    /// Replace a host's session list. If the active session vanished (killed or
+    /// exited elsewhere), the selection is cleared.
+    pub fn set_sessions(&mut self, id: HostId, sessions: Vec<SessionInfo>) {
+        if let Some(h) = self.host_mut(id) {
+            h.sessions = sessions;
+        }
+        if let Some((h, name)) = &self.active
+            && *h == id
+            && self
+                .host(id)
+                .is_some_and(|h| !h.sessions.iter().any(|s| &s.name == name))
+        {
+            self.active = None;
+        }
+    }
+
+    pub fn select(&mut self, host: HostId, name: String) {
+        self.active = Some((host, name));
+    }
+
+    pub fn is_active(&self, host: HostId, name: &str) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|(h, n)| *h == host && n == name)
+    }
+
+    pub fn total_sessions(&self) -> usize {
+        self.hosts.iter().map(|h| h.sessions.len()).sum()
+    }
+}
+
+/// Compact "time since creation": `just now`, `5m`, `18m`, `2h`, `3d`.
+/// `now_ms`/`created_ms` are Unix-epoch milliseconds.
+pub fn short_age(created_ms: u64, now_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(created_ms) / 1000;
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(name: &str, created_ms: u64, clients: u32) -> SessionInfo {
+        SessionInfo {
+            name: name.to_string(),
+            created_ms,
+            attached_clients: clients,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    #[test]
+    fn remote_spec_parses_forms() {
+        assert_eq!(
+            RemoteSpec::parse("deploy@gpu-01.lab", "me"),
+            Some(RemoteSpec {
+                user: "deploy".into(),
+                host: "gpu-01.lab".into(),
+                port: 22
+            })
+        );
+        assert_eq!(
+            RemoteSpec::parse("edge-7:2200", "me"),
+            Some(RemoteSpec {
+                user: "me".into(),
+                host: "edge-7".into(),
+                port: 2200
+            })
+        );
+        assert_eq!(RemoteSpec::parse("  ", "me"), None);
+        // A bad port is rejected rather than silently defaulting.
+        assert_eq!(RemoteSpec::parse("host:notaport", "me"), None);
+    }
+
+    #[test]
+    fn remote_spec_labels_hide_default_port() {
+        let s = RemoteSpec::parse("deploy@gpu-01.lab", "me").unwrap();
+        assert_eq!(s.label(), "deploy@gpu-01.lab");
+        assert_eq!(s.short_host(), "gpu-01");
+        let s = RemoteSpec::parse("deploy@edge-7:2200", "me").unwrap();
+        assert_eq!(s.label(), "deploy@edge-7:2200");
+    }
+
+    #[test]
+    fn add_remote_is_idempotent_per_spec() {
+        let mut m = Model::with_local();
+        let spec = RemoteSpec::parse("a@b", "me").unwrap();
+        let id1 = m.add_remote(spec.clone());
+        let id2 = m.add_remote(spec);
+        assert_eq!(id1, id2);
+        assert_eq!(m.hosts.len(), 2); // local + one remote
+    }
+
+    #[test]
+    fn killing_the_active_session_clears_selection() {
+        let mut m = Model::with_local();
+        m.set_sessions(LOCAL_ID, vec![info("web", 0, 1), info("logs", 0, 0)]);
+        m.select(LOCAL_ID, "web".into());
+        assert!(m.is_active(LOCAL_ID, "web"));
+        // "web" disappears from the list → selection is dropped.
+        m.set_sessions(LOCAL_ID, vec![info("logs", 0, 0)]);
+        assert_eq!(m.active, None);
+    }
+
+    #[test]
+    fn short_age_buckets() {
+        let m = 60_000; // one minute in ms
+        assert_eq!(short_age(0, 30 * 1000), "just now");
+        assert_eq!(short_age(0, 5 * m), "5m");
+        assert_eq!(short_age(0, 120 * m), "2h");
+        assert_eq!(short_age(0, 3 * 24 * 60 * m), "3d");
+        // created in the future (clock skew) never panics.
+        assert_eq!(short_age(1_000, 0), "just now");
+    }
+
+    #[test]
+    fn local_host_is_permanent() {
+        let mut m = Model::with_local();
+        m.remove_host(LOCAL_ID);
+        assert_eq!(m.hosts.len(), 1);
+    }
+}

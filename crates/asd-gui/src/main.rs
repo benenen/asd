@@ -1,24 +1,31 @@
-//! `asd-gui`: the GPU terminal client (spec §7).
+//! `asd-gui`: the GPU terminal client (spec §7), M2 two-pane redesign.
 //!
-//! One window = one UDS connection + a render thread that owns the render
-//! terminal (see [`conn`]). The thread streams [`RenderSnapshot`]s to this iced
-//! app, which draws them on a canvas; key presses go back to the thread to be
-//! encoded (its mode state mirrors the session, so DECCKM etc. stay in sync).
+//! A host-grouped session sidebar (local + SSH remotes) beside the live
+//! terminal. One background **supervisor** (in the iced subscription) owns a
+//! per-host actor thread (see [`conn`]); each actor keeps its own `!Send`
+//! terminal off iced's multi-threaded runtime. The app holds only plain data
+//! ([`model::Model`] + the active [`RenderSnapshot`]) and routes [`AppCmd`]s to
+//! the supervisor.
 
 mod conn;
 mod key;
+mod model;
 mod render;
+mod ssh;
+mod theme;
+mod view;
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::time::Duration;
 
-use asd_proto::paths;
-use asd_vt::RenderSnapshot;
-use conn::{Cmd, WorkerEvent};
+use asd_vt::{KeyEvent, RenderSnapshot};
+use conn::{HostCmd, HostHandle, UiEvent};
 use iced::futures::stream::BoxStream;
 use iced::futures::{SinkExt, StreamExt};
-use iced::widget::{Canvas, canvas, center, text};
-use iced::{Element, Length, Size, Subscription, Task};
-use tokio::sync::mpsc::UnboundedSender;
+use iced::widget::canvas;
+use iced::{Element, Size, Subscription, Task};
+use model::{HostId, HostKind, HostState, LOCAL_ID, Model, RemoteSpec};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
@@ -32,202 +39,403 @@ fn main() -> iced::Result {
         .subscription(App::subscription)
         .title(App::title)
         .antialiasing(true)
+        // Keep the startup size in sync with App::new's initial grid estimate.
+        .window_size(iced::Size::new(960.0, 600.0))
         .run()
 }
 
-/// Identity of a connection attempt. Its `Hash` drives the subscription: bump
-/// `generation` and iced restarts the worker — that is how reconnect works.
-#[derive(Clone, Hash)]
-struct ConnConfig {
-    socket: PathBuf,
-    name: String,
-    cols: u16,
-    rows: u16,
-    generation: u64,
+/// Commands the app sends to the supervisor.
+#[derive(Debug, Clone)]
+pub(crate) enum AppCmd {
+    AddRemote {
+        id: HostId,
+        spec: RemoteSpec,
+    },
+    RemoveHost {
+        id: HostId,
+    },
+    SetActive {
+        host: HostId,
+        name: String,
+        cols: u16,
+        rows: u16,
+    },
+    Key(KeyEvent),
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    Create {
+        host: HostId,
+    },
+    Kill {
+        host: HostId,
+        name: String,
+    },
 }
 
-enum Status {
-    Connecting,
+/// State of the *active* session's stream (the terminal pane). When nothing is
+/// selected the pane shows a hint regardless of this.
+pub(crate) enum Status {
     Live,
     Ended(String),
     Disconnected(String),
 }
 
-struct App {
-    config: ConnConfig,
-    cmd_tx: Option<UnboundedSender<Cmd>>,
-    frame: Option<RenderSnapshot>,
-    cache: canvas::Cache,
-    status: Status,
-    metrics: render::Metrics,
-    live_cols: u16,
-    live_rows: u16,
+pub(crate) struct App {
+    pub(crate) model: Model,
+    pub(crate) frame: Option<RenderSnapshot>,
+    pub(crate) cache: canvas::Cache,
+    pub(crate) metrics: render::Metrics,
+    pub(crate) status: Status,
+    pub(crate) live_cols: u16,
+    pub(crate) live_rows: u16,
+    pub(crate) window: Size,
+    pub(crate) remote_input: String,
+    pub(crate) now_ms: u64,
+    sup_tx: Option<UnboundedSender<AppCmd>>,
+    generation: u64,
 }
 
 #[derive(Debug, Clone)]
-enum Message {
-    /// The worker started; carries the channel to send it commands.
-    Connected(UnboundedSender<Cmd>),
-    Worker(WorkerEvent),
+pub(crate) enum Message {
+    /// The supervisor started; carries the channel to command it.
+    Supervisor(UnboundedSender<AppCmd>),
+    Ui(UiEvent),
+    Select(HostId, String),
+    NewSession(HostId),
+    Kill(HostId, String),
+    RemoveHost(HostId),
+    RemoteInput(String),
+    RemoteSubmit,
+    /// Restart every host connection (the local daemon can't be auto-spawned
+    /// from here, so this is how the user recovers after starting it).
+    Reconnect,
     Keyboard(iced::keyboard::Event),
     Resized(Size),
+    Tick,
 }
 
 impl App {
     fn new() -> (Self, Task<Message>) {
-        // `asd-gui [session]` — session name defaults to s0; socket honors
-        // $ASD_SOCKET via the shared path contract.
-        let name = std::env::args().nth(1).unwrap_or_else(|| "s0".to_string());
         let metrics = render::Metrics::new(15.0);
-        let (cols, rows) = (80u16, 24u16);
-        let config = ConnConfig {
-            socket: paths::socket_path(),
-            name,
-            cols,
-            rows,
-            generation: 0,
-        };
+        // iced doesn't emit a resize on startup, so seed the grid from the
+        // default window minus the chrome — otherwise the first attach sizes to
+        // a stale 80×24 until the user resizes.
+        let window = Size::new(960.0, 600.0);
+        let w = (window.width - view::SIDEBAR_W).max(1.0);
+        let h = (window.height - view::STATUS_H - view::TERMHEAD_H).max(1.0);
+        let (live_cols, live_rows) = metrics.grid(Size::new(w, h));
         (
             Self {
-                config,
-                cmd_tx: None,
+                model: Model::with_local(),
                 frame: None,
                 cache: canvas::Cache::new(),
-                status: Status::Connecting,
                 metrics,
-                live_cols: cols,
-                live_rows: rows,
+                status: Status::Live,
+                live_cols,
+                live_rows,
+                window,
+                remote_input: String::new(),
+                now_ms: now_ms(),
+                sup_tx: None,
+                generation: 0,
             },
             Task::none(),
         )
     }
 
     fn title(&self) -> String {
-        format!("asd — {}", self.config.name)
+        match &self.model.active {
+            Some((_, name)) => format!("asd — {name}"),
+            None => "asd".to_string(),
+        }
+    }
+
+    /// Terminal columns/rows that fit the terminal pane (window minus chrome).
+    fn grid(&self) -> (u16, u16) {
+        let w = (self.window.width - view::SIDEBAR_W).max(1.0);
+        let h = (self.window.height - view::STATUS_H - view::TERMHEAD_H).max(1.0);
+        self.metrics.grid(Size::new(w, h))
+    }
+
+    fn send(&self, cmd: AppCmd) {
+        if let Some(tx) = &self.sup_tx {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    fn attach(&mut self, host: HostId, name: String) {
+        let (cols, rows) = (self.live_cols, self.live_rows);
+        self.model.select(host, name.clone());
+        self.status = Status::Live;
+        self.frame = None;
+        self.cache.clear();
+        self.send(AppCmd::SetActive {
+            host,
+            name,
+            cols,
+            rows,
+        });
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Connected(tx) => self.cmd_tx = Some(tx),
-            Message::Worker(WorkerEvent::Frame(snap)) => {
-                self.frame = Some(*snap);
-                self.cache.clear();
-                self.status = Status::Live;
+            Message::Supervisor(tx) => {
+                self.sup_tx = Some(tx);
+                // Re-establish any remote hosts and the active session after a
+                // (re)start of the supervisor.
+                let remotes: Vec<(HostId, RemoteSpec)> = self
+                    .model
+                    .hosts
+                    .iter()
+                    .filter_map(|h| match &h.kind {
+                        HostKind::Ssh(s) => Some((h.id, s.clone())),
+                        HostKind::Local => None,
+                    })
+                    .collect();
+                for (id, spec) in remotes {
+                    self.send(AppCmd::AddRemote { id, spec });
+                }
+                if let Some((host, name)) = self.model.active.clone() {
+                    let (cols, rows) = (self.live_cols, self.live_rows);
+                    self.send(AppCmd::SetActive {
+                        host,
+                        name,
+                        cols,
+                        rows,
+                    });
+                }
             }
-            Message::Worker(WorkerEvent::SessionEnded(msg)) => {
-                self.status = Status::Ended(msg);
-                self.cmd_tx = None;
+            Message::Ui(UiEvent::State { host, state }) => {
+                self.model.set_state(host, state.clone());
+                // If the host of the session we're viewing dropped, reflect it.
+                if let HostState::Down(msg) = &state
+                    && self.model.active.as_ref().is_some_and(|(h, _)| *h == host)
+                {
+                    self.status = Status::Disconnected(msg.clone());
+                }
             }
-            Message::Worker(WorkerEvent::Disconnected(msg)) => {
-                self.status = Status::Disconnected(msg);
-                self.cmd_tx = None;
+            Message::Ui(UiEvent::Sessions { host, sessions }) => {
+                self.model.set_sessions(host, sessions);
+                // Auto-select the first local session on first populate so the
+                // window isn't empty on launch.
+                if self.model.active.is_none()
+                    && host == LOCAL_ID
+                    && let Some(first) = self.model.host(LOCAL_ID).and_then(|h| h.sessions.first())
+                {
+                    let name = first.name.clone();
+                    self.attach(LOCAL_ID, name);
+                }
+            }
+            Message::Ui(UiEvent::Created { host, name }) => {
+                // The user asked for it — show it.
+                self.attach(host, name);
+            }
+            Message::Ui(UiEvent::Frame { host, snap }) => {
+                if self.model.active.as_ref().is_some_and(|(h, _)| *h == host) {
+                    self.frame = Some(*snap);
+                    self.cache.clear();
+                    self.status = Status::Live;
+                }
+            }
+            Message::Ui(UiEvent::SessionEnded { host, name, msg }) => {
+                if self.model.is_active(host, &name) {
+                    self.status = Status::Ended(msg);
+                }
+            }
+            Message::Select(host, name) => {
+                if !self.model.is_active(host, &name) {
+                    self.attach(host, name);
+                }
+            }
+            Message::NewSession(host) => self.send(AppCmd::Create { host }),
+            Message::Kill(host, name) => self.send(AppCmd::Kill { host, name }),
+            Message::RemoveHost(id) => {
+                self.model.remove_host(id);
+                self.send(AppCmd::RemoveHost { id });
+            }
+            Message::Reconnect => {
+                // Bumping the generation changes the subscription seed's hash,
+                // so iced restarts the supervisor; App::update replays the
+                // remote hosts and active session on the fresh Supervisor.
+                self.generation += 1;
+                for h in &mut self.model.hosts {
+                    h.state = HostState::Connecting;
+                }
+            }
+            Message::RemoteInput(s) => self.remote_input = s,
+            Message::RemoteSubmit => {
+                let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                if let Some(spec) = RemoteSpec::parse(&self.remote_input, &user) {
+                    let id = self.model.add_remote(spec.clone());
+                    self.send(AppCmd::AddRemote { id, spec });
+                    self.remote_input.clear();
+                }
             }
             Message::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                // While disconnected, 'r' reconnects; other keys do nothing.
-                if matches!(self.status, Status::Disconnected(_) | Status::Ended(_)) {
-                    if let iced::keyboard::Key::Character(s) = &key
-                        && s.as_str() == "r"
-                    {
-                        return self.reconnect();
-                    }
-                    return Task::none();
-                }
-                if let Some(ev) = key::map_key(&key, modifiers)
-                    && let Some(tx) = &self.cmd_tx
+                if self.model.active.is_some()
+                    && let Some(ev) = key::map_key(&key, modifiers)
                 {
-                    let _ = tx.send(Cmd::Key(ev));
+                    self.send(AppCmd::Key(ev));
                 }
             }
-            // Key releases and modifier changes are not forwarded.
             Message::Keyboard(_) => {}
             Message::Resized(size) => {
-                let (cols, rows) = self.metrics.grid(size);
+                self.window = size;
+                let (cols, rows) = self.grid();
                 if (cols, rows) != (self.live_cols, self.live_rows) {
                     self.live_cols = cols;
                     self.live_rows = rows;
-                    if let Some(tx) = &self.cmd_tx {
-                        let _ = tx.send(Cmd::Resize { cols, rows });
-                    }
+                    self.send(AppCmd::Resize { cols, rows });
                 }
             }
+            Message::Tick => self.now_ms = now_ms(),
         }
-        Task::none()
-    }
-
-    fn reconnect(&mut self) -> Task<Message> {
-        // Bumping the generation changes ConnConfig's hash → the subscription
-        // restarts with a fresh connection.
-        self.config.generation += 1;
-        self.config.cols = self.live_cols;
-        self.config.rows = self.live_rows;
-        self.status = Status::Connecting;
-        self.frame = None;
-        self.cmd_tx = None;
-        self.cache.clear();
         Task::none()
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let mut subs = vec![
+        Subscription::batch([
             iced::keyboard::listen().map(Message::Keyboard),
             iced::window::resize_events().map(|(_, size)| Message::Resized(size)),
-        ];
-        // A dead session does not auto-retry; everything else keeps the worker
-        // subscription registered (the same hash won't restart a finished
-        // stream — only a generation bump does).
-        if !matches!(self.status, Status::Ended(_)) {
-            subs.push(Subscription::run_with(
-                self.config.clone(),
-                connection_worker,
-            ));
-        }
-        Subscription::batch(subs)
+            iced::time::every(Duration::from_secs(15)).map(|_| Message::Tick),
+            Subscription::run_with(
+                Seed {
+                    generation: self.generation,
+                },
+                supervisor,
+            ),
+        ])
     }
 
     fn view(&self) -> Element<'_, Message> {
-        match &self.status {
-            Status::Live | Status::Connecting => Canvas::new(render::TermCanvas {
-                frame: self.frame.as_ref(),
-                cache: &self.cache,
-                metrics: self.metrics,
-            })
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
-            Status::Disconnected(msg) => center(text(format!(
-                "[disconnected: {msg}]  —  press r to reconnect"
-            )))
-            .into(),
-            Status::Ended(msg) => center(text(format!(
-                "[session ended: {msg}]  —  press r to reconnect"
-            )))
-            .into(),
-        }
+        view::view(self)
     }
 }
 
-/// Subscription worker: spawns the render thread and bridges its channels to
-/// iced messages. `fn(&ConnConfig)` so it can be a plain function pointer for
-/// `Subscription::run_with`.
-fn connection_worker(cfg: &ConnConfig) -> BoxStream<'static, Message> {
-    let cfg = cfg.clone();
+/// The subscription seed; bumping `generation` restarts the whole supervisor.
+#[derive(Clone, Hash)]
+struct Seed {
+    generation: u64,
+}
+
+/// The supervisor: spawns a host actor per host, routes [`AppCmd`]s to the
+/// right actor, and forwards every [`UiEvent`] to the app.
+fn supervisor(_seed: &Seed) -> BoxStream<'static, Message> {
     iced::stream::channel(
         256,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
-            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerEvent>();
-            std::thread::spawn(move || {
-                conn::run(cfg.socket, cfg.name, cfg.cols, cfg.rows, cmd_rx, ev_tx);
-            });
-            let _ = output.send(Message::Connected(cmd_tx)).await;
-            while let Some(ev) = ev_rx.recv().await {
-                let terminal = !matches!(ev, WorkerEvent::Frame(_));
-                let _ = output.send(Message::Worker(ev)).await;
-                if terminal {
-                    break;
+            let (appcmd_tx, mut appcmd_rx) = unbounded_channel::<AppCmd>();
+            let (ui_tx, mut ui_rx) = unbounded_channel::<UiEvent>();
+            let mut hosts: HashMap<HostId, HostHandle> = HashMap::new();
+            let mut active: Option<HostId> = None;
+
+            spawn_host(LOCAL_ID, HostKind::Local, &ui_tx, &mut hosts);
+            if output.send(Message::Supervisor(appcmd_tx)).await.is_err() {
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    cmd = appcmd_rx.recv() => {
+                        let Some(cmd) = cmd else { break };
+                        route(cmd, &ui_tx, &mut hosts, &mut active);
+                    }
+                    ev = ui_rx.recv() => {
+                        let Some(ev) = ev else { break };
+                        if output.send(Message::Ui(ev)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         },
     )
     .boxed()
+}
+
+fn route(
+    cmd: AppCmd,
+    ui_tx: &UnboundedSender<UiEvent>,
+    hosts: &mut HashMap<HostId, HostHandle>,
+    active: &mut Option<HostId>,
+) {
+    match cmd {
+        AppCmd::AddRemote { id, spec } => {
+            if !hosts.contains_key(&id) {
+                spawn_host(id, HostKind::Ssh(spec), ui_tx, hosts);
+            }
+        }
+        AppCmd::RemoveHost { id } => {
+            if let Some(h) = hosts.remove(&id) {
+                let _ = h.cmd_tx.send(HostCmd::Shutdown);
+            }
+            if *active == Some(id) {
+                *active = None;
+            }
+        }
+        AppCmd::SetActive {
+            host,
+            name,
+            cols,
+            rows,
+        } => {
+            if let Some(prev) = *active
+                && prev != host
+                && let Some(h) = hosts.get(&prev)
+            {
+                let _ = h.cmd_tx.send(HostCmd::Detach);
+            }
+            *active = Some(host);
+            if let Some(h) = hosts.get(&host) {
+                let _ = h.cmd_tx.send(HostCmd::Attach { name, cols, rows });
+            }
+        }
+        AppCmd::Key(ev) => {
+            if let Some(a) = *active
+                && let Some(h) = hosts.get(&a)
+            {
+                let _ = h.cmd_tx.send(HostCmd::Key(ev));
+            }
+        }
+        AppCmd::Resize { cols, rows } => {
+            if let Some(a) = *active
+                && let Some(h) = hosts.get(&a)
+            {
+                let _ = h.cmd_tx.send(HostCmd::Resize { cols, rows });
+            }
+        }
+        AppCmd::Create { host } => {
+            if let Some(h) = hosts.get(&host) {
+                let _ = h.cmd_tx.send(HostCmd::Create);
+            }
+        }
+        AppCmd::Kill { host, name } => {
+            if let Some(h) = hosts.get(&host) {
+                let _ = h.cmd_tx.send(HostCmd::Kill { name });
+            }
+        }
+    }
+}
+
+fn spawn_host(
+    id: HostId,
+    kind: HostKind,
+    ui_tx: &UnboundedSender<UiEvent>,
+    hosts: &mut HashMap<HostId, HostHandle>,
+) {
+    let (cmd_tx, cmd_rx): (UnboundedSender<HostCmd>, UnboundedReceiver<HostCmd>) =
+        unbounded_channel();
+    let ev = ui_tx.clone();
+    std::thread::spawn(move || conn::run_host(id, kind, cmd_rx, ev));
+    hosts.insert(id, HostHandle { cmd_tx });
+}
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

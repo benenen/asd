@@ -20,7 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | asd-vt | `VtBackend` trait + libghostty-vt 实现（逃生门边界） | iced/wgpu、portable-pty、asd-proto |
 | asd-daemon（lib） | session 管理、UDS 服务 | iced/wgpu（含传递依赖） |
 | asd-cli（唯一 bin `asd`） | 调试客户端、`attach --stdio` 代理、内嵌 daemon（`asd daemon`） | iced/wgpu |
-| asd-gui（bin `asd-gui`，iced/wgpu） | 渲染、输入、拨号 | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基）；可依赖 asd-vt/asd-proto |
+| asd-gui（bin `asd-gui`，iced/wgpu） | 渲染、输入、拨号、SSH remote | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基）；可依赖 asd-vt/asd-proto。**SSH 走纯 Rust `russh`（网络客户端，不 spawn 进程/不用 ssh.exe，不违反边界）**，不是 spawn `ssh` 子进程 |
 
 ## 常用命令
 
@@ -55,4 +55,6 @@ cargo fmt --all
 
 **路径契约（spec §2）**：collected in `asd-proto::paths` —— socket 解析优先级 `$ASD_SOCKET` > `$XDG_RUNTIME_DIR/asd.sock` > `/tmp/asd-$UID/asd.sock`（0700），daemon 与所有客户端共用这一份实现；数据目录 `~/.local/share/asd/`（daemon 日志 `daemon.log` 在此，由 `asd attach -A` 拉起时重定向）。
 
-**asd-gui（spec §7，iced 0.14 + wgpu）**：`asd-gui [session]` 一个窗口一条 UDS 连接。三层线程/异步：① 一个 std **渲染线程**（`conn.rs`）自带 current_thread tokio runtime，独占 `!Send` 的 `GhosttyVt`（不能上 iced 的多线程 runtime），喂 Snapshot/Output、产 `RenderSnapshot` 出一条 channel、收 Key/Resize 进另一条；`encode_key` 用渲染终端自己的模式态，DECCKM 等天然同步（spec §7）。② iced `Subscription::run_with(ConnConfig, connection_worker)` 用 `iced::stream::channel` 桥接：把 cmd-Sender 交给 app、把渲染线程的事件转成 Message。**重连 = bump `ConnConfig.generation`**（它的 Hash 变了 iced 就重启 subscription，spec §7 的手动 `r` 重连即改这个）。③ `render.rs` 的 `canvas::Program` 把 `RenderSnapshot` 画到 iced canvas（等宽 `Font::MONOSPACE`，bg 矩形 + fg 字形 + 反显块光标；cell 尺寸按字号估算，M0 ASCII 正确即可，CJK/样式保真是 M1）。**GUI 靠人肉验收**（沙箱/CI 无显示器，只编译 + 跑纯函数单测：`key.rs` 键映射、`render.rs` 网格换算）。
+**asd-gui（spec §7，iced 0.14 + wgpu）**：`render.rs` 的 `canvas::Program` 把 `RenderSnapshot` 画到 iced canvas（等宽 `Font::MONOSPACE`，bg 矩形 + fg 字形 + 反显块光标；cell 尺寸按字号估算，ASCII 正确，CJK/样式保真是 M1）。`encode_key` 用渲染终端自己的模式态，DECCKM 等天然同步。**GUI 靠人肉验收**（沙箱/CI 无显示器，只编译 + 跑纯函数单测：`model.rs` 分组/时长/host 解析、`key.rs` 键映射、`render.rs` 网格换算）。
+
+**M2 两栏重构（2026-07-14，对标 boo `boo ui`）**：单窗口从「一条 UDS 连接」升级为 **host 分组的 session 侧栏 + 终端面板 + 底部状态栏**。架构分层：① **supervisor**（跑在 iced subscription 的 `iced::stream::channel` 里，`main.rs::supervisor`）：每个 host 起一个 std 线程 actor，路由 `AppCmd`→对应 host 的 `HostCmd`，把所有 host 的 `UiEvent` 转 Message 汇给 app；app 侧只持纯数据 `model::Model`（Send）。② **host actor**（`conn.rs::run_host`，每 host 一线程 + current-thread runtime + `!Send` `GhosttyVt`）：握手后按 `LIST_INTERVAL` 轮询 `ListSessions`→喂侧栏；**只有当前查看的 session 那台**发 `Attach` 并流式 Output→产 `RenderSnapshot`；切换 session = 同一连接 `Detach`+`Attach`（`attaching` 标志丢弃切换间隙的旧 Output）。传输用 `BoxRead/BoxWrite`（`Box<dyn AsyncRead/Write>`）——本地 `UnixStream`、remote russh `ChannelStream` 共用一条 `drive` loop。③ **SSH remote**（`ssh.rs`，russh 0.62）：`client::connect((host,port),…)`→`check_server_key` 查 `~/.ssh/known_hosts`（未知/变更即拒）→key-file 认证（`~/.ssh/id_*` 无口令；**ssh-agent/口令/2FA 是后续**）→`channel.exec("asd attach --stdio")`→`into_stream()`。remote 侧靠已有的 `--stdio` 透传代理，于是 GUI 对 remote daemon 说的还是同一套协议。**重连 = bump `Seed.generation`**（Hash 变→重启 supervisor→app 在新 `Message::Supervisor` 里重放 AddRemote+SetActive）；**GUI 不能自启 daemon（进程管理边界），本地 daemon 没跑就点侧栏底部「daemon down · click to reconnect」**。侧栏配色见 `theme.rs`：**host origin 用双色 rail 编码——本地 amber、SSH remote cyan**。`SessionInfo` 无命令字段，故侧栏显 uptime+attached 数而非命令行（要显命令得 bump proto 给 `SessionInfo` 加字段）。

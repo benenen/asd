@@ -17,6 +17,7 @@ anyhow = { workspace = true }
 asd-proto = { workspace = true }
 asd-vt = { workspace = true }
 iced = { version = "0.14", features = ["canvas", "tokio"] }
+russh = "0.62.2"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
