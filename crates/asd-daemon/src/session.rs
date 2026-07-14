@@ -172,8 +172,9 @@ impl SessionHandle {
 }
 
 /// The terminal's foreground command: the process group in the foreground of
-/// the pty (`tcgetpgrp` on the master), resolved to a command line via `/proc`.
-/// `None` when there is no foreground group or `/proc` is unavailable.
+/// the pty (`tcgetpgrp` on the master), resolved to a command via `/proc`
+/// (Linux) or libproc's `proc_pidpath` (macOS). `None` when there is no
+/// foreground group or the platform has no cheap way to resolve it.
 fn foreground_command(master_fd: RawFd) -> Option<String> {
     if master_fd < 0 {
         return None;
@@ -187,37 +188,74 @@ fn foreground_command(master_fd: RawFd) -> Option<String> {
     proc_command(pgrp)
 }
 
+/// Strip the leading `-` of a login shell's argv[0] (`-bash` → `bash`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn strip_login_dash(s: &str) -> &str {
+    s.strip_prefix('-').unwrap_or(s)
+}
+
+/// A `--cmd` session's foreground is our non-interactive `sh -c <c>` wrapper
+/// (no job control, so sh stays the group leader). Show the command it runs,
+/// not the wrapper. Interactive foreground jobs get their own process group and
+/// never look like this.
+#[cfg(target_os = "linux")]
+fn unwrap_shell_c(cmd: String) -> String {
+    for prefix in ["sh -c ", "bash -c ", "dash -c ", "zsh -c "] {
+        if let Some(rest) = cmd.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    cmd
+}
+
 /// Format process `pid`'s command from `/proc/<pid>/cmdline` — argv[0]
 /// basenamed (and de-`-`ed for login shells), remaining args kept — falling
 /// back to `/proc/<pid>/comm`.
+#[cfg(target_os = "linux")]
 fn proc_command(pid: libc::pid_t) -> Option<String> {
     if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
         let mut argv = raw.split(|&b| b == 0).filter(|s| !s.is_empty());
         if let Some(arg0) = argv.next() {
             let arg0 = String::from_utf8_lossy(arg0);
             let base = arg0.rsplit('/').next().unwrap_or(&arg0);
-            let base = base.strip_prefix('-').unwrap_or(base); // login shell "-bash"
-            let mut out = base.to_string();
+            let mut out = strip_login_dash(base).to_string();
             for arg in argv {
                 out.push(' ');
                 out.push_str(&String::from_utf8_lossy(arg));
             }
-            // A `--cmd` session's foreground is our non-interactive `sh -c <c>`
-            // wrapper (no job control, so sh stays the group leader). Show the
-            // command it runs, not the wrapper. Interactive foreground jobs get
-            // their own process group and never hit this.
-            for prefix in ["sh -c ", "bash -c ", "dash -c ", "zsh -c "] {
-                if let Some(rest) = out.strip_prefix(prefix) {
-                    return Some(rest.to_string());
-                }
-            }
-            return Some(out);
+            return Some(unwrap_shell_c(out));
         }
     }
     match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
         Ok(c) if !c.trim().is_empty() => Some(c.trim().to_string()),
         _ => None,
     }
+}
+
+/// macOS has no `/proc`; use libproc's `proc_pidpath` for the foreground
+/// process's executable path and take its basename. Arguments aren't cheaply
+/// available here, so this reports the program name (e.g. `vim`, `node`,
+/// `top`) rather than a full command line.
+#[cfg(target_os = "macos")]
+fn proc_command(pid: libc::pid_t) -> Option<String> {
+    // PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN).
+    const MAX: usize = 4096;
+    let mut buf = [0u8; MAX];
+    // SAFETY: `buf` is valid for `MAX` bytes; `proc_pidpath` writes at most
+    // that many and returns the byte length written (<= 0 on failure).
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast::<libc::c_void>(), MAX as u32) };
+    if n <= 0 {
+        return None;
+    }
+    let path = std::str::from_utf8(&buf[..n as usize]).ok()?;
+    let base = strip_login_dash(path.rsplit('/').next().unwrap_or(path));
+    (!base.is_empty()).then(|| base.to_string())
+}
+
+/// No cheap foreground-command source on other targets.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn proc_command(_pid: libc::pid_t) -> Option<String> {
+    None
 }
 
 /// Create the pty, start the child process, and launch the session thread
