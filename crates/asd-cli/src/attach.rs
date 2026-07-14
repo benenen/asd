@@ -2,15 +2,18 @@
 //!
 //! Unlike a dumb passthrough, this client keeps its own [`GhosttyVt`] terminal
 //! (fed the daemon's Snapshot + Output) and renders it to the screen itself.
-//! That local VT model gives a single Live view two things at once:
+//! That local VT model gives a single Live view (modeled on boo's `boo ui`):
 //! - **detach restores the original screen** (we run on the alternate screen);
-//! - **scrollback into history** — a client-local action (Shift+PageUp/PageDown/
-//!   Home/End) that never disturbs other attached clients.
+//! - **wheel scrolls** back through history — a client-local action that never
+//!   disturbs other attached clients (keyboard Shift+PageUp/PageDown/Home/End
+//!   work too);
+//! - **drag selects + copies** — we grab the mouse (1002+1006, so drag motion
+//!   is reported), highlight the selection, and write the system clipboard via
+//!   OSC 52. Hold **Shift** while dragging to fall back to the host terminal's
+//!   own native selection instead.
 //!
-//! We deliberately do **not** grab the mouse: no mouse-tracking modes are
-//! enabled, so the host terminal's own drag-to-select and copy keep working.
-//! (On the alternate screen the host's native scrollback is unavailable, which
-//! is why scrollback is driven from the keyboard here.)
+//! When the session program itself wants the mouse (vim/htop), we mirror its
+//! exact modes to the host and forward the events to it (`sync_host_mouse`).
 
 use std::io::Write as _;
 use std::os::fd::AsFd;
@@ -80,12 +83,19 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
 
     // Lines scrolled up from the live bottom (0 = following live output).
     let mut scroll = 0usize;
-    // Mouse-tracking modes currently enabled on the host terminal, mirroring
-    // the session (empty = host mouse off, so native drag-select/copy works).
+    // Mouse modes currently enabled on the host terminal. When the session
+    // wants the mouse (vim) we mirror its exact modes; otherwise we keep our
+    // own base (1002+1006) so the wheel scrolls and drags select locally.
     let mut host_mouse: Vec<u16> = Vec::new();
+    // Whether the session program currently wants the mouse (routes events:
+    // true → forward to it; false → wheel scrolls / drag selects locally).
+    let mut session_mouse = false;
+    // Active drag selection (viewport cells), while `selecting`.
+    let mut selection: Option<render::Selection> = None;
+    let mut selecting = false;
 
-    render_now(&mut vt, scroll)?;
-    sync_host_mouse(&mut vt, &mut host_mouse)?;
+    render_now(&mut vt, scroll, selection)?;
+    sync_host_mouse(&mut vt, &mut host_mouse, &mut session_mouse)?;
 
     // Socket reader → Ev channel.
     let (ev_tx, mut ev_rx) = mpsc::channel::<Ev>(256);
@@ -146,24 +156,24 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                             vt.feed(&more);
                             let _ = vt.take_pty_responses();
                         }
-                        // The session may have toggled its mouse mode in this
-                        // output; mirror the change onto the host terminal.
-                        if sync_host_mouse(&mut vt, &mut host_mouse).is_err() {
+                        // The session may have toggled its mouse mode; mirror
+                        // it (or fall back to our base) onto the host terminal.
+                        if sync_host_mouse(&mut vt, &mut host_mouse, &mut session_mouse).is_err() {
                             break Exit::DaemonGone;
                         }
                         // While scrolled up we keep the view frozen so reading
                         // history is not yanked around by live output.
-                        if scroll == 0 && render_now(&mut vt, scroll).is_err() {
+                        if scroll == 0 && render_now(&mut vt, scroll, selection).is_err() {
                             break Exit::DaemonGone;
                         }
                     }
                     Ev::Snapshot(dump) => {
                         vt.feed(&dump);
                         let _ = vt.take_pty_responses();
-                        if sync_host_mouse(&mut vt, &mut host_mouse).is_err() {
+                        if sync_host_mouse(&mut vt, &mut host_mouse, &mut session_mouse).is_err() {
                             break Exit::DaemonGone;
                         }
-                        if render_now(&mut vt, scroll).is_err() {
+                        if render_now(&mut vt, scroll, selection).is_err() {
                             break Exit::DaemonGone;
                         }
                     }
@@ -190,42 +200,85 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                     };
                     if new_scroll != scroll {
                         scroll = new_scroll;
-                        if render_now(&mut vt, scroll).is_err() {
+                        if render_now(&mut vt, scroll, selection).is_err() {
                             break Exit::DaemonGone;
                         }
                     }
                     continue;
                 }
 
-                // Mouse reports only reach us when the session has mouse on (we
-                // mirrored it to the host). In the live view they belong to the
-                // session; while scrolled back they stay local (wheel scrolls,
-                // other events are swallowed) so history reading is undisturbed.
                 if is_mouse_report(&chunk) {
-                    if scroll == 0 {
-                        // Live: host viewport == session grid, and the host
-                        // already encoded in the session's mode, so forward
-                        // verbatim (no coordinate/encoding translation needed).
+                    // When the session wants the mouse (vim/htop), the event is
+                    // its business: forward verbatim in the live view (the host
+                    // mirrors the session's encoding, and the viewport is 1:1,
+                    // so no translation is needed). While scrolled back, the
+                    // wheel still scrolls our view.
+                    if session_mouse && scroll == 0 {
                         if writer.write_frame(&Frame::Input { bytes: chunk }).await.is_err() {
                             break Exit::DaemonGone;
                         }
-                    } else if let Some(dir) = mouse_wheel(&chunk) {
-                        let max_scroll = vt.scrollback_rows();
-                        scroll = match dir {
-                            WheelDir::Up => (scroll + WHEEL_STEP).min(max_scroll),
-                            WheelDir::Down => scroll.saturating_sub(WHEEL_STEP),
-                        };
-                        if render_now(&mut vt, scroll).is_err() {
-                            break Exit::DaemonGone;
+                        continue;
+                    }
+                    // Otherwise the mouse is ours (shell prompt, or scrolled
+                    // back): wheel scrolls, drag selects + copies via OSC 52.
+                    let max_scroll = vt.scrollback_rows();
+                    let mut dirty = false;
+                    for ev in render::parse_mouse(&chunk) {
+                        match ev.kind {
+                            render::MouseKind::WheelUp => {
+                                scroll = (scroll + WHEEL_STEP).min(max_scroll);
+                                dirty = true;
+                            }
+                            render::MouseKind::WheelDown => {
+                                scroll = scroll.saturating_sub(WHEEL_STEP);
+                                dirty = true;
+                            }
+                            render::MouseKind::Press => {
+                                selecting = true;
+                                selection = Some(render::Selection {
+                                    start: (ev.x, ev.y),
+                                    end: (ev.x, ev.y),
+                                });
+                                dirty = true;
+                            }
+                            render::MouseKind::Drag if selecting => {
+                                if let Some(sel) = &mut selection {
+                                    sel.end = (ev.x, ev.y);
+                                    dirty = true;
+                                }
+                            }
+                            render::MouseKind::Release if selecting => {
+                                selecting = false;
+                                if let Some(sel) = selection {
+                                    // Position the viewport at the current
+                                    // scroll so selection coords match what is
+                                    // displayed, then copy via OSC 52.
+                                    vt.set_scroll(scroll);
+                                    let text = vt.selection_text(asd_vt::Selection {
+                                        start: sel.start,
+                                        end: sel.end,
+                                        block: false,
+                                    });
+                                    if !text.is_empty() {
+                                        let _ = write_stdout(&render::osc52_copy(&text));
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
+                    }
+                    if dirty && render_now(&mut vt, scroll, selection).is_err() {
+                        break Exit::DaemonGone;
                     }
                     continue;
                 }
 
-                // Typing: snap back to the live bottom and forward.
-                if scroll != 0 {
+                // Typing: snap back to the live bottom, clear any selection, and
+                // forward.
+                if scroll != 0 || selection.is_some() {
                     scroll = 0;
-                    let _ = render_now(&mut vt, scroll);
+                    selection = None;
+                    let _ = render_now(&mut vt, scroll, selection);
                 }
                 if writer.write_frame(&Frame::Input { bytes: chunk }).await.is_err() {
                     break Exit::DaemonGone;
@@ -238,7 +291,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                 if writer.write_frame(&Frame::Resize { cols, rows }).await.is_err() {
                     break Exit::DaemonGone;
                 }
-                let _ = render_now(&mut vt, scroll);
+                let _ = render_now(&mut vt, scroll, selection);
             }
         }
     };
@@ -248,19 +301,26 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     drop(_screen);
     drop(_raw);
 
+    // A normal detach returns silently to the shell prompt (the alt-screen
+    // restore already put the cursor back). Only abnormal exits print a reason.
     match exit {
-        Exit::Detached => eprintln!("[asd: detached]"),
+        Exit::Detached => {}
         Exit::SessionEnded(msg) => eprintln!("[asd: {msg}]"),
         Exit::DaemonGone => eprintln!("[asd: connection to daemon lost]"),
     }
     Ok(())
 }
 
-/// Position the viewport at `scroll` and paint one frame.
-fn render_now(vt: &mut GhosttyVt, scroll: usize) -> std::io::Result<()> {
+/// Position the viewport at `scroll` and paint one frame (with the active
+/// selection highlighted, if any).
+fn render_now(
+    vt: &mut GhosttyVt,
+    scroll: usize,
+    sel: Option<render::Selection>,
+) -> std::io::Result<()> {
     vt.set_scroll(scroll);
     let snap = vt.render_snapshot();
-    write_stdout(&render::render_frame(&snap))
+    write_stdout(&render::render_frame(&snap, sel))
 }
 
 /// A scrollback navigation key.
@@ -286,12 +346,27 @@ fn parse_scroll_key(chunk: &[u8]) -> Option<ScrollKey> {
     }
 }
 
-/// Mirror the session's mouse-tracking modes onto the host terminal, emitting
-/// only the delta. `host` is updated in place. When the session has no mouse
-/// (e.g. a shell prompt) the host ends up mouse-free, so its native
-/// drag-to-select/copy works.
-fn sync_host_mouse(vt: &mut GhosttyVt, host: &mut Vec<u16>) -> std::io::Result<()> {
-    let want = vt.mouse_modes();
+/// Our base mouse modes when the session does not want the mouse: button-event
+/// tracking (1002, so drags are reported for local text selection) + SGR
+/// encoding (1006). Matches boo's `boo ui`.
+const BASE_MOUSE: &[u16] = &[1002, 1006];
+
+/// Keep the host terminal's mouse modes in sync. When the session wants the
+/// mouse (vim/htop) we mirror its exact modes so its events arrive in the
+/// encoding it expects; otherwise we assert our own base (1002+1006) so the
+/// wheel scrolls and drags select locally. `host` and `session_mouse` are
+/// updated in place; only the delta is emitted.
+fn sync_host_mouse(
+    vt: &mut GhosttyVt,
+    host: &mut Vec<u16>,
+    session_mouse: &mut bool,
+) -> std::io::Result<()> {
+    *session_mouse = vt.is_mouse_tracking();
+    let want = if *session_mouse {
+        vt.mouse_modes()
+    } else {
+        BASE_MOUSE.to_vec()
+    };
     if want == *host {
         return Ok(());
     }
@@ -324,36 +399,6 @@ fn mouse_mode_delta(old: &[u16], new: &[u16]) -> Vec<u8> {
 /// (`CSI M ...`). These only arrive when host mouse tracking is on.
 fn is_mouse_report(chunk: &[u8]) -> bool {
     chunk.starts_with(b"\x1b[<") || chunk.starts_with(b"\x1b[M")
-}
-
-/// Wheel scroll direction of a mouse report, or `None` if it is not a wheel
-/// event. Handles SGR (button 64/65) and legacy (byte 96/97).
-fn mouse_wheel(chunk: &[u8]) -> Option<WheelDir> {
-    if let Some(rest) = chunk.strip_prefix(b"\x1b[<") {
-        // SGR: button number before the first ';'.
-        let end = rest.iter().position(|&b| b == b';').unwrap_or(rest.len());
-        let n: u32 = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
-        return match n {
-            64 => Some(WheelDir::Up),
-            65 => Some(WheelDir::Down),
-            _ => None,
-        };
-    }
-    if let Some(rest) = chunk.strip_prefix(b"\x1b[M") {
-        // Legacy: button byte is 32 + code; wheel up = 96, wheel down = 97.
-        return match rest.first() {
-            Some(96) => Some(WheelDir::Up),
-            Some(97) => Some(WheelDir::Down),
-            _ => None,
-        };
-    }
-    None
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WheelDir {
-    Up,
-    Down,
 }
 
 /// `--stdio` proxy: bidirectional raw byte copy between stdio and the UDS;
@@ -398,11 +443,10 @@ pub fn term_size() -> (u16, u16) {
 }
 
 /// Alternate-screen guard. Enters the alternate screen (DEC 1049) so detach
-/// restores the caller's screen; on drop, disables any mouse-tracking mode we
-/// may have mirrored from the session, leaves the alt screen, and resets the
-/// cursor shape. It does not enable mouse tracking itself — that is mirrored
-/// dynamically (see `sync_host_mouse`), so at a shell prompt the host stays
-/// mouse-free and its native drag-to-select/copy works.
+/// restores the caller's screen; on drop, disables every mouse mode we may
+/// have enabled, leaves the alt screen, and resets the cursor shape. It does
+/// not enable mouse tracking itself — `sync_host_mouse` does that right after
+/// the first paint (our base 1002+1006, or the session's exact modes).
 struct ScreenGuard;
 
 impl ScreenGuard {
@@ -497,16 +541,5 @@ mod tests {
         assert!(is_mouse_report(b"\x1b[M \"5")); // legacy
         assert!(!is_mouse_report(b"ls\r"));
         assert!(!is_mouse_report(b"\x1b[A")); // arrow key
-    }
-
-    #[test]
-    fn parses_wheel_direction() {
-        assert_eq!(mouse_wheel(b"\x1b[<64;10;5M"), Some(WheelDir::Up));
-        assert_eq!(mouse_wheel(b"\x1b[<65;10;5M"), Some(WheelDir::Down));
-        // Legacy wheel: byte 96 = up, 97 = down.
-        assert_eq!(mouse_wheel(b"\x1b[M\x60\x21\x21"), Some(WheelDir::Up));
-        assert_eq!(mouse_wheel(b"\x1b[M\x61\x21\x21"), Some(WheelDir::Down));
-        // A plain click is not a wheel event.
-        assert_eq!(mouse_wheel(b"\x1b[<0;10;5M"), None);
     }
 }
