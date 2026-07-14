@@ -301,10 +301,8 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     drop(_screen);
     drop(_raw);
 
-    // A normal detach returns silently to the shell prompt (the alt-screen
-    // restore already put the cursor back). Only abnormal exits print a reason.
     match exit {
-        Exit::Detached => {}
+        Exit::Detached => eprintln!("[asd: detached]"),
         Exit::SessionEnded(msg) => eprintln!("[asd: {msg}]"),
         Exit::DaemonGone => eprintln!("[asd: connection to daemon lost]"),
     }
