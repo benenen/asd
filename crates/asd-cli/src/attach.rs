@@ -221,18 +221,23 @@ pub fn term_size() -> (u16, u16) {
 /// Alternate-screen guard: enters the alternate screen (DEC 1049, clears it
 /// and saves the cursor) on creation, and restores the primary screen with
 /// its previous contents on drop.
+///
+/// Also enables "alternate scroll" (DEC 1007): on the alternate screen the
+/// mouse wheel is translated to arrow keys by the terminal, so wheel
+/// scrolling works inside pagers/vim/htop. True scrollback of session
+/// history is the M1 FetchHistory feature (spec §4).
 struct AltScreenGuard;
 
 impl AltScreenGuard {
     fn enter() -> std::io::Result<Self> {
-        write_stdout(b"\x1b[?1049h")?;
+        write_stdout(b"\x1b[?1049h\x1b[?1007h")?;
         Ok(Self)
     }
 }
 
 impl Drop for AltScreenGuard {
     fn drop(&mut self) {
-        let _ = write_stdout(b"\x1b[?1049l");
+        let _ = write_stdout(b"\x1b[?1007l\x1b[?1049l");
     }
 }
 
