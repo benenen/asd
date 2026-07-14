@@ -357,6 +357,21 @@ fn selection_text_extracts_viewport_range() {
 }
 
 #[test]
+fn selection_text_screen_spans_off_viewport_rows() {
+    let mut vt = term(20, 4);
+    for i in 0..20 {
+        vt.feed(format!("row{i}\r\n").as_bytes());
+    }
+    // The viewport is at the live bottom, but a screen-space selection reaches
+    // rows that scrolled off — coordinates are absolute (0 = oldest line), so
+    // it does not depend on where the viewport currently sits.
+    vt.set_scroll(0);
+    // Screen rows 2..=4 hold row2/row3/row4 (row 0 = the oldest line).
+    let text = vt.selection_text_screen((0, 2), (19, 4));
+    assert_eq!(text, "row2\nrow3\nrow4");
+}
+
+#[test]
 fn alt_screen_and_mouse_tracking_reflect_app_state() {
     let mut vt = term(20, 4);
     assert!(!vt.is_alt_screen());

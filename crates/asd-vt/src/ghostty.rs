@@ -376,6 +376,49 @@ impl VtBackend for GhosttyVt {
             _ => String::new(),
         }
     }
+
+    fn selection_text_screen(&mut self, start: (u16, u32), end: (u16, u32)) -> String {
+        let (cols, _) = self.cols_rows();
+        if cols == 0 {
+            return String::new();
+        }
+        let total = self.history_len() as u32;
+        if total == 0 {
+            return String::new();
+        }
+        let clampx = |x: u16| x.min(cols - 1);
+        let clampy = |y: u32| y.min(total - 1);
+        // Order the two ends row-major so grid_ref gets top-left → bottom-right.
+        let (a, b) = if (start.1, start.0) <= (end.1, end.0) {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let a = PointCoordinate {
+            x: clampx(a.0),
+            y: clampy(a.1),
+        };
+        let b = PointCoordinate {
+            x: clampx(b.0),
+            y: clampy(b.1),
+        };
+        let (Ok(pa), Ok(pb)) = (
+            self.terminal.grid_ref(Point::Screen(a)),
+            self.terminal.grid_ref(Point::Screen(b)),
+        ) else {
+            return String::new();
+        };
+        let selection = Selection::new(pa, pb, false);
+        let opts = SelFormatOptions::new()
+            .with_selection(&selection)
+            .with_emit_format(Format::Plain)
+            .with_unwrap(true)
+            .with_trim(true);
+        match self.terminal.format_selection_alloc(None, opts) {
+            Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+            _ => String::new(),
+        }
+    }
 }
 
 impl GhosttyVt {

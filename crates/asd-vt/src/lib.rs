@@ -129,4 +129,18 @@ pub trait VtBackend: Sized {
         let _ = sel;
         String::new()
     }
+
+    /// Text of a selection given in screen-space coordinates (`(x, row)` with
+    /// row 0 = the oldest scrollback line; see [`history_len`]). Unlike
+    /// [`selection_text`] this is independent of the current viewport/scroll,
+    /// so it captures a selection that spans rows scrolled off-screen — the
+    /// natural fit for a content-anchored selection. Same copy semantics
+    /// (unwrap soft-wraps, trim trailing blanks). Default returns empty.
+    ///
+    /// [`history_len`]: VtBackend::history_len
+    /// [`selection_text`]: VtBackend::selection_text
+    fn selection_text_screen(&mut self, start: (u16, u32), end: (u16, u32)) -> String {
+        let _ = (start, end);
+        String::new()
+    }
 }

@@ -90,8 +90,9 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     // Whether the session program currently wants the mouse (routes events:
     // true → forward to it; false → wheel scrolls / drag selects locally).
     let mut session_mouse = false;
-    // Active drag selection (viewport cells), while `selecting`.
-    let mut selection: Option<render::Selection> = None;
+    // Active drag selection, anchored in screen-space (see `Sel`) so the
+    // highlight follows the underlying text as the wheel scrolls.
+    let mut selection: Option<Sel> = None;
     let mut selecting = false;
 
     render_now(&mut vt, scroll, selection)?;
@@ -235,30 +236,29 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                             }
                             render::MouseKind::Press => {
                                 selecting = true;
-                                selection = Some(render::Selection {
-                                    start: (ev.x, ev.y),
-                                    end: (ev.x, ev.y),
+                                let row = screen_row(max_scroll, scroll, ev.y);
+                                selection = Some(Sel {
+                                    anchor: (ev.x, row),
+                                    head: (ev.x, row),
                                 });
                                 dirty = true;
                             }
                             render::MouseKind::Drag if selecting => {
                                 if let Some(sel) = &mut selection {
-                                    sel.end = (ev.x, ev.y);
+                                    sel.head = (ev.x, screen_row(max_scroll, scroll, ev.y));
                                     dirty = true;
                                 }
                             }
                             render::MouseKind::Release if selecting => {
                                 selecting = false;
                                 if let Some(sel) = selection {
-                                    // Position the viewport at the current
-                                    // scroll so selection coords match what is
-                                    // displayed, then copy via OSC 52.
-                                    vt.set_scroll(scroll);
-                                    let text = vt.selection_text(asd_vt::Selection {
-                                        start: sel.start,
-                                        end: sel.end,
-                                        block: false,
-                                    });
+                                    // Screen-space coordinates are scroll-
+                                    // independent, so this copies the whole
+                                    // selection even if part scrolled off-view.
+                                    let text = vt.selection_text_screen(
+                                        (sel.anchor.0, sel.anchor.1 as u32),
+                                        (sel.head.0, sel.head.1 as u32),
+                                    );
                                     if !text.is_empty() {
                                         let _ = write_stdout(&render::osc52_copy(&text));
                                     }
@@ -319,14 +319,70 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
 
 /// Position the viewport at `scroll` and paint one frame (with the active
 /// selection highlighted, if any).
-fn render_now(
-    vt: &mut GhosttyVt,
-    scroll: usize,
-    sel: Option<render::Selection>,
-) -> std::io::Result<()> {
+fn render_now(vt: &mut GhosttyVt, scroll: usize, sel: Option<Sel>) -> std::io::Result<()> {
     vt.set_scroll(scroll);
+    let scrollback = vt.scrollback_rows();
     let snap = vt.render_snapshot();
-    write_stdout(&render::render_frame(&snap, sel))
+    // Project the screen-space selection onto the viewport we are about to
+    // paint; it clips to what is visible (None when fully off-screen).
+    let vsel = sel.and_then(|s| s.viewport(scrollback, scroll, snap.cols, snap.rows));
+    write_stdout(&render::render_frame(&snap, vsel))
+}
+
+/// A drag selection anchored in screen-space (absolute) coordinates: each end
+/// is `(x, screen_row)` where `screen_row` counts from the top of scrollback
+/// (0 = oldest line; see `VtBackend::history_len`). Anchoring absolute — not to
+/// viewport rows — is what makes the highlight follow the underlying text as
+/// the wheel scrolls, the way boo pins its selection to terminal content
+/// instead of leaving it on fixed screen rows.
+#[derive(Debug, Clone, Copy)]
+struct Sel {
+    anchor: (u16, usize),
+    head: (u16, usize),
+}
+
+impl Sel {
+    /// Project onto the viewport that the next frame renders at `scroll` over a
+    /// `scrollback`-deep history, clipping to the visible rows. `None` when the
+    /// whole selection is scrolled out of view.
+    fn viewport(
+        self,
+        scrollback: usize,
+        scroll: usize,
+        cols: u16,
+        rows: u16,
+    ) -> Option<render::Selection> {
+        // Order the ends row-major in screen space.
+        let (a, b) = if (self.anchor.1, self.anchor.0) <= (self.head.1, self.head.0) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        };
+        // screen_row → viewport row: y = screen_row - (scrollback - scroll).
+        let base = scrollback as isize - scroll as isize;
+        let ay = a.1 as isize - base;
+        let by = b.1 as isize - base;
+        let rows = i32::from(rows) as isize;
+        if rows <= 0 || by < 0 || ay >= rows {
+            return None; // entirely above or below the viewport
+        }
+        // Clip the earlier end to the top edge and the later end to the bottom
+        // edge; the clipped portion covers those rows in full.
+        let start = if ay < 0 { (0, 0) } else { (a.0, ay as u16) };
+        let end = if by >= rows {
+            (cols.saturating_sub(1), (rows - 1) as u16)
+        } else {
+            (b.0, by as u16)
+        };
+        Some(render::Selection { start, end })
+    }
+}
+
+/// Screen-space row of a viewport row `y` while scrolled `scroll` lines up over
+/// a `scrollback`-deep history: the viewport's top row sits at
+/// `scrollback - scroll` in screen space, so row `y` is that plus `y`.
+fn screen_row(scrollback: usize, scroll: usize, y: u16) -> usize {
+    scrollback.saturating_sub(scroll) + usize::from(y)
 }
 
 /// A scrollback navigation key.
@@ -543,6 +599,48 @@ mod tests {
         );
         // No change: nothing emitted.
         assert!(mouse_mode_delta(&[1000, 1006], &[1000, 1006]).is_empty());
+    }
+
+    #[test]
+    fn selection_follows_the_text_as_it_scrolls() {
+        // 200 lines of history, 24-row viewport. Select viewport row 5 at the
+        // live bottom (scroll 0): its screen-space row is 200 - 0 + 5 = 205.
+        let scrollback = 200;
+        let row = screen_row(scrollback, 0, 5);
+        assert_eq!(row, 205);
+        let sel = Sel {
+            anchor: (2, row),
+            head: (8, row),
+        };
+
+        // At scroll 0 the highlight is on viewport row 5, where we dragged.
+        let v0 = sel.viewport(scrollback, 0, 80, 24).unwrap();
+        assert_eq!((v0.start, v0.end), ((2, 5), (8, 5)));
+
+        // Scroll up 3: the same text is now 3 rows lower on screen (row 8),
+        // and the highlight follows it — it does NOT stay on row 5.
+        let v3 = sel.viewport(scrollback, 3, 80, 24).unwrap();
+        assert_eq!((v3.start, v3.end), ((2, 8), (8, 8)));
+
+        // Scroll it far enough that the row leaves the bottom of the viewport.
+        assert!(sel.viewport(scrollback, 30, 80, 24).is_none());
+    }
+
+    #[test]
+    fn multi_row_selection_clips_to_the_viewport() {
+        // A tall selection spanning screen rows 100..=140.
+        let sel = Sel {
+            anchor: (3, 100),
+            head: (7, 140),
+        };
+        // Viewport top at screen row 110 (scrollback 200, scroll 90): rows
+        // 100..109 are above it and 141.. below. Visible band is 0..=30.
+        let v = sel.viewport(200, 90, 80, 24).unwrap();
+        // Earlier end clipped to the top-left corner; later end is at row
+        // 140 - 110 = 30, but that is past the 24-row viewport, so it clips to
+        // the bottom-right corner.
+        assert_eq!(v.start, (0, 0));
+        assert_eq!(v.end, (79, 23));
     }
 
     #[test]
