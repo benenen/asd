@@ -298,7 +298,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
 
     reader_task.abort();
     stdin_task.abort();
-    drop(_screen);
+    drop(_screen); // restore the terminal (leave alt screen, show cursor, ...)
     drop(_raw);
 
     match exit {
@@ -306,7 +306,15 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
         Exit::SessionEnded(msg) => eprintln!("[asd: {msg}]"),
         Exit::DaemonGone => eprintln!("[asd: connection to daemon lost]"),
     }
-    Ok(())
+
+    // Exit the process directly instead of returning. tokio's blocking stdin
+    // reader cannot be cancelled, so letting the runtime shut down would hang
+    // on that read until the user pressed Enter — leaving the shell prompt
+    // stuck. The terminal is already restored and the message flushed, so a
+    // hard exit here is clean.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(0);
 }
 
 /// Position the viewport at `scroll` and paint one frame (with the active
@@ -460,7 +468,12 @@ impl Drop for ScreenGuard {
         for m in MOUSE_MODES {
             seq.extend_from_slice(format!("\x1b[?{m}l").as_bytes());
         }
-        seq.extend_from_slice(b"\x1b[?1049l\x1b[0 q");
+        // Leave the alt screen, then restore the *global* states our rendering
+        // changed but the alt-screen restore does not: show the cursor again
+        // (every frame starts with `?25l`, so a hidden cursor can leak to the
+        // primary screen — leaving the shell prompt with no visible cursor),
+        // reset SGR, and reset the cursor shape.
+        seq.extend_from_slice(b"\x1b[?1049l\x1b[?25h\x1b[0m\x1b[0 q");
         let _ = write_stdout(&seq);
     }
 }
