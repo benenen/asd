@@ -58,8 +58,10 @@ pub enum ClientKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub name: String,
-    /// The command the session runs: the `cmd` given to `Create`, or the
-    /// resolved default shell when none was. Display-only.
+    /// The command running in the session's terminal now — the pty's foreground
+    /// process (e.g. `vim file`, `npm run dev`) — falling back to the spawn
+    /// command (the `Create` cmd or the default shell) when it can't be
+    /// resolved. Display-only.
     pub command: String,
     /// Creation time, Unix epoch milliseconds.
     pub created_ms: u64,

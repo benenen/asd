@@ -6,7 +6,8 @@
 //! via a channel. The network side (tokio) holds only a [`SessionHandle`].
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use asd_proto::{Frame, code};
@@ -147,18 +148,75 @@ pub struct SessionMeta {
     pub attached_clients: AtomicU32,
     pub child_pid: AtomicU32,
     pub alive: AtomicBool,
+    /// Raw fd of the pty master, for reading the foreground process group
+    /// (`tcgetpgrp`). `-1` when unavailable. Read-only from the network side.
+    pub pty_master_fd: AtomicI32,
 }
 
 impl SessionHandle {
     pub fn info(&self) -> asd_proto::SessionInfo {
+        // Report the live foreground command (what's actually running in the
+        // terminal now), falling back to the spawn command when it can't be
+        // resolved (session gone, or no /proc — e.g. non-Linux).
+        let fd = self.meta.pty_master_fd.load(Ordering::Relaxed);
+        let command = foreground_command(fd).unwrap_or_else(|| self.command.clone());
         asd_proto::SessionInfo {
             name: self.name.clone(),
-            command: self.command.clone(),
+            command,
             created_ms: self.created_ms,
             attached_clients: self.meta.attached_clients.load(Ordering::Relaxed),
             cols: self.meta.cols.load(Ordering::Relaxed),
             rows: self.meta.rows.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// The terminal's foreground command: the process group in the foreground of
+/// the pty (`tcgetpgrp` on the master), resolved to a command line via `/proc`.
+/// `None` when there is no foreground group or `/proc` is unavailable.
+fn foreground_command(master_fd: RawFd) -> Option<String> {
+    if master_fd < 0 {
+        return None;
+    }
+    // SAFETY: a plain read syscall on the fd; the master stays open for the
+    // session's lifetime, and a stale fd just yields an error → None.
+    let pgrp = unsafe { libc::tcgetpgrp(master_fd) };
+    if pgrp <= 0 {
+        return None;
+    }
+    proc_command(pgrp)
+}
+
+/// Format process `pid`'s command from `/proc/<pid>/cmdline` — argv[0]
+/// basenamed (and de-`-`ed for login shells), remaining args kept — falling
+/// back to `/proc/<pid>/comm`.
+fn proc_command(pid: libc::pid_t) -> Option<String> {
+    if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        let mut argv = raw.split(|&b| b == 0).filter(|s| !s.is_empty());
+        if let Some(arg0) = argv.next() {
+            let arg0 = String::from_utf8_lossy(arg0);
+            let base = arg0.rsplit('/').next().unwrap_or(&arg0);
+            let base = base.strip_prefix('-').unwrap_or(base); // login shell "-bash"
+            let mut out = base.to_string();
+            for arg in argv {
+                out.push(' ');
+                out.push_str(&String::from_utf8_lossy(arg));
+            }
+            // A `--cmd` session's foreground is our non-interactive `sh -c <c>`
+            // wrapper (no job control, so sh stays the group leader). Show the
+            // command it runs, not the wrapper. Interactive foreground jobs get
+            // their own process group and never hit this.
+            for prefix in ["sh -c ", "bash -c ", "dash -c ", "zsh -c "] {
+                if let Some(rest) = out.strip_prefix(prefix) {
+                    return Some(rest.to_string());
+                }
+            }
+            return Some(out);
+        }
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(c) if !c.trim().is_empty() => Some(c.trim().to_string()),
+        _ => None,
     }
 }
 
@@ -204,6 +262,9 @@ pub fn spawn_session(
     let child_pid = child.process_id().unwrap_or(0);
 
     let master = pair.master;
+    // Raw fd for foreground-process lookups; the master owns it and stays open
+    // for the session's lifetime (this is a borrow, not a dup).
+    let master_fd = master.as_raw_fd().unwrap_or(-1);
     let pty_writer = master.take_writer()?;
     let pty_reader = master.try_clone_reader()?;
 
@@ -214,6 +275,7 @@ pub fn spawn_session(
         attached_clients: AtomicU32::new(0),
         child_pid: AtomicU32::new(child_pid),
         alive: AtomicBool::new(true),
+        pty_master_fd: AtomicI32::new(master_fd),
     });
 
     let created_ms = std::time::SystemTime::now()

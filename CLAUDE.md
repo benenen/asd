@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 代码规范
 
 - **代码中的注释一律使用英文**（doc comments、行内注释、Cargo.toml 注释都算）。
-- **协议加帧或改帧结构必须 bump `asd-proto` 的 `PROTO_VERSION`**（双端同升，不做多版本兼容运行），并在 `crates/asd-proto/tests/codec.rs` 的 `all_frames()` 里补/改 roundtrip 用例。当前 `PROTO_VERSION = 2`（v1 加了 scrollback 的 `FetchHistory`/`History` 与 `Refresh`；v2 给 `SessionInfo` 加了 `command` 字段——daemon 存 spawn 命令/默认 shell，CLI `list` 与 GUI 侧栏显示）。
+- **协议加帧或改帧结构必须 bump `asd-proto` 的 `PROTO_VERSION`**（双端同升，不做多版本兼容运行），并在 `crates/asd-proto/tests/codec.rs` 的 `all_frames()` 里补/改 roundtrip 用例。当前 `PROTO_VERSION = 2`（v1 加了 scrollback 的 `FetchHistory`/`History` 与 `Refresh`；v2 给 `SessionInfo` 加了 `command` 字段——daemon 报**实时前台进程**：`tcgetpgrp(pty master fd)` 取前台进程组 → 读 `/proc/<pgid>/cmdline`（argv0 basename、剥 `sh -c` 包装前缀），回退到 spawn 命令/默认 shell；交互式 shell 里跑的作业靠 job control 各自成组，故能显 `vim`/`npm run dev`/`top`。CLI `list` 与 GUI 侧栏显示。master fd 存在 `SessionMeta.pty_master_fd`（borrow 不 dup，否则 slave 收不到 hangup）。
 - crate 依赖边界是硬契约（spec §3），违反即架构回归：
 
 | crate | 职责 | 禁止依赖 |

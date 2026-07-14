@@ -10,6 +10,7 @@ license.workspace = true
 anyhow = { workspace = true }
 asd-proto = { workspace = true }
 asd-vt = { workspace = true }
+libc = { workspace = true }
 nix = { workspace = true }
 portable-pty = { workspace = true }
 tokio = { workspace = true }
