@@ -2,6 +2,7 @@
 
 mod attach;
 mod client;
+mod render;
 
 use std::path::PathBuf;
 
@@ -59,7 +60,8 @@ fn main() -> anyhow::Result<()> {
     client_main(args)
 }
 
-#[tokio::main]
+// current_thread: the render client holds a `!Send` GhosttyVt across awaits.
+#[tokio::main(flavor = "current_thread")]
 async fn client_main(args: Args) -> anyhow::Result<()> {
     let socket = args.socket.unwrap_or_else(paths::socket_path);
 

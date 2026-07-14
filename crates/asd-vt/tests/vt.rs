@@ -312,3 +312,60 @@ fn fetch_history_preserves_wide_chars() {
     let all = vt.fetch_history(0, total);
     assert_eq!(line(&all, 0), "中文0");
 }
+
+// ---- viewport scroll + selection (render client) ----
+
+#[test]
+fn set_scroll_moves_viewport_into_history() {
+    let mut vt = term(20, 4);
+    for i in 0..20 {
+        vt.feed(format!("row{i}\r\n").as_bytes());
+    }
+    // At the bottom the viewport shows the last lines. 20 printed lines plus a
+    // trailing blank in a 4-row screen → the top visible line is row17.
+    vt.set_scroll(0);
+    let bottom = vt.render_snapshot();
+    assert_eq!(row_text(&bottom, 0).trim_end(), "row17");
+
+    // Scroll up: older lines come into view; scrollback is client-local
+    // state on this terminal only.
+    let sb = vt.scrollback_rows();
+    assert!(sb >= 16, "expected scrollback, got {sb}");
+    vt.set_scroll(5);
+    let scrolled = vt.render_snapshot();
+    assert_eq!(row_text(&scrolled, 0).trim_end(), "row12");
+
+    // Back to bottom.
+    vt.set_scroll(0);
+    let back = vt.render_snapshot();
+    assert_eq!(row_text(&back, 0).trim_end(), "row17");
+}
+
+#[test]
+fn selection_text_extracts_viewport_range() {
+    let mut vt = term(20, 4);
+    vt.feed(b"hello world\r\n");
+    vt.feed(b"second line\r\n");
+    vt.set_scroll(0);
+    // Select "world" on row 0 (cols 6..=10).
+    let sel = asd_vt::Selection {
+        start: (6, 0),
+        end: (10, 0),
+        block: false,
+    };
+    assert_eq!(vt.selection_text(sel), "world");
+}
+
+#[test]
+fn alt_screen_and_mouse_tracking_reflect_app_state() {
+    let mut vt = term(20, 4);
+    assert!(!vt.is_alt_screen());
+    assert!(!vt.is_mouse_tracking());
+    vt.feed(b"\x1b[?1049h"); // enter alt screen
+    assert!(vt.is_alt_screen());
+    vt.feed(b"\x1b[?1000h"); // enable mouse tracking
+    assert!(vt.is_mouse_tracking());
+    vt.feed(b"\x1b[?1000l\x1b[?1049l");
+    assert!(!vt.is_alt_screen());
+    assert!(!vt.is_mouse_tracking());
+}

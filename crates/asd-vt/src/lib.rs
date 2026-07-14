@@ -52,7 +52,37 @@ pub trait VtBackend: Sized {
     fn snapshot_vt(&mut self) -> Vec<u8>;
 
     /// Produce a plain-data render snapshot to hand to the GUI across threads.
+    /// Renders whatever the viewport currently shows — call [`set_scroll`]
+    /// first to render a scrolled-back view.
+    ///
+    /// [`set_scroll`]: VtBackend::set_scroll
     fn render_snapshot(&mut self) -> RenderSnapshot;
+
+    /// Position the render viewport `lines_up` lines above the live bottom
+    /// (0 = follow the live screen). Clamped to [`scrollback_rows`]. Affects
+    /// the next [`render_snapshot`]/[`selection_text`].
+    ///
+    /// [`scrollback_rows`]: VtBackend::scrollback_rows
+    /// [`render_snapshot`]: VtBackend::render_snapshot
+    /// [`selection_text`]: VtBackend::selection_text
+    fn set_scroll(&mut self, lines_up: usize) {
+        let _ = lines_up;
+    }
+
+    /// Number of scrollback rows above the live screen (max scroll-up).
+    fn scrollback_rows(&mut self) -> usize {
+        0
+    }
+
+    /// Whether the program is on the alternate screen (vim/less/htop/...).
+    fn is_alt_screen(&mut self) -> bool {
+        false
+    }
+
+    /// Whether the program has any mouse tracking mode active.
+    fn is_mouse_tracking(&mut self) -> bool {
+        false
+    }
 
     /// Encode a keystroke into input bytes according to the current terminal
     /// modes (DECCKM, kitty protocol, etc.).
@@ -80,8 +110,13 @@ pub trait VtBackend: Sized {
         Vec::new()
     }
 
-    /// Selection text (delivered in M1; default returns an empty string).
-    fn selection_text(&self, sel: Selection) -> String {
+    /// Text of a selection over the current viewport (viewport coordinates;
+    /// call [`set_scroll`] first so coordinates match what is displayed).
+    /// Uses copy semantics: soft-wrapped lines unwrapped, trailing blanks
+    /// trimmed. Default returns an empty string.
+    ///
+    /// [`set_scroll`]: VtBackend::set_scroll
+    fn selection_text(&mut self, sel: Selection) -> String {
         let _ = sel;
         String::new()
     }

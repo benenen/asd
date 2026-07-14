@@ -1,44 +1,42 @@
-//! Interactive attach (with a local scrollback viewer) and the `--stdio` proxy.
+//! Interactive attach as a VT-render client, plus the `--stdio` proxy.
 //!
-//! Painting and mode state live in the main loop; the socket-reader and
-//! stdin-reader run as their own tasks feeding it, because `read_frame` and a
-//! blocking stdin read are not cancel-safe and must not sit in a `select!`.
+//! Unlike a dumb passthrough, this client keeps its own [`GhosttyVt`] terminal
+//! (fed the daemon's Snapshot + Output) and renders it to the screen itself.
+//! That local VT model is what lets a single Live view do all three at once:
+//! - **detach restores the original screen** (we run on the alternate screen);
+//! - **wheel scrolls back through history** (we scroll our own viewport — a
+//!   client-local action that never disturbs other attached clients);
+//! - **drag-select copies** (we highlight the selection and write the system
+//!   clipboard via OSC 52, so the terminal's own selection is not needed and
+//!   mouse reporting can stay on to catch the wheel).
 //!
-//! Two modes:
-//! - **Live**: Output/Snapshot are painted; stdin is forwarded as Input.
-//!   `PageUp` enters the scrollback viewer, `Ctrl-\` detaches.
-//! - **Copy** (scrollback viewer): the client renders a window of the
-//!   session's history fetched via `FetchHistory`; live Output is ignored
-//!   until the user leaves. Wheel / PgUp/PgDn / arrows / g / G navigate;
-//!   `q` / `End` / `Ctrl-\` leave (a `Refresh` resyncs the live screen).
+//! When the session program is itself full-screen or grabbing the mouse (vim,
+//! htop), the wheel and clicks are forwarded to it instead — the client knows
+//! precisely from its VT model (`is_alt_screen` / `is_mouse_tracking`).
 
 use std::io::Write as _;
 use std::os::fd::AsFd;
 
 use anyhow::Context;
-use asd_proto::{Frame, code};
+use asd_proto::Frame;
+use asd_vt::{GhosttyVt, VtBackend};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use crate::client::Client;
+use crate::render::{self, MouseKind, Selection};
 
 /// Detach key: Ctrl-\ (byte 0x1C in raw mode).
 const DETACH_BYTE: u8 = 0x1c;
-/// Ctrl-C inside the scrollback viewer leaves it (does not reach the session).
-const CTRL_C: u8 = 0x03;
+/// Lines moved per wheel tick.
+const WHEEL_LINES: usize = 3;
 
 /// Frames the socket-reader task forwards to the main loop.
 enum Ev {
     Output(Vec<u8>),
     Snapshot(Vec<u8>),
-    History {
-        total_rows: u32,
-        start: u32,
-        rows: Vec<Vec<u8>>,
-    },
-    /// Session ended or errored; carries the reason to print on exit.
     Ended(Exit),
 }
 
@@ -46,25 +44,6 @@ enum Exit {
     Detached,
     SessionEnded(String),
     DaemonGone,
-}
-
-/// Scrollback-viewer state. `top` is the screen-space index of the topmost
-/// visible line; the window is `[top, top + view_rows)`.
-struct Copy {
-    top: u32,
-    total: u32,
-    view_rows: u16,
-    /// First reply is a probe to learn `total`; we jump and refetch, so the
-    /// probe itself is not painted.
-    initialized: bool,
-    /// After leaving, we sent `Refresh` and wait for the `Snapshot` to resync;
-    /// meanwhile Output/History/input are ignored.
-    resyncing: bool,
-}
-
-enum Mode {
-    Live,
-    Copy(Copy),
 }
 
 pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
@@ -78,24 +57,33 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
         })
         .await?;
 
-    // The first frame must be Snapshot (or an error); handling errors before
-    // entering raw mode is friendlier
-    let snapshot = match client.reader.read_frame().await? {
+    // The first frame must be Snapshot (or an error); handle errors before
+    // switching the terminal's mode so the message stays visible.
+    let first = match client.reader.read_frame().await? {
         Some(Frame::Snapshot { vt }) => vt,
         Some(Frame::Error { code, msg }) => anyhow::bail!("attach failed ({code}): {msg}"),
         other => anyhow::bail!("expected Snapshot after Attach, got {other:?}"),
     };
 
-    // Hint lands on the primary screen, so it is still visible after detach
-    eprintln!("[asd: attached to '{name}', scrollback: PgUp, detach: Ctrl-\\]");
+    eprintln!("[asd: attached to '{name}', detach: Ctrl-\\]");
     let _raw = RawGuard::enable().context("enabling raw terminal mode")?;
-    // Session runs on the alternate screen; detach restores the caller's
-    // original screen contents (tmux-like). Declared after RawGuard so it
-    // drops first: leave the alt screen, then restore termios.
-    let _alt = AltScreenGuard::enter().context("entering alternate screen")?;
-    paint_snapshot(&snapshot)?;
+    // Alt screen (detach restores the caller's screen) + mouse reporting (so
+    // the wheel and drags reach us as events). Dropped before RawGuard.
+    let _screen = ScreenGuard::enter().context("entering alternate screen")?;
 
-    // Socket reader → Ev channel (no direct painting).
+    // Our local mirror of the session terminal.
+    let mut vt = GhosttyVt::new(cols.max(1), rows.max(1), 100_000);
+    vt.feed(&first);
+    let _ = vt.take_pty_responses(); // the daemon already answered any queries
+
+    // Scrollback view state.
+    let mut scroll = 0usize; // lines scrolled up from the live bottom
+    let mut selection: Option<Selection> = None;
+    let mut selecting = false;
+
+    render_now(&mut vt, scroll, selection)?;
+
+    // Socket reader → Ev channel.
     let (ev_tx, mut ev_rx) = mpsc::channel::<Ev>(256);
     let mut reader = client.reader;
     let reader_task = tokio::spawn(async move {
@@ -103,31 +91,18 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
             let ev = match reader.read_frame().await {
                 Ok(Some(Frame::Output { bytes })) => Ev::Output(bytes),
                 Ok(Some(Frame::Snapshot { vt })) => Ev::Snapshot(vt),
-                Ok(Some(Frame::History {
-                    total_rows,
-                    start,
-                    rows,
-                })) => Ev::History {
-                    total_rows,
-                    start,
-                    rows,
-                },
-                Ok(Some(Frame::Error { code: c, msg })) => {
-                    let reason = if c == code::SESSION_EXITED {
-                        Exit::SessionEnded(msg)
+                Ok(Some(Frame::Error { code, msg })) => Ev::Ended(Exit::SessionEnded(
+                    if code == asd_proto::code::SESSION_EXITED {
+                        msg
                     } else {
-                        Exit::SessionEnded(format!("error {c}: {msg}"))
-                    };
-                    let _ = ev_tx.send(Ev::Ended(reason)).await;
-                    break;
-                }
+                        format!("error {code}: {msg}")
+                    },
+                )),
                 Ok(Some(_)) => continue,
-                Ok(None) | Err(_) => {
-                    let _ = ev_tx.send(Ev::Ended(Exit::DaemonGone)).await;
-                    break;
-                }
+                Ok(None) | Err(_) => Ev::Ended(Exit::DaemonGone),
             };
-            if ev_tx.send(ev).await.is_err() {
+            let stop = matches!(ev, Ev::Ended(_));
+            if ev_tx.send(ev).await.is_err() || stop {
                 break;
             }
         }
@@ -137,7 +112,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
     let stdin_task = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 8192];
         loop {
             match stdin.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -152,140 +127,124 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
 
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut writer = client.writer;
-    let mut mode = Mode::Live;
 
-    let exit = 'main: loop {
+    let exit = loop {
         tokio::select! {
             ev = ev_rx.recv() => {
                 let Some(ev) = ev else { break Exit::DaemonGone };
                 match ev {
                     Ev::Ended(reason) => break reason,
                     Ev::Output(bytes) => {
-                        // Ignored while viewing scrollback (repainted on exit).
-                        if matches!(mode, Mode::Live) && write_stdout(&bytes).is_err() {
+                        vt.feed(&bytes);
+                        let _ = vt.take_pty_responses();
+                        // Drain any further pending output before painting once.
+                        while let Ok(Ev::Output(more)) = ev_rx.try_recv() {
+                            vt.feed(&more);
+                            let _ = vt.take_pty_responses();
+                        }
+                        // While scrolled up we keep the view frozen so reading
+                        // history is not yanked around by live output.
+                        if scroll == 0 && render_now(&mut vt, scroll, selection).is_err() {
                             break Exit::DaemonGone;
                         }
                     }
-                    Ev::Snapshot(vt) => {
-                        // Attach reply or the Refresh resync after leaving copy.
-                        if paint_snapshot(&vt).is_err() {
+                    Ev::Snapshot(dump) => {
+                        vt.feed(&dump);
+                        let _ = vt.take_pty_responses();
+                        if render_now(&mut vt, scroll, selection).is_err() {
                             break Exit::DaemonGone;
-                        }
-                        mode = Mode::Live;
-                    }
-                    Ev::History { total_rows, start, rows } => {
-                        if let Mode::Copy(c) = &mut mode {
-                            if c.resyncing { continue; }
-                            c.total = total_rows;
-                            if !c.initialized {
-                                // Probe reply: learn total, jump up a page, refetch.
-                                c.initialized = true;
-                                let page = u32::from(c.view_rows);
-                                let max_top = total_rows.saturating_sub(u32::from(c.view_rows));
-                                c.top = max_top.saturating_sub(page);
-                                let req = Frame::FetchHistory { start: c.top, count: u32::from(c.view_rows) };
-                                if writer.write_frame(&req).await.is_err() {
-                                    break Exit::DaemonGone;
-                                }
-                            } else {
-                                c.top = start;
-                                if paint_copy(&rows, start, total_rows, cols, c.view_rows).is_err() {
-                                    break Exit::DaemonGone;
-                                }
-                            }
                         }
                     }
                 }
             }
             chunk = in_rx.recv() => {
                 let Some(chunk) = chunk else { break Exit::Detached };
-                match &mut mode {
-                    Mode::Live => {
-                        match handle_live_input(&chunk) {
-                            LiveAction::Detach { forward } => {
-                                if !forward.is_empty() {
-                                    let _ = writer.write_frame(&Frame::Input { bytes: forward }).await;
-                                }
-                                let _ = writer.write_frame(&Frame::Detach).await;
-                                break Exit::Detached;
+                if chunk.contains(&DETACH_BYTE) {
+                    let _ = writer.write_frame(&Frame::Detach).await;
+                    break Exit::Detached;
+                }
+
+                // If the app is full-screen or grabbing the mouse, everything
+                // (including the wheel) belongs to it.
+                let app_owns_mouse = vt.is_alt_screen() || vt.is_mouse_tracking();
+                let mouse = render::parse_mouse(&chunk);
+
+                if app_owns_mouse || mouse.is_empty() {
+                    // Typing (or app-owned mouse): forward verbatim. Typing
+                    // snaps the view back to the live bottom.
+                    if scroll != 0 && !is_only_mouse(&chunk) {
+                        scroll = 0;
+                        selection = None;
+                        let _ = render_now(&mut vt, scroll, selection);
+                    }
+                    if writer.write_frame(&Frame::Input { bytes: chunk }).await.is_err() {
+                        break Exit::DaemonGone;
+                    }
+                    continue;
+                }
+
+                // Shell prompt: the wheel scrolls our view, drags select+copy.
+                let mut dirty = false;
+                let max_scroll = vt.scrollback_rows();
+                for ev in mouse {
+                    match ev.kind {
+                        MouseKind::WheelUp => {
+                            scroll = (scroll + WHEEL_LINES).min(max_scroll);
+                            dirty = true;
+                        }
+                        MouseKind::WheelDown => {
+                            scroll = scroll.saturating_sub(WHEEL_LINES);
+                            dirty = true;
+                        }
+                        MouseKind::Press => {
+                            selecting = true;
+                            selection = Some(Selection { start: (ev.x, ev.y), end: (ev.x, ev.y) });
+                            dirty = true;
+                        }
+                        MouseKind::Drag => {
+                            if selecting && let Some(sel) = &mut selection {
+                                sel.end = (ev.x, ev.y);
+                                dirty = true;
                             }
-                            LiveAction::EnterCopy { forward } => {
-                                if !forward.is_empty() {
-                                    let _ = writer.write_frame(&Frame::Input { bytes: forward }).await;
-                                }
-                                let view_rows = rows.saturating_sub(1).max(1);
-                                enter_copy(&mut mode, view_rows);
-                                // Probe fetch to learn total; reply drives the jump.
-                                let req = Frame::FetchHistory { start: 0, count: u32::from(view_rows) };
-                                if writer.write_frame(&req).await.is_err() {
-                                    break Exit::DaemonGone;
-                                }
-                            }
-                            LiveAction::Forward(bytes) => {
-                                if writer.write_frame(&Frame::Input { bytes }).await.is_err() {
-                                    break Exit::DaemonGone;
+                        }
+                        MouseKind::Release => {
+                            if selecting && let Some(sel) = selection {
+                                selecting = false;
+                                // Viewport is already positioned at `scroll`.
+                                let text = vt.selection_text(asd_vt::Selection {
+                                    start: sel.start,
+                                    end: sel.end,
+                                    block: false,
+                                });
+                                if !text.is_empty() {
+                                    let _ = write_stdout(&render::osc52_copy(&text));
                                 }
                             }
                         }
+                        MouseKind::Other => {}
                     }
-                    Mode::Copy(c) => {
-                        if c.resyncing { continue; }
-                        match handle_copy_input(&chunk) {
-                            CopyAction::Detach => {
-                                let _ = writer.write_frame(&Frame::Detach).await;
-                                break Exit::Detached;
-                            }
-                            CopyAction::Leave => {
-                                c.resyncing = true;
-                                let _ = write_stdout(MOUSE_OFF);
-                                if writer.write_frame(&Frame::Refresh).await.is_err() {
-                                    break Exit::DaemonGone;
-                                }
-                            }
-                            CopyAction::Scroll(delta) => {
-                                if !c.initialized { continue; }
-                                let max_top = c.total.saturating_sub(u32::from(c.view_rows));
-                                let new_top = apply_delta(c.top, delta, max_top);
-                                if new_top != c.top || c.total == 0 {
-                                    c.top = new_top;
-                                    let req = Frame::FetchHistory { start: new_top, count: u32::from(c.view_rows) };
-                                    if writer.write_frame(&req).await.is_err() {
-                                        break Exit::DaemonGone;
-                                    }
-                                }
-                            }
-                            CopyAction::None => {}
-                        }
-                    }
+                }
+                if dirty && render_now(&mut vt, scroll, selection).is_err() {
+                    break Exit::DaemonGone;
                 }
             }
             _ = sigwinch.recv() => {
                 let (c, r) = term_size();
                 cols = c; rows = r;
+                vt.resize(cols.max(1), rows.max(1));
                 if writer.write_frame(&Frame::Resize { cols, rows }).await.is_err() {
                     break Exit::DaemonGone;
                 }
-                if let Mode::Copy(c) = &mut mode {
-                    c.view_rows = rows.saturating_sub(1).max(1);
-                    if c.initialized && !c.resyncing {
-                        let max_top = c.total.saturating_sub(u32::from(c.view_rows));
-                        c.top = c.top.min(max_top);
-                        let req = Frame::FetchHistory { start: c.top, count: u32::from(c.view_rows) };
-                        if writer.write_frame(&req).await.is_err() {
-                            break 'main Exit::DaemonGone;
-                        }
-                    }
-                }
+                let _ = render_now(&mut vt, scroll, selection);
             }
         }
     };
 
     reader_task.abort();
     stdin_task.abort();
-    drop(_alt);
+    drop(_screen);
     drop(_raw);
 
-    // Printed on the restored primary screen, right under the attach hint
     match exit {
         Exit::Detached => eprintln!("[asd: detached]"),
         Exit::SessionEnded(msg) => eprintln!("[asd: {msg}]"),
@@ -294,207 +253,19 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn enter_copy(mode: &mut Mode, view_rows: u16) {
-    // Enable mouse reporting for the viewer so the wheel navigates it; it is
-    // turned back off on leave so the live view keeps native drag-to-select.
-    let _ = write_stdout(MOUSE_ON);
-    *mode = Mode::Copy(Copy {
-        top: 0,
-        total: 0,
-        view_rows,
-        initialized: false,
-        resyncing: false,
-    });
+/// Position the viewport at `scroll` and paint one frame.
+fn render_now(vt: &mut GhosttyVt, scroll: usize, sel: Option<Selection>) -> std::io::Result<()> {
+    vt.set_scroll(scroll);
+    let snap = vt.render_snapshot();
+    write_stdout(&render::render_frame(&snap, sel))
 }
 
-/// How much to move `top` by (positive = toward the bottom / newer lines).
-fn apply_delta(top: u32, delta: i64, max_top: u32) -> u32 {
-    let next = i64::from(top) + delta;
-    next.clamp(0, i64::from(max_top)) as u32
+/// Whether a chunk is entirely SGR mouse reports (so it should not be forwarded
+/// as typing when the app owns the mouse... actually used to avoid snapping the
+/// scroll to bottom on a stray mouse event).
+fn is_only_mouse(chunk: &[u8]) -> bool {
+    !chunk.is_empty() && chunk.starts_with(b"\x1b[<")
 }
-
-// ---- input classification ----
-
-enum LiveAction {
-    /// Detach; `forward` is any input preceding the detach key in the chunk.
-    Detach {
-        forward: Vec<u8>,
-    },
-    /// Enter the scrollback viewer; `forward` is input preceding PageUp.
-    EnterCopy {
-        forward: Vec<u8>,
-    },
-    Forward(Vec<u8>),
-}
-
-/// PageUp: `ESC [ 5 ~`.
-const PAGE_UP: &[u8] = b"\x1b[5~";
-
-fn handle_live_input(chunk: &[u8]) -> LiveAction {
-    if let Some(pos) = chunk.iter().position(|&b| b == DETACH_BYTE) {
-        return LiveAction::Detach {
-            forward: chunk[..pos].to_vec(),
-        };
-    }
-    if let Some(pos) = find_subseq(chunk, PAGE_UP) {
-        return LiveAction::EnterCopy {
-            forward: chunk[..pos].to_vec(),
-        };
-    }
-    // Everything else passes through verbatim: typing, and the mouse (native
-    // drag-select works because live mode leaves mouse reporting off, and an
-    // app that wants the mouse enables it via passthrough as in M0).
-    LiveAction::Forward(chunk.to_vec())
-}
-
-enum CopyAction {
-    /// Leave the viewer and resync the live screen.
-    Leave,
-    /// Detach entirely.
-    Detach,
-    /// Move `top` by this many lines (negative = up/older).
-    Scroll(i64),
-    None,
-}
-
-fn handle_copy_input(chunk: &[u8]) -> CopyAction {
-    // Recognize one salient action per chunk; key presses arrive whole.
-    if chunk.contains(&DETACH_BYTE) {
-        return CopyAction::Detach;
-    }
-    if chunk.contains(&CTRL_C) || chunk.contains(&b'q') {
-        return CopyAction::Leave;
-    }
-    if chunk.contains(&b'g') {
-        return CopyAction::Scroll(i64::MIN); // to top
-    }
-    if chunk.contains(&b'G') {
-        return CopyAction::Scroll(i64::MAX); // to bottom
-    }
-    // SGR mouse wheel: ESC [ < 64/65 ; ... M
-    if find_subseq(chunk, b"\x1b[<64").is_some() {
-        return CopyAction::Scroll(-3);
-    }
-    if find_subseq(chunk, b"\x1b[<65").is_some() {
-        return CopyAction::Scroll(3);
-    }
-    if find_subseq(chunk, PAGE_UP).is_some() {
-        return CopyAction::Scroll(-16);
-    }
-    if find_subseq(chunk, b"\x1b[6~").is_some() {
-        // PageDown
-        return CopyAction::Scroll(16);
-    }
-    if find_subseq(chunk, b"\x1b[A").is_some() {
-        return CopyAction::Scroll(-1);
-    }
-    if find_subseq(chunk, b"\x1b[B").is_some() {
-        return CopyAction::Scroll(1);
-    }
-    if find_subseq(chunk, b"\x1b[H").is_some() || find_subseq(chunk, b"\x1b[1~").is_some() {
-        return CopyAction::Scroll(i64::MIN);
-    }
-    if find_subseq(chunk, b"\x1b[F").is_some() || find_subseq(chunk, b"\x1b[4~").is_some() {
-        return CopyAction::Scroll(i64::MAX);
-    }
-    CopyAction::None
-}
-
-fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-// ---- painting ----
-
-/// Paint a VT snapshot from scratch: clear and home first — the dump has no
-/// leading position sequence and paints relative to the current cursor.
-fn paint_snapshot(vt: &[u8]) -> std::io::Result<()> {
-    let mut buf = Vec::with_capacity(vt.len() + 7);
-    buf.extend_from_slice(b"\x1b[2J\x1b[H");
-    buf.extend_from_slice(vt);
-    write_stdout(&buf)
-}
-
-/// Paint the scrollback window plus a reverse-video status bar on the last row.
-fn paint_copy(
-    rows: &[Vec<u8>],
-    top: u32,
-    total: u32,
-    cols: u16,
-    view_rows: u16,
-) -> std::io::Result<()> {
-    let cols = usize::from(cols).max(1);
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"\x1b[2J\x1b[H");
-    for (i, line) in rows.iter().take(usize::from(view_rows)).enumerate() {
-        if i > 0 {
-            buf.extend_from_slice(b"\r\n");
-        }
-        // Lines are already <= cols wide; clear to EOL to erase stale glyphs.
-        buf.extend_from_slice(line);
-        buf.extend_from_slice(b"\x1b[K");
-    }
-
-    // Status bar: move to the last row, reverse video, padded to full width.
-    let last_row = view_rows + 1;
-    let bottom = (top as usize + usize::from(view_rows)).min(total as usize);
-    let mut status = format!(
-        " SCROLLBACK {}-{}/{}   PgUp/PgDn ↑↓ wheel  g/G top/bottom  q live ",
-        top as usize + 1,
-        bottom,
-        total,
-    );
-    truncate_to_cols(&mut status, cols);
-    while display_len(&status) < cols {
-        status.push(' ');
-    }
-    buf.extend_from_slice(format!("\x1b[{last_row};1H").as_bytes());
-    buf.extend_from_slice(b"\x1b[7m");
-    buf.extend_from_slice(status.as_bytes());
-    buf.extend_from_slice(b"\x1b[0m");
-    write_stdout(&buf)
-}
-
-/// Rough display width (counts a CJK/wide char as 2 columns). Good enough for
-/// clamping the status bar.
-fn display_len(s: &str) -> usize {
-    s.chars().map(char_cols).sum()
-}
-
-fn char_cols(c: char) -> usize {
-    // Treat common CJK/full-width ranges as width 2.
-    let u = c as u32;
-    let wide = matches!(u,
-        0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 |
-        0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 |
-        0x20000..=0x3FFFD);
-    if wide { 2 } else { 1 }
-}
-
-fn truncate_to_cols(s: &mut String, cols: usize) {
-    if display_len(s) <= cols {
-        return;
-    }
-    let mut acc = 0;
-    let mut end = s.len();
-    for (i, c) in s.char_indices() {
-        if acc + char_cols(c) > cols {
-            end = i;
-            break;
-        }
-        acc += char_cols(c);
-    }
-    s.truncate(end);
-}
-
-/// Enable button + SGR mouse reporting (kept on for the whole attach so the
-/// wheel is delivered as events we can route).
-const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
-/// Disable mouse reporting.
-const MOUSE_OFF: &[u8] = b"\x1b[?1000l\x1b[?1006l";
 
 /// `--stdio` proxy: bidirectional raw byte copy between stdio and the UDS;
 /// the protocol is spoken by the pipe's far end (a future remote GUI/CLI) —
@@ -537,30 +308,22 @@ pub fn term_size() -> (u16, u16) {
     }
 }
 
-/// Alternate-screen guard: enters the alternate screen (DEC 1049, clears it
-/// and saves the cursor) on creation, and restores the primary screen with
-/// its previous contents on drop.
-///
-/// Live mode keeps mouse reporting OFF so the terminal's native drag-to-select
-/// (copy) keeps working; DEC 1007 alternate-scroll makes the wheel send arrow
-/// keys, which pagers use. Session-history scrollback is the viewer, opened
-/// with `PageUp`; mouse reporting is turned on only inside it (so the wheel
-/// navigates it) and off again on leave.
-struct AltScreenGuard;
+/// Alternate-screen + mouse-reporting guard. Enters the alternate screen (DEC
+/// 1049), enables button + SGR mouse reporting (1000/1006) so the wheel and
+/// drags arrive as events, and enables focus... on drop, undoes all of it and
+/// restores the primary screen with its previous contents.
+struct ScreenGuard;
 
-impl AltScreenGuard {
+impl ScreenGuard {
     fn enter() -> std::io::Result<Self> {
-        write_stdout(b"\x1b[?1049h\x1b[?1007h")?;
+        write_stdout(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h")?;
         Ok(Self)
     }
 }
 
-impl Drop for AltScreenGuard {
+impl Drop for ScreenGuard {
     fn drop(&mut self) {
-        // Defensively disable mouse reporting in case we drop mid-viewer.
-        let mut seq = MOUSE_OFF.to_vec();
-        seq.extend_from_slice(b"\x1b[?1007l\x1b[?1049l");
-        let _ = write_stdout(&seq);
+        let _ = write_stdout(b"\x1b[?1006l\x1b[?1000l\x1b[?1049l\x1b[0 q");
     }
 }
 

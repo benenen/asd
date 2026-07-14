@@ -74,6 +74,7 @@ dependencies = [
  "anyhow",
  "asd-daemon",
  "asd-proto",
+ "asd-vt",
  "clap",
  "libc",
  "nix 0.30.1",

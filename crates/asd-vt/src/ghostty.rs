@@ -11,10 +11,10 @@ use libghostty_vt::{
     fmt::{Format, Formatter, FormatterOptions},
     key as gkey,
     render::{CellIterator, CursorVisualStyle, Dirty, RowIterator},
-    screen::CellWide,
+    screen::{CellWide, Screen},
     selection::{FormatOptions as SelFormatOptions, Selection},
     style::{RgbColor, Underline},
-    terminal::{Point, PointCoordinate},
+    terminal::{Point, PointCoordinate, ScrollViewport},
 };
 
 use crate::{
@@ -294,6 +294,66 @@ impl VtBackend for GhosttyVt {
             }
             // No content selected (e.g. an all-blank window) → blank rows.
             _ => vec![Vec::new(); want],
+        }
+    }
+
+    fn scrollback_rows(&mut self) -> usize {
+        self.terminal.scrollback_rows().unwrap_or(0)
+    }
+
+    fn set_scroll(&mut self, lines_up: usize) {
+        let max = self.terminal.scrollback_rows().unwrap_or(0);
+        let up = lines_up.min(max);
+        // Anchor at the bottom, then move up by `up` — deterministic
+        // regardless of any auto-follow the last write may have applied.
+        self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        if up > 0 {
+            self.terminal
+                .scroll_viewport(ScrollViewport::Delta(-(up as isize)));
+        }
+    }
+
+    fn is_alt_screen(&mut self) -> bool {
+        self.terminal
+            .active_screen()
+            .map(|s| s == Screen::Alternate)
+            .unwrap_or(false)
+    }
+
+    fn is_mouse_tracking(&mut self) -> bool {
+        self.terminal.is_mouse_tracking().unwrap_or(false)
+    }
+
+    fn selection_text(&mut self, sel: crate::Selection) -> String {
+        let (cols, rows) = self.cols_rows();
+        if cols == 0 || rows == 0 {
+            return String::new();
+        }
+        let clampx = |x: u16| x.min(cols - 1);
+        let clampy = |y: u16| y.min(rows - 1);
+        let start = PointCoordinate {
+            x: clampx(sel.start.0),
+            y: u32::from(clampy(sel.start.1)),
+        };
+        let end = PointCoordinate {
+            x: clampx(sel.end.0),
+            y: u32::from(clampy(sel.end.1)),
+        };
+        let (Ok(a), Ok(b)) = (
+            self.terminal.grid_ref(Point::Viewport(start)),
+            self.terminal.grid_ref(Point::Viewport(end)),
+        ) else {
+            return String::new();
+        };
+        let selection = Selection::new(a, b, sel.block);
+        let opts = SelFormatOptions::new()
+            .with_selection(&selection)
+            .with_emit_format(Format::Plain)
+            .with_unwrap(true)
+            .with_trim(true);
+        match self.terminal.format_selection_alloc(None, opts) {
+            Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+            _ => String::new(),
         }
     }
 }
