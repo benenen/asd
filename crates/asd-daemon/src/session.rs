@@ -133,6 +133,8 @@ pub const MAX_HISTORY_ROWS_PER_FETCH: u32 = 2000;
 #[derive(Clone)]
 pub struct SessionHandle {
     pub name: String,
+    /// The command this session runs (the `Create` cmd, or the default shell).
+    pub command: String,
     pub created_ms: u64,
     pub tx: mpsc::Sender<SessionMsg>,
     pub meta: Arc<SessionMeta>,
@@ -151,6 +153,7 @@ impl SessionHandle {
     pub fn info(&self) -> asd_proto::SessionInfo {
         asd_proto::SessionInfo {
             name: self.name.clone(),
+            command: self.command.clone(),
             created_ms: self.created_ms,
             attached_clients: self.meta.attached_clients.load(Ordering::Relaxed),
             cols: self.meta.cols.load(Ordering::Relaxed),
@@ -175,6 +178,12 @@ pub fn spawn_session(
         pixel_width: 0,
         pixel_height: 0,
     })?;
+
+    // Display string for `SessionInfo.command`: the user command as given, or
+    // the resolved default shell when none was.
+    let command = cmd
+        .clone()
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()));
 
     let mut builder = match &cmd {
         // The user command is parsed via sh -c, supporting arguments/pipes
@@ -252,6 +261,7 @@ pub fn spawn_session(
 
     Ok(SessionHandle {
         name,
+        command,
         created_ms,
         tx,
         meta,

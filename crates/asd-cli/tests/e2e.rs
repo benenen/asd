@@ -270,12 +270,18 @@ async fn two_clients_both_receive_broadcast() {
 async fn list_and_kill_via_cli() {
     let daemon = Daemon::start("listkill");
 
-    let out = daemon.cli().args(["new", "tokill"]).output().unwrap();
+    let out = daemon
+        .cli()
+        .args(["new", "tokill", "--cmd", "sleep 300"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
 
     let out = daemon.cli().arg("list").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("tokill"), "list output: {stdout}");
+    // The command (SessionInfo.command, proto v2) reaches the client.
+    assert!(stdout.contains("sleep 300"), "list output: {stdout}");
 
     let out = daemon.cli().args(["kill", "tokill"]).output().unwrap();
     assert!(out.status.success(), "kill failed: {out:?}");

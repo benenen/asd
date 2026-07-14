@@ -204,6 +204,10 @@ fn session_row<'a>(
     .align_y(Vertical::Center);
 
     content = content.push(spacer());
+    let cmd = model::short_cmd(&s.command);
+    if !cmd.is_empty() {
+        content = content.push(text(cmd).size(11).font(mono()).color(theme::MUTED));
+    }
     if s.attached_clients > 1 {
         content = content.push(peers_pill(accent, s.attached_clients));
     }

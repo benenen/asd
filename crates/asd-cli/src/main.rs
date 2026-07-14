@@ -75,16 +75,17 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                         println!("no sessions");
                     } else {
                         println!(
-                            "{:<20} {:>8} {:>9} {:>13}",
+                            "{:<16} {:>8} {:>8} {:>12}  COMMAND",
                             "NAME", "SIZE", "CLIENTS", "CREATED"
                         );
                         for s in sessions {
                             println!(
-                                "{:<20} {:>8} {:>9} {:>13}",
+                                "{:<16} {:>8} {:>8} {:>12}  {}",
                                 s.name,
                                 format!("{}x{}", s.cols, s.rows),
                                 s.attached_clients,
                                 format_age(s.created_ms),
+                                s.command,
                             );
                         }
                     }

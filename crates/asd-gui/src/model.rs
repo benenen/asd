@@ -209,6 +209,30 @@ impl Model {
     }
 }
 
+/// Compact a session's command for the sidebar: a bare path shows just its
+/// basename (a shell reads as `bash`, not `/usr/bin/bash`); anything with
+/// arguments is kept whole, and everything is capped so a long command can't
+/// blow out the row width.
+pub fn short_cmd(cmd: &str) -> String {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return String::new();
+    }
+    let base = if !cmd.contains(char::is_whitespace) && cmd.contains('/') {
+        cmd.rsplit('/').next().unwrap_or(cmd)
+    } else {
+        cmd
+    };
+    const MAX: usize = 24;
+    if base.chars().count() > MAX {
+        let mut s: String = base.chars().take(MAX - 1).collect();
+        s.push('…');
+        s
+    } else {
+        base.to_string()
+    }
+}
+
 /// Compact "time since creation": `just now`, `5m`, `18m`, `2h`, `3d`.
 /// `now_ms`/`created_ms` are Unix-epoch milliseconds.
 pub fn short_age(created_ms: u64, now_ms: u64) -> String {
@@ -231,11 +255,26 @@ mod tests {
     fn info(name: &str, created_ms: u64, clients: u32) -> SessionInfo {
         SessionInfo {
             name: name.to_string(),
+            command: "sh".into(),
             created_ms,
             attached_clients: clients,
             cols: 80,
             rows: 24,
         }
+    }
+
+    #[test]
+    fn short_cmd_basenames_paths_but_keeps_args() {
+        assert_eq!(short_cmd("/usr/bin/bash"), "bash");
+        assert_eq!(short_cmd("/bin/zsh"), "zsh");
+        // A command with arguments is kept whole (it's the interesting part).
+        assert_eq!(short_cmd("journalctl -f"), "journalctl -f");
+        assert_eq!(short_cmd("npm run dev"), "npm run dev");
+        assert_eq!(short_cmd(""), "");
+        // Overlong commands are truncated with an ellipsis.
+        let long = short_cmd("python train.py --config really/long/path/to/config.yaml");
+        assert_eq!(long.chars().count(), 24);
+        assert!(long.ends_with('…'));
     }
 
     #[test]

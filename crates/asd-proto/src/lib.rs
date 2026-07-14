@@ -5,10 +5,11 @@
 //! `AsyncRead + AsyncWrite` — the same codec serves the local UDS and the
 //! remote SSH dumb pipe.
 //!
-//! Adding any frame requires bumping [`PROTO_VERSION`], with both ends
-//! upgraded together; the protocol does not run multi-version compatible, a
-//! version mismatch always gets `Error{code=1}` followed by disconnect.
-//! v1 added the scrollback frames (`FetchHistory`/`History`) and `Refresh`.
+//! Adding any frame — or changing a frame's shape — requires bumping
+//! [`PROTO_VERSION`], with both ends upgraded together; the protocol does not
+//! run multi-version compatible, a version mismatch always gets `Error{code=1}`
+//! followed by disconnect. v1 added the scrollback frames
+//! (`FetchHistory`/`History`) and `Refresh`; v2 added `SessionInfo.command`.
 
 mod codec;
 pub mod paths;
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
 /// Per-frame cap: 4 MiB (postcard payload, excluding the 4-byte length prefix).
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -57,6 +58,9 @@ pub enum ClientKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub name: String,
+    /// The command the session runs: the `cmd` given to `Create`, or the
+    /// resolved default shell when none was. Display-only.
+    pub command: String,
     /// Creation time, Unix epoch milliseconds.
     pub created_ms: u64,
     pub attached_clients: u32,

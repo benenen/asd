@@ -23,6 +23,7 @@ fn all_frames() -> Vec<Frame> {
             sessions: vec![
                 SessionInfo {
                     name: "s0".into(),
+                    command: "/bin/bash".into(),
                     created_ms: 1_752_450_000_000,
                     attached_clients: 2,
                     cols: 120,
@@ -30,6 +31,7 @@ fn all_frames() -> Vec<Frame> {
                 },
                 SessionInfo {
                     name: "work".into(),
+                    command: "htop".into(),
                     created_ms: 0,
                     attached_clients: 0,
                     cols: 80,
