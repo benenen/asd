@@ -33,9 +33,9 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-手工冒烟：`cargo run -p asd-cli -- attach -A demo`（自动拉起 daemon + 创建 session；detach 键 Ctrl-\，attach 时会打印提示）。**attach 视图是 tmux 式交替屏（已确认的设计决策，2026-07-14）**：detach 恢复原屏幕。**滚回历史（M1 已交付）**：`PageUp` 或**在 shell 提示符下直接滚轮上滚**即进入客户端本地的 scrollback 查看器（copy-mode），用滚轮 / PgUp/PgDn / ↑↓ / g/G 浏览 daemon 里的会话历史，`q`/`End`/`Ctrl-\` 退出（发 `Refresh` 用一张新 `Snapshot` 重绘 live 屏）。
+手工冒烟：`cargo run -p asd-cli -- attach -A demo`（自动拉起 daemon + 创建 session；detach 键 Ctrl-\，attach 时会打印提示）。**attach 视图是 tmux 式交替屏（已确认的设计决策，2026-07-14）**：detach 恢复原屏幕。
 
-**滚轮路由（借鉴 boo）**：整个 attach 期间开鼠标上报（`1000h/1006h`）；CLI 扫 session 的 Output 流跟踪 `app_alt`/`app_mouse`（asd 是透明透传，app 自己的模式切换会经过客户端——boo 反而要 daemon 发 `.screen` 消息，因为它把切换剥掉了）。据此路由：primary 屏无鼠标（提示符）→滚轮进 scrollback；app 要鼠标（vim）→转发鼠标；alt 屏无鼠标的 pager→转成方向键。**这是 thin 客户端的启发式，非严格 VT 解析**——真正干净的滚回属于 asd-gui（有完整 VT 模型，对标 boo 的 `boo ui`）。相关踩坑见 mem 胶囊。`asd new` 也会自动拉起 daemon（tmux 语义）；`list`/`kill`/裸 `attach` 则要求 daemon 已在跑。`asd daemon` 可前台手动跑 daemon。`--socket`/`$ASD_SOCKET` 可把 socket 指到任意路径做隔离实验。注意 daemon 自带 tokio runtime，`main()` 必须在进入 `#[tokio::main]` 之前分发 `Cmd::Daemon`（不能嵌套 runtime）。
+**鼠标取舍（已确认，2026-07-14）**：live 屏**关鼠标上报**——保住终端原生拖选复制（这是"滚轮直接进 scrollback"与"拖选复制"在终端层互斥后用户选的一侧）。live 屏用 DEC 1007 alt-scroll（滚轮转方向键给 pager）。**滚回历史（M1 已交付）**：按 `PageUp` 进入客户端本地的 scrollback 查看器（copy-mode），此时才临时开鼠标上报（`1000h/1006h`），用滚轮 / PgUp/PgDn / ↑↓ / g/G 浏览 daemon 里的会话历史，`q`/`End`/`Ctrl-\` 退出（关鼠标 + 发 `Refresh` 用一张新 `Snapshot` 重绘 live 屏）。真正干净的"滚轮即滚回 + 选中复制"要 asd-gui（完整 VT 模型，对标 boo 的 `boo ui`：自带终端 + daemon 回放历史 + OSC52 剪贴板）。`asd new` 也会自动拉起 daemon（tmux 语义）；`list`/`kill`/裸 `attach` 则要求 daemon 已在跑。`asd daemon` 可前台手动跑 daemon。`--socket`/`$ASD_SOCKET` 可把 socket 指到任意路径做隔离实验。注意 daemon 自带 tokio runtime，`main()` 必须在进入 `#[tokio::main]` 之前分发 `Cmd::Daemon`（不能嵌套 runtime）。
 
 ## 架构（跨文件才能看懂的部分）
 

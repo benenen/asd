@@ -154,14 +154,6 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     let mut writer = client.writer;
     let mut mode = Mode::Live;
 
-    // Track the session program's screen/mouse state by scanning its Output
-    // (asd is a transparent passthrough, so the app's own mode toggles reach
-    // us). This is what decides where the wheel goes: at a shell prompt
-    // (primary screen, no mouse grab) the wheel drives the scrollback viewer;
-    // in a full-screen app the wheel goes to the app. This mirrors boo's
-    // `.screen` signal, computed client-side instead of via the protocol.
-    let mut app = AppMode::default();
-
     let exit = 'main: loop {
         tokio::select! {
             ev = ev_rx.recv() => {
@@ -169,12 +161,6 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                 match ev {
                     Ev::Ended(reason) => break reason,
                     Ev::Output(bytes) => {
-                        // Track the app's screen/mouse modes from its output.
-                        // If the app just turned mouse reporting off, re-assert
-                        // ours so the wheel keeps reaching the scrollback view.
-                        if app.observe(&bytes) && write_stdout(MOUSE_ON).is_err() {
-                            break Exit::DaemonGone;
-                        }
                         // Ignored while viewing scrollback (repainted on exit).
                         if matches!(mode, Mode::Live) && write_stdout(&bytes).is_err() {
                             break Exit::DaemonGone;
@@ -215,7 +201,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                 let Some(chunk) = chunk else { break Exit::Detached };
                 match &mut mode {
                     Mode::Live => {
-                        match handle_live_input(&chunk, app) {
+                        match handle_live_input(&chunk) {
                             LiveAction::Detach { forward } => {
                                 if !forward.is_empty() {
                                     let _ = writer.write_frame(&Frame::Input { bytes: forward }).await;
@@ -251,6 +237,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                             }
                             CopyAction::Leave => {
                                 c.resyncing = true;
+                                let _ = write_stdout(MOUSE_OFF);
                                 if writer.write_frame(&Frame::Refresh).await.is_err() {
                                     break Exit::DaemonGone;
                                 }
@@ -308,7 +295,9 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
 }
 
 fn enter_copy(mode: &mut Mode, view_rows: u16) {
-    // Mouse reporting is already on for the whole attach; no toggle needed.
+    // Enable mouse reporting for the viewer so the wheel navigates it; it is
+    // turned back off on leave so the live view keeps native drag-to-select.
+    let _ = write_stdout(MOUSE_ON);
     *mode = Mode::Copy(Copy {
         top: 0,
         total: 0,
@@ -316,62 +305,6 @@ fn enter_copy(mode: &mut Mode, view_rows: u16) {
         initialized: false,
         resyncing: false,
     });
-}
-
-/// The session program's screen/mouse state, tracked by scanning its output.
-/// Decides where a wheel event goes in Live mode.
-#[derive(Default, Clone, Copy)]
-struct AppMode {
-    /// The app is on the alternate screen (vim/less/htop/...).
-    alt: bool,
-    /// The app enabled mouse reporting (1000/1002/1003).
-    mouse: bool,
-}
-
-impl AppMode {
-    /// Update from an Output chunk. Returns true if the app just turned mouse
-    /// reporting off (so the caller should re-assert ours).
-    fn observe(&mut self, bytes: &[u8]) -> bool {
-        let was_mouse = self.mouse;
-        for (mode, set) in scan_private_modes(bytes) {
-            match mode {
-                47 | 1047 | 1049 => self.alt = set,
-                1000 | 1002 | 1003 => self.mouse = set,
-                _ => {}
-            }
-        }
-        was_mouse && !self.mouse
-    }
-}
-
-/// Scan for DEC private mode sets/resets (`ESC [ ? <params> h|l`) and return
-/// each `(mode, is_set)`. Per-chunk only; a sequence split across two Output
-/// frames is missed (rare — apps emit these atomically), self-correcting on
-/// the next toggle.
-fn scan_private_modes(buf: &[u8]) -> Vec<(u16, bool)> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + 3 < buf.len() {
-        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'?' {
-            let start = i + 3;
-            let mut j = start;
-            while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
-                j += 1;
-            }
-            if j < buf.len() && (buf[j] == b'h' || buf[j] == b'l') {
-                let set = buf[j] == b'h';
-                for p in buf[start..j].split(|&b| b == b';') {
-                    if let Ok(n) = std::str::from_utf8(p).unwrap_or("").parse::<u16>() {
-                        out.push((n, set));
-                    }
-                }
-                i = j + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
 }
 
 /// How much to move `top` by (positive = toward the bottom / newer lines).
@@ -396,47 +329,21 @@ enum LiveAction {
 
 /// PageUp: `ESC [ 5 ~`.
 const PAGE_UP: &[u8] = b"\x1b[5~";
-/// SGR wheel-up / wheel-down report prefixes (`ESC [ < 64|65 ; ...`).
-const WHEEL_UP: &[u8] = b"\x1b[<64";
-const WHEEL_DOWN: &[u8] = b"\x1b[<65";
 
-fn handle_live_input(chunk: &[u8], app: AppMode) -> LiveAction {
+fn handle_live_input(chunk: &[u8]) -> LiveAction {
     if let Some(pos) = chunk.iter().position(|&b| b == DETACH_BYTE) {
         return LiveAction::Detach {
             forward: chunk[..pos].to_vec(),
         };
-    }
-    // Wheel routing (boo's insight): only when the app is neither on the
-    // alternate screen nor grabbing the mouse — i.e. at a shell prompt — does
-    // the wheel open the scrollback viewer. Otherwise the wheel belongs to
-    // the app.
-    let wheel_up = find_subseq(chunk, WHEEL_UP).is_some();
-    let wheel_down = find_subseq(chunk, WHEEL_DOWN).is_some();
-    if (wheel_up || wheel_down) && !app.alt && !app.mouse {
-        if wheel_up {
-            return LiveAction::EnterCopy {
-                forward: Vec::new(),
-            };
-        }
-        // Wheel-down at the live bottom: nothing to reveal.
-        return LiveAction::Forward(Vec::new());
-    }
-    if (wheel_up || wheel_down) && app.alt && !app.mouse {
-        // Full-screen app that did not grab the mouse (a pager without mouse
-        // mode): emulate alternate-scroll by sending arrow keys.
-        let arrow: &[u8] = if wheel_up { b"\x1bOA" } else { b"\x1bOB" };
-        let mut bytes = Vec::new();
-        for _ in 0..3 {
-            bytes.extend_from_slice(arrow);
-        }
-        return LiveAction::Forward(bytes);
     }
     if let Some(pos) = find_subseq(chunk, PAGE_UP) {
         return LiveAction::EnterCopy {
             forward: chunk[..pos].to_vec(),
         };
     }
-    // Everything else (typing, and mouse events the app wants) passes through.
+    // Everything else passes through verbatim: typing, and the mouse (native
+    // drag-select works because live mode leaves mouse reporting off, and an
+    // app that wants the mouse enables it via passthrough as in M0).
     LiveAction::Forward(chunk.to_vec())
 }
 
@@ -630,26 +537,29 @@ pub fn term_size() -> (u16, u16) {
     }
 }
 
-/// Alternate-screen guard: on creation enters the alternate screen (DEC 1049,
-/// clears it and saves the cursor) and turns on mouse reporting so the wheel
-/// is delivered as events we can route (to the scrollback viewer at a shell
-/// prompt, or to the app otherwise). On drop it disables mouse reporting and
-/// restores the primary screen with its previous contents.
+/// Alternate-screen guard: enters the alternate screen (DEC 1049, clears it
+/// and saves the cursor) on creation, and restores the primary screen with
+/// its previous contents on drop.
+///
+/// Live mode keeps mouse reporting OFF so the terminal's native drag-to-select
+/// (copy) keeps working; DEC 1007 alternate-scroll makes the wheel send arrow
+/// keys, which pagers use. Session-history scrollback is the viewer, opened
+/// with `PageUp`; mouse reporting is turned on only inside it (so the wheel
+/// navigates it) and off again on leave.
 struct AltScreenGuard;
 
 impl AltScreenGuard {
     fn enter() -> std::io::Result<Self> {
-        let mut seq = b"\x1b[?1049h".to_vec();
-        seq.extend_from_slice(MOUSE_ON);
-        write_stdout(&seq)?;
+        write_stdout(b"\x1b[?1049h\x1b[?1007h")?;
         Ok(Self)
     }
 }
 
 impl Drop for AltScreenGuard {
     fn drop(&mut self) {
+        // Defensively disable mouse reporting in case we drop mid-viewer.
         let mut seq = MOUSE_OFF.to_vec();
-        seq.extend_from_slice(b"\x1b[?1049l");
+        seq.extend_from_slice(b"\x1b[?1007l\x1b[?1049l");
         let _ = write_stdout(&seq);
     }
 }
