@@ -65,6 +65,21 @@ pub trait VtBackend: Sized {
         Vec::new()
     }
 
+    /// Total number of rows in "screen space": scrollback history plus the
+    /// live screen. Row 0 is the oldest scrollback line; the live view is the
+    /// bottom `rows` of this space. Backs the M1 scrollback viewer.
+    fn history_len(&mut self) -> usize {
+        0
+    }
+
+    /// Read the screen-space row window `[start, start + count)` as plain
+    /// UTF-8 text lines (trailing blanks trimmed), clamped to the available
+    /// range. See [`VtBackend::history_len`] for the coordinate space.
+    fn fetch_history(&mut self, start: u32, count: u32) -> Vec<Vec<u8>> {
+        let _ = (start, count);
+        Vec::new()
+    }
+
     /// Selection text (delivered in M1; default returns an empty string).
     fn selection_text(&self, sel: Selection) -> String {
         let _ = sel;

@@ -12,7 +12,9 @@ use libghostty_vt::{
     key as gkey,
     render::{CellIterator, CursorVisualStyle, Dirty, RowIterator},
     screen::CellWide,
+    selection::{FormatOptions as SelFormatOptions, Selection},
     style::{RgbColor, Underline},
+    terminal::{Point, PointCoordinate},
 };
 
 use crate::{
@@ -231,6 +233,78 @@ impl VtBackend for GhosttyVt {
 
     fn take_pty_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut *self.pty_responses.borrow_mut())
+    }
+
+    fn history_len(&mut self) -> usize {
+        let scrollback = self.terminal.scrollback_rows().unwrap_or(0);
+        let rows = usize::from(self.cols_rows().1);
+        scrollback + rows
+    }
+
+    fn fetch_history(&mut self, start: u32, count: u32) -> Vec<Vec<u8>> {
+        let total = self.history_len();
+        if count == 0 || total == 0 {
+            return Vec::new();
+        }
+        let (cols, _) = self.cols_rows();
+        if cols == 0 {
+            return Vec::new();
+        }
+        let start = (start as usize).min(total.saturating_sub(1));
+        let end = (start + count as usize).min(total); // exclusive
+        let last = end - 1;
+
+        // One read-only pass over the requested window: a screen-space
+        // selection from (0, start) to (cols-1, last), formatted as plain
+        // text. Screen space spans scrollback + the live screen (row 0 =
+        // oldest). Reading per-cell via grid_ref would be O(scrollback) each.
+        let x_end = cols - 1;
+        let Ok(start_ref) = self.terminal.grid_ref(Point::Screen(PointCoordinate {
+            x: 0,
+            y: start as u32,
+        })) else {
+            return Vec::new();
+        };
+        let Ok(end_ref) = self.terminal.grid_ref(Point::Screen(PointCoordinate {
+            x: x_end,
+            y: last as u32,
+        })) else {
+            return Vec::new();
+        };
+        let selection = Selection::new(start_ref, end_ref, false);
+        let opts = SelFormatOptions::new()
+            .with_selection(&selection)
+            .with_emit_format(Format::Plain)
+            .with_unwrap(false)
+            .with_trim(true);
+
+        let want = end - start;
+        match self.terminal.format_selection_alloc(None, opts) {
+            Ok(Some(bytes)) => {
+                let mut rows: Vec<Vec<u8>> =
+                    bytes.split(|&b| b == b'\n').map(<[u8]>::to_vec).collect();
+                // Plain output has no trailing newline, so N rows yield N
+                // segments; pad/truncate to exactly the requested count so
+                // the client's coordinate math stays exact.
+                rows.truncate(want);
+                while rows.len() < want {
+                    rows.push(Vec::new());
+                }
+                rows
+            }
+            // No content selected (e.g. an all-blank window) → blank rows.
+            _ => vec![Vec::new(); want],
+        }
+    }
+}
+
+impl GhosttyVt {
+    /// Current (cols, rows) of the terminal.
+    fn cols_rows(&self) -> (u16, u16) {
+        (
+            self.terminal.cols().unwrap_or(0),
+            self.terminal.rows().unwrap_or(0),
+        )
     }
 }
 

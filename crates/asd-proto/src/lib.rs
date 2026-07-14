@@ -1,4 +1,4 @@
-//! asd wire protocol v0 (spec §4).
+//! asd wire protocol v1 (spec §4).
 //!
 //! Frame format: `u32 LE length prefix + postcard serialization`, 4 MiB cap
 //! per frame; exceeding it is a protocol error → disconnect. Works over any
@@ -6,8 +6,9 @@
 //! remote SSH dumb pipe.
 //!
 //! Adding any frame requires bumping [`PROTO_VERSION`], with both ends
-//! upgraded together; v0/v1 do not run multi-version compatible, a version
-//! mismatch always gets `Error{code=1}` followed by disconnect.
+//! upgraded together; the protocol does not run multi-version compatible, a
+//! version mismatch always gets `Error{code=1}` followed by disconnect.
+//! v1 added the scrollback frames (`FetchHistory`/`History`) and `Refresh`.
 
 mod codec;
 pub mod paths;
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 0;
+pub const PROTO_VERSION: u32 = 1;
 
 /// Per-frame cap: 4 MiB (postcard payload, excluding the 4-byte length prefix).
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -63,7 +64,7 @@ pub struct SessionInfo {
     pub rows: u16,
 }
 
-/// All frames of protocol v0 (spec §4).
+/// All frames of protocol v1 (spec §4).
 ///
 /// Handshake: each side sends once after connecting; the client sends
 /// `Hello` first.
@@ -121,6 +122,25 @@ pub enum Frame {
         rows: u16,
     },
     Detach,
+    // Scrollback (v1, spec §4). Rows are indexed in "screen space": row 0 is
+    // the oldest scrollback line, row `total_rows - 1` is the bottom of the
+    // live screen. The live view is the bottom `rows` of this space.
+    /// client → daemon: request the row window `[start, start + count)`.
+    FetchHistory {
+        start: u32,
+        count: u32,
+    },
+    /// daemon → client: the requested window. `rows` are plain UTF-8 text
+    /// lines (one screen row each), trailing blanks trimmed; `total_rows`
+    /// and `start` let the client clamp and render a scroll position.
+    History {
+        total_rows: u32,
+        start: u32,
+        rows: Vec<Vec<u8>>,
+    },
+    /// client → daemon: request a fresh `Snapshot` of the live screen (used
+    /// to resync after leaving the client's local scrollback view).
+    Refresh,
     // Errors
     Error {
         code: u32,

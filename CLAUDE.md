@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 代码规范
 
 - **代码中的注释一律使用英文**（doc comments、行内注释、Cargo.toml 注释都算）。
-- **协议加帧必须 bump `asd-proto` 的 `PROTO_VERSION`**（双端同升，不做多版本兼容运行），并在 `crates/asd-proto/tests/codec.rs` 的 `all_frames()` 里补 roundtrip 用例。
+- **协议加帧必须 bump `asd-proto` 的 `PROTO_VERSION`**（双端同升，不做多版本兼容运行），并在 `crates/asd-proto/tests/codec.rs` 的 `all_frames()` 里补 roundtrip 用例。当前 `PROTO_VERSION = 1`（v1 加了 scrollback 的 `FetchHistory`/`History` 与 `Refresh`）。
 - crate 依赖边界是硬契约（spec §3），违反即架构回归：
 
 | crate | 职责 | 禁止依赖 |
@@ -33,7 +33,7 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-手工冒烟：`cargo run -p asd-cli -- attach -A demo`（自动拉起 daemon + 创建 session；detach 键 Ctrl-\，attach 时会打印提示）。`asd new` 也会自动拉起 daemon（tmux 语义）；`list`/`kill`/裸 `attach` 则要求 daemon 已在跑。`asd daemon` 可前台手动跑 daemon。`--socket`/`$ASD_SOCKET` 可把 socket 指到任意路径做隔离实验。注意 daemon 自带 tokio runtime，`main()` 必须在进入 `#[tokio::main]` 之前分发 `Cmd::Daemon`（不能嵌套 runtime）。
+手工冒烟：`cargo run -p asd-cli -- attach -A demo`（自动拉起 daemon + 创建 session；detach 键 Ctrl-\，attach 时会打印提示）。**attach 视图是 tmux 式交替屏（已确认的设计决策，2026-07-14）**：detach 恢复原屏幕。**滚回历史（M1 已交付）**：在 attach 中按 `PageUp` 进入客户端本地的 scrollback 查看器（copy-mode），用滚轮 / PgUp/PgDn / ↑↓ / g/G 浏览 daemon 里的会话历史，`q`/`End`/`Ctrl-\` 退出（发 `Refresh` 用一张新 `Snapshot` 重绘 live 屏）。查看器只在 copy-mode 内临时开启鼠标上报（`1000h/1006h`），退出即关，不破坏 live 屏对 session 的鼠标透传。`asd new` 也会自动拉起 daemon（tmux 语义）；`list`/`kill`/裸 `attach` 则要求 daemon 已在跑。`asd daemon` 可前台手动跑 daemon。`--socket`/`$ASD_SOCKET` 可把 socket 指到任意路径做隔离实验。注意 daemon 自带 tokio runtime，`main()` 必须在进入 `#[tokio::main]` 之前分发 `Cmd::Daemon`（不能嵌套 runtime）。
 
 ## 架构（跨文件才能看懂的部分）
 

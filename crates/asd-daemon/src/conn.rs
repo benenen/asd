@@ -172,6 +172,32 @@ pub async fn handle_conn(stream: UnixStream, registry: Arc<Mutex<Registry>>, con
                     });
                 }
             }
+            Frame::FetchHistory { start, count } => {
+                if let Some(a) = &attached {
+                    // Same out_tx/queued as the attach sink so the History
+                    // reply rides the connection's ordered outbound queue.
+                    let sink = ClientSink::new(conn_id, out_tx.clone(), Arc::clone(&queued));
+                    let _ = a
+                        .session_tx
+                        .send(SessionMsg::FetchHistory { sink, start, count });
+                } else {
+                    reply(Frame::Error {
+                        code: code::BAD_HANDSHAKE,
+                        msg: "FetchHistory before Attach".into(),
+                    });
+                }
+            }
+            Frame::Refresh => {
+                if let Some(a) = &attached {
+                    let sink = ClientSink::new(conn_id, out_tx.clone(), Arc::clone(&queued));
+                    let _ = a.session_tx.send(SessionMsg::Refresh { sink });
+                } else {
+                    reply(Frame::Error {
+                        code: code::BAD_HANDSHAKE,
+                        msg: "Refresh before Attach".into(),
+                    });
+                }
+            }
             other => {
                 warn!(conn = conn_id, frame = ?other, "unexpected frame from client");
                 reply(Frame::Error {

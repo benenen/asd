@@ -245,3 +245,70 @@ fn encode_function_key() {
     let mut vt = term(10, 3);
     assert_eq!(vt.encode_key(KeyEvent::plain(Key::F(1))), b"\x1bOP");
 }
+
+// ---- scrollback history (M1) ----
+
+fn line(rows: &[Vec<u8>], i: usize) -> String {
+    String::from_utf8_lossy(&rows[i]).trim_end().to_string()
+}
+
+#[test]
+fn history_len_counts_scrollback_plus_screen() {
+    let mut vt = term(20, 4);
+    // Nothing fed yet: just the live screen rows.
+    assert_eq!(vt.history_len(), 4);
+    for i in 0..12 {
+        vt.feed(format!("line{i}\r\n").as_bytes());
+    }
+    // 12 printed lines + trailing blank in a 4-row screen => 9 scrollback + 4.
+    assert_eq!(vt.history_len(), 13);
+}
+
+#[test]
+fn fetch_history_reads_scrolled_off_lines() {
+    let mut vt = term(20, 4);
+    for i in 0..12 {
+        vt.feed(format!("line{i}\r\n").as_bytes());
+    }
+    let total = vt.history_len() as u32;
+
+    // Whole buffer: row 0 is the oldest line, live screen is at the bottom.
+    let all = vt.fetch_history(0, total);
+    assert_eq!(all.len(), total as usize);
+    assert_eq!(line(&all, 0), "line0");
+    assert_eq!(line(&all, 11), "line11");
+
+    // A window in the middle of scrollback.
+    let win = vt.fetch_history(2, 3);
+    assert_eq!(win.len(), 3);
+    assert_eq!(line(&win, 0), "line2");
+    assert_eq!(line(&win, 1), "line3");
+    assert_eq!(line(&win, 2), "line4");
+}
+
+#[test]
+fn fetch_history_clamps_to_available_rows() {
+    let mut vt = term(20, 4);
+    for i in 0..6 {
+        vt.feed(format!("row{i}\r\n").as_bytes());
+    }
+    let total = vt.history_len();
+    // Asking for more than remains from `start` returns only what is
+    // available (no rows past the end of screen space).
+    let rows = vt.fetch_history(total as u32 - 2, 10);
+    assert_eq!(rows.len(), 2);
+    // Out-of-range start is clamped to the last row, never panics.
+    let past = vt.fetch_history(total as u32 + 100, 5);
+    assert_eq!(past.len(), 1);
+}
+
+#[test]
+fn fetch_history_preserves_wide_chars() {
+    let mut vt = term(20, 3);
+    for i in 0..6 {
+        vt.feed(format!("中文{i}\r\n").as_bytes());
+    }
+    let total = vt.history_len() as u32;
+    let all = vt.fetch_history(0, total);
+    assert_eq!(line(&all, 0), "中文0");
+}

@@ -163,6 +163,21 @@ impl ProtoClient {
         }
     }
 
+    /// Receive the next frame that is not Output (draining live Output).
+    async fn recv_skipping_output(&mut self) -> Frame {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected a non-Output frame within the deadline"
+            );
+            match self.recv().await {
+                Frame::Output { .. } => {}
+                other => return other,
+            }
+        }
+    }
+
     /// Keep receiving Output until needle appears in the accumulated bytes.
     async fn read_output_until(&mut self, needle: &[u8]) -> Vec<u8> {
         let mut acc = Vec::new();
@@ -416,4 +431,89 @@ async fn sigterm_reaps_children_and_removes_socket() {
     }
     // The socket has been cleaned up
     assert!(!daemon.socket.exists(), "socket file not removed");
+}
+
+/// M1 scrollback: write more than a screen of lines, then FetchHistory must
+/// return the earlier lines that scrolled off (spec §4).
+#[tokio::test]
+async fn fetch_history_returns_scrolled_off_lines() {
+    let daemon = Daemon::start("history");
+    let out = daemon.cli().args(["new", "hist"]).output().unwrap();
+    assert!(out.status.success());
+
+    let mut a = ProtoClient::connect(&daemon.socket).await;
+    a.attach("hist").await;
+    // Print 60 numbered lines into a 24-row screen: the first ~36 scroll off.
+    a.send(Frame::Input {
+        bytes: b"for i in $(seq 1 60); do echo HL-$i; done\n".to_vec(),
+    })
+    .await;
+    // Wait until the last line has been produced so scrollback is populated.
+    a.read_output_until(b"HL-60").await;
+
+    // Fetch the whole screen space; earliest lines must be present.
+    a.send(Frame::FetchHistory {
+        start: 0,
+        count: 4000,
+    })
+    .await;
+    let (total_rows, rows) = match a.recv_skipping_output().await {
+        Frame::History {
+            total_rows, rows, ..
+        } => (total_rows, rows),
+        other => panic!("expected History, got {other:?}"),
+    };
+    assert!(total_rows > 24, "scrollback should exceed one screen");
+    let flat: Vec<String> = rows
+        .iter()
+        .map(|r| String::from_utf8_lossy(r).trim_end().to_string())
+        .collect();
+    // A line that must have scrolled off the 24-row live screen.
+    assert!(
+        flat.iter().any(|l| l == "HL-1"),
+        "earliest scrolled-off line missing from history: {flat:?}"
+    );
+    assert!(
+        flat.iter().any(|l| l == "HL-60"),
+        "latest line missing from history"
+    );
+
+    // A narrow window near the top returns just those rows.
+    a.send(Frame::FetchHistory { start: 0, count: 3 }).await;
+    match a.recv_skipping_output().await {
+        Frame::History { rows, start, .. } => {
+            assert_eq!(start, 0);
+            assert_eq!(rows.len(), 3);
+        }
+        other => panic!("expected History, got {other:?}"),
+    }
+}
+
+/// Refresh returns a fresh Snapshot of the live screen (used to resync after
+/// leaving the client-side scrollback view).
+#[tokio::test]
+async fn refresh_returns_fresh_snapshot() {
+    let daemon = Daemon::start("refresh");
+    let out = daemon.cli().args(["new", "refr"]).output().unwrap();
+    assert!(out.status.success());
+
+    let mut a = ProtoClient::connect(&daemon.socket).await;
+    a.attach("refr").await;
+    a.send(Frame::Input {
+        bytes: b"echo REFRESH-MARK\n".to_vec(),
+    })
+    .await;
+    a.read_output_until(b"REFRESH-MARK").await;
+
+    a.send(Frame::Refresh).await;
+    match a.recv_skipping_output().await {
+        Frame::Snapshot { vt } => {
+            assert!(
+                contains(&vt, b"REFRESH-MARK"),
+                "refresh snapshot missing recent output: {:?}",
+                String::from_utf8_lossy(&vt)
+            );
+        }
+        other => panic!("expected Snapshot from Refresh, got {other:?}"),
+    }
 }

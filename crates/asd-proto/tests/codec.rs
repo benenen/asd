@@ -6,7 +6,7 @@ use asd_proto::{
     decode_frame, encode_frame,
 };
 
-/// Covers all 14 frame kinds of protocol v0. New frames must be added here in
+/// Covers all frame kinds of protocol v1. New frames must be added here in
 /// lockstep.
 fn all_frames() -> Vec<Frame> {
     vec![
@@ -63,6 +63,16 @@ fn all_frames() -> Vec<Frame> {
         },
         Frame::Resize { cols: 80, rows: 24 },
         Frame::Detach,
+        Frame::FetchHistory {
+            start: 100,
+            count: 40,
+        },
+        Frame::History {
+            total_rows: 512,
+            start: 100,
+            rows: vec![b"line one".to_vec(), b"line two".to_vec(), Vec::new()],
+        },
+        Frame::Refresh,
         Frame::Error {
             code: asd_proto::code::VERSION_MISMATCH,
             msg: "proto version mismatch".into(),

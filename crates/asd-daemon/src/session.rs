@@ -108,10 +108,26 @@ pub enum SessionMsg {
     Detach {
         client_id: u64,
     },
+    /// Fetch a scrollback window for one client (v1). Replies with a
+    /// `History` frame on that client's sink.
+    FetchHistory {
+        sink: ClientSink,
+        start: u32,
+        count: u32,
+    },
+    /// Send a fresh `Snapshot` of the live screen to one client (v1). Used to
+    /// resync after the client leaves its local scrollback view.
+    Refresh {
+        sink: ClientSink,
+    },
     /// Kill the session: SIGHUP the child, then SIGKILL if it is still alive
     /// after 2s.
     Kill,
 }
+
+/// Server-side cap on rows returned per `FetchHistory` (keeps a `History`
+/// frame well under the 4 MiB cap; the client paginates as it scrolls).
+pub const MAX_HISTORY_ROWS_PER_FETCH: u32 = 2000;
 
 /// The session handle held by the network side (metadata + message inlet).
 #[derive(Clone)]
@@ -302,6 +318,23 @@ fn session_thread(
                 meta.attached_clients
                     .store(clients.len() as u32, Ordering::Relaxed);
                 debug!(session = %name, client = client_id, "client detached");
+            }
+            SessionMsg::FetchHistory { sink, start, count } => {
+                let count = count.min(MAX_HISTORY_ROWS_PER_FETCH);
+                let total_rows = vt.history_len() as u32;
+                let rows = vt.fetch_history(start, count);
+                // Reply on the requesting client's own sink. History is not a
+                // data-plane frame, so it does not consume the flow-control
+                // quota; the window is bounded by MAX_HISTORY_ROWS_PER_FETCH.
+                sink.send(Frame::History {
+                    total_rows,
+                    start,
+                    rows,
+                });
+            }
+            SessionMsg::Refresh { sink } => {
+                let snapshot = vt.snapshot_vt();
+                sink.send(Frame::Snapshot { vt: snapshot });
             }
             SessionMsg::Kill => {
                 info!(session = %name, "kill requested");
