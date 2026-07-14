@@ -198,7 +198,7 @@ fn strip_login_dash(s: &str) -> &str {
 /// (no job control, so sh stays the group leader). Show the command it runs,
 /// not the wrapper. Interactive foreground jobs get their own process group and
 /// never look like this.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unwrap_shell_c(cmd: String) -> String {
     for prefix in ["sh -c ", "bash -c ", "dash -c ", "zsh -c "] {
         if let Some(rest) = cmd.strip_prefix(prefix) {
@@ -232,17 +232,106 @@ fn proc_command(pid: libc::pid_t) -> Option<String> {
     }
 }
 
-/// macOS has no `/proc`; use libproc's `proc_pidpath` for the foreground
-/// process's executable path and take its basename. Arguments aren't cheaply
-/// available here, so this reports the program name (e.g. `vim`, `node`,
-/// `top`) rather than a full command line.
+/// macOS has no `/proc`. Get the full argv via `sysctl(KERN_PROCARGS2)` for
+/// parity with Linux, falling back to libproc's `proc_pidpath` (executable
+/// basename) if the argv read fails.
 #[cfg(target_os = "macos")]
 fn proc_command(pid: libc::pid_t) -> Option<String> {
-    // PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN).
-    const MAX: usize = 4096;
+    procargs2(pid).or_else(|| proc_pidpath_basename(pid))
+}
+
+/// Full command line from `sysctl(KERN_PROCARGS2)`: argv[0] basenamed, args
+/// kept, our `sh -c` wrapper stripped — same shape as the Linux `/proc` path.
+#[cfg(target_os = "macos")]
+fn procargs2(pid: libc::pid_t) -> Option<String> {
+    // Size the buffer from KERN_ARGMAX (the args+env blob can't exceed it).
+    let mut argmax: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: mib has `namelen` entries; oldp/oldlenp point at `argmax`/`len`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            (&mut argmax as *mut libc::c_int).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || argmax <= 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; argmax as usize];
+    let mut len = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: mib has 3 entries; oldp is `buf` (len bytes), oldlenp is `len`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    parse_procargs2(&buf)
+}
+
+/// Parse a `KERN_PROCARGS2` blob: `[argc:i32][exec_path\0][\0…][argv0\0]…`.
+/// Pure byte parsing (no syscalls), so it's built in `test` too for coverage.
+#[cfg(any(target_os = "macos", test))]
+fn parse_procargs2(buf: &[u8]) -> Option<String> {
+    let int_sz = std::mem::size_of::<libc::c_int>();
+    let argc = i32::from_ne_bytes(buf.get(..int_sz)?.try_into().ok()?);
+    if argc <= 0 {
+        return None;
+    }
+    let mut i = int_sz;
+    // Skip the exec path, then the run of NUL padding before argv[0].
+    while i < buf.len() && buf[i] != 0 {
+        i += 1;
+    }
+    while i < buf.len() && buf[i] == 0 {
+        i += 1;
+    }
+    // Read `argc` NUL-terminated argv strings.
+    let mut argv: Vec<String> = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        if i >= buf.len() {
+            break;
+        }
+        let start = i;
+        while i < buf.len() && buf[i] != 0 {
+            i += 1;
+        }
+        argv.push(String::from_utf8_lossy(&buf[start..i]).into_owned());
+        i += 1; // step over the NUL
+    }
+    let arg0 = argv.first()?;
+    let base = strip_login_dash(arg0.rsplit('/').next().unwrap_or(arg0));
+    let mut out = base.to_string();
+    for arg in &argv[1..] {
+        out.push(' ');
+        out.push_str(arg);
+    }
+    Some(unwrap_shell_c(out))
+}
+
+/// The foreground process's executable basename via libproc `proc_pidpath` —
+/// the macOS fallback when the argv read is unavailable.
+#[cfg(target_os = "macos")]
+fn proc_pidpath_basename(pid: libc::pid_t) -> Option<String> {
+    const MAX: usize = 4096; // PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN)
     let mut buf = [0u8; MAX];
-    // SAFETY: `buf` is valid for `MAX` bytes; `proc_pidpath` writes at most
-    // that many and returns the byte length written (<= 0 on failure).
+    // SAFETY: `buf` is valid for `MAX` bytes; `proc_pidpath` writes at most that
+    // many and returns the byte length written (<= 0 on failure).
     let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast::<libc::c_void>(), MAX as u32) };
     if n <= 0 {
         return None;
@@ -522,5 +611,48 @@ pub fn signal_child(meta: &SessionMeta, sig: Signal) {
     let pid = meta.child_pid.load(Ordering::Relaxed);
     if pid != 0 {
         let _ = kill(Pid::from_raw(pid as i32), sig);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic `KERN_PROCARGS2` blob: argc, exec path, NUL padding,
+    /// then the argv strings (env, which the parser ignores, follows).
+    fn procargs2_blob(exec: &str, argv: &[&str], pad: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(argv.len() as i32).to_ne_bytes());
+        b.extend_from_slice(exec.as_bytes());
+        b.push(0);
+        b.extend(std::iter::repeat_n(0u8, pad));
+        for a in argv {
+            b.extend_from_slice(a.as_bytes());
+            b.push(0);
+        }
+        b.extend_from_slice(b"HOME=/x\0"); // trailing env, must be ignored
+        b
+    }
+
+    #[test]
+    fn parse_procargs2_basenames_argv0_and_keeps_args() {
+        let blob = procargs2_blob("/usr/bin/node", &["/usr/bin/node", "vite", "serve"], 3);
+        assert_eq!(parse_procargs2(&blob).as_deref(), Some("node vite serve"));
+    }
+
+    #[test]
+    fn parse_procargs2_unwraps_sh_c_and_strips_login_dash() {
+        // Our `--cmd` wrapper: sh -c "sleep 300" → "sleep 300".
+        let blob = procargs2_blob("/bin/sh", &["/bin/sh", "-c", "sleep 300"], 1);
+        assert_eq!(parse_procargs2(&blob).as_deref(), Some("sleep 300"));
+        // A login shell's leading '-' is stripped.
+        let blob = procargs2_blob("/bin/zsh", &["-zsh"], 0);
+        assert_eq!(parse_procargs2(&blob).as_deref(), Some("zsh"));
+    }
+
+    #[test]
+    fn parse_procargs2_rejects_malformed() {
+        assert_eq!(parse_procargs2(&[]), None); // too short for argc
+        assert_eq!(parse_procargs2(&0i32.to_ne_bytes()), None); // argc = 0
     }
 }
