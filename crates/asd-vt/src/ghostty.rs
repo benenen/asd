@@ -324,6 +324,26 @@ impl VtBackend for GhosttyVt {
         self.terminal.is_mouse_tracking().unwrap_or(false)
     }
 
+    fn mouse_modes(&mut self) -> Vec<u16> {
+        use libghostty_vt::terminal::Mode;
+        // Ascending by mode number so the client's diff is deterministic.
+        const MODES: &[(Mode, u16)] = &[
+            (Mode::X10_MOUSE, 9),
+            (Mode::NORMAL_MOUSE, 1000),
+            (Mode::BUTTON_MOUSE, 1002),
+            (Mode::ANY_MOUSE, 1003),
+            (Mode::UTF8_MOUSE, 1005),
+            (Mode::SGR_MOUSE, 1006),
+            (Mode::URXVT_MOUSE, 1015),
+            (Mode::SGR_PIXELS_MOUSE, 1016),
+        ];
+        MODES
+            .iter()
+            .filter(|(m, _)| self.terminal.mode(*m).unwrap_or(false))
+            .map(|(_, n)| *n)
+            .collect()
+    }
+
     fn selection_text(&mut self, sel: crate::Selection) -> String {
         let (cols, rows) = self.cols_rows();
         if cols == 0 || rows == 0 {

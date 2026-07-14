@@ -369,3 +369,21 @@ fn alt_screen_and_mouse_tracking_reflect_app_state() {
     assert!(!vt.is_alt_screen());
     assert!(!vt.is_mouse_tracking());
 }
+
+#[test]
+fn mouse_modes_reflect_enabled_dec_modes() {
+    let mut vt = term(20, 4);
+    assert!(vt.mouse_modes().is_empty(), "no mouse by default");
+
+    // Enable normal tracking (1000) + SGR encoding (1006), like most TUIs.
+    vt.feed(b"\x1b[?1000h\x1b[?1006h");
+    assert_eq!(vt.mouse_modes(), vec![1000, 1006]);
+
+    // Upgrade to button-event tracking (1002) as well.
+    vt.feed(b"\x1b[?1002h");
+    assert_eq!(vt.mouse_modes(), vec![1000, 1002, 1006]);
+
+    // Turn it all off (shell prompt): back to empty so native selection works.
+    vt.feed(b"\x1b[?1000l\x1b[?1002l\x1b[?1006l");
+    assert!(vt.mouse_modes().is_empty());
+}

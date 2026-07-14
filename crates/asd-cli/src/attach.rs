@@ -28,6 +28,11 @@ use crate::render;
 
 /// Detach key: Ctrl-\ (byte 0x1C in raw mode).
 const DETACH_BYTE: u8 = 0x1c;
+/// Lines the wheel scrolls per tick while in the scrollback view.
+const WHEEL_STEP: usize = 3;
+/// DEC private mouse modes we mirror/disable (ascending — matches
+/// `VtBackend::mouse_modes`).
+const MOUSE_MODES: &[u16] = &[9, 1000, 1002, 1003, 1005, 1006, 1015, 1016];
 
 /// Frames the socket-reader task forwards to the main loop.
 enum Ev {
@@ -63,8 +68,9 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
 
     eprintln!("[asd: attached to '{name}', detach: Ctrl-\\]");
     let _raw = RawGuard::enable().context("enabling raw terminal mode")?;
-    // Alt screen (detach restores the caller's screen) + mouse reporting (so
-    // the wheel and drags reach us as events). Dropped before RawGuard.
+    // Alt screen only — no mouse tracking is enabled here. We enable/disable it
+    // dynamically to mirror the session (see `sync_host_mouse`). Dropped before
+    // RawGuard.
     let _screen = ScreenGuard::enter().context("entering alternate screen")?;
 
     // Our local mirror of the session terminal.
@@ -74,8 +80,12 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
 
     // Lines scrolled up from the live bottom (0 = following live output).
     let mut scroll = 0usize;
+    // Mouse-tracking modes currently enabled on the host terminal, mirroring
+    // the session (empty = host mouse off, so native drag-select/copy works).
+    let mut host_mouse: Vec<u16> = Vec::new();
 
     render_now(&mut vt, scroll)?;
+    sync_host_mouse(&mut vt, &mut host_mouse)?;
 
     // Socket reader → Ev channel.
     let (ev_tx, mut ev_rx) = mpsc::channel::<Ev>(256);
@@ -136,6 +146,11 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                             vt.feed(&more);
                             let _ = vt.take_pty_responses();
                         }
+                        // The session may have toggled its mouse mode in this
+                        // output; mirror the change onto the host terminal.
+                        if sync_host_mouse(&mut vt, &mut host_mouse).is_err() {
+                            break Exit::DaemonGone;
+                        }
                         // While scrolled up we keep the view frozen so reading
                         // history is not yanked around by live output.
                         if scroll == 0 && render_now(&mut vt, scroll).is_err() {
@@ -145,6 +160,9 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                     Ev::Snapshot(dump) => {
                         vt.feed(&dump);
                         let _ = vt.take_pty_responses();
+                        if sync_host_mouse(&mut vt, &mut host_mouse).is_err() {
+                            break Exit::DaemonGone;
+                        }
                         if render_now(&mut vt, scroll).is_err() {
                             break Exit::DaemonGone;
                         }
@@ -158,10 +176,9 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                     break Exit::Detached;
                 }
 
-                // Scrollback keys (Shift+PageUp/PageDown/Home/End) drive our own
-                // viewport, since the host terminal's native scrollback is off
-                // on the alternate screen. Everything else is forwarded to the
-                // session (and snaps the view back to the live bottom).
+                // Scrollback keys (Shift+PageUp/PageDown/Home/End) always drive
+                // our own viewport (the host's native scrollback is off on the
+                // alternate screen).
                 if let Some(action) = parse_scroll_key(&chunk) {
                     let max_scroll = vt.scrollback_rows();
                     let page = usize::from(rows).saturating_sub(1).max(1);
@@ -180,6 +197,32 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                     continue;
                 }
 
+                // Mouse reports only reach us when the session has mouse on (we
+                // mirrored it to the host). In the live view they belong to the
+                // session; while scrolled back they stay local (wheel scrolls,
+                // other events are swallowed) so history reading is undisturbed.
+                if is_mouse_report(&chunk) {
+                    if scroll == 0 {
+                        // Live: host viewport == session grid, and the host
+                        // already encoded in the session's mode, so forward
+                        // verbatim (no coordinate/encoding translation needed).
+                        if writer.write_frame(&Frame::Input { bytes: chunk }).await.is_err() {
+                            break Exit::DaemonGone;
+                        }
+                    } else if let Some(dir) = mouse_wheel(&chunk) {
+                        let max_scroll = vt.scrollback_rows();
+                        scroll = match dir {
+                            WheelDir::Up => (scroll + WHEEL_STEP).min(max_scroll),
+                            WheelDir::Down => scroll.saturating_sub(WHEEL_STEP),
+                        };
+                        if render_now(&mut vt, scroll).is_err() {
+                            break Exit::DaemonGone;
+                        }
+                    }
+                    continue;
+                }
+
+                // Typing: snap back to the live bottom and forward.
                 if scroll != 0 {
                     scroll = 0;
                     let _ = render_now(&mut vt, scroll);
@@ -243,6 +286,76 @@ fn parse_scroll_key(chunk: &[u8]) -> Option<ScrollKey> {
     }
 }
 
+/// Mirror the session's mouse-tracking modes onto the host terminal, emitting
+/// only the delta. `host` is updated in place. When the session has no mouse
+/// (e.g. a shell prompt) the host ends up mouse-free, so its native
+/// drag-to-select/copy works.
+fn sync_host_mouse(vt: &mut GhosttyVt, host: &mut Vec<u16>) -> std::io::Result<()> {
+    let want = vt.mouse_modes();
+    if want == *host {
+        return Ok(());
+    }
+    let seq = mouse_mode_delta(host, &want);
+    if !seq.is_empty() {
+        write_stdout(&seq)?;
+    }
+    *host = want;
+    Ok(())
+}
+
+/// The DEC private-mode toggles to move the host from `old` to `new`:
+/// `CSI ? n l` for modes being dropped, `CSI ? n h` for modes being added.
+fn mouse_mode_delta(old: &[u16], new: &[u16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for m in old {
+        if !new.contains(m) {
+            out.extend_from_slice(format!("\x1b[?{m}l").as_bytes());
+        }
+    }
+    for m in new {
+        if !old.contains(m) {
+            out.extend_from_slice(format!("\x1b[?{m}h").as_bytes());
+        }
+    }
+    out
+}
+
+/// Whether a chunk is a mouse report: SGR (`CSI < ...`) or legacy X10/UTF-8
+/// (`CSI M ...`). These only arrive when host mouse tracking is on.
+fn is_mouse_report(chunk: &[u8]) -> bool {
+    chunk.starts_with(b"\x1b[<") || chunk.starts_with(b"\x1b[M")
+}
+
+/// Wheel scroll direction of a mouse report, or `None` if it is not a wheel
+/// event. Handles SGR (button 64/65) and legacy (byte 96/97).
+fn mouse_wheel(chunk: &[u8]) -> Option<WheelDir> {
+    if let Some(rest) = chunk.strip_prefix(b"\x1b[<") {
+        // SGR: button number before the first ';'.
+        let end = rest.iter().position(|&b| b == b';').unwrap_or(rest.len());
+        let n: u32 = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
+        return match n {
+            64 => Some(WheelDir::Up),
+            65 => Some(WheelDir::Down),
+            _ => None,
+        };
+    }
+    if let Some(rest) = chunk.strip_prefix(b"\x1b[M") {
+        // Legacy: button byte is 32 + code; wheel up = 96, wheel down = 97.
+        return match rest.first() {
+            Some(96) => Some(WheelDir::Up),
+            Some(97) => Some(WheelDir::Down),
+            _ => None,
+        };
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WheelDir {
+    Up,
+    Down,
+}
+
 /// `--stdio` proxy: bidirectional raw byte copy between stdio and the UDS;
 /// the protocol is spoken by the pipe's far end (a future remote GUI/CLI) —
 /// this process is a pure passthrough.
@@ -285,9 +398,11 @@ pub fn term_size() -> (u16, u16) {
 }
 
 /// Alternate-screen guard. Enters the alternate screen (DEC 1049) so detach
-/// restores the caller's screen; on drop, leaves it and resets the cursor
-/// shape. Crucially it does **not** enable any mouse-tracking mode, so the host
-/// terminal's own drag-to-select and copy keep working.
+/// restores the caller's screen; on drop, disables any mouse-tracking mode we
+/// may have mirrored from the session, leaves the alt screen, and resets the
+/// cursor shape. It does not enable mouse tracking itself — that is mirrored
+/// dynamically (see `sync_host_mouse`), so at a shell prompt the host stays
+/// mouse-free and its native drag-to-select/copy works.
 struct ScreenGuard;
 
 impl ScreenGuard {
@@ -299,7 +414,12 @@ impl ScreenGuard {
 
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
-        let _ = write_stdout(b"\x1b[?1049l\x1b[0 q");
+        let mut seq = Vec::new();
+        for m in MOUSE_MODES {
+            seq.extend_from_slice(format!("\x1b[?{m}l").as_bytes());
+        }
+        seq.extend_from_slice(b"\x1b[?1049l\x1b[0 q");
+        let _ = write_stdout(&seq);
     }
 }
 
@@ -347,5 +467,46 @@ mod tests {
         assert_eq!(parse_scroll_key(b"\x1b[H"), None);
         assert_eq!(parse_scroll_key(b"ls -la\r"), None);
         assert_eq!(parse_scroll_key(b""), None);
+    }
+
+    #[test]
+    fn mode_delta_emits_only_changes() {
+        // Off → normal+SGR: enable both, in ascending order.
+        assert_eq!(
+            mouse_mode_delta(&[], &[1000, 1006]),
+            b"\x1b[?1000h\x1b[?1006h"
+        );
+        // Add button tracking (1002): only the new one is enabled.
+        assert_eq!(
+            mouse_mode_delta(&[1000, 1006], &[1000, 1002, 1006]),
+            b"\x1b[?1002h"
+        );
+        // Session turns mouse off: disable everything that was on.
+        assert_eq!(
+            mouse_mode_delta(&[1000, 1002, 1006], &[]),
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1006l"
+        );
+        // No change: nothing emitted.
+        assert!(mouse_mode_delta(&[1000, 1006], &[1000, 1006]).is_empty());
+    }
+
+    #[test]
+    fn detects_mouse_reports() {
+        assert!(is_mouse_report(b"\x1b[<0;10;5M")); // SGR press
+        assert!(is_mouse_report(b"\x1b[<64;1;1M")); // SGR wheel
+        assert!(is_mouse_report(b"\x1b[M \"5")); // legacy
+        assert!(!is_mouse_report(b"ls\r"));
+        assert!(!is_mouse_report(b"\x1b[A")); // arrow key
+    }
+
+    #[test]
+    fn parses_wheel_direction() {
+        assert_eq!(mouse_wheel(b"\x1b[<64;10;5M"), Some(WheelDir::Up));
+        assert_eq!(mouse_wheel(b"\x1b[<65;10;5M"), Some(WheelDir::Down));
+        // Legacy wheel: byte 96 = up, 97 = down.
+        assert_eq!(mouse_wheel(b"\x1b[M\x60\x21\x21"), Some(WheelDir::Up));
+        assert_eq!(mouse_wheel(b"\x1b[M\x61\x21\x21"), Some(WheelDir::Down));
+        // A plain click is not a wheel event.
+        assert_eq!(mouse_wheel(b"\x1b[<0;10;5M"), None);
     }
 }

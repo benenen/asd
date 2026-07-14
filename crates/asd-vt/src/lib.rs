@@ -84,6 +84,15 @@ pub trait VtBackend: Sized {
         false
     }
 
+    /// The DEC private mode numbers the program currently has enabled among
+    /// the mouse set — tracking level (9/1000/1002/1003) and encoding
+    /// (1005/1006/1015/1016), ascending. Empty = no mouse (native selection is
+    /// fine). A client mirrors these onto a host terminal so mouse events reach
+    /// the program in the exact encoding it expects. Default returns empty.
+    fn mouse_modes(&mut self) -> Vec<u16> {
+        Vec::new()
+    }
+
     /// Encode a keystroke into input bytes according to the current terminal
     /// modes (DECCKM, kitty protocol, etc.).
     fn encode_key(&mut self, ev: KeyEvent) -> Vec<u8>;
