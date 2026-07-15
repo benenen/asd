@@ -27,3 +27,6 @@ target
 
 # Packaged release archives (`make package`/`dist`)
 /dist
+
+# Local proxy config for `make` (not committed; see .env.example)
+/.env

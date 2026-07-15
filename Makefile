@@ -15,6 +15,15 @@
 # MSVC natively). For a dependable Windows build, run `cargo build --release`
 # on Windows, or build gui-only: `make win WIN_FEATURES="--no-default-features
 # --features gui"`. Both need `cross` + Docker + Zig in the container.
+#
+# Behind a proxy? Copy .env.example to .env and set your proxy there — `make`
+# loads it and forwards it into the cross container's Zig download.
+
+# Load optional local proxy config (.env, gitignored) and export it so cross
+# build containers can reach ziglang.org for the Zig download. Cross.toml passes
+# these through into the container. Copy .env.example to .env to set yours.
+-include .env
+export HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 
 CARGO   ?= cargo
 PREFIX  ?= /usr/local
