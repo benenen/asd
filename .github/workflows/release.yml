@@ -91,8 +91,10 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
 
-  # Native Windows build — the reliable path for the full binary (wgpu/iced +
-  # ConPTY all target msvc natively; cross-from-Linux is not dependable).
+  # Native Windows build — the GPU GUI client (`gui` feature only). The `local`
+  # side pulls the Unix-only `nix` crate (daemon/PTY), which can't compile for
+  # Windows; the Windows deliverable is the GUI. russh → aws-lc-sys needs NASM to
+  # assemble its crypto.
   windows:
     name: x86_64-pc-windows-msvc
     runs-on: windows-latest
@@ -108,8 +110,11 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Build (full)
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Install NASM (aws-lc-sys, pulled by russh)
+        uses: ilammy/setup-nasm@v1
+
+      - name: Build (GUI only)
+        run: cargo build --release --locked --no-default-features --features gui --target x86_64-pc-windows-msvc
 
       - name: Package
         id: pkg
@@ -129,6 +134,63 @@ jobs:
           $archive = "$name.zip"
           Compress-Archive -Path $stage -DestinationPath $archive -Force
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.archive }}
+          path: ${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.archive }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  # macOS — full binary (CLI + daemon + GUI); macOS is unix, so the daemon side
+  # compiles. aarch64 is native on the runner; x86_64 is cross-built by the Apple
+  # toolchain. Zig builds the vendored ghostty for each `-Dtarget`.
+  macos:
+    name: ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build (full)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="${REF_NAME#v}"
+          [ "$version" = "$REF_NAME" ] && version="$(git rev-parse --short HEAD)"
+          name="asd-${version}-${TARGET}"
+          stage="$(mktemp -d)/${name}"
+          mkdir -p "$stage"
+          cp "target/${TARGET}/release/asd" "$stage/"
+          [ -f LICENSE ] && cp LICENSE "$stage/" || true
+          [ -f README.md ] && cp README.md "$stage/" || true
+          tar -czf "${name}.tar.gz" -C "$(dirname "$stage")" "${name}"
+          echo "archive=${name}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4

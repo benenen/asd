@@ -18,7 +18,12 @@ passthrough = [
 
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
-    "apt-get update && apt-get install --yes --no-install-recommends curl ca-certificates xz-utils git",
+    # The cross image (ubuntu 18.04) ships git 2.17, which lacks
+    # `git clone --filter=blob:none` — libghostty-vt-sys's build.rs uses that to
+    # fetch ghostty, failing with "unknown option filter=blob:none". Pull a
+    # modern git from the git-core PPA (2.19+ has partial clone).
+    "apt-get update && apt-get install --yes --no-install-recommends curl ca-certificates xz-utils git software-properties-common",
+    "add-apt-repository -y ppa:git-core/ppa && apt-get update && apt-get install --yes --only-upgrade git",
     "curl -fsSL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o /tmp/zig.tar.xz",
     "mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1",
     "ln -sf /opt/zig/zig /usr/local/bin/zig",

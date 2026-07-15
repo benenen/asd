@@ -71,13 +71,22 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// Real uid of the current process (std has no API for this; obtained via
-/// /proc metadata to avoid pulling in libc).
+/// Real uid of the current process (std has no API for this; on unix obtained
+/// via `/proc` metadata to avoid pulling in libc). Windows has no uid concept —
+/// the per-uid `/tmp/asd-<uid>` socket path is unix-only anyway (the Windows
+/// client is GUI-only and reaches daemons over `$ASD_SOCKET`/remotes), so 0 is
+/// a harmless placeholder that lets the crate compile there.
+#[cfg(unix)]
 fn uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/proc/self")
         .map(|m| m.uid())
         .unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn uid() -> u32 {
+    0
 }
 
 #[cfg(test)]
