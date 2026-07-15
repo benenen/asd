@@ -55,6 +55,13 @@ async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", socket_path.display()))?;
     info!(socket = %socket_path.display(), version = env!("CARGO_PKG_VERSION"), "asd daemon listening");
 
+    // Record our pid next to the socket so `asd restart` can stop us by signal
+    // (removed on clean shutdown below).
+    let pid_path = paths::pid_path(&socket_path);
+    if let Err(e) = std::fs::write(&pid_path, std::process::id().to_string()) {
+        warn!(error = %e, "failed to write pid file");
+    }
+
     let registry = Arc::new(Mutex::new(Registry::default()));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -86,6 +93,7 @@ async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
     if let Err(e) = std::fs::remove_file(&socket_path) {
         warn!(error = %e, "failed to remove socket file");
     }
+    let _ = std::fs::remove_file(&pid_path);
     info!("asd daemon stopped");
     Ok(())
 }

@@ -306,6 +306,57 @@ async fn list_and_kill_via_cli() {
     assert!(!out.status.success());
 }
 
+/// `asd restart` stops the running daemon (by signal, via the pid file) and
+/// brings up a fresh one; sessions are dropped. This is the recovery path for a
+/// protocol-version bump, where the client can't handshake the old daemon.
+#[tokio::test]
+async fn restart_replaces_the_daemon() {
+    let mut daemon = Daemon::start("restart");
+    let old_pid = daemon.child.id();
+
+    // A session to lose across the restart.
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "gone"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let out = daemon.cli().arg("restart").output().unwrap();
+    assert!(out.status.success(), "restart failed: {out:?}");
+
+    // The old daemon exited — reap the zombie child.
+    let deadline = std::time::Instant::now() + WAIT;
+    while daemon.child.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "old daemon survived restart"
+        );
+        std::thread::sleep(TICK);
+    }
+
+    // A fresh daemon is up under a new pid, answers `list`, and the old session
+    // did not survive.
+    let new_pid: i32 = std::fs::read_to_string(daemon.socket.with_extension("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(new_pid as u32, old_pid, "restart reused the old pid");
+    let list = daemon.cli().arg("list").output().unwrap();
+    assert!(list.status.success(), "list after restart failed: {list:?}");
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains("gone"),
+        "session survived restart"
+    );
+
+    // The fresh daemon is detached (not our child); stop it so it doesn't leak.
+    unsafe { libc::kill(new_pid, libc::SIGTERM) };
+}
+
 /// Version mismatch: the daemon replies Error{code=1} then disconnects
 /// (spec §4).
 #[tokio::test]

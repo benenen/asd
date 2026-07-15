@@ -48,6 +48,10 @@ enum Cmd {
     /// Run the mux daemon in the foreground (normally started on demand by
     /// `asd new` / `asd attach -A`)
     Daemon,
+    /// Restart the daemon: stop the running one and start a fresh copy of this
+    /// binary. Handy after a rebuild bumps the protocol version (all sessions
+    /// are lost — the daemon does not persist them).
+    Restart,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -159,6 +163,14 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             }
 
             attach::run(c, &name).await?;
+        }
+        Cmd::Restart => {
+            let c = client::restart(&socket).await?;
+            println!(
+                "asd-daemon restarted (v{}, proto v{})",
+                c.daemon_version,
+                asd_proto::PROTO_VERSION
+            );
         }
         Cmd::Daemon => unreachable!("dispatched in main before the runtime starts"),
     }
