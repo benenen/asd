@@ -5,8 +5,16 @@
 #   make install    # install to $(PREFIX)/bin   (PREFIX, DESTDIR honored)
 #   make package    # stage a tar.gz install archive for THIS platform in dist/
 #   make cross-arm  # cross-build + package the aarch64 CLI archive (needs cross)
-#   make dist       # package every buildable target
+#   make deb        # build a Debian .deb for this host (needs `cargo deb`)
+#   make win        # cross-build + zip a Windows x64 package (see note)
+#   make dist       # package every buildable Linux target
 #   make clean
+#
+# Note on `make win`: cross-compiling from Linux is best-effort. The GUI links
+# wgpu, which does not cross-compile to Windows from Linux reliably (it targets
+# MSVC natively). For a dependable Windows build, run `cargo build --release`
+# on Windows, or build gui-only: `make win WIN_FEATURES="--no-default-features
+# --features gui"`. Both need `cross` + Docker + Zig in the container.
 
 CARGO   ?= cargo
 PREFIX  ?= /usr/local
@@ -21,9 +29,13 @@ VERSION := $(shell awk -F'"' '/^\[workspace\.package\]/{f=1} f&&/^version/{print
 
 # aarch64 Linux ships CLI-only: wgpu (the GUI) can't be cross-compiled cheaply.
 ARM_TARGET := aarch64-unknown-linux-gnu
+# Windows x64. Feature set is overridable, e.g.
+#   make win WIN_FEATURES="--no-default-features --features gui"
+WIN_TARGET   := x86_64-pc-windows-gnu
+WIN_FEATURES ?=
 
 .DEFAULT_GOAL := build
-.PHONY: build cli install uninstall package package-cli cross-arm dist archive clean help
+.PHONY: build cli install uninstall package package-cli cross-arm win deb dist archive archive-zip clean help
 
 build: ## Build the full asd binary (CLI + daemon + GUI) for the host
 	$(CARGO) build --release
@@ -49,7 +61,15 @@ cross-arm: ## Cross-build + package the aarch64 CLI archive (needs `cross` + Zig
 	cross build --release --no-default-features --features local --target $(ARM_TARGET)
 	@$(MAKE) --no-print-directory archive BIN=target/$(ARM_TARGET)/release/asd NAME=asd-$(VERSION)-$(ARM_TARGET)-cli
 
-dist: package cross-arm ## Package every buildable target's archive
+deb: build ## Build a Debian .deb (host arch, full binary; needs `cargo deb`)
+	$(CARGO) deb --no-build
+	@echo "packaged $$(ls -t target/debian/*.deb | head -1)"
+
+win: ## Cross-build + zip a Windows x64 package (best-effort — see note below)
+	cross build --release --target $(WIN_TARGET) $(WIN_FEATURES)
+	@$(MAKE) --no-print-directory archive-zip BIN=target/$(WIN_TARGET)/release/asd.exe NAME=asd-$(VERSION)-$(WIN_TARGET)
+
+dist: package cross-arm ## Package every buildable Linux target's archive
 
 # Stage $(BIN) + LICENSE/README into $(DIST)/$(NAME)/ and tar.gz it.
 archive:
@@ -60,6 +80,16 @@ archive:
 	tar -czf "$(DIST)/$(NAME).tar.gz" -C "$(DIST)" "$(NAME)"
 	rm -rf "$(DIST)/$(NAME)"
 	@echo "packaged $(DIST)/$(NAME).tar.gz"
+
+# Same, but a .zip (Windows convention).
+archive-zip:
+	@mkdir -p "$(DIST)/$(NAME)"
+	cp "$(BIN)" "$(DIST)/$(NAME)/"
+	[ -f LICENSE ] && cp LICENSE "$(DIST)/$(NAME)/" || true
+	[ -f README.md ] && cp README.md "$(DIST)/$(NAME)/" || true
+	cd "$(DIST)" && zip -qr "$(NAME).zip" "$(NAME)"
+	rm -rf "$(DIST)/$(NAME)"
+	@echo "packaged $(DIST)/$(NAME).zip"
 
 clean: ## Remove build output and dist/
 	$(CARGO) clean

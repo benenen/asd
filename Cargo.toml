@@ -9,6 +9,22 @@ license.workspace = true
 name = "asd"
 path = "src/main.rs"
 
+# `cargo deb` metadata (make deb). The binary goes to /usr/bin; the license
+# is taken from `[package].license`.
+[package.metadata.deb]
+maintainer = "benshi <isles@lau.edu>"
+copyright = "2026, benshi"
+section = "utils"
+priority = "optional"
+extended-description = """\
+asd is a GPU-rendered terminal multiplexer client with an embedded headless \
+daemon: one session = one PTY (shpool-style), a two-pane GUI, and SSH-remote \
+session lists. This package ships the full binary (CLI + daemon + GUI)."""
+assets = [
+    ["target/release/asd", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/asd/README.md", "644"],
+]
+
 [features]
 default = ["local", "gui"]
 # Terminal side: CLI subcommands + embedded daemon (pulls in portable-pty).
