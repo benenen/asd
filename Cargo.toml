@@ -12,7 +12,7 @@ path = "src/main.rs"
 # `cargo deb` metadata (make deb). The binary goes to /usr/bin; the license
 # is taken from `[package].license`.
 [package.metadata.deb]
-maintainer = "benshi <isles@lau.edu>"
+maintainer = "benshi <shiben789@163.com>"
 copyright = "2026, benshi"
 section = "utils"
 priority = "optional"
