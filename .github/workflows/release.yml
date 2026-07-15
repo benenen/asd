@@ -90,3 +90,57 @@ jobs:
           files: ${{ steps.pkg.outputs.archive }}
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  # Native Windows build — the reliable path for the full binary (wgpu/iced +
+  # ConPTY all target msvc natively; cross-from-Linux is not dependable).
+  windows:
+    name: x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build (full)
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package
+        id: pkg
+        shell: pwsh
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $version = $env:REF_NAME -replace '^v', ''
+          if ($version -eq $env:REF_NAME) { $version = (git rev-parse --short HEAD) }
+          $target = "x86_64-pc-windows-msvc"
+          $name = "asd-$version-$target"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/$target/release/asd.exe" $stage
+          if (Test-Path LICENSE) { Copy-Item LICENSE $stage }
+          if (Test-Path README.md) { Copy-Item README.md $stage }
+          $archive = "$name.zip"
+          Compress-Archive -Path $stage -DestinationPath $archive -Force
+          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.archive }}
+          path: ${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.archive }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
