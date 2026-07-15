@@ -99,8 +99,15 @@ where
     }
 
     fn diff(&self, tree: &mut Tree) {
-        tree.children.clear();
-        tree.children.push(Tree::new(&self.content));
+        // Preserve the child tree to avoid resetting the inner widget's
+        // state on every view rebuild. Clearing and recreating triggers
+        // repeated layout invalidation (iced warns after 3 consecutive).
+        if tree.children.len() == 1 {
+            self.content.as_widget().diff(&mut tree.children[0]);
+        } else {
+            tree.children.clear();
+            tree.children.push(Tree::new(&self.content));
+        }
     }
 
     fn operate(

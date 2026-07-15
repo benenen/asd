@@ -447,10 +447,13 @@ impl App {
                     };
                     if new_scroll != self.scroll {
                         self.scroll = new_scroll;
-                        // Invalidate the canvas cache so the viewport updates
-                        // immediately, rather than waiting for the next daemon
-                        // frame to arrive.
-                        self.cache.clear();
+                        // Don't invalidate the canvas cache here — the frame
+                        // data hasn't changed yet (the daemon hasn't sent the
+                        // updated viewport). Clearing it would trigger a redraw
+                        // with stale cells, then ANOTHER redraw when the frame
+                        // arrives, causing a double-paint flicker that feels
+                        // jerky when switching scroll directions. Instead, let
+                        // the frame update drive cache invalidation.
                         self.send(AppCmd::Scroll(self.scroll));
                     }
                 }
