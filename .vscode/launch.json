@@ -1,0 +1,124 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug unit tests in library 'asd_cli'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=asd-cli"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'asd_daemon'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=asd-daemon"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'asd_proto'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=asd-proto"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'codec'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=codec",
+                    "--package=asd-proto"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'asd_vt'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=asd-vt"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'vt'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=vt",
+                    "--package=asd-vt"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'asd_gui'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=asd-gui"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'asd'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=asd",
+                    "--package=asd"
+                ],
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'asd'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=asd",
+                    "--package=asd"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'e2e'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=e2e",
+                    "--package=asd"
+                ]
+            }
+        }
+    ]
+}

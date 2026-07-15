@@ -22,6 +22,8 @@ pub struct TermIme<'a, Message, Theme, Renderer> {
     on_ime: Option<OnIme<'a, Message>>,
     /// Terminal cursor position in widget-local pixel coordinates.
     cursor_pos: Point,
+    /// Height of one terminal row in pixels (for the IME cursor area height).
+    cell_h: f32,
 }
 
 impl<'a, Message, Theme, Renderer> TermIme<'a, Message, Theme, Renderer> {
@@ -30,6 +32,7 @@ impl<'a, Message, Theme, Renderer> TermIme<'a, Message, Theme, Renderer> {
             content,
             on_ime: None,
             cursor_pos: Point::new(0.0, 0.0),
+            cell_h: 19.0,
         }
     }
 
@@ -39,10 +42,11 @@ impl<'a, Message, Theme, Renderer> TermIme<'a, Message, Theme, Renderer> {
         self
     }
 
-    /// Set the terminal cursor position in widget-local pixel coordinates
-    /// so the IME composition window follows the cursor.
-    pub fn cursor_pos(mut self, pos: Point) -> Self {
+    /// Set the terminal cursor position (widget-local pixel coords) and row
+    /// height so the IME composition window sits at the text cursor.
+    pub fn cursor(mut self, pos: Point, cell_h: f32) -> Self {
         self.cursor_pos = pos;
+        self.cell_h = cell_h;
         self
     }
 }
@@ -125,10 +129,14 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        // Enable IME with the cursor position so the OS composition window
-        // appears at the terminal's text cursor.
+        // Compute the IME cursor area in window coordinates: widget-local
+        // cursor position offset by the widget's position within the window.
+        let bounds = layout.bounds();
         let ime: input_method::InputMethod = input_method::InputMethod::Enabled {
-            cursor: Rectangle::new(self.cursor_pos, Size::new(1.0, 1.0)),
+            cursor: Rectangle::new(
+                Point::new(bounds.x + self.cursor_pos.x, bounds.y + self.cursor_pos.y),
+                Size::new(1.0, self.cell_h),
+            ),
             purpose: input_method::Purpose::Terminal,
             preedit: None,
         };

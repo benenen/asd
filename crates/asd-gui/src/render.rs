@@ -21,7 +21,7 @@ impl Metrics {
             font_size,
             // JetBrains Mono advance ratio ~0.60 at typical sizes; line-height
             // ratio ~1.4 gives comfortable spacing (matching Ghostty's default).
-            cell_w: (font_size * 0.60).round().max(1.0),
+            cell_w: (font_size * 0.60).max(1.0),
             cell_h: (font_size * 1.40).round().max(1.0),
         }
     }

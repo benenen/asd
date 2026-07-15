@@ -337,7 +337,7 @@ fn terminal_pane(app: &App, sel: Option<crate::GuiSelection>, scroll: usize) -> 
 
             TermIme::new(mouse.into())
                 .on_ime(|text| Message::ImeCommit(text))
-                .cursor_pos(cursor_pos)
+                .cursor(cursor_pos, app.metrics.cell_h)
                 .into()
         },
     };
