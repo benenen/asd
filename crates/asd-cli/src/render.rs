@@ -48,7 +48,11 @@ pub fn render_frame(snap: &RenderSnapshot, sel: Option<Selection>) -> Vec<u8> {
                 // Emitted as part of the preceding wide char.
                 continue;
             }
-            let selected = sel.is_some_and(|s| s.contains(x, y as u16));
+            // Only cells with written content take the selection highlight —
+            // blank (never-written) cells stay plain, so clicking or dragging
+            // over empty areas shows no reverse-video block.
+            let selected =
+                !cell.grapheme.is_empty() && sel.is_some_and(|s| s.contains(x, y as u16));
             let sgr = cell_sgr(cell, snap, selected);
             if last_sgr.as_deref() != Some(sgr.as_str()) {
                 out.extend_from_slice(b"\x1b[0m");
@@ -321,5 +325,45 @@ mod tests {
         let out = render_frame(&mk(None), None);
         assert!(!contains(&out, b"\x1b[?25h"));
         assert!(contains(&out, b"\x1b[?25l"));
+    }
+
+    #[test]
+    fn selection_highlights_text_but_not_blank_cells() {
+        use asd_vt::{CursorSnapshot, RenderSnapshot};
+        let cell = |g: &str| CellSnapshot {
+            grapheme: g.to_string(),
+            ..CellSnapshot::default()
+        };
+        let mk = |row: Vec<CellSnapshot>| RenderSnapshot {
+            cols: row.len() as u16,
+            rows: 1,
+            cells: vec![row],
+            row_dirty: vec![true],
+            cursor: CursorSnapshot::default(),
+            palette: [Rgb::default(); 256],
+            foreground: Rgb::default(),
+            background: Rgb::default(),
+        };
+        // Default colors are all-zero, so reverse video (SGR `7`) is the only
+        // way a `[7;` run can appear.
+        let has_reverse = |out: &[u8]| out.windows(3).any(|w| w == b"[7;");
+        let sel = Some(Selection {
+            start: (0, 0),
+            end: (2, 0),
+        });
+
+        // Text in the selection → highlighted.
+        assert!(has_reverse(&render_frame(
+            &mk(vec![cell("a"), cell("b"), cell("c")]),
+            sel
+        )));
+        // An all-blank (never-written) selection → nothing highlighted.
+        assert!(!has_reverse(&render_frame(
+            &mk(vec![cell(""), cell(""), cell("")]),
+            sel
+        )));
+        // A written space still counts as content and is highlighted (so an
+        // intra-line space in selected text doesn't leave a gap).
+        assert!(has_reverse(&render_frame(&mk(vec![cell(" ")]), sel)));
     }
 }
