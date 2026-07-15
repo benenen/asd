@@ -19,9 +19,11 @@
 # Behind a proxy? Copy .env.example to .env and set your proxy there — `make`
 # loads it and forwards it into the cross container's Zig download.
 
-# Load optional local proxy config (.env, gitignored) and export it so cross
-# build containers can reach ziglang.org for the Zig download. Cross.toml passes
-# these through into the container. Copy .env.example to .env to set yours.
+# Load optional local proxy config (.env, gitignored). The exported vars reach
+# cross's cargo/crates fetch via Cross.toml `passthrough` (the `docker run`
+# stage). The Zig download happens earlier, in `docker build` (cross pre-build),
+# which ignores those — that stage is proxied via DOCKER_CONFIG (see _cross-proxy
+# below). Copy .env.example to .env to set yours; unset → everything runs direct.
 -include .env
 export HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 
@@ -43,8 +45,18 @@ ARM_TARGET := aarch64-unknown-linux-gnu
 WIN_TARGET   := x86_64-pc-windows-gnu
 WIN_FEATURES ?=
 
+# Proxy for cross's in-container Zig download. It is fetched during `docker
+# build` (cross's pre-build), which does NOT inherit shell env vars — Docker
+# only injects a proxy into build RUN steps when its client config declares one.
+# So when .env provides a proxy we stage a throwaway Docker client config that
+# carries it and point DOCKER_CONFIG at it (see _cross-proxy). No proxy set →
+# DOCKER_CONFIG stays unset and the download goes direct (this is the CI path).
+CROSS_PROXY         := $(strip $(or $(HTTPS_PROXY),$(https_proxy),$(HTTP_PROXY),$(http_proxy)))
+DOCKER_PROXY_CONFIG := $(abspath $(DIST)/.docker-proxy)
+CROSS_DOCKER_ENV    := $(if $(CROSS_PROXY),DOCKER_CONFIG=$(DOCKER_PROXY_CONFIG),)
+
 .DEFAULT_GOAL := build
-.PHONY: build cli install uninstall package package-cli cross-arm win deb dist archive archive-zip clean help
+.PHONY: build cli install uninstall package package-cli cross-arm win deb dist archive archive-zip clean help _cross-proxy
 
 build: ## Build the full asd binary (CLI + daemon + GUI) for the host
 	$(CARGO) build --release
@@ -66,16 +78,25 @@ package: build ## Package the host install archive (full, with GUI) into dist/
 package-cli: cli ## Package a CLI-only host archive into dist/
 	@$(MAKE) --no-print-directory archive BIN=target/release/asd NAME=asd-$(VERSION)-$(TARGET)-cli
 
-cross-arm: ## Cross-build + package the aarch64 CLI archive (needs `cross` + Zig)
-	cross build --release --no-default-features --features local --target $(ARM_TARGET)
+# Stage a throwaway Docker client config carrying .env's proxy, so cross's
+# `docker build` pre-build fetches Zig through it. No-op when no proxy is set.
+_cross-proxy:
+	@if [ -n "$(CROSS_PROXY)" ]; then \
+		mkdir -p "$(DOCKER_PROXY_CONFIG)"; \
+		printf '{"proxies":{"default":{"httpProxy":"%s","httpsProxy":"%s"}}}\n' '$(CROSS_PROXY)' '$(CROSS_PROXY)' > "$(DOCKER_PROXY_CONFIG)/config.json"; \
+		echo "cross: routing the in-container Zig download through $(CROSS_PROXY)"; \
+	fi
+
+cross-arm: _cross-proxy ## Cross-build + package the aarch64 CLI archive (needs `cross` + Zig)
+	env $(CROSS_DOCKER_ENV) cross build --release --no-default-features --features local --target $(ARM_TARGET)
 	@$(MAKE) --no-print-directory archive BIN=target/$(ARM_TARGET)/release/asd NAME=asd-$(VERSION)-$(ARM_TARGET)-cli
 
 deb: build ## Build a Debian .deb (host arch, full binary; needs `cargo deb`)
 	$(CARGO) deb --no-build
 	@echo "packaged $$(ls -t target/debian/*.deb | head -1)"
 
-win: ## Cross-build + zip a Windows x64 package (best-effort — see note below)
-	cross build --release --target $(WIN_TARGET) $(WIN_FEATURES)
+win: _cross-proxy ## Cross-build + zip a Windows x64 package (best-effort — see note below)
+	env $(CROSS_DOCKER_ENV) cross build --release --target $(WIN_TARGET) $(WIN_FEATURES)
 	@$(MAKE) --no-print-directory archive-zip BIN=target/$(WIN_TARGET)/release/asd.exe NAME=asd-$(VERSION)-$(WIN_TARGET)
 
 dist: package cross-arm ## Package every buildable Linux target's archive
