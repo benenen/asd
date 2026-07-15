@@ -8,17 +8,8 @@ on:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    # macOS is non-blocking: the vendored libghostty-vt-sys Zig build currently
-    # fails to link its build runner against libSystem on the macOS runner
-    # (Zig 0.15.2 toolchain issue, unrelated to this repo's code). Kept in the
-    # matrix so it verifies for real once that's resolved upstream.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: test (ubuntu)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -32,17 +23,8 @@ jobs:
         with:
           version: 0.15.2
 
-      # Zig links its build runner against libSystem; on the CI runner it needs
-      # to be pointed at the macOS SDK explicitly, or the link fails with
-      # undefined symbols (__availability_version_check, _dispatch_*, …).
-      - name: Point Zig at the macOS SDK
-        if: runner.os == 'macOS'
-        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
-
       - name: Build
         run: cargo build --workspace
 
-      # e2e tests spawn a real `asd daemon` with ptys; on macOS the
-      # list_and_kill test exercises the sysctl(KERN_PROCARGS2) foreground path.
       - name: Test
         run: cargo test --workspace
