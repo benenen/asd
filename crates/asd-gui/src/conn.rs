@@ -51,6 +51,8 @@ pub enum HostCmd {
     Kill {
         name: String,
     },
+    /// Set the scrollback viewport offset (0 = follow live output).
+    Scroll(usize),
     /// Disconnect and end the actor.
     Shutdown,
 }
@@ -74,6 +76,10 @@ pub enum UiEvent {
     Frame {
         host: HostId,
         snap: Box<RenderSnapshot>,
+        /// Whether the session program is currently tracking the mouse
+        /// (vim/htop): the GUI forwards mouse events instead of scrolling
+        /// or selecting locally.
+        session_wants_mouse: bool,
     },
     SessionEnded {
         host: HostId,
@@ -175,6 +181,8 @@ async fn drive(
     // True between sending Attach and receiving its Snapshot: drop stale Output
     // so it never lands in the fresh view.
     let mut attaching = false;
+    // Scrollback offset: 0 = follow live output, >0 = lines scrolled up.
+    let mut scroll: usize = 0;
     let mut attached: Option<String> = None;
 
     let mut ticker = tokio::time::interval(LIST_INTERVAL);
@@ -196,7 +204,9 @@ async fn drive(
                     if let Some(term) = &mut vt {
                         term.feed(&dump);
                         let _ = term.take_pty_responses();
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()) });
+                        let wants_mouse = term.is_mouse_tracking();
+                        term.set_scroll(scroll);
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse });
                     }
                 }
                 Ok(Some(Frame::Output { bytes })) => {
@@ -204,7 +214,9 @@ async fn drive(
                     if let Some(term) = &mut vt {
                         term.feed(&bytes);
                         let _ = term.take_pty_responses();
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()) });
+                        let wants_mouse = term.is_mouse_tracking();
+                        term.set_scroll(scroll);
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse });
                     }
                 }
                 Ok(Some(Frame::Created { name })) => {
@@ -235,6 +247,7 @@ async fn drive(
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
                     vt = Some(GhosttyVt::new(cols.max(1), rows.max(1), SCROLLBACK));
+                    scroll = 0;
                     attaching = true;
                     attached = Some(name.clone());
                     if writer.write_frame(&Frame::Attach { name, cols, rows }).await.is_err() {
@@ -264,7 +277,9 @@ async fn drive(
                         if writer.write_frame(&Frame::Resize { cols, rows }).await.is_err() {
                             return Err("resize write failed".to_string());
                         }
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()) });
+                        let wants_mouse = term.is_mouse_tracking();
+                        term.set_scroll(scroll);
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse });
                     }
                 }
                 Some(HostCmd::Create) => {
@@ -277,6 +292,14 @@ async fn drive(
                         return Err("kill write failed".to_string());
                     }
                     let _ = writer.write_frame(&Frame::ListSessions).await;
+                }
+                Some(HostCmd::Scroll(lines)) => {
+                    scroll = lines;
+                    if let Some(term) = &mut vt {
+                        let wants_mouse = term.is_mouse_tracking();
+                        term.set_scroll(scroll);
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse });
+                    }
                 }
                 Some(HostCmd::Shutdown) | None => {
                     if attached.is_some() {

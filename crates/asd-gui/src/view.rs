@@ -12,6 +12,7 @@ use iced::{Background, Border, Color, Element, Font, Length, Padding};
 use crate::model::{Host, HostState, Model};
 use crate::render::TermCanvas;
 use crate::{App, Message, Status, model, theme};
+use crate::ime::TermIme;
 
 /// A flexible horizontal gap that pushes following items to the right.
 fn spacer() -> Space {
@@ -56,8 +57,8 @@ fn bold() -> Font {
 }
 
 /// The whole window: sidebar | terminal, over a full-width status bar.
-pub fn view(app: &App) -> Element<'_, Message> {
-    let body = row![sidebar(app), vline(), terminal_pane(app)].height(Length::Fill);
+pub fn view(app: &App, sel: Option<crate::GuiSelection>) -> Element<'_, Message> {
+    let body = row![sidebar(app), vline(), terminal_pane(app,  sel, app.scroll)].height(Length::Fill);
     column![
         container(body).height(Length::Fill),
         hline(theme::LINE),
@@ -81,12 +82,12 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     }
     groups = groups.push(connect_remote(&app.remote_input));
 
-    let scroll = scrollable(groups).height(Length::Fill);
+    let list = scrollable(groups).height(Length::Fill);
 
     let inner = column![
         container(brand).padding(pad2(16.0, 16.0)),
         label("HOSTS"),
-        scroll,
+        list,
         hline(theme::LINE),
         sidebar_foot(m),
     ]
@@ -296,21 +297,49 @@ fn sidebar_foot(m: &Model) -> Element<'_, Message> {
 
 // ------------------------------------------------------------- terminal pane
 
-fn terminal_pane(app: &App) -> Element<'_, Message> {
+fn terminal_pane(app: &App, sel: Option<crate::GuiSelection>, scroll: usize) -> Element<'_, Message> {
     let head = term_head(app);
 
     let screen: Element<'_, Message> = match (&app.status, app.model.active.is_some()) {
         (Status::Disconnected(msg), _) => center_note(format!("connection lost: {msg}")),
         (Status::Ended(msg), _) => center_note(format!("session ended: {msg}")),
         (_, false) => center_note("Select a session, or connect a host to start.".into()),
-        (_, true) => canvas(TermCanvas {
-            frame: app.frame.as_ref(),
-            cache: &app.cache,
-            metrics: app.metrics,
-        })
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into(),
+        (_, true) => {
+            let term = canvas(TermCanvas {
+                frame: app.frame.as_ref(),
+                cache: &app.cache,
+                metrics: app.metrics,
+                selection: sel,
+                scroll,
+            })
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+            let mouse = mouse_area(term)
+                .on_scroll(|delta| {
+                    let lines = match delta {
+                        iced::mouse::ScrollDelta::Lines { y, .. } => y as i32,
+                        iced::mouse::ScrollDelta::Pixels { y, .. } => (y / 19.6) as i32,
+                    };
+                    Message::MouseScroll(lines)
+                })
+                .on_press(Message::MousePress)
+                .on_release(Message::MouseRelease)
+                .on_move(|pos| Message::MouseMove(pos));
+
+            let cursor_pos = app.frame.as_ref()
+                .and_then(|snap| snap.cursor.position)
+                .map(|(col, row)| iced::Point::new(
+                    col as f32 * app.metrics.cell_w,
+                    row as f32 * app.metrics.cell_h,
+                ))
+                .unwrap_or(iced::Point::new(0.0, 0.0));
+
+            TermIme::new(mouse.into())
+                .on_ime(|text| Message::ImeCommit(text))
+                .cursor_pos(cursor_pos)
+                .into()
+        },
     };
 
     let pane = column![
@@ -389,6 +418,8 @@ fn status_bar(app: &App) -> Element<'_, Message> {
         hint("×", "kill"),
         sep(),
         hint("user@host", "add remote"),
+        sep(),
+        settings_btn(),
     ]
     .spacing(10)
     .align_y(Vertical::Center);
@@ -600,4 +631,56 @@ fn session_style(selected: bool, accent: Color, status: button::Status) -> butto
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+/// Settings gear button for the status bar.
+fn settings_btn() -> Element<'static, Message> {
+    button(
+        text("⚙").size(14).font(mono()).color(theme::MUTED)
+    )
+    .padding(pad2(2.0, 6.0))
+    .on_press(Message::ToggleSettings)
+    .style(move |_, status| button::Style {
+        background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+            .then_some(Background::Color(theme::HOVER)),
+        text_color: theme::BRIGHT,
+        border: Border {
+            radius: 5.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// Full-screen settings overlay: dark backdrop + centered settings card.
+/// Called from App::view when settings are shown.
+pub fn settings_overlay<'a>(
+    page: crate::settings::SettingsPage,
+    connections: &'a [crate::settings::SshConnection],
+    form: &'a Option<crate::settings::SshForm>,
+) -> Element<'a, Message> {
+    let card = crate::settings::view(page, connections, form)
+        .map(|msg| Message::Settings(msg));
+
+    // Dark backdrop catches clicks to close.
+    let backdrop = button(container(text("")).width(Length::Fill).height(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .on_press(Message::Settings(crate::settings::SettingsMsg::Close))
+        .style(|_, _| button::Style {
+            background: Some(Background::Color(Color {
+                r: 0.0, g: 0.0, b: 0.0, a: 0.55,
+            })),
+            ..Default::default()
+        });
+
+    // Center the card.
+    let centered = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center);
+
+    iced::widget::stack([backdrop.into(), centered.into()]).into()
 }

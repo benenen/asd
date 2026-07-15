@@ -38,6 +38,27 @@ pub fn map_key(key: &Key, mods: Modifiers) -> Option<KeyEvent> {
     }
 }
 
+
+/// Build a character key event from a single IME-committed character (e.g.
+/// CJK). Returns `None` for control characters. The caller iterates over
+/// a multi-character commit and sends one event per codepoint.
+pub fn map_ime_char(c: char, mods: Modifiers) -> Option<KeyEvent> {
+    if c.is_control() {
+        return None;
+    }
+    let m = Mods {
+        shift: false, // IME text is already composed, no shift needed
+        ctrl: mods.control(),
+        alt: mods.alt(),
+        super_key: mods.logo(),
+    };
+    Some(KeyEvent {
+        key: VtKey::Char(c),
+        mods: m,
+        text: Some(c.to_string()),
+    })
+}
+
 fn map_named(named: Named) -> Option<VtKey> {
     Some(match named {
         Named::Enter => VtKey::Enter,

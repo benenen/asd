@@ -12,9 +12,11 @@
 //! portable-pty/process-management so a GUI-only build (Windows) is viable.
 
 mod conn;
+mod ime;
 mod key;
 mod model;
 mod render;
+pub(crate) mod settings;
 mod ssh;
 mod theme;
 mod view;
@@ -27,8 +29,9 @@ use conn::{HostCmd, HostHandle, UiEvent};
 use iced::futures::stream::BoxStream;
 use iced::futures::{SinkExt, StreamExt};
 use iced::widget::canvas;
-use iced::{Element, Size, Subscription, Task};
+use iced::{Element, Point, Size, Subscription, Task};
 use model::{HostId, HostKind, HostState, LOCAL_ID, Model, RemoteSpec};
+use settings::{SettingsConfig, SettingsMsg, SettingsPage, SshConnection, SshForm};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Launch the GUI. `session`, when given (`asd gui <session>`), is pre-selected
@@ -80,6 +83,8 @@ pub(crate) enum AppCmd {
         host: HostId,
         name: String,
     },
+    /// Set the terminal's scrollback offset (0 = follow live output).
+    Scroll(usize),
 }
 
 /// State of the *active* session's stream (the terminal pane). When nothing is
@@ -88,6 +93,50 @@ pub(crate) enum Status {
     Live,
     Ended(String),
     Disconnected(String),
+}
+
+/// Extract plain text from cells within a screen-space selection,
+/// projecting to the current viewport.
+fn extract_selection_text(snap: &RenderSnapshot, sel: GuiSelection, scroll: usize) -> String {
+    let (a, b) = if (sel.anchor.1, sel.anchor.0) <= (sel.head.1, sel.head.0) {
+        (sel.anchor, sel.head)
+    } else {
+        (sel.head, sel.anchor)
+    };
+    // Project screen rows to viewport rows: vpy = screen_row - scroll.
+    // Clamp to what's visible (rows beyond the viewport are out of frame data).
+    let rows = snap.rows as usize;
+    let vpy_a = a.1.saturating_sub(scroll).min(rows.saturating_sub(1));
+    let vpy_b = b.1.saturating_sub(scroll).min(rows.saturating_sub(1));
+    if vpy_a > vpy_b {
+        return String::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for y in vpy_a..=vpy_b {
+        let row_cells = match snap.cells.get(y) {
+            Some(r) => r,
+            None => continue,
+        };
+        let start_x: usize = if y == vpy_a { a.0 as usize } else { 0 };
+        let end_x: usize = if y == vpy_b { b.0 as usize } else { snap.cols.saturating_sub(1) as usize };
+        let mut line = String::new();
+        for x in start_x..=end_x.min(row_cells.len().saturating_sub(1)) {
+            let cell = &row_cells[x];
+            if cell.width == asd_vt::CellWidth::SpacerTail {
+                continue;
+            }
+            if cell.grapheme.is_empty() {
+                line.push(' ');
+            } else {
+                line.push_str(&cell.grapheme);
+            }
+        }
+        while line.ends_with(' ') {
+            line.pop();
+        }
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 pub(crate) struct App {
@@ -101,11 +150,34 @@ pub(crate) struct App {
     pub(crate) window: Size,
     pub(crate) remote_input: String,
     pub(crate) now_ms: u64,
+    /// Scrollback offset: 0 = following live output.
+    pub(crate) scroll: usize,
+    /// Current drag selection in screen-space coordinates, if any.
+    pub(crate) selection: Option<GuiSelection>,
+    /// Whether the active session is in mouse-tracking mode (vim/htop).
+    pub(crate) session_wants_mouse: bool,
+    /// Last known mouse position in the terminal pane (pixels).
+    pub(crate) last_mouse_pos: Option<(f32, f32)>,
     sup_tx: Option<UnboundedSender<AppCmd>>,
     generation: u64,
     /// A session named on the command line (`asd gui <session>`) to auto-select
     /// once the local host's list arrives; cleared after it is honored.
     preferred: Option<String>,
+    // ── settings ──
+    pub(crate) show_settings: bool,
+    pub(crate) settings_page: SettingsPage,
+    pub(crate) settings_form: Option<SshForm>,
+    pub(crate) saved_ssh: Vec<SshConnection>,
+}
+
+/// A drag selection anchored in screen-space (absolute) coordinates:
+/// (col, screen_row) where screen_row = scroll + viewport_row at press time.
+/// Anchoring absolute makes the highlight follow text when scrolling,
+/// matching the CLI's content-pin selection behavior.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GuiSelection {
+    pub anchor: (u16, usize),
+    pub head: (u16, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -125,11 +197,24 @@ pub(crate) enum Message {
     Keyboard(iced::keyboard::Event),
     Resized(Size),
     Tick,
+    /// Mouse wheel scroll (positive = up).
+    MouseScroll(i32),
+    /// Mouse press at (x, y) in cell coordinates.
+    MousePress, 
+    /// Mouse drag to (x, y).
+    MouseMove(Point), 
+    /// Mouse release: finalizes and copies the selection.
+    MouseRelease,
+    /// IME-composed text committed (e.g. a CJK character confirmed by the user).
+    ImeCommit(String),
+    // ── settings ──
+    ToggleSettings,
+    Settings(SettingsMsg),
 }
 
 impl App {
     fn new(preferred: Option<String>) -> (Self, Task<Message>) {
-        let metrics = render::Metrics::new(15.0);
+        let metrics = render::Metrics::new(14.0);
         // iced doesn't emit a resize on startup, so seed the grid from the
         // default window minus the chrome — otherwise the first attach sizes to
         // a stale 80×24 until the user resizes.
@@ -137,6 +222,7 @@ impl App {
         let w = (window.width - view::SIDEBAR_W).max(1.0);
         let h = (window.height - view::STATUS_H - view::TERMHEAD_H).max(1.0);
         let (live_cols, live_rows) = metrics.grid(Size::new(w, h));
+        let config = SettingsConfig::load();
         (
             Self {
                 model: Model::with_local(),
@@ -152,6 +238,14 @@ impl App {
                 sup_tx: None,
                 generation: 0,
                 preferred,
+                scroll: 0,
+                selection: None,
+                session_wants_mouse: false,
+                last_mouse_pos: None,
+                show_settings: false,
+                settings_page: SettingsPage::General,
+                settings_form: None,
+                saved_ssh: config.ssh_connections,
             },
             Task::none(),
         )
@@ -181,6 +275,8 @@ impl App {
         let (cols, rows) = (self.live_cols, self.live_rows);
         self.model.select(host, name.clone());
         self.status = Status::Live;
+        self.scroll = 0;
+        self.selection = None;
         self.frame = None;
         self.cache.clear();
         self.send(AppCmd::SetActive {
@@ -189,6 +285,14 @@ impl App {
             cols,
             rows,
         });
+    }
+
+    /// Persist the current SSH connection list to disk.
+    fn save_ssh_config(&self) {
+        let config = SettingsConfig {
+            ssh_connections: self.saved_ssh.clone(),
+        };
+        config.save();
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -253,8 +357,9 @@ impl App {
                 // The user asked for it — show it.
                 self.attach(host, name);
             }
-            Message::Ui(UiEvent::Frame { host, snap }) => {
+            Message::Ui(UiEvent::Frame { host, snap, session_wants_mouse }) => {
                 if self.model.active.as_ref().is_some_and(|(h, _)| *h == host) {
+                    self.session_wants_mouse = session_wants_mouse;
                     self.frame = Some(*snap);
                     self.cache.clear();
                     self.status = Status::Live;
@@ -294,11 +399,28 @@ impl App {
                     self.remote_input.clear();
                 }
             }
-            Message::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                if self.model.active.is_some()
-                    && let Some(ev) = key::map_key(&key, modifiers)
-                {
-                    self.send(AppCmd::Key(ev));
+            Message::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
+                if self.model.active.is_some() {
+                    // Typing snaps back to the live bottom and clears any selection.
+                    if self.scroll != 0 {
+                        self.scroll = 0;
+                        self.send(AppCmd::Scroll(0));
+                    }
+                    self.selection = None;
+                    // First try the key mapping (named keys, ASCII chars).
+                    if let Some(ev) = key::map_key(&key, modifiers) {
+                        self.send(AppCmd::Key(ev));
+                    } else if let Some(t) = text {
+                        // IME-committed text (e.g. CJK characters) arrives as
+                        // KeyPressed with key=Unidentified and text set.
+                        // Send each character individually so the PTY gets
+                        // one codepoint per write.
+                        for ch in t.chars() {
+                            if let Some(ev) = key::map_ime_char(ch, modifiers) {
+                                self.send(AppCmd::Key(ev));
+                            }
+                        }
+                    }
                 }
             }
             Message::Keyboard(_) => {}
@@ -312,6 +434,163 @@ impl App {
                 }
             }
             Message::Tick => self.now_ms = now_ms(),
+            Message::MouseScroll(delta) => {
+                if self.model.active.is_some() {
+                    // TODO: when session_wants_mouse && scroll == 0, forward
+                    // wheel events to the session as SGR mouse reports instead
+                    // of scrolling locally.
+                    let max = 100_000;
+                    let new_scroll = if delta > 0 {
+                        (self.scroll + delta as usize).min(max)
+                    } else {
+                        self.scroll.saturating_sub((-delta) as usize)
+                    };
+                    if new_scroll != self.scroll {
+                        self.scroll = new_scroll;
+                        // Invalidate the canvas cache so the viewport updates
+                        // immediately, rather than waiting for the next daemon
+                        // frame to arrive.
+                        self.cache.clear();
+                        self.send(AppCmd::Scroll(self.scroll));
+                    }
+                }
+            }
+            Message::MousePress => {
+                // When session wants the mouse (vim/htop) and we're at the
+                // live bottom, don't start a local selection — the session
+                // should receive the mouse events instead.
+                // TODO: forward mouse to session when session_wants_mouse.
+                if self.session_wants_mouse && self.scroll == 0 {
+                    return Task::none();
+                }
+                if self.model.active.is_some()
+                    && let Some((px, py)) = self.last_mouse_pos
+                {
+                    // Convert pixel → cell, then viewport row → screen row.
+                    let x = (px / self.metrics.cell_w).floor() as u16;
+                    let vpy = (py / self.metrics.cell_h).floor() as u16;
+                    let screen_row = self.scroll + vpy as usize;
+                    self.selection = Some(GuiSelection {
+                        anchor: (x, screen_row),
+                        head: (x, screen_row),
+                    });
+                }
+            }
+            Message::MouseMove(pos) => {
+                self.last_mouse_pos = Some((pos.x, pos.y));
+                // Only update the local drag selection; when session wants
+                // mouse we don't start one (see MousePress).
+                if self.selection.is_some() {
+                    let x = (pos.x / self.metrics.cell_w).floor() as u16;
+                    let vpy = (pos.y / self.metrics.cell_h).floor() as u16;
+                    let screen_row = self.scroll + vpy as usize;
+                    if let Some(ref mut sel) = self.selection {
+                        sel.head = (x, screen_row);
+                    }
+                }
+            }
+            Message::MouseRelease => {
+                if let Some(sel) = self.selection.take() {
+                    if let Some(ref snap) = self.frame {
+                        let text = extract_selection_text(snap, sel, self.scroll);
+                        if !text.is_empty() {
+                            return iced::clipboard::write(text);
+                        }
+                    }
+                }
+            }
+            Message::ImeCommit(text) => {
+                // Forward IME-composed text to the session as individual
+                // character key events, same as the keyboard handler does
+                // for committed IME text via KeyPressed.
+                if self.model.active.is_some() {
+                    if self.scroll != 0 {
+                        self.scroll = 0;
+                        self.send(AppCmd::Scroll(0));
+                    }
+                    self.selection = None;
+                    for ch in text.chars() {
+                        if ch.is_control() {
+                            continue;
+                        }
+                        let ev = asd_vt::KeyEvent {
+                            key: asd_vt::Key::Char(ch),
+                            mods: asd_vt::Mods { shift: false, ctrl: false, alt: false, super_key: false },
+                            text: Some(ch.to_string()),
+                        };
+                        self.send(AppCmd::Key(ev));
+                    }
+                }
+            }
+            // ── settings ──
+            Message::ToggleSettings => {
+                self.show_settings = !self.show_settings;
+                if !self.show_settings {
+                    self.settings_form = None;
+                }
+            }
+            Message::Settings(msg) => match msg {
+                SettingsMsg::Close => {
+                    self.show_settings = false;
+                    self.settings_form = None;
+                }
+                SettingsMsg::Nav(page) => {
+                    self.settings_page = page;
+                    self.settings_form = None;
+                }
+                SettingsMsg::AddConnection => {
+                    self.settings_form = Some(SshForm::default());
+                }
+                SettingsMsg::EditConnection(i) => {
+                    if let Some(conn) = self.saved_ssh.get(i) {
+                        self.settings_form = Some(SshForm::from_conn(conn, i));
+                    }
+                }
+                SettingsMsg::DeleteConnection(i) => {
+                    if i < self.saved_ssh.len() {
+                        self.saved_ssh.remove(i);
+                        self.save_ssh_config();
+                    }
+                }
+                SettingsMsg::SaveConnection => {
+                    if let Some(ref form) = self.settings_form
+                        && let Some(conn) = form.into_connection()
+                    {
+                        if let Some(i) = form.index
+                            && i < self.saved_ssh.len()
+                        {
+                            self.saved_ssh[i] = conn;
+                        } else {
+                            self.saved_ssh.push(conn);
+                        }
+                        self.save_ssh_config();
+                        self.settings_form = None;
+                    }
+                }
+                SettingsMsg::CancelEdit => {
+                    self.settings_form = None;
+                }
+                SettingsMsg::FormName(s) => {
+                    if let Some(ref mut f) = self.settings_form {
+                        f.name = s;
+                    }
+                }
+                SettingsMsg::FormHost(s) => {
+                    if let Some(ref mut f) = self.settings_form {
+                        f.host = s;
+                    }
+                }
+                SettingsMsg::FormUser(s) => {
+                    if let Some(ref mut f) = self.settings_form {
+                        f.user = s;
+                    }
+                }
+                SettingsMsg::FormPort(s) => {
+                    if let Some(ref mut f) = self.settings_form {
+                        f.port = s;
+                    }
+                }
+            },
         }
         Task::none()
     }
@@ -331,7 +610,19 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        view::view(self)
+        let body = view::view(self, self.selection);
+        if self.show_settings {
+            // The settings overlay is built in view.rs where all widget
+            // helpers are available.
+            let overlay = view::settings_overlay(
+                self.settings_page,
+                &self.saved_ssh,
+                &self.settings_form,
+            );
+            iced::widget::stack([body, overlay]).into()
+        } else {
+            body
+        }
     }
 }
 
@@ -435,6 +726,13 @@ fn route(
         AppCmd::Kill { host, name } => {
             if let Some(h) = hosts.get(&host) {
                 let _ = h.cmd_tx.send(HostCmd::Kill { name });
+            }
+        }
+        AppCmd::Scroll(lines) => {
+            if let Some(a) = *active
+                && let Some(h) = hosts.get(&a)
+            {
+                let _ = h.cmd_tx.send(HostCmd::Scroll(lines));
             }
         }
     }
