@@ -27,6 +27,13 @@ jobs:
         with:
           version: 0.15.2
 
+      # Zig links its build runner against libSystem; on the CI runner it needs
+      # to be pointed at the macOS SDK explicitly, or the link fails with
+      # undefined symbols (__availability_version_check, _dispatch_*, …).
+      - name: Point Zig at the macOS SDK
+        if: runner.os == 'macOS'
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+
       - name: Build
         run: cargo build --workspace
 
