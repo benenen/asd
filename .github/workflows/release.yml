@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # manual trigger to verify the build without cutting a tag
+
+permissions:
+  contents: write # create the release and upload assets
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Full binary (CLI + daemon + GUI), built natively.
+          - target: x86_64-unknown-linux-gnu
+            use_cross: false
+            build_flags: ""
+            kind: full
+          # ARM64: CLI + daemon only — wgpu can't be cross-compiled here cheaply.
+          - target: aarch64-unknown-linux-gnu
+            use_cross: true
+            build_flags: "--no-default-features --features local"
+            kind: cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Native build: Zig on the runner. Cross build: Zig is installed in the
+      # container by Cross.toml instead.
+      - name: Install Zig (native)
+        if: ${{ !matrix.use_cross }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install cross
+        if: ${{ matrix.use_cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (native)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.build_flags }}
+
+      - name: Build (cross)
+        if: ${{ matrix.use_cross }}
+        run: cross build --release --locked --target ${{ matrix.target }} ${{ matrix.build_flags }}
+
+      - name: Package
+        id: pkg
+        env:
+          TARGET: ${{ matrix.target }}
+          KIND: ${{ matrix.kind }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="${REF_NAME#v}"
+          [ "$version" = "$REF_NAME" ] && version="$(git rev-parse --short HEAD)"
+          # Tag the ARM64 archive as cli-only so it's clear it has no GUI.
+          suffix=""
+          [ "$KIND" = "cli" ] && suffix="-cli"
+          name="asd-${version}-${TARGET}${suffix}"
+          stage="$(mktemp -d)/${name}"
+          mkdir -p "$stage"
+          cp "target/${TARGET}/release/asd" "$stage/"
+          [ -f LICENSE ] && cp LICENSE "$stage/" || true
+          [ -f README.md ] && cp README.md "$stage/" || true
+          tar -czf "${name}.tar.gz" -C "$(dirname "$stage")" "${name}"
+          echo "archive=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.archive }}
+          path: ${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.archive }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true

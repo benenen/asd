@@ -1,0 +1,25 @@
+# `cross` config for the aarch64 Linux release build.
+#
+# Only aarch64 is cross-compiled (x86_64 is built natively). The `local`
+# feature (CLI + daemon, no GUI) is what ships for aarch64 — wgpu can't be
+# cross-compiled there cheaply. The vendored libghostty-vt-sys builds via Zig,
+# so Zig goes into the container; build.rs passes `-Dtarget` for the cross build.
+
+[build.env]
+# Reach the network through a host proxy when one is set (empty/harmless in CI).
+passthrough = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+]
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install --yes --no-install-recommends curl ca-certificates xz-utils git",
+    "curl -fsSL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o /tmp/zig.tar.xz",
+    "mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1",
+    "ln -sf /opt/zig/zig /usr/local/bin/zig",
+]
