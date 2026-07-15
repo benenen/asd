@@ -251,10 +251,16 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                             }
                             render::MouseKind::Release if selecting => {
                                 selecting = false;
-                                if let Some(sel) = selection {
-                                    // Screen-space coordinates are scroll-
-                                    // independent, so this copies the whole
-                                    // selection even if part scrolled off-view.
+                                // Releasing the button copies the selection and
+                                // then clears it: `take()` deselects, and a
+                                // plain click (a 1-cell "selection") leaves no
+                                // leftover highlight block behind. Screen-space
+                                // coords are scroll-independent, so the copy
+                                // captures the whole range even off-view.
+                                if let Some(sel) = selection.take()
+                                    && sel.anchor != sel.head
+                                {
+                                    // A real drag (not a bare click): copy it.
                                     let text = vt.selection_text_screen(
                                         (sel.anchor.0, sel.anchor.1 as u32),
                                         (sel.head.0, sel.head.1 as u32),
@@ -263,6 +269,9 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                                         let _ = write_stdout(&render::osc52_copy(&text));
                                     }
                                 }
+                                // Repaint without the selection to erase the
+                                // highlight (and any single-click mark).
+                                dirty = true;
                             }
                             _ => {}
                         }
