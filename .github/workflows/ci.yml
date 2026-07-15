@@ -7,6 +7,31 @@ on:
   workflow_dispatch:
 
 jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # rustfmt doesn't compile anything, so check it before the slower clippy
+      # build and fail fast on formatting.
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # clippy builds the workspace, so it needs Zig for libghostty-vt-sys.
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   test:
     name: test (ubuntu)
     runs-on: ubuntu-latest
