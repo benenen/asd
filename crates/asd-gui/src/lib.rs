@@ -6,6 +6,10 @@
 //! terminal off iced's multi-threaded runtime. The app holds only plain data
 //! ([`model::Model`] + the active [`RenderSnapshot`]) and routes [`AppCmd`]s to
 //! the supervisor.
+//!
+//! Shipped as a library so the single `asd` binary can embed it behind the
+//! `gui` feature ([`run`] is the entry point); this crate stays free of
+//! portable-pty/process-management so a GUI-only build (Windows) is viable.
 
 mod conn;
 mod key;
@@ -27,15 +31,19 @@ use iced::{Element, Size, Subscription, Task};
 use model::{HostId, HostKind, HostState, LOCAL_ID, Model, RemoteSpec};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-fn main() -> iced::Result {
-    tracing_subscriber::fmt()
+/// Launch the GUI. `session`, when given (`asd gui <session>`), is pre-selected
+/// on the local host once its list arrives. This is the `gui`-feature entry
+/// point of the single `asd` binary.
+pub fn run(session: Option<String>) -> iced::Result {
+    // try_init: the embedding binary may already have a subscriber installed.
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr)
-        .init();
+        .try_init();
 
-    iced::application(App::new, App::update, App::view)
+    iced::application(move || App::new(session.clone()), App::update, App::view)
         .subscription(App::subscription)
         .title(App::title)
         .antialiasing(true)
@@ -95,6 +103,9 @@ pub(crate) struct App {
     pub(crate) now_ms: u64,
     sup_tx: Option<UnboundedSender<AppCmd>>,
     generation: u64,
+    /// A session named on the command line (`asd gui <session>`) to auto-select
+    /// once the local host's list arrives; cleared after it is honored.
+    preferred: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +128,7 @@ pub(crate) enum Message {
 }
 
 impl App {
-    fn new() -> (Self, Task<Message>) {
+    fn new(preferred: Option<String>) -> (Self, Task<Message>) {
         let metrics = render::Metrics::new(15.0);
         // iced doesn't emit a resize on startup, so seed the grid from the
         // default window minus the chrome — otherwise the first attach sizes to
@@ -140,6 +151,7 @@ impl App {
                 now_ms: now_ms(),
                 sup_tx: None,
                 generation: 0,
+                preferred,
             },
             Task::none(),
         )
@@ -218,14 +230,23 @@ impl App {
             }
             Message::Ui(UiEvent::Sessions { host, sessions }) => {
                 self.model.set_sessions(host, sessions);
-                // Auto-select the first local session on first populate so the
-                // window isn't empty on launch.
-                if self.model.active.is_none()
-                    && host == LOCAL_ID
-                    && let Some(first) = self.model.host(LOCAL_ID).and_then(|h| h.sessions.first())
-                {
-                    let name = first.name.clone();
-                    self.attach(LOCAL_ID, name);
+                // On the local host's first populate, auto-select something so
+                // the window isn't empty: the session named on the command line
+                // if it exists, otherwise the first one.
+                if self.model.active.is_none() && host == LOCAL_ID {
+                    let names: Vec<String> = self
+                        .model
+                        .host(LOCAL_ID)
+                        .map(|h| h.sessions.iter().map(|s| s.name.clone()).collect())
+                        .unwrap_or_default();
+                    if let Some(first) = names.first() {
+                        let pick = self
+                            .preferred
+                            .take()
+                            .filter(|name| names.contains(name))
+                            .unwrap_or_else(|| first.clone());
+                        self.attach(LOCAL_ID, pick);
+                    }
                 }
             }
             Message::Ui(UiEvent::Created { host, name }) => {

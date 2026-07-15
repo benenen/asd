@@ -5,13 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "asd-gui"
-path = "src/main.rs"
+# Library only (`pub fn run`): the single `asd` binary embeds it behind the
+# `gui` feature. Contract (spec §3): NO portable-pty or any PTY/process
+# management — the basis of a viable Windows client. asd-vt (rendering) and
+# asd-proto (the connection) are allowed; asd-vt/asd-proto forbid iced/wgpu.
+[lib]
+path = "src/lib.rs"
 
-# Contract (spec §3): NO portable-pty or any PTY/process management — this is
-# the basis of a viable Windows client. asd-vt (rendering) and asd-proto (the
-# connection) are allowed; asd-vt/asd-proto forbid iced/wgpu themselves.
 [dependencies]
 anyhow = { workspace = true }
 asd-proto = { workspace = true }

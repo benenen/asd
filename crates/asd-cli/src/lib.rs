@@ -1,4 +1,8 @@
-//! `asd`: debug client + stdio proxy (spec §3, M0 step 5).
+//! `asd` terminal-mux client + stdio proxy + embedded daemon, shipped as a
+//! library so the single `asd` binary can drive it behind the `local` feature.
+//! [`run`] parses the CLI and dispatches; a `None`/`gui` invocation is handed
+//! to the caller-provided [`GuiLauncher`] (the GUI lives in a separate crate to
+//! keep this one free of iced).
 
 mod attach;
 mod client;
@@ -10,14 +14,20 @@ use anyhow::bail;
 use asd_proto::{ClientKind, Frame, paths};
 use clap::{Parser, Subcommand};
 
+/// Launches the GUI for an optional session name. Injected by the binary (the
+/// GUI crate is only linked under the `gui` feature), so this crate never
+/// depends on iced.
+pub type GuiLauncher = fn(Option<String>) -> anyhow::Result<()>;
+
 #[derive(Parser, Debug)]
 #[command(name = "asd", version, about = "asd terminal mux client")]
 struct Args {
     /// UDS path (defaults to $ASD_SOCKET, then $XDG_RUNTIME_DIR/asd.sock)
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
+    /// No subcommand opens the GUI (when built with it).
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -52,16 +62,38 @@ enum Cmd {
     /// binary. Handy after a rebuild bumps the protocol version (all sessions
     /// are lost — the daemon does not persist them).
     Restart,
+    /// Open the GUI (same as running `asd` with no subcommand).
+    Gui {
+        /// Session to pre-select.
+        session: Option<String>,
+    },
 }
 
-fn main() -> anyhow::Result<()> {
+/// Parse the CLI and run the requested command. A `None`/`gui` invocation opens
+/// the GUI via `gui` (absent in a `local`-only build). Not async: the daemon
+/// and the GUI each own their own runtime, and the client commands get a
+/// current-thread runtime below — so nothing nests.
+pub fn run(gui: Option<GuiLauncher>) -> anyhow::Result<()> {
     let args = Args::parse();
-    // The daemon owns its own tokio runtime, so dispatch it before entering
-    // the client's #[tokio::main] runtime (no nesting).
-    if matches!(args.cmd, Cmd::Daemon) {
-        return asd_daemon::run(args.socket);
+    match &args.cmd {
+        // The daemon owns its own tokio runtime → dispatch before ours starts.
+        Some(Cmd::Daemon) => return asd_daemon::run(args.socket),
+        // No subcommand or `gui` → hand off to the injected GUI launcher.
+        None => return launch_gui(gui, None),
+        Some(Cmd::Gui { session }) => return launch_gui(gui, session.clone()),
+        _ => {}
     }
     client_main(args)
+}
+
+fn launch_gui(gui: Option<GuiLauncher>, session: Option<String>) -> anyhow::Result<()> {
+    match gui {
+        Some(launch) => launch(session),
+        None => bail!(
+            "this build has no GUI (compiled without the `gui` feature); \
+             use a subcommand such as `asd new` or `asd attach`"
+        ),
+    }
 }
 
 // current_thread: the render client holds a `!Send` GhosttyVt across awaits.
@@ -69,7 +101,11 @@ fn main() -> anyhow::Result<()> {
 async fn client_main(args: Args) -> anyhow::Result<()> {
     let socket = args.socket.unwrap_or_else(paths::socket_path);
 
-    match args.cmd {
+    // Daemon/Gui/None are dispatched in `run` before this runtime starts.
+    let Some(cmd) = args.cmd else {
+        unreachable!("no-subcommand is dispatched before the runtime starts")
+    };
+    match cmd {
         Cmd::List => {
             let mut c = client::connect(&socket, ClientKind::Cli).await?;
             c.writer.write_frame(&Frame::ListSessions).await?;
@@ -172,7 +208,9 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                 asd_proto::PROTO_VERSION
             );
         }
-        Cmd::Daemon => unreachable!("dispatched in main before the runtime starts"),
+        Cmd::Daemon | Cmd::Gui { .. } => {
+            unreachable!("dispatched in `run` before the runtime starts")
+        }
     }
     Ok(())
 }

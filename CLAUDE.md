@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `asd` = GPU 终端客户端 + headless mux daemon，定位 **shpool 而非 tmux**：一个 session 即一个 PTY，不做 pane/window 分屏。规格与里程碑文档在 Obsidian：`idea/spacs/gmux GPU 终端 Spec`、`idea/plans/gmux GPU 终端计划`（文档用 `gmux-*` 命名，本仓库对应为 `asd-*`）。M0 五个模块 asd-proto / asd-vt / asd-daemon / asd-cli / asd-gui 均已落地。
 
-**单二进制分发（有意偏离 spec §2 的双二进制契约，用户决定）**：只产出一个 `asd` 可执行文件，daemon 以 `asd daemon` 子命令运行；asd-daemon 是 library crate，被 asd-cli 内嵌。自愈拉起 = re-exec `current_exe()` + `daemon` 参数。
+**单二进制分发（有意偏离 spec §2，用户决定）**：只产出**一个** `asd` 可执行文件，CLI + 内嵌 daemon + GUI 全在里面。**bin 是 workspace 根 package `asd`（`Cargo.toml` 既是 `[workspace]` 又是 `[package]`，`src/main.rs`）**；asd-daemon/asd-cli/asd-gui 都是 **library crate**，根 bin 用 **feature** 组合：`local`（=asd-cli，带 daemon/portable-pty）+ `gui`（=asd-gui，iced），`default=["local","gui"]`。**裸 `asd` 开 GUI**，`asd gui [session]` 也开 GUI，`new/attach/list/kill/daemon/restart` 是 CLI 子命令。**Windows 客户端 = `--no-default-features --features gui`**（纯 GUI、无 portable-pty，边界靠 feature 守住，`cargo tree` 验证 gui-only 0 个 portable-pty）。daemon 仍以 `asd daemon` 子命令运行，自愈拉起 = re-exec `current_exe()` + `daemon`。GUI 入口 `asd_gui::run(session)`；CLI 入口 `asd_cli::run(gui: Option<GuiLauncher>)`（GUI 启动器由 bin 注入，asd-cli 因此不碰 iced）。
 
 ## 代码规范
 
@@ -19,8 +19,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | asd-proto | 帧枚举、postcard 编解码、framed reader/writer、路径契约 | tokio 之外的运行时、任何业务 crate |
 | asd-vt | `VtBackend` trait + libghostty-vt 实现（逃生门边界） | iced/wgpu、portable-pty、asd-proto |
 | asd-daemon（lib） | session 管理、UDS 服务 | iced/wgpu（含传递依赖） |
-| asd-cli（唯一 bin `asd`） | 调试客户端、`attach --stdio` 代理、内嵌 daemon（`asd daemon`） | iced/wgpu |
-| asd-gui（bin `asd-gui`，iced/wgpu） | 渲染、输入、拨号、SSH remote | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基）；可依赖 asd-vt/asd-proto。**SSH 走纯 Rust `russh`（网络客户端，不 spawn 进程/不用 ssh.exe，不违反边界）**，不是 spawn `ssh` 子进程 |
+| asd-cli（**lib**，`pub fn run`） | 调试客户端、`attach --stdio` 代理、内嵌 daemon（`asd daemon`）；被根 bin 的 `local` feature 组合 | iced/wgpu（GUI 启动器由 bin 注入，不直接依赖 iced） |
+| asd-gui（**lib**，`pub fn run`，iced/wgpu） | 渲染、输入、拨号、SSH remote；被根 bin 的 `gui` feature 组合 | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基）；可依赖 asd-vt/asd-proto。**SSH 走纯 Rust `russh`（网络客户端，不 spawn 进程/不用 ssh.exe，不违反边界）**，不是 spawn `ssh` 子进程 |
+| asd（**根 package**，唯一 bin `asd`） | 组合上面两个 lib 成单一可执行文件（feature `local`/`gui`）；除组合外无逻辑 | 直接依赖 iced 或 portable-pty（应经由 feature 拉 asd-gui/asd-cli，保持两 lib 边界纯净） |
 
 ## 常用命令
 
@@ -28,12 +29,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build --workspace              # 首次构建会用 Zig 编译 libghostty-vt-sys（vendored），需 PATH 里有 zig 0.15.x
 cargo test --workspace               # e2e 测试会真实拉起 asd-daemon 进程（独立 socket，互不干扰）
 cargo test -p asd-vt                 # 单 crate
-cargo test -p asd-cli --test e2e sigterm   # 单个测试（按名字过滤）
+cargo test --test e2e sigterm        # 单个 e2e（e2e 在根 package tests/，非 asd-cli）
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-手工冒烟：`cargo run -p asd-cli -- attach -A demo`（自动拉起 daemon + 创建 session；detach 键 Ctrl-\）。
+手工冒烟：`cargo run -- attach -A demo`（根 bin `asd`；自动拉起 daemon + 创建 session；detach 键 Ctrl-\）。`cargo run` 裸跑 = 开 GUI。`cargo build --workspace` 编所有 crate；`cargo test --workspace` 跑所有测试（`cargo test` 不带 `--workspace` 只测根 package）。
 
 **`asd attach` 是 VT 渲染客户端（2026-07-14，对标 boo 的 `boo ui`）**，不是哑管道：客户端自带一份 `GhosttyVt`（asd-cli 因此依赖 asd-vt），把 daemon 的 Snapshot+Output 喂进去、自己渲染（`render.rs`：RenderSnapshot→ANSI）。本地 VT 模型让 live 视图同时有：① 交替屏（`1049h`）detach 恢复原屏；② 滚回历史（滚自己的视口 `set_scroll`，**滚轮** 或键盘 `Shift+PageUp/PageDown/Home/End`；**客户端本地、不影响其他 attach 的人**）；③ 拖选复制。
 

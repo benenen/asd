@@ -1,3 +1,32 @@
+[package]
+name = "asd"
+description = "asd: GPU terminal mux — CLI, embedded daemon, and GUI in one binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "asd"
+path = "src/main.rs"
+
+[features]
+default = ["local", "gui"]
+# Terminal side: CLI subcommands + embedded daemon (pulls in portable-pty).
+local = ["dep:asd-cli"]
+# GPU GUI (iced/wgpu). Build with `--no-default-features --features gui` for a
+# PTY-free, GUI-only client (the basis of a viable Windows client).
+gui = ["dep:asd-gui"]
+
+[dependencies]
+anyhow = { workspace = true }
+asd-cli = { workspace = true, optional = true }
+asd-gui = { workspace = true, optional = true }
+
+[dev-dependencies]
+asd-proto = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+
 [workspace]
 members = ["crates/*"]
 resolver = "3"
@@ -9,6 +38,8 @@ license = "MIT"
 repository = ""
 
 [workspace.dependencies]
+asd-cli = { path = "crates/asd-cli" }
+asd-gui = { path = "crates/asd-gui" }
 asd-daemon = { path = "crates/asd-daemon" }
 asd-proto = { path = "crates/asd-proto" }
 asd-vt = { path = "crates/asd-vt" }

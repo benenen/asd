@@ -1,13 +1,12 @@
 [package]
 name = "asd-cli"
-description = "asd single binary: client, stdio proxy, and embedded daemon (`asd daemon`)"
+description = "asd client, stdio proxy, and embedded daemon — a library the `asd` binary drives"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "asd"
-path = "src/main.rs"
+[lib]
+path = "src/lib.rs"
 
 # Contract (spec §3): depending on iced/wgpu is forbidden. asd-vt is allowed
 # (it forbids iced/wgpu itself) and powers the render client's local terminal.

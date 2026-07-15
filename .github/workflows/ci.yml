@@ -71,13 +71,11 @@ jobs:
       - name: Build (release)
         run: cargo build --workspace --release
 
-      # Publish the optimized binaries (`asd` CLI/daemon + `asd-gui`) so a run
-      # produces downloadable artifacts.
-      - name: Upload binaries
+      # Publish the single optimized `asd` binary (CLI + daemon + GUI) so a run
+      # produces a downloadable artifact.
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: asd-linux-x86_64
-          path: |
-            target/release/asd
-            target/release/asd-gui
+          path: target/release/asd
           if-no-files-found: error
