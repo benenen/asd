@@ -95,19 +95,27 @@ pub(crate) enum Status {
     Disconnected(String),
 }
 
-/// Extract plain text from cells within a screen-space selection,
-/// projecting to the current viewport.
-fn extract_selection_text(snap: &RenderSnapshot, sel: GuiSelection, scroll: usize) -> String {
+/// Extract plain text from cells within an absolute-anchored selection,
+/// projecting to the current viewport (`base` = viewport's absolute top row).
+fn extract_selection_text(snap: &RenderSnapshot, sel: GuiSelection, base: usize) -> String {
     let (a, b) = if (sel.anchor.1, sel.anchor.0) <= (sel.head.1, sel.head.0) {
         (sel.anchor, sel.head)
     } else {
         (sel.head, sel.anchor)
     };
-    // Project screen rows to viewport rows: vpy = screen_row - scroll.
-    // Clamp to what's visible (rows beyond the viewport are out of frame data).
-    let rows = snap.rows as usize;
-    let vpy_a = a.1.saturating_sub(scroll).min(rows.saturating_sub(1));
-    let vpy_b = b.1.saturating_sub(scroll).min(rows.saturating_sub(1));
+    // Project absolute rows to viewport rows (vpy = abs_row − base), clamping
+    // ends scrolled out of frame — only the visible cells are available.
+    let rows = snap.rows;
+    let vpy_a = match crate::render::viewport_row(a.1, base, rows) {
+        Some(v) => v,
+        None if a.1 < base => 0,      // top above view → clamp to first
+        None => return String::new(), // whole selection below view
+    };
+    let vpy_b = match crate::render::viewport_row(b.1, base, rows) {
+        Some(v) => v,
+        None if b.1 >= base => rows.saturating_sub(1) as usize, // bottom below → last row
+        None => return String::new(),                           // whole selection above view
+    };
     if vpy_a > vpy_b {
         return String::new();
     }
@@ -118,10 +126,16 @@ fn extract_selection_text(snap: &RenderSnapshot, sel: GuiSelection, scroll: usiz
             None => continue,
         };
         let start_x: usize = if y == vpy_a { a.0 as usize } else { 0 };
-        let end_x: usize = if y == vpy_b { b.0 as usize } else { snap.cols.saturating_sub(1) as usize };
+        let end_x: usize = if y == vpy_b {
+            b.0 as usize
+        } else {
+            snap.cols.saturating_sub(1) as usize
+        };
         let mut line = String::new();
-        for x in start_x..=end_x.min(row_cells.len().saturating_sub(1)) {
-            let cell = &row_cells[x];
+        let end_x = end_x.min(row_cells.len().saturating_sub(1));
+        // `.get()` yields None (not a panic) when start_x > end_x, e.g. an empty
+        // row; that row contributes an empty line, matching the old behavior.
+        for cell in row_cells.get(start_x..=end_x).into_iter().flatten() {
             if cell.width == asd_vt::CellWidth::SpacerTail {
                 continue;
             }
@@ -152,7 +166,12 @@ pub(crate) struct App {
     pub(crate) now_ms: u64,
     /// Scrollback offset: 0 = following live output.
     pub(crate) scroll: usize,
-    /// Current drag selection in screen-space coordinates, if any.
+    /// Absolute row of the current frame's viewport top (`scrollback_rows −
+    /// scroll`), reported by the host actor with each frame. Selections are
+    /// anchored in this absolute space and projected back through it so the
+    /// highlight tracks the text while scrolling.
+    pub(crate) frame_base: usize,
+    /// Current drag selection anchored in absolute scrollback rows, if any.
     pub(crate) selection: Option<GuiSelection>,
     /// Whether the active session is in mouse-tracking mode (vim/htop).
     pub(crate) session_wants_mouse: bool,
@@ -170,10 +189,12 @@ pub(crate) struct App {
     pub(crate) saved_ssh: Vec<SshConnection>,
 }
 
-/// A drag selection anchored in screen-space (absolute) coordinates:
-/// (col, screen_row) where screen_row = scroll + viewport_row at press time.
-/// Anchoring absolute makes the highlight follow text when scrolling,
-/// matching the CLI's content-pin selection behavior.
+/// A drag selection anchored in **absolute scrollback rows**: each end is
+/// `(col, abs_row)` where `abs_row = frame_base + viewport_row` at the moment
+/// it was set (`frame_base` = scrollback_rows − scroll, 0 = oldest line).
+/// Anchoring absolute — rather than to the viewport row — makes the highlight
+/// follow the text as the viewport scrolls, matching the CLI's content-pin
+/// selection. Projected back to a viewport row via [`render::viewport_row`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GuiSelection {
     pub anchor: (u16, usize),
@@ -200,9 +221,9 @@ pub(crate) enum Message {
     /// Mouse wheel scroll (positive = up).
     MouseScroll(i32),
     /// Mouse press at (x, y) in cell coordinates.
-    MousePress, 
+    MousePress,
     /// Mouse drag to (x, y).
-    MouseMove(Point), 
+    MouseMove(Point),
     /// Mouse release: finalizes and copies the selection.
     MouseRelease,
     /// IME-composed text committed (e.g. a CJK character confirmed by the user).
@@ -239,6 +260,7 @@ impl App {
                 generation: 0,
                 preferred,
                 scroll: 0,
+                frame_base: 0,
                 selection: None,
                 session_wants_mouse: false,
                 last_mouse_pos: None,
@@ -357,9 +379,15 @@ impl App {
                 // The user asked for it — show it.
                 self.attach(host, name);
             }
-            Message::Ui(UiEvent::Frame { host, snap, session_wants_mouse }) => {
+            Message::Ui(UiEvent::Frame {
+                host,
+                snap,
+                session_wants_mouse,
+                base,
+            }) => {
                 if self.model.active.as_ref().is_some_and(|(h, _)| *h == host) {
                     self.session_wants_mouse = session_wants_mouse;
+                    self.frame_base = base;
                     self.frame = Some(*snap);
                     self.cache.clear();
                     self.status = Status::Live;
@@ -399,7 +427,12 @@ impl App {
                     self.remote_input.clear();
                 }
             }
-            Message::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
+            Message::Keyboard(iced::keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                text,
+                ..
+            }) => {
                 if self.model.active.is_some() {
                     // Typing snaps back to the live bottom and clears any selection.
                     if self.scroll != 0 {
@@ -469,13 +502,13 @@ impl App {
                 if self.model.active.is_some()
                     && let Some((px, py)) = self.last_mouse_pos
                 {
-                    // Convert pixel → cell, then viewport row → screen row.
-                    let x = (px / self.metrics.cell_w).floor() as u16;
-                    let vpy = (py / self.metrics.cell_h).floor() as u16;
-                    let screen_row = self.scroll + vpy as usize;
+                    // Pixel → cell, then anchor the viewport row in absolute
+                    // scrollback space so the selection tracks the text.
+                    let x = self.metrics.col_at(px);
+                    let abs = render::abs_row(self.frame_base, self.metrics.row_at(py) as usize);
                     self.selection = Some(GuiSelection {
-                        anchor: (x, screen_row),
-                        head: (x, screen_row),
+                        anchor: (x, abs),
+                        head: (x, abs),
                     });
                 }
             }
@@ -484,21 +517,20 @@ impl App {
                 // Only update the local drag selection; when session wants
                 // mouse we don't start one (see MousePress).
                 if self.selection.is_some() {
-                    let x = (pos.x / self.metrics.cell_w).floor() as u16;
-                    let vpy = (pos.y / self.metrics.cell_h).floor() as u16;
-                    let screen_row = self.scroll + vpy as usize;
+                    let x = self.metrics.col_at(pos.x);
+                    let abs = render::abs_row(self.frame_base, self.metrics.row_at(pos.y) as usize);
                     if let Some(ref mut sel) = self.selection {
-                        sel.head = (x, screen_row);
+                        sel.head = (x, abs);
                     }
                 }
             }
             Message::MouseRelease => {
-                if let Some(sel) = self.selection.take() {
-                    if let Some(ref snap) = self.frame {
-                        let text = extract_selection_text(snap, sel, self.scroll);
-                        if !text.is_empty() {
-                            return iced::clipboard::write(text);
-                        }
+                if let Some(sel) = self.selection.take()
+                    && let Some(ref snap) = self.frame
+                {
+                    let text = extract_selection_text(snap, sel, self.frame_base);
+                    if !text.is_empty() {
+                        return iced::clipboard::write(text);
                     }
                 }
             }
@@ -518,7 +550,12 @@ impl App {
                         }
                         let ev = asd_vt::KeyEvent {
                             key: asd_vt::Key::Char(ch),
-                            mods: asd_vt::Mods { shift: false, ctrl: false, alt: false, super_key: false },
+                            mods: asd_vt::Mods {
+                                shift: false,
+                                ctrl: false,
+                                alt: false,
+                                super_key: false,
+                            },
                             text: Some(ch.to_string()),
                         };
                         self.send(AppCmd::Key(ev));
@@ -617,11 +654,8 @@ impl App {
         if self.show_settings {
             // The settings overlay is built in view.rs where all widget
             // helpers are available.
-            let overlay = view::settings_overlay(
-                self.settings_page,
-                &self.saved_ssh,
-                &self.settings_form,
-            );
+            let overlay =
+                view::settings_overlay(self.settings_page, &self.saved_ssh, &self.settings_form);
             iced::widget::stack([body, overlay]).into()
         } else {
             body

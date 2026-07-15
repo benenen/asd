@@ -7,15 +7,12 @@
 //! explicit default renderer.
 
 use iced::alignment::{Horizontal, Vertical};
-use iced::widget::{
-    button, column, container, row, scrollable, text, text_input, Space,
-};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Background, Border, Color, Element, Font, Length, Padding, Theme};
 
 use crate::theme;
 use crate::theme::{
-    ALERT, BRIGHT, DIM, HOVER, LINE, LINE_SOFT, LOCAL, MUTED, PANEL, REMOTE,
-    SCREEN, TEXT,
+    ALERT, BRIGHT, DIM, HOVER, LINE, LINE_SOFT, LOCAL, MUTED, PANEL, REMOTE, SCREEN, TEXT,
 };
 
 use serde::{Deserialize, Serialize};
@@ -121,6 +118,8 @@ impl SshForm {
             && self.port.trim().parse::<u16>().is_ok()
     }
 
+    // Borrows rather than consumes (the form stays editable), despite the name.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn into_connection(&self) -> Option<SshConnection> {
         if !self.valid() {
             return None;
@@ -200,8 +199,7 @@ pub fn view<'a>(
     connections: &'a [SshConnection],
     form: &'a Option<SshForm>,
 ) -> Element<'a, SettingsMsg> {
-    let inner = row![nav(page), content(page, connections, form)]
-        .height(Length::Fixed(PANEL_H));
+    let inner = row![nav(page), content(page, connections, form)].height(Length::Fixed(PANEL_H));
 
     container(inner)
         .width(Length::Fixed(PANEL_W))
@@ -275,10 +273,7 @@ fn nav_item<'a>(
             label_col,
         ]
     } else {
-        row![
-            container(text("")).width(Length::Fixed(3.0)),
-            label_col,
-        ]
+        row![container(text("")).width(Length::Fixed(3.0)), label_col,]
     };
 
     button(item.spacing(10).align_y(Vertical::Center))
@@ -288,8 +283,7 @@ fn nav_item<'a>(
         .style(move |_: &Theme, status| button::Style {
             background: if is_active {
                 bg
-            } else if matches!(status, button::Status::Hovered | button::Status::Pressed)
-            {
+            } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
                 Some(Background::Color(HOVER))
             } else {
                 None
@@ -324,10 +318,13 @@ fn general_page() -> Element<'static, SettingsMsg> {
     .spacing(4);
 
     let p = pad2(10.0, 20.0);
-    container(column![container(title).padding(p), container(body).padding(p)])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    container(column![
+        container(title).padding(p),
+        container(body).padding(p)
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 fn setting_row<'a>(label: &'a str, value: &'a str) -> Element<'a, SettingsMsg> {
@@ -349,13 +346,12 @@ fn connections_page<'a>(
     connections: &'a [SshConnection],
     form: &'a Option<SshForm>,
 ) -> Element<'a, SettingsMsg> {
-    let add_btn: Element<'a, SettingsMsg> = button(
-        text("+ Add").size(12).font(bold()).color(LOCAL),
-    )
-    .padding(pad2(5.0, 12.0))
-    .on_press(SettingsMsg::AddConnection)
-    .style(move |_: &Theme, status| btn_outline(LOCAL, status))
-    .into();
+    let add_btn: Element<'a, SettingsMsg> =
+        button(text("+ Add").size(12).font(bold()).color(LOCAL))
+            .padding(pad2(5.0, 12.0))
+            .on_press(SettingsMsg::AddConnection)
+            .style(move |_: &Theme, status| btn_outline(LOCAL, status))
+            .into();
 
     let title = row![
         text("SSH Connections").size(16).font(bold()).color(BRIGHT),
@@ -401,7 +397,9 @@ fn connections_page<'a>(
     let p = pad2(10.0, 20.0);
     container(column![
         container(title).padding(p),
-        container(body).padding(pad2(4.0, 20.0)).height(Length::Fill),
+        container(body)
+            .padding(pad2(4.0, 20.0))
+            .height(Length::Fill),
     ])
     .width(Length::Fill)
     .height(Length::Fill)
@@ -433,11 +431,15 @@ fn connection_row<'a>(index: usize, conn: &'a SshConnection) -> Element<'a, Sett
     ]
     .spacing(6);
 
-    button(row![dot, info.width(Length::Fill), actions].spacing(10).align_y(Vertical::Center))
-        .width(Length::Fill)
-        .padding(pad2(8.0, 12.0))
-        .style(move |_: &Theme, status| btn_row_style(status))
-        .into()
+    button(
+        row![dot, info.width(Length::Fill), actions]
+            .spacing(10)
+            .align_y(Vertical::Center),
+    )
+    .width(Length::Fill)
+    .padding(pad2(8.0, 12.0))
+    .style(move |_: &Theme, status| btn_row_style(status))
+    .into()
 }
 
 fn connection_form<'a>(
@@ -452,13 +454,13 @@ fn connection_form<'a>(
     };
 
     let lbl = form_field("Name", &form.name, SettingsMsg::FormName, "My GPU Server");
-    let hst = form_field("Host", &form.host, SettingsMsg::FormHost, "gpu-01.example.com");
-    let usr = form_field(
-        "User",
-        &form.user,
-        SettingsMsg::FormUser,
-        "your-username",
+    let hst = form_field(
+        "Host",
+        &form.host,
+        SettingsMsg::FormHost,
+        "gpu-01.example.com",
     );
+    let usr = form_field("User", &form.user, SettingsMsg::FormUser, "your-username");
     let prt = form_field("Port", &form.port, SettingsMsg::FormPort, "22");
 
     let valid = form.valid()
@@ -477,21 +479,18 @@ fn connection_form<'a>(
             .on_press(SettingsMsg::CancelEdit)
             .style(move |_: &Theme, status| btn_outline(MUTED, status)),
         if valid {
-            let b: Element<'a, SettingsMsg> = button(
-                text("Save").size(12).font(bold()).color(SCREEN),
-            )
-            .padding(pad2(6.0, 16.0))
-            .on_press(SettingsMsg::SaveConnection)
-            .style(move |_: &Theme, status| btn_filled(LOCAL, status))
-            .into();
+            let b: Element<'a, SettingsMsg> =
+                button(text("Save").size(12).font(bold()).color(SCREEN))
+                    .padding(pad2(6.0, 16.0))
+                    .on_press(SettingsMsg::SaveConnection)
+                    .style(move |_: &Theme, status| btn_filled(LOCAL, status))
+                    .into();
             b
         } else {
-            let b: Element<'a, SettingsMsg> = button(
-                text("Save").size(12).font(bold()).color(DIM),
-            )
-            .padding(pad2(6.0, 16.0))
-            .style(move |_: &Theme, _| btn_filled(DIM, button::Status::Active))
-            .into();
+            let b: Element<'a, SettingsMsg> = button(text("Save").size(12).font(bold()).color(DIM))
+                .padding(pad2(6.0, 16.0))
+                .style(move |_: &Theme, _| btn_filled(DIM, button::Status::Active))
+                .into();
             b
         },
     ]
@@ -546,11 +545,8 @@ fn icon_btn<'a>(glyph: &'a str, msg: SettingsMsg, color: Color) -> Element<'a, S
         .padding(pad2(3.0, 7.0))
         .on_press(msg)
         .style(move |_: &Theme, status| button::Style {
-            background: matches!(
-                status,
-                button::Status::Hovered | button::Status::Pressed
-            )
-            .then_some(Background::Color(HOVER)),
+            background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                .then_some(Background::Color(HOVER)),
             text_color: color,
             border: Border {
                 radius: 4.0.into(),

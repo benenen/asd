@@ -80,6 +80,11 @@ pub enum UiEvent {
         /// (vim/htop): the GUI forwards mouse events instead of scrolling
         /// or selecting locally.
         session_wants_mouse: bool,
+        /// Absolute row of the viewport's top line for this frame:
+        /// `scrollback_rows − scroll` (0 = oldest scrollback line). The app
+        /// anchors text selections in this absolute space so the highlight
+        /// tracks the text — not a screen position — while scrolling.
+        base: usize,
     },
     SessionEnded {
         host: HostId,
@@ -206,7 +211,8 @@ async fn drive(
                         let _ = term.take_pty_responses();
                         let wants_mouse = term.is_mouse_tracking();
                         term.set_scroll(scroll);
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse });
+                        let base = term.scrollback_rows().saturating_sub(scroll);
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
                     }
                 }
                 Ok(Some(Frame::Output { bytes })) => {
@@ -216,7 +222,8 @@ async fn drive(
                         let _ = term.take_pty_responses();
                         let wants_mouse = term.is_mouse_tracking();
                         term.set_scroll(scroll);
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse });
+                        let base = term.scrollback_rows().saturating_sub(scroll);
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
                     }
                 }
                 Ok(Some(Frame::Created { name })) => {
@@ -279,7 +286,8 @@ async fn drive(
                         }
                         let wants_mouse = term.is_mouse_tracking();
                         term.set_scroll(scroll);
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse });
+                        let base = term.scrollback_rows().saturating_sub(scroll);
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
                     }
                 }
                 Some(HostCmd::Create) => {
@@ -298,7 +306,8 @@ async fn drive(
                     if let Some(term) = &mut vt {
                         let wants_mouse = term.is_mouse_tracking();
                         term.set_scroll(scroll);
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse });
+                        let base = term.scrollback_rows().saturating_sub(scroll);
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
                     }
                 }
                 Some(HostCmd::Shutdown) | None => {

@@ -38,7 +38,6 @@ pub fn map_key(key: &Key, mods: Modifiers) -> Option<KeyEvent> {
     }
 }
 
-
 /// Build a character key event from a single IME-committed character (e.g.
 /// CJK). Returns `None` for control characters. The caller iterates over
 /// a multi-character commit and sends one event per codepoint.

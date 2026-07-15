@@ -9,10 +9,10 @@ use iced::widget::{
 };
 use iced::{Background, Border, Color, Element, Font, Length, Padding};
 
+use crate::ime::TermIme;
 use crate::model::{Host, HostState, Model};
 use crate::render::TermCanvas;
 use crate::{App, Message, Status, model, theme};
-use crate::ime::TermIme;
 
 /// A flexible horizontal gap that pushes following items to the right.
 fn spacer() -> Space {
@@ -58,7 +58,12 @@ fn bold() -> Font {
 
 /// The whole window: sidebar | terminal, over a full-width status bar.
 pub fn view(app: &App, sel: Option<crate::GuiSelection>) -> Element<'_, Message> {
-    let body = row![sidebar(app), vline(), terminal_pane(app,  sel, app.scroll)].height(Length::Fill);
+    let body = row![
+        sidebar(app),
+        vline(),
+        terminal_pane(app, sel, app.frame_base)
+    ]
+    .height(Length::Fill);
     column![
         container(body).height(Length::Fill),
         hline(theme::LINE),
@@ -297,7 +302,7 @@ fn sidebar_foot(m: &Model) -> Element<'_, Message> {
 
 // ------------------------------------------------------------- terminal pane
 
-fn terminal_pane(app: &App, sel: Option<crate::GuiSelection>, scroll: usize) -> Element<'_, Message> {
+fn terminal_pane(app: &App, sel: Option<crate::GuiSelection>, base: usize) -> Element<'_, Message> {
     let head = term_head(app);
 
     let screen: Element<'_, Message> = match (&app.status, app.model.active.is_some()) {
@@ -310,7 +315,7 @@ fn terminal_pane(app: &App, sel: Option<crate::GuiSelection>, scroll: usize) -> 
                 cache: &app.cache,
                 metrics: app.metrics,
                 selection: sel,
-                scroll,
+                base,
             })
             .width(Length::Fill)
             .height(Length::Fill);
@@ -325,21 +330,25 @@ fn terminal_pane(app: &App, sel: Option<crate::GuiSelection>, scroll: usize) -> 
                 })
                 .on_press(Message::MousePress)
                 .on_release(Message::MouseRelease)
-                .on_move(|pos| Message::MouseMove(pos));
+                .on_move(Message::MouseMove);
 
-            let cursor_pos = app.frame.as_ref()
+            let cursor_pos = app
+                .frame
+                .as_ref()
                 .and_then(|snap| snap.cursor.position)
-                .map(|(col, row)| iced::Point::new(
-                    col as f32 * app.metrics.cell_w,
-                    row as f32 * app.metrics.cell_h,
-                ))
+                .map(|(col, row)| {
+                    iced::Point::new(
+                        col as f32 * app.metrics.cell_w,
+                        row as f32 * app.metrics.cell_h,
+                    )
+                })
                 .unwrap_or(iced::Point::new(0.0, 0.0));
 
             TermIme::new(mouse.into())
-                .on_ime(|text| Message::ImeCommit(text))
+                .on_ime(Message::ImeCommit)
                 .cursor(cursor_pos, app.metrics.cell_h)
                 .into()
-        },
+        }
     };
 
     let pane = column![
@@ -635,22 +644,20 @@ fn plural(n: usize) -> &'static str {
 
 /// Settings gear button for the status bar.
 fn settings_btn() -> Element<'static, Message> {
-    button(
-        text("⚙").size(14).font(mono()).color(theme::MUTED)
-    )
-    .padding(pad2(2.0, 6.0))
-    .on_press(Message::ToggleSettings)
-    .style(move |_, status| button::Style {
-        background: matches!(status, button::Status::Hovered | button::Status::Pressed)
-            .then_some(Background::Color(theme::HOVER)),
-        text_color: theme::BRIGHT,
-        border: Border {
-            radius: 5.0.into(),
+    button(text("⚙").size(14).font(mono()).color(theme::MUTED))
+        .padding(pad2(2.0, 6.0))
+        .on_press(Message::ToggleSettings)
+        .style(move |_, status| button::Style {
+            background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                .then_some(Background::Color(theme::HOVER)),
+            text_color: theme::BRIGHT,
+            border: Border {
+                radius: 5.0.into(),
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    })
-    .into()
+        })
+        .into()
 }
 
 /// Full-screen settings overlay: dark backdrop + centered settings card.
@@ -660,8 +667,7 @@ pub fn settings_overlay<'a>(
     connections: &'a [crate::settings::SshConnection],
     form: &'a Option<crate::settings::SshForm>,
 ) -> Element<'a, Message> {
-    let card = crate::settings::view(page, connections, form)
-        .map(|msg| Message::Settings(msg));
+    let card = crate::settings::view(page, connections, form).map(Message::Settings);
 
     // Dark backdrop catches clicks to close.
     let backdrop = button(container(text("")).width(Length::Fill).height(Length::Fill))
@@ -670,7 +676,10 @@ pub fn settings_overlay<'a>(
         .on_press(Message::Settings(crate::settings::SettingsMsg::Close))
         .style(|_, _| button::Style {
             background: Some(Background::Color(Color {
-                r: 0.0, g: 0.0, b: 0.0, a: 0.55,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.55,
             })),
             ..Default::default()
         });

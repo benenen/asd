@@ -7,11 +7,9 @@
 //! When the IME commits composed text (e.g. a Chinese character), it publishes
 //! an `ImeCommit` message; the app forwards the text to the session.
 
-use iced::advanced::widget::{Tree, Operation};
-use iced::advanced::{
-    Clipboard, Layout, Shell, input_method, mouse, overlay, renderer,
-};
-use iced::{Element, Event, Length, Rectangle, Size, Vector, Point};
+use iced::advanced::widget::{Operation, Tree};
+use iced::advanced::{Clipboard, Layout, Shell, input_method, mouse, overlay, renderer};
+use iced::{Element, Event, Length, Point, Rectangle, Size, Vector};
 
 type OnIme<'a, Message> = Box<dyn Fn(String) -> Message + 'a>;
 
@@ -66,11 +64,9 @@ where
         renderer: &Renderer,
         limits: &iced::advanced::layout::Limits,
     ) -> iced::advanced::layout::Node {
-        self.content.as_widget_mut().layout(
-            &mut tree.children[0],
-            renderer,
-            limits,
-        )
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
     }
 
     fn draw(
@@ -117,12 +113,9 @@ where
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.content.as_widget_mut().operate(
-            &mut tree.children[0],
-            layout,
-            renderer,
-            operation,
-        );
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
     }
 
     fn update(
