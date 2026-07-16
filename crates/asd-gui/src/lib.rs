@@ -393,11 +393,14 @@ impl App {
             }
             Message::Ui(UiEvent::Frame {
                 host,
+                name,
                 snap,
                 session_wants_mouse,
                 base,
             }) => {
-                if self.model.active.as_ref().is_some_and(|(h, _)| *h == host) {
+                // Gate on the session too: frames from the one we just left
+                // can still be in flight right after a switch.
+                if self.model.is_active(host, &name) {
                     self.session_wants_mouse = session_wants_mouse;
                     self.frame_base = base;
                     self.frame = Some(*snap);

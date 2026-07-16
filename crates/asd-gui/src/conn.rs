@@ -74,6 +74,9 @@ pub enum UiEvent {
     },
     Frame {
         host: HostId,
+        /// Session this frame renders; the app drops frames whose session is
+        /// no longer the active one (stale frames in flight across a switch).
+        name: String,
         snap: Box<RenderSnapshot>,
         /// Whether the session program is currently tracking the mouse
         /// (vim/htop): the GUI forwards mouse events instead of scrolling
@@ -191,9 +194,13 @@ async fn drive(
 
     // Terminal for the active attach (None while not viewing this host).
     let mut vt: Option<GhosttyVt> = None;
-    // True between sending Attach and receiving its Snapshot: drop stale Output
-    // so it never lands in the fresh view.
-    let mut attaching = false;
+    // Attach frames sent whose Snapshot has not arrived yet. While > 0, Output
+    // belongs to a session we already left and is dropped. While > 1, arriving
+    // Snapshots belong to superseded attaches (the user switched again before
+    // the reply landed) and are dropped too — feeding them would paint the old
+    // session over the new one and stack both scrollbacks (a plain bool here
+    // let a quick A→B→A switch scramble text and selection coordinates).
+    let mut pending_attach: usize = 0;
     // Scrollback offset: 0 = follow live output, >0 = lines scrolled up.
     let mut scroll: usize = 0;
     let mut attached: Option<String> = None;
@@ -213,25 +220,29 @@ async fn drive(
                     let _ = ev_tx.send(UiEvent::Sessions { host: id, sessions });
                 }
                 Ok(Some(Frame::Snapshot { vt: dump })) => {
-                    attaching = false;
+                    if pending_attach > 1 {
+                        pending_attach -= 1; // superseded attach — not our view
+                        continue;
+                    }
+                    pending_attach = 0;
                     if let Some(term) = &mut vt {
                         term.feed(&dump);
                         let _ = term.take_pty_responses();
                         let wants_mouse = term.is_mouse_tracking();
                         term.set_scroll(scroll);
                         let base = term.scrollback_rows().saturating_sub(scroll);
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, name: attached.clone().unwrap_or_default(), snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
                     }
                 }
                 Ok(Some(Frame::Output { bytes })) => {
-                    if attaching { continue; } // belongs to a session we just left
+                    if pending_attach > 0 { continue; } // belongs to a session we just left
                     if let Some(term) = &mut vt {
                         term.feed(&bytes);
                         let _ = term.take_pty_responses();
                         let wants_mouse = term.is_mouse_tracking();
                         term.set_scroll(scroll);
                         let base = term.scrollback_rows().saturating_sub(scroll);
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, name: attached.clone().unwrap_or_default(), snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
                     }
                 }
                 Ok(Some(Frame::Created { name })) => {
@@ -246,8 +257,14 @@ async fn drive(
                             let _ = ev_tx.send(UiEvent::SessionEnded { host: id, name, msg });
                         }
                     }
-                    // Other errors (e.g. NO_SUCH_SESSION on a race) are logged
-                    // and ignored; the next list poll reconciles.
+                    // A failed Attach (the session died before the daemon saw
+                    // it) sends this instead of a Snapshot — drain the count
+                    // or every later Snapshot would be taken for a stale one.
+                    else if code == code::NO_SUCH_SESSION && pending_attach > 0 {
+                        pending_attach -= 1;
+                    }
+                    // Other errors are logged and ignored; the next list poll
+                    // reconciles.
                     else {
                         tracing::debug!(host = id, code, %msg, "daemon error");
                     }
@@ -263,7 +280,7 @@ async fn drive(
                     }
                     vt = Some(GhosttyVt::new(cols.max(1), rows.max(1), SCROLLBACK));
                     scroll = 0;
-                    attaching = true;
+                    pending_attach += 1;
                     attached = Some(name.clone());
                     if writer.write_frame(&Frame::Attach { name, cols, rows }).await.is_err() {
                         return Err("attach write failed".to_string());
@@ -274,7 +291,9 @@ async fn drive(
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
                     vt = None;
-                    attaching = false;
+                    // pending_attach stays: any Snapshot still in flight must
+                    // drain through the Snapshot branch (vt is None, nothing
+                    // renders) so the count stays aligned with the stream.
                 }
                 Some(HostCmd::Key(ev)) => {
                     if let Some(term) = &mut vt {
@@ -295,7 +314,7 @@ async fn drive(
                         let wants_mouse = term.is_mouse_tracking();
                         term.set_scroll(scroll);
                         let base = term.scrollback_rows().saturating_sub(scroll);
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, name: attached.clone().unwrap_or_default(), snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
                     }
                 }
                 Some(HostCmd::Create) => {
@@ -315,7 +334,7 @@ async fn drive(
                         let wants_mouse = term.is_mouse_tracking();
                         term.set_scroll(scroll);
                         let base = term.scrollback_rows().saturating_sub(scroll);
-                        let _ = ev_tx.send(UiEvent::Frame { host: id, snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
+                        let _ = ev_tx.send(UiEvent::Frame { host: id, name: attached.clone().unwrap_or_default(), snap: Box::new(term.render_snapshot()), session_wants_mouse: wants_mouse, base });
                     }
                 }
                 Some(HostCmd::Shutdown) | None => {
