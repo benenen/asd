@@ -5,6 +5,8 @@
 
 use asd_proto::SessionInfo;
 
+use crate::settings::SshAuth;
+
 /// Stable identifier for a host. `0` is always the local daemon.
 pub type HostId = u64;
 
@@ -26,34 +28,15 @@ pub struct RemoteSpec {
     pub user: String,
     pub host: String,
     pub port: u16,
+    /// How to authenticate (password / key). Carried through from the saved
+    /// [`crate::settings::SshConnection`] so [`crate::ssh`] can use it.
+    pub auth: SshAuth,
+    /// The saved connection's display name, shown in the sidebar. May be empty
+    /// (older hosts), in which case the short host name is shown instead.
+    pub name: String,
 }
 
 impl RemoteSpec {
-    /// Parse `user@host`, `user@host:port`, or `host` (user defaults to the
-    /// current login, port to 22). Returns `None` if the host part is empty.
-    pub fn parse(input: &str, default_user: &str) -> Option<Self> {
-        let input = input.trim();
-        if input.is_empty() {
-            return None;
-        }
-        let (user, rest) = match input.split_once('@') {
-            Some((u, r)) if !u.is_empty() => (u.to_string(), r),
-            _ => (default_user.to_string(), input),
-        };
-        let (host, port) = match rest.rsplit_once(':') {
-            Some((h, p)) => (h, p.parse().ok()?),
-            None => (rest, 22u16),
-        };
-        if host.is_empty() {
-            return None;
-        }
-        Some(Self {
-            user,
-            host: host.to_string(),
-            port,
-        })
-    }
-
     /// `user@host`, hiding the port when it is the default.
     pub fn label(&self) -> String {
         if self.port == 22 {
@@ -92,10 +75,12 @@ impl Host {
         matches!(self.kind, HostKind::Ssh(_))
     }
 
-    /// Group-header label: `local`, or the remote's short host name.
+    /// Group-header label: `local`, the saved connection's name, or (when it has
+    /// none) the remote's short host name.
     pub fn label(&self) -> String {
         match &self.kind {
             HostKind::Local => "local".to_string(),
+            HostKind::Ssh(spec) if !spec.name.trim().is_empty() => spec.name.clone(),
             HostKind::Ssh(spec) => spec.short_host().to_string(),
         }
     }
@@ -143,12 +128,23 @@ impl Model {
 
     /// Add a remote host (or return the existing one with the same spec).
     /// Returns the host id.
+    /// Whether a remote host with this address (user@host:port) is already in
+    /// the list. Ignores auth/name so re-adding the same host is caught even if
+    /// its saved credentials or label were edited.
+    pub fn has_remote(&self, user: &str, host: &str, port: u16) -> bool {
+        self.hosts.iter().any(|h| {
+            matches!(&h.kind, HostKind::Ssh(s)
+                if s.user == user && s.host == host && s.port == port)
+        })
+    }
+
     pub fn add_remote(&mut self, spec: RemoteSpec) -> HostId {
-        if let Some(h) = self
-            .hosts
-            .iter()
-            .find(|h| h.kind == HostKind::Ssh(spec.clone()))
-        {
+        // Dedup by address, not the whole spec: the same host must not be added
+        // twice even if the saved auth or display name differs.
+        if let Some(h) = self.hosts.iter().find(|h| {
+            matches!(&h.kind, HostKind::Ssh(s)
+                if s.user == spec.user && s.host == spec.host && s.port == spec.port)
+        }) {
             return h.id;
         }
         let id = self.next_id;
@@ -277,42 +273,29 @@ mod tests {
         assert!(long.ends_with('…'));
     }
 
-    #[test]
-    fn remote_spec_parses_forms() {
-        assert_eq!(
-            RemoteSpec::parse("deploy@gpu-01.lab", "me"),
-            Some(RemoteSpec {
-                user: "deploy".into(),
-                host: "gpu-01.lab".into(),
-                port: 22
-            })
-        );
-        assert_eq!(
-            RemoteSpec::parse("edge-7:2200", "me"),
-            Some(RemoteSpec {
-                user: "me".into(),
-                host: "edge-7".into(),
-                port: 2200
-            })
-        );
-        assert_eq!(RemoteSpec::parse("  ", "me"), None);
-        // A bad port is rejected rather than silently defaulting.
-        assert_eq!(RemoteSpec::parse("host:notaport", "me"), None);
+    fn spec(user: &str, host: &str, port: u16) -> RemoteSpec {
+        RemoteSpec {
+            user: user.into(),
+            host: host.into(),
+            port,
+            auth: SshAuth::default(),
+            name: String::new(),
+        }
     }
 
     #[test]
     fn remote_spec_labels_hide_default_port() {
-        let s = RemoteSpec::parse("deploy@gpu-01.lab", "me").unwrap();
+        let s = spec("deploy", "gpu-01.lab", 22);
         assert_eq!(s.label(), "deploy@gpu-01.lab");
         assert_eq!(s.short_host(), "gpu-01");
-        let s = RemoteSpec::parse("deploy@edge-7:2200", "me").unwrap();
+        let s = spec("deploy", "edge-7", 2200);
         assert_eq!(s.label(), "deploy@edge-7:2200");
     }
 
     #[test]
     fn add_remote_is_idempotent_per_spec() {
         let mut m = Model::with_local();
-        let spec = RemoteSpec::parse("a@b", "me").unwrap();
+        let spec = spec("me", "b", 22);
         let id1 = m.add_remote(spec.clone());
         let id2 = m.add_remote(spec);
         assert_eq!(id1, id2);

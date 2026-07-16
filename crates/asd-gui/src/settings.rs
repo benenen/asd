@@ -26,10 +26,65 @@ pub struct SshConnection {
     pub user: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// How to authenticate to this host. Defaults to key-based so existing
+    /// configs (written before this field existed) keep working.
+    #[serde(default)]
+    pub auth: SshAuth,
 }
 
 fn default_port() -> u16 {
     22
+}
+
+/// How a saved connection authenticates. `Password` stores the password inline;
+/// `Key` names a private-key file (empty path = try the default `~/.ssh` keys),
+/// with an optional passphrase.
+///
+/// Note: secrets are persisted in the local config file (`config.json`) in
+/// plain text — same trust model as `~/.ssh` on a single-user machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum SshAuth {
+    Password {
+        password: String,
+    },
+    Key {
+        key_path: String,
+        passphrase: String,
+    },
+}
+
+impl Default for SshAuth {
+    fn default() -> Self {
+        Self::Key {
+            key_path: String::new(),
+            passphrase: String::new(),
+        }
+    }
+}
+
+impl SshAuth {
+    fn kind(&self) -> AuthKind {
+        match self {
+            Self::Password { .. } => AuthKind::Password,
+            Self::Key { .. } => AuthKind::Key,
+        }
+    }
+
+    /// One-word tag for the connection list ("password" / "key").
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Password { .. } => "password",
+            Self::Key { .. } => "key",
+        }
+    }
+}
+
+/// The two authentication choices offered in the form's segmented toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    Password,
+    Key,
 }
 
 impl SshConnection {
@@ -87,6 +142,10 @@ pub struct SshForm {
     pub host: String,
     pub user: String,
     pub port: String,
+    pub auth_kind: AuthKind,
+    pub password: String,
+    pub key_path: String,
+    pub passphrase: String,
 }
 
 impl Default for SshForm {
@@ -97,25 +156,72 @@ impl Default for SshForm {
             host: String::new(),
             user: String::new(),
             port: String::from("22"),
+            auth_kind: AuthKind::Key,
+            password: String::new(),
+            key_path: String::new(),
+            passphrase: String::new(),
         }
     }
 }
 
 impl SshForm {
     pub(crate) fn from_conn(c: &SshConnection, i: usize) -> Self {
+        let (password, key_path, passphrase) = match &c.auth {
+            SshAuth::Password { password } => (password.clone(), String::new(), String::new()),
+            SshAuth::Key {
+                key_path,
+                passphrase,
+            } => (String::new(), key_path.clone(), passphrase.clone()),
+        };
         Self {
             index: Some(i),
             name: c.name.clone(),
             host: c.host.clone(),
             user: c.user.clone(),
             port: c.port.to_string(),
+            auth_kind: c.auth.kind(),
+            password,
+            key_path,
+            passphrase,
         }
     }
 
+    /// The first reason the form can't be saved, phrased for the user, or
+    /// `None` when it is valid. Drives both the disabled Save button and the
+    /// inline hint.
+    pub(crate) fn invalid_reason(&self) -> Option<&'static str> {
+        if self.name.trim().is_empty() {
+            return Some("Name is required.");
+        }
+        if self.host.trim().is_empty() {
+            return Some("Host is required.");
+        }
+        if self.user.trim().is_empty() {
+            return Some("User is required.");
+        }
+        if self.port.trim().parse::<u16>().is_err() {
+            return Some("Port must be a number (1–65535).");
+        }
+        if self.auth_kind == AuthKind::Password && self.password.is_empty() {
+            return Some("Password is required.");
+        }
+        None
+    }
+
     pub(crate) fn valid(&self) -> bool {
-        !self.host.trim().is_empty()
-            && !self.user.trim().is_empty()
-            && self.port.trim().parse::<u16>().is_ok()
+        self.invalid_reason().is_none()
+    }
+
+    fn auth(&self) -> SshAuth {
+        match self.auth_kind {
+            AuthKind::Password => SshAuth::Password {
+                password: self.password.clone(),
+            },
+            AuthKind::Key => SshAuth::Key {
+                key_path: self.key_path.trim().to_string(),
+                passphrase: self.passphrase.clone(),
+            },
+        }
     }
 
     // Borrows rather than consumes (the form stays editable), despite the name.
@@ -124,16 +230,12 @@ impl SshForm {
         if !self.valid() {
             return None;
         }
-        let name = if self.name.trim().is_empty() {
-            format!("{}@{}", self.user.trim(), self.host.trim())
-        } else {
-            self.name.trim().to_string()
-        };
         Some(SshConnection {
-            name,
+            name: self.name.trim().to_string(),
             host: self.host.trim().to_string(),
             user: self.user.trim().to_string(),
             port: self.port.trim().parse().unwrap_or(22),
+            auth: self.auth(),
         })
     }
 }
@@ -153,6 +255,10 @@ pub enum SettingsMsg {
     FormHost(String),
     FormUser(String),
     FormPort(String),
+    FormAuthKind(AuthKind),
+    FormPassword(String),
+    FormKeyPath(String),
+    FormPassphrase(String),
 }
 
 // ── layout constants ──────────────────────────────────────────────────
@@ -256,29 +362,31 @@ fn nav_item<'a>(
         None
     };
 
-    let label_col = text(label).size(13).font(mono());
-    let item = if is_active {
-        row![
-            container(text(""))
-                .width(Length::Fixed(3.0))
-                .height(Length::Fill)
-                .style(move |_: &Theme| container::Style {
-                    background: Some(Background::Color(LOCAL)),
-                    border: Border {
-                        radius: 2.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }),
-            label_col,
-        ]
-    } else {
-        row![container(text("")).width(Length::Fixed(3.0)), label_col,]
-    };
+    // A full-height 3px rail — colored only when active — is present on every
+    // item so the label is vertically centered whether or not it is selected
+    // (a Fill-height child lets `align_y(Center)` work; without it an inactive
+    // item's row shrinks to the text and sits at the top).
+    let rail = container(text(""))
+        .width(Length::Fixed(3.0))
+        .height(Length::Fill)
+        .style(move |_: &Theme| container::Style {
+            background: is_active.then_some(Background::Color(LOCAL)),
+            border: Border {
+                radius: 2.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    let item = row![rail, text(label).size(13).font(mono())]
+        .spacing(10)
+        .align_y(Vertical::Center);
 
-    button(item.spacing(10).align_y(Vertical::Center))
+    // Fixed height: the accent rail is `height(Fill)`, which would otherwise
+    // stretch the item to consume the whole nav column.
+    button(item)
         .width(Length::Fill)
-        .padding(pad2(9.0, 20.0))
+        .height(Length::Fixed(38.0))
+        .padding(pad2(0.0, 20.0))
         .on_press(SettingsMsg::Nav(page))
         .style(move |_: &Theme, status| button::Style {
             background: if is_active {
@@ -347,10 +455,10 @@ fn connections_page<'a>(
     form: &'a Option<SshForm>,
 ) -> Element<'a, SettingsMsg> {
     let add_btn: Element<'a, SettingsMsg> =
-        button(text("+ Add").size(12).font(bold()).color(LOCAL))
+        button(text("+ Add").size(12).font(bold()).color(REMOTE))
             .padding(pad2(5.0, 12.0))
             .on_press(SettingsMsg::AddConnection)
-            .style(move |_: &Theme, status| btn_outline(LOCAL, status))
+            .style(move |_: &Theme, status| btn_outline(REMOTE, status))
             .into();
 
     let title = row![
@@ -432,9 +540,14 @@ fn connection_row<'a>(index: usize, conn: &'a SshConnection) -> Element<'a, Sett
     .spacing(6);
 
     button(
-        row![dot, info.width(Length::Fill), actions]
-            .spacing(10)
-            .align_y(Vertical::Center),
+        row![
+            dot,
+            info.width(Length::Fill),
+            auth_pill(conn.auth.tag()),
+            actions
+        ]
+        .spacing(10)
+        .align_y(Vertical::Center),
     )
     .width(Length::Fill)
     .padding(pad2(8.0, 12.0))
@@ -448,94 +561,255 @@ fn connection_form<'a>(
 ) -> Element<'a, SettingsMsg> {
     let is_edit = form.index.is_some();
     let heading = if is_edit {
-        "Edit Connection"
+        "Edit connection"
     } else {
-        "New Connection"
+        "New connection"
     };
 
-    let lbl = form_field("Name", &form.name, SettingsMsg::FormName, "My GPU Server");
-    let hst = form_field(
-        "Host",
-        &form.host,
-        SettingsMsg::FormHost,
-        "gpu-01.example.com",
-    );
-    let usr = form_field("User", &form.user, SettingsMsg::FormUser, "your-username");
-    let prt = form_field("Port", &form.port, SettingsMsg::FormPort, "22");
+    // Identity: Name (required), Host + Port on one row, User.
+    let host_port = row![
+        container(field(
+            "Host",
+            &form.host,
+            SettingsMsg::FormHost,
+            "gpu-01.example.com",
+            true,
+            false,
+        ))
+        .width(Length::Fill),
+        container(field(
+            "Port",
+            &form.port,
+            SettingsMsg::FormPort,
+            "22",
+            false,
+            false,
+        ))
+        .width(Length::Fixed(96.0)),
+    ]
+    .spacing(12);
 
-    let valid = form.valid()
-        && !connections.iter().enumerate().any(|(i, c)| {
-            if form.index == Some(i) {
-                return false;
-            }
-            c.host == form.host.trim()
-                && c.user == form.user.trim()
-                && c.port.to_string() == form.port.trim()
-        });
+    // Authentication: segmented toggle + method-specific fields.
+    let auth_fields: Element<'a, SettingsMsg> = match form.auth_kind {
+        AuthKind::Password => field(
+            "Password",
+            &form.password,
+            SettingsMsg::FormPassword,
+            "required",
+            true,
+            true,
+        ),
+        AuthKind::Key => column![
+            field(
+                "Private key",
+                &form.key_path,
+                SettingsMsg::FormKeyPath,
+                "~/.ssh/id_ed25519   ·   blank = default keys",
+                false,
+                false,
+            ),
+            field(
+                "Passphrase",
+                &form.passphrase,
+                SettingsMsg::FormPassphrase,
+                "optional",
+                false,
+                true,
+            ),
+        ]
+        .spacing(12)
+        .into(),
+    };
+
+    let auth = column![
+        section_label("AUTHENTICATION"),
+        auth_toggle(form.auth_kind),
+        auth_fields,
+    ]
+    .spacing(10);
+
+    let fields = column![
+        field(
+            "Name",
+            &form.name,
+            SettingsMsg::FormName,
+            "My GPU server",
+            true,
+            false,
+        ),
+        host_port,
+        field(
+            "User",
+            &form.user,
+            SettingsMsg::FormUser,
+            "root",
+            true,
+            false,
+        ),
+        divider(),
+        auth,
+    ]
+    .spacing(14);
+
+    // Validation: field-level reason first, then the duplicate-host check.
+    let dup = connections.iter().enumerate().any(|(i, c)| {
+        form.index != Some(i)
+            && c.host == form.host.trim()
+            && c.user == form.user.trim()
+            && c.port.to_string() == form.port.trim()
+    });
+    let reason: Option<&str> = form
+        .invalid_reason()
+        .or(dup.then_some("A connection to this host already exists."));
+    let valid = reason.is_none();
+
+    let save: Element<'a, SettingsMsg> = if valid {
+        button(text("Save").size(12).font(bold()).color(SCREEN))
+            .padding(pad2(6.0, 18.0))
+            .on_press(SettingsMsg::SaveConnection)
+            .style(move |_: &Theme, status| btn_filled(REMOTE, status))
+            .into()
+    } else {
+        button(text("Save").size(12).font(bold()).color(DIM))
+            .padding(pad2(6.0, 18.0))
+            .style(move |_: &Theme, _| btn_filled(DIM, button::Status::Active))
+            .into()
+    };
+
+    let hint: Element<'a, SettingsMsg> = match reason {
+        Some(r) => text(r).size(11).font(mono()).color(MUTED).into(),
+        None => text("").into(),
+    };
 
     let actions = row![
+        hint,
+        spacer(),
         button(text("Cancel").size(12).font(mono()).color(MUTED))
             .padding(pad2(6.0, 14.0))
             .on_press(SettingsMsg::CancelEdit)
             .style(move |_: &Theme, status| btn_outline(MUTED, status)),
-        if valid {
-            let b: Element<'a, SettingsMsg> =
-                button(text("Save").size(12).font(bold()).color(SCREEN))
-                    .padding(pad2(6.0, 16.0))
-                    .on_press(SettingsMsg::SaveConnection)
-                    .style(move |_: &Theme, status| btn_filled(LOCAL, status))
-                    .into();
-            b
-        } else {
-            let b: Element<'a, SettingsMsg> = button(text("Save").size(12).font(bold()).color(DIM))
-                .padding(pad2(6.0, 16.0))
-                .style(move |_: &Theme, _| btn_filled(DIM, button::Status::Active))
-                .into();
-            b
-        },
+        save,
     ]
-    .spacing(10);
+    .spacing(10)
+    .align_y(Vertical::Center);
 
     container(
         column![
             text(heading).size(14).font(bold()).color(BRIGHT),
-            column![lbl, hst, usr, prt].spacing(12),
+            scrollable(fields).height(Length::Fill),
             actions,
         ]
-        .spacing(16),
+        .spacing(14),
     )
-    .padding(pad2(16.0, 0.0))
+    .height(Length::Fill)
+    .padding(pad2(4.0, 0.0))
     .into()
 }
 
-fn form_field<'a>(
+/// A labeled text field. `required` adds a cyan asterisk; `secure` masks input.
+fn field<'a>(
     label: &'a str,
     value: &'a str,
     msg: fn(String) -> SettingsMsg,
     placeholder: &'a str,
+    required: bool,
+    secure: bool,
 ) -> Element<'a, SettingsMsg> {
+    let mut head = row![text(label).size(11).font(mono()).color(MUTED)].spacing(3);
+    if required {
+        head = head.push(text("*").size(11).font(bold()).color(REMOTE));
+    }
     column![
-        text(label).size(11).font(mono()).color(MUTED),
+        head.align_y(Vertical::Center),
         text_input(placeholder, value)
             .on_input(msg)
+            .secure(secure)
             .font(mono())
             .size(13)
             .padding(pad2(8.0, 10.0))
-            .style(|_, _| text_input::Style {
-                background: Background::Color(PANEL),
-                border: Border {
-                    color: LINE_SOFT,
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                icon: DIM,
-                placeholder: DIM,
-                value: TEXT,
-                selection: theme::tint(LOCAL, 0.3),
-            }),
+            .style(field_style),
     ]
     .spacing(4)
     .into()
+}
+
+/// Text-input styling: cyan focus ring, matching the remote accent.
+fn field_style(_: &Theme, status: text_input::Status) -> text_input::Style {
+    let focused = matches!(status, text_input::Status::Focused { .. });
+    text_input::Style {
+        background: Background::Color(PANEL),
+        border: Border {
+            color: if focused { REMOTE } else { LINE_SOFT },
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        icon: DIM,
+        placeholder: DIM,
+        value: TEXT,
+        selection: theme::tint(REMOTE, 0.3),
+    }
+}
+
+/// An uppercase eyebrow label for a form section.
+fn section_label(s: &'static str) -> Element<'static, SettingsMsg> {
+    text(s).size(10).font(bold()).color(DIM).into()
+}
+
+/// A 1px hairline separating form sections.
+fn divider() -> Element<'static, SettingsMsg> {
+    container(Space::new().height(Length::Fixed(1.0)).width(Length::Fill))
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(LINE_SOFT)),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// The Password | Key segmented toggle. The active segment is filled with the
+/// remote (cyan) accent to match the rest of the connection UI.
+fn auth_toggle(active: AuthKind) -> Element<'static, SettingsMsg> {
+    row![
+        seg_btn("Password", AuthKind::Password, active),
+        seg_btn("Key", AuthKind::Key, active),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn seg_btn(label: &'static str, kind: AuthKind, active: AuthKind) -> Element<'static, SettingsMsg> {
+    let is = kind == active;
+    button(
+        text(label)
+            .size(12)
+            .font(if is { bold() } else { mono() })
+            .color(if is { SCREEN } else { MUTED }),
+    )
+    .padding(pad2(6.0, 16.0))
+    .on_press(SettingsMsg::FormAuthKind(kind))
+    .style(move |_: &Theme, status| {
+        if is {
+            btn_filled(REMOTE, status)
+        } else {
+            btn_outline(MUTED, status)
+        }
+    })
+    .into()
+}
+
+/// Small pill showing a saved connection's auth method ("key" / "password").
+fn auth_pill(tag: &'static str) -> Element<'static, SettingsMsg> {
+    container(text(tag).size(9).font(mono()).color(REMOTE))
+        .padding(pad2(1.0, 6.0))
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(theme::tint(REMOTE, 0.1))),
+            border: Border {
+                color: theme::tint(REMOTE, 0.35),
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 // ── small icon button ─────────────────────────────────────────────────

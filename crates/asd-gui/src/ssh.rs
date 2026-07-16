@@ -7,10 +7,11 @@
 //! stdio. The channel's [`AsyncRead`]+[`AsyncWrite`] stream then speaks the
 //! normal asd protocol, exactly like a local `UnixStream`.
 //!
-//! Auth (this pass): ssh-agent first, then unencrypted default key files. Host
-//! keys are checked against `~/.ssh/known_hosts` and unknown/changed keys are
-//! rejected. Password / passphrase / 2FA prompts are a follow-up (they need a
-//! modal in the UI).
+//! Auth follows the saved connection's [`SshAuth`]: a stored password, an
+//! explicit private-key file (with optional passphrase), or — when no key path
+//! is set — the unencrypted default `~/.ssh` keys. Host keys are checked against
+//! `~/.ssh/known_hosts` and unknown/changed keys are rejected. ssh-agent and
+//! 2FA prompts are still a follow-up.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use russh::keys::{PrivateKeyWithHashAlg, PublicKey, load_secret_key};
 
 use crate::conn::{BoxRead, BoxWrite};
 use crate::model::RemoteSpec;
+use crate::settings::SshAuth;
 
 /// The command run on the remote: proxy its daemon socket to our channel.
 const REMOTE_CMD: &str = "asd attach --stdio";
@@ -37,7 +39,7 @@ pub async fn open(spec: &RemoteSpec) -> anyhow::Result<(BoxRead, BoxWrite)> {
         .await
         .with_context(|| format!("ssh connect {}:{}", spec.host, spec.port))?;
 
-    authenticate(&mut handle, &spec.user)
+    authenticate(&mut handle, spec)
         .await
         .with_context(|| format!("ssh auth as {}@{}", spec.user, spec.host))?;
 
@@ -80,12 +82,46 @@ impl client::Handler for HostKeyVerifier {
     }
 }
 
-/// Authenticate with the first accepted unencrypted default key file.
-///
-/// This pass supports only on-disk keys with no passphrase; ssh-agent and
-/// passphrase/2FA prompts are a follow-up (they need agent-identity plumbing
-/// and a UI modal respectively).
+/// Authenticate according to the connection's [`SshAuth`].
 async fn authenticate(
+    handle: &mut client::Handle<HostKeyVerifier>,
+    spec: &RemoteSpec,
+) -> anyhow::Result<()> {
+    let user = &spec.user;
+    match &spec.auth {
+        SshAuth::Password { password } => {
+            let res = handle
+                .authenticate_password(user.clone(), password.clone())
+                .await?;
+            if res.success() {
+                Ok(())
+            } else {
+                Err(anyhow!("password authentication rejected"))
+            }
+        }
+        // An explicit key file (optionally passphrase-protected).
+        SshAuth::Key {
+            key_path,
+            passphrase,
+        } if !key_path.trim().is_empty() => {
+            let pass = (!passphrase.is_empty()).then_some(passphrase.as_str());
+            let key = load_secret_key(key_path.trim(), pass)
+                .with_context(|| format!("loading private key {}", key_path.trim()))?;
+            let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+            let res = handle.authenticate_publickey(user, key).await?;
+            if res.success() {
+                Ok(())
+            } else {
+                Err(anyhow!("key authentication rejected"))
+            }
+        }
+        // No explicit key path: fall back to the default `~/.ssh` keys.
+        SshAuth::Key { .. } => authenticate_default_keys(handle, user).await,
+    }
+}
+
+/// Try each unencrypted default key file in turn (the pre-config behavior).
+async fn authenticate_default_keys(
     handle: &mut client::Handle<HostKeyVerifier>,
     user: &str,
 ) -> anyhow::Result<()> {
@@ -109,7 +145,7 @@ async fn authenticate(
         }
     }
     Err(anyhow!(
-        "no usable key in ~/.ssh (id_ed25519/id_ecdsa/id_rsa); passphrase-protected keys and ssh-agent are not yet supported"
+        "no usable key in ~/.ssh (id_ed25519/id_ecdsa/id_rsa); set a password or key file for this connection, or add a default key"
     ))
 }
 

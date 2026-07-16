@@ -17,16 +17,6 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
     }
 }
 
-/// Same, with an explicit alpha in `0.0..=1.0`.
-const fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color {
-    Color {
-        r: r as f32 / 255.0,
-        g: g as f32 / 255.0,
-        b: b as f32 / 255.0,
-        a,
-    }
-}
-
 // Grounds.
 pub const VOID: Color = rgb(0x0E, 0x11, 0x16); // app frame
 pub const PANEL: Color = rgb(0x14, 0x18, 0x1F); // sidebar
@@ -66,6 +56,3 @@ pub fn tint(c: Color, a: f32) -> Color {
 /// The keycap fill used by the `a s d` wordmark.
 pub const KEYCAP: Color = rgb(0x1B, 0x22, 0x2C);
 pub const KEYCAP_EDGE: Color = rgb(0x2B, 0x35, 0x42);
-
-/// Dashed-border color for the "connect remote" affordance at rest.
-pub const DASH: Color = rgba(0x2C, 0x35, 0x42, 1.0);

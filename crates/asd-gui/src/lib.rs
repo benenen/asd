@@ -168,7 +168,9 @@ pub(crate) struct App {
     pub(crate) live_cols: u16,
     pub(crate) live_rows: u16,
     pub(crate) window: Size,
-    pub(crate) remote_input: String,
+    /// Whether the "add a saved SSH connection" menu (opened by the `+` next to
+    /// the HOSTS header) is showing.
+    pub(crate) connect_menu_open: bool,
     pub(crate) now_ms: u64,
     /// Scrollback offset: 0 = following live output.
     pub(crate) scroll: usize,
@@ -216,8 +218,12 @@ pub(crate) enum Message {
     NewSession(HostId),
     Kill(HostId, String),
     RemoveHost(HostId),
-    RemoteInput(String),
-    RemoteSubmit,
+    /// Toggle the "add saved SSH connection" menu next to the HOSTS header.
+    ToggleConnectMenu,
+    /// Connect the saved SSH connection at this index in `saved_ssh`.
+    ConnectSaved(usize),
+    /// Open the settings panel on the Connections page (to configure a host).
+    OpenConnections,
     /// Restart every host connection (the local daemon can't be auto-spawned
     /// from here, so this is how the user recovers after starting it).
     Reconnect,
@@ -260,7 +266,7 @@ impl App {
                 live_cols,
                 live_rows,
                 window,
-                remote_input: String::new(),
+                connect_menu_open: false,
                 now_ms: now_ms(),
                 sup_tx: None,
                 generation: 0,
@@ -424,14 +430,30 @@ impl App {
                     h.state = HostState::Connecting;
                 }
             }
-            Message::RemoteInput(s) => self.remote_input = s,
-            Message::RemoteSubmit => {
-                let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
-                if let Some(spec) = RemoteSpec::parse(&self.remote_input, &user) {
+            Message::ToggleConnectMenu => self.connect_menu_open = !self.connect_menu_open,
+            Message::ConnectSaved(i) => {
+                self.connect_menu_open = false;
+                if let Some(conn) = self.saved_ssh.get(i) {
+                    // Ignore a click on a host that is already in the list (the
+                    // menu also disables it, but guard here too).
+                    if self.model.has_remote(&conn.user, &conn.host, conn.port) {
+                        return Task::none();
+                    }
+                    let spec = RemoteSpec {
+                        user: conn.user.clone(),
+                        host: conn.host.clone(),
+                        port: conn.port,
+                        auth: conn.auth.clone(),
+                        name: conn.name.clone(),
+                    };
                     let id = self.model.add_remote(spec.clone());
                     self.send(AppCmd::AddRemote { id, spec });
-                    self.remote_input.clear();
                 }
+            }
+            Message::OpenConnections => {
+                self.connect_menu_open = false;
+                self.show_settings = true;
+                self.settings_page = SettingsPage::Connections;
             }
             Message::Keyboard(iced::keyboard::Event::KeyPressed {
                 modified_key,
@@ -638,6 +660,26 @@ impl App {
                 SettingsMsg::FormPort(s) => {
                     if let Some(ref mut f) = self.settings_form {
                         f.port = s;
+                    }
+                }
+                SettingsMsg::FormAuthKind(k) => {
+                    if let Some(ref mut f) = self.settings_form {
+                        f.auth_kind = k;
+                    }
+                }
+                SettingsMsg::FormPassword(s) => {
+                    if let Some(ref mut f) = self.settings_form {
+                        f.password = s;
+                    }
+                }
+                SettingsMsg::FormKeyPath(s) => {
+                    if let Some(ref mut f) = self.settings_form {
+                        f.key_path = s;
+                    }
+                }
+                SettingsMsg::FormPassphrase(s) => {
+                    if let Some(ref mut f) = self.settings_form {
+                        f.passphrase = s;
                     }
                 }
             },

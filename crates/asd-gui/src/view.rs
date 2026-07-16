@@ -4,9 +4,7 @@
 //! SSH remote (see [`crate::theme`]).
 
 use iced::alignment::{Horizontal, Vertical};
-use iced::widget::{
-    Space, button, canvas, column, container, mouse_area, row, scrollable, text, text_input,
-};
+use iced::widget::{Space, button, canvas, column, container, mouse_area, row, scrollable, text};
 use iced::{Background, Border, Color, Element, Font, Length, Padding};
 
 use crate::ime::TermIme;
@@ -85,18 +83,18 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     for host in &m.hosts {
         groups = groups.push(host_group(host, m, app.now_ms));
     }
-    groups = groups.push(connect_remote(&app.remote_input));
 
     let list = scrollable(groups).height(Length::Fill);
 
-    let inner = column![
-        container(brand).padding(pad2(16.0, 16.0)),
-        label("HOSTS"),
-        list,
-        hline(theme::LINE),
-        sidebar_foot(m),
-    ]
-    .height(Length::Fill);
+    let mut inner = column![container(brand).padding(pad2(16.0, 16.0)), hosts_header(),];
+    if app.connect_menu_open {
+        inner = inner.push(connect_menu(&app.saved_ssh, &app.model));
+    }
+    let inner = inner
+        .push(list)
+        .push(hline(theme::LINE))
+        .push(sidebar_foot(m))
+        .height(Length::Fill);
 
     container(inner)
         .width(Length::Fixed(SIDEBAR_W))
@@ -185,10 +183,38 @@ fn host_head(host: &Host) -> Element<'_, Message> {
         line = line.push(icon_button("×", Message::RemoveHost(host.id), theme::DIM));
     }
 
-    container(line)
-        .width(Length::Fill)
-        .padding(pad2(7.0, 8.0))
-        .into()
+    let head = container(line).width(Length::Fill).padding(pad2(7.0, 8.0));
+
+    // When a host is offline, show *why* on a second line (SSH auth, host-key,
+    // or reachability) — "offline" alone gives the user nothing to act on.
+    if let HostState::Down(reason) = &host.state
+        && !reason.trim().is_empty()
+    {
+        return column![
+            head,
+            container(
+                text(short_reason(reason))
+                    .size(9)
+                    .font(mono())
+                    .color(theme::tint(theme::ALERT, 0.85)),
+            )
+            .padding(pad(0.0, 8.0, 5.0, 26.0)),
+        ]
+        .into();
+    }
+    head.into()
+}
+
+/// First line of an error, collapsed and truncated for the compact sidebar.
+fn short_reason(reason: &str) -> String {
+    let one = reason.lines().next().unwrap_or(reason).trim();
+    if one.chars().count() > 52 {
+        let mut s: String = one.chars().take(51).collect();
+        s.push('…');
+        s
+    } else {
+        one.to_string()
+    }
 }
 
 fn session_row<'a>(
@@ -241,28 +267,119 @@ fn session_row<'a>(
     .into()
 }
 
-fn connect_remote(input: &str) -> Element<'_, Message> {
-    let field = text_input("user@host  ↵ connect", input)
-        .on_input(Message::RemoteInput)
-        .on_submit(Message::RemoteSubmit)
-        .font(mono())
-        .size(12)
-        .padding(pad2(7.0, 9.0))
-        .style(|_, _| text_input::Style {
-            background: Background::Color(theme::SCREEN),
-            border: Border {
-                color: theme::DASH,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            icon: theme::DIM,
-            placeholder: theme::DIM,
-            value: theme::REMOTE,
-            selection: theme::tint(theme::REMOTE, 0.3),
-        });
-    container(row![text("+").size(13).color(theme::REMOTE), field].spacing(8))
-        .padding(pad2(6.0, 16.0))
+/// The "HOSTS" section header with a `+` that opens the saved-connection menu.
+fn hosts_header() -> Element<'static, Message> {
+    container(
+        row![
+            text("HOSTS").size(10).font(mono()).color(theme::DIM),
+            spacer(),
+            icon_button("+", Message::ToggleConnectMenu, theme::REMOTE),
+        ]
+        .align_y(Vertical::Center),
+    )
+    .padding(pad(12.0, 10.0, 6.0, 16.0))
+    .into()
+}
+
+/// Drop-down list of saved SSH connections (from Settings → Connections).
+/// Clicking one connects it; the footer opens Settings to add/manage.
+fn connect_menu<'a>(
+    saved: &'a [crate::settings::SshConnection],
+    model: &Model,
+) -> Element<'a, Message> {
+    let mut col = column![].spacing(1);
+    if saved.is_empty() {
+        col = col.push(
+            container(
+                text("No saved connections")
+                    .size(11)
+                    .font(mono())
+                    .color(theme::DIM),
+            )
+            .padding(pad2(6.0, 10.0)),
+        );
+    } else {
+        for (i, c) in saved.iter().enumerate() {
+            let added = model.has_remote(&c.user, &c.host, c.port);
+            col = col.push(connect_menu_item(i, c, added));
+        }
+    }
+    col = col.push(connect_menu_manage());
+    container(col)
+        .width(Length::Fill)
+        .padding(pad(2.0, 10.0, 6.0, 10.0))
+        .style(|_| panel(theme::SCREEN))
         .into()
+}
+
+/// One saved connection in the `+` menu. When it is already in the host list,
+/// the row is disabled (no press) and tagged "added" so it can't be re-added.
+fn connect_menu_item(
+    i: usize,
+    c: &crate::settings::SshConnection,
+    added: bool,
+) -> Element<'_, Message> {
+    let title = if c.name.trim().is_empty() {
+        c.label()
+    } else {
+        c.name.clone()
+    };
+    let info = column![
+        text(title)
+            .size(12)
+            .font(bold())
+            .color(if added { theme::DIM } else { theme::TEXT }),
+        text(c.label()).size(10).font(mono()).color(theme::DIM),
+    ]
+    .spacing(1);
+
+    let mut content = row![info.width(Length::Fill)]
+        .spacing(8)
+        .align_y(Vertical::Center);
+    if added {
+        content = content.push(text("added").size(10).font(mono()).color(theme::MUTED));
+    }
+
+    let mut b = button(content)
+        .width(Length::Fill)
+        .padding(pad2(6.0, 10.0))
+        .style(menu_item_style);
+    if !added {
+        b = b.on_press(Message::ConnectSaved(i));
+    }
+    b.into()
+}
+
+fn connect_menu_manage() -> Element<'static, Message> {
+    button(
+        row![
+            text("+").size(12).color(theme::REMOTE),
+            text("Manage connections…")
+                .size(11)
+                .font(mono())
+                .color(theme::MUTED),
+        ]
+        .spacing(8)
+        .align_y(Vertical::Center),
+    )
+    .width(Length::Fill)
+    .padding(pad2(6.0, 10.0))
+    .on_press(Message::OpenConnections)
+    .style(menu_item_style)
+    .into()
+}
+
+/// Quiet row button that tints on hover (saved-connection menu entries).
+fn menu_item_style(_: &iced::Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+            .then_some(Background::Color(theme::HOVER)),
+        border: Border {
+            radius: 6.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 fn sidebar_foot(m: &Model) -> Element<'_, Message> {
@@ -421,8 +538,6 @@ fn status_bar(app: &App) -> Element<'_, Message> {
         sep(),
         hint("×", "kill"),
         sep(),
-        hint("user@host", "add remote"),
-        sep(),
         settings_btn(),
     ]
     .spacing(10)
@@ -514,12 +629,6 @@ fn host_chip(label: String, accent: Color) -> Element<'static, Message> {
         ..Default::default()
     })
     .into()
-}
-
-fn label(s: &str) -> Element<'_, Message> {
-    container(text(s).size(10).font(mono()).color(theme::DIM))
-        .padding(pad(12.0, 16.0, 6.0, 16.0))
-        .into()
 }
 
 /// A small glyph button (new / kill / disconnect), quiet until hovered.
