@@ -11,21 +11,19 @@ permissions:
 jobs:
   build:
     name: ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Full binary (CLI + daemon + GUI), built natively.
+          # Full binary (CLI + daemon + GUI), built natively on each arch. aarch64
+          # uses a native arm64 runner rather than a cross container: the cross
+          # image is ubuntu 16.04 (glibc 2.23 / git 2.7), too old to build the
+          # vendored ghostty via zig (`copy_file_range` needs glibc 2.27+).
           - target: x86_64-unknown-linux-gnu
-            use_cross: false
-            build_flags: ""
-            kind: full
-          # ARM64: CLI + daemon only — wgpu can't be cross-compiled here cheaply.
+            os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
-            use_cross: true
-            build_flags: "--no-default-features --features local"
-            kind: cli
+            os: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -33,41 +31,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Native build: Zig on the runner. Cross build: Zig is installed in the
-      # container by Cross.toml instead.
-      - name: Install Zig (native)
-        if: ${{ !matrix.use_cross }}
+      - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
-      - name: Install cross
-        if: ${{ matrix.use_cross }}
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
-      - name: Build (native)
-        if: ${{ !matrix.use_cross }}
-        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.build_flags }}
-
-      - name: Build (cross)
-        if: ${{ matrix.use_cross }}
-        run: cross build --release --locked --target ${{ matrix.target }} ${{ matrix.build_flags }}
+      - name: Build (full)
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         id: pkg
         env:
           TARGET: ${{ matrix.target }}
-          KIND: ${{ matrix.kind }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           version="${REF_NAME#v}"
           [ "$version" = "$REF_NAME" ] && version="$(git rev-parse --short HEAD)"
-          # Tag the ARM64 archive as cli-only so it's clear it has no GUI.
-          suffix=""
-          [ "$KIND" = "cli" ] && suffix="-cli"
-          name="asd-${version}-${TARGET}${suffix}"
+          name="asd-${version}-${TARGET}"
           stage="$(mktemp -d)/${name}"
           mkdir -p "$stage"
           cp "target/${TARGET}/release/asd" "$stage/"
@@ -155,11 +135,18 @@ jobs:
   # toolchain. Zig builds the vendored ghostty for each `-Dtarget`.
   macos:
     name: ${{ matrix.target }}
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+        include:
+          # Native per-arch runners so zig never cross-compiles ghostty (the
+          # `<arch>-macos-none` cross target didn't link libSystem): arm64 on
+          # macos-14, Intel on macos-13.
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
     steps:
       - uses: actions/checkout@v4
 
