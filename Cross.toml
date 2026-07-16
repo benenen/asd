@@ -6,14 +6,18 @@
 # so Zig goes into the container; build.rs passes `-Dtarget` for the cross build.
 
 [build.env]
-# Reach the network through a host proxy when one is set (empty/harmless in CI).
 passthrough = [
+    # Reach the network through a host proxy when one is set (empty/harmless in CI).
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "http_proxy",
     "https_proxy",
     "ALL_PROXY",
     "all_proxy",
+    # HOME is `/` in the cross container, so zig's global cache defaults to
+    # `/.cache/zig` → "AccessDenied" when building the vendored ghostty. Point it
+    # at a writable dir. (Set to a fixed value, not forwarded from the host.)
+    "ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache",
 ]
 
 [target.aarch64-unknown-linux-gnu]

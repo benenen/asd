@@ -173,7 +173,12 @@ jobs:
           version: 0.15.2
 
       - name: Build (full)
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        # Zig needs the macOS SDK to resolve libSystem (posix_memalign, sigaction,
+        # waitpid, …) when building the vendored ghostty; point it at the SDK
+        # explicitly so the link doesn't fail with "undefined symbol".
+        run: |
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         id: pkg

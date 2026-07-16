@@ -11,7 +11,6 @@
 //! and a remote russh `ChannelStream` (see [`crate::ssh`]). Only plain `Send`
 //! data ([`UiEvent`]) leaves the thread.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, PROTO_VERSION, code};
@@ -139,14 +138,23 @@ pub fn run_host(
     });
 }
 
-/// Open the local daemon socket and box the halves.
+/// Open the local daemon socket and box the halves. Unix only: the local
+/// daemon speaks over a Unix socket (tokio has no `UnixStream` on Windows), and
+/// the Windows client is GUI-only with no bundled daemon — it reaches sessions
+/// through SSH remotes instead.
+#[cfg(unix)]
 async fn connect_local() -> anyhow::Result<(BoxRead, BoxWrite)> {
-    let socket: PathBuf = asd_proto::paths::socket_path();
+    let socket = asd_proto::paths::socket_path();
     let stream = tokio::net::UnixStream::connect(&socket)
         .await
         .map_err(|e| anyhow::anyhow!("connect {}: {e}", socket.display()))?;
     let (r, w) = tokio::io::split(stream);
     Ok((Box::new(r), Box::new(w)))
+}
+
+#[cfg(not(unix))]
+async fn connect_local() -> anyhow::Result<(BoxRead, BoxWrite)> {
+    anyhow::bail!("no local daemon on this platform — connect an SSH remote instead")
 }
 
 /// The per-host event loop. Returns `Err(reason)` if the connection ends
