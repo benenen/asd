@@ -86,6 +86,58 @@ impl VtBackend for GhosttyVt {
     }
 
     fn snapshot_vt(&mut self) -> Vec<u8> {
+        // Two layers, because scrollback fidelity and cursor fidelity conflict in
+        // a single dump: a whole-screen dump carries the scrollback but drops
+        // trailing blank rows, so re-feeding it shifts the active screen and the
+        // active-area cursor CUP lands a few rows too high; an active-area-only
+        // dump keeps the cursor right but throws the scrollback away.
+        //
+        //   1. Seed the whole buffer (scrollback + active) as *plain* scrolling
+        //      lines — this reconstructs the scrollback on the client for
+        //      scrolling back. Styling on these history rows is dropped (fine).
+        //   2. Redraw just the active screen with full styling/state on top; the
+        //      active-area selection reproduces it 1:1, so the cursor CUP below
+        //      lands on the right cell.
+        let (cols, rows) = self.cols_rows();
+        if cols == 0 || rows == 0 {
+            return Vec::new();
+        }
+        let scrollback = self.terminal.scrollback_rows().unwrap_or(0);
+        let total = scrollback + rows as usize;
+        let mut out = Vec::new();
+
+        // 1. Plain scrolling-line seed of every row (row 0 = oldest scrollback).
+        if let (Ok(s), Ok(e)) = (
+            self.terminal
+                .grid_ref(Point::Screen(PointCoordinate { x: 0, y: 0 })),
+            self.terminal.grid_ref(Point::Screen(PointCoordinate {
+                x: cols - 1,
+                y: total.saturating_sub(1) as u32,
+            })),
+        ) {
+            let sel = Selection::new(s, e, false);
+            let sopts = SelFormatOptions::new()
+                .with_selection(&sel)
+                .with_emit_format(Format::Plain)
+                .with_unwrap(false)
+                .with_trim(false);
+            if let Ok(Some(bytes)) = self.terminal.format_selection_alloc(None, sopts) {
+                let mut lines: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+                lines.truncate(total);
+                let n = lines.len();
+                for (i, line) in lines.iter().enumerate() {
+                    out.extend_from_slice(line);
+                    // No CRLF after the last row, so exactly `rows` rows remain on
+                    // screen and the earlier `total - rows` become scrollback.
+                    if i + 1 < n {
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+            }
+        }
+
+        // 2. Home, then a full-state redraw of the active screen on top.
+        out.extend_from_slice(b"\x1b[H");
         let opts = FormatterOptions::new()
             .with_format(Format::Vt)
             .with_unwrap(false)
@@ -102,60 +154,25 @@ impl VtBackend for GhosttyVt {
             .with_protection(true)
             .with_kitty_keyboard(true)
             .with_charsets(true);
-
-        // Restrict the dump to the *active area* (the live screen). The
-        // formatter's default is the whole screen, which includes scrollback
-        // rows and drops trailing blank rows; re-feeding that into a same-sized
-        // terminal scrolls the content so the active-area cursor CUP below lands
-        // a few rows too high (visible as a misplaced cursor in TUIs after the
-        // screen has scrolled). Selecting exactly the active area reproduces the
-        // screen 1:1 on the client, keeping the cursor row aligned with its cell.
-        let (cols, rows) = self.cols_rows();
-        let mut out = match (
+        if let (Ok(s), Ok(e)) = (
             self.terminal
                 .grid_ref(Point::Active(PointCoordinate { x: 0, y: 0 })),
             self.terminal.grid_ref(Point::Active(PointCoordinate {
-                x: cols.saturating_sub(1),
-                y: u32::from(rows.saturating_sub(1)),
+                x: cols - 1,
+                y: u32::from(rows - 1),
             })),
         ) {
-            (Ok(start), Ok(end)) if cols > 0 && rows > 0 => {
-                let selection = Selection::new(start, end, false);
-                let mut formatter = Formatter::new(&self.terminal, opts.with_selection(&selection))
-                    .expect("formatter allocation failed");
-                formatter
-                    .format_alloc(None)
-                    .expect("formatting terminal snapshot failed")
-                    .to_vec()
-            }
-            // Degenerate size: fall back to the default whole-screen dump.
-            _ => {
-                let opts = FormatterOptions::new()
-                    .with_format(Format::Vt)
-                    .with_unwrap(false)
-                    .with_trim(false)
-                    .with_palette(true)
-                    .with_modes(true)
-                    .with_scrolling_region(true)
-                    .with_tabstops(true)
-                    .with_keyboard(true)
-                    .with_cursor(true)
-                    .with_style(true)
-                    .with_hyperlink(true)
-                    .with_protection(true)
-                    .with_kitty_keyboard(true)
-                    .with_charsets(true);
-                let mut formatter =
-                    Formatter::new(&self.terminal, opts).expect("formatter allocation failed");
-                formatter
-                    .format_alloc(None)
-                    .expect("formatting terminal snapshot failed")
-                    .to_vec()
-            }
-        };
-        // The Formatter emits the tabstop/scrolling-region sequences after
-        // CUP, and those sequences move the cursor (CHA, DECSTBM homing), so
-        // an authoritative CUP must be appended at the end.
+            let sel = Selection::new(s, e, false);
+            let mut fmt = Formatter::new(&self.terminal, opts.with_selection(&sel))
+                .expect("formatter allocation failed");
+            out.extend_from_slice(
+                &fmt.format_alloc(None)
+                    .expect("formatting terminal snapshot failed"),
+            );
+        }
+
+        // 3. Authoritative cursor position — the formatter emits trailing
+        // tabstop/scrolling-region sequences that move the cursor (CHA, DECSTBM).
         let x = self.terminal.cursor_x().unwrap_or(0);
         let y = self.terminal.cursor_y().unwrap_or(0);
         out.extend_from_slice(format!("\x1b[{};{}H", y + 1, x + 1).as_bytes());

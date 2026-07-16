@@ -50,4 +50,13 @@ fn cursor_tracks_its_cell_after_snapshot_roundtrip_with_scrollback() {
         client_snap.cursor.position.map(|(_, y)| y as usize),
         origin_cursor
     );
+
+    // The snapshot must also carry the scrollback so the client can scroll back
+    // through pre-attach history (15 lines printed on an 8-row screen ⇒ ~7 rows
+    // of scrollback). Dumping the active area only would drop it.
+    assert!(
+        client.scrollback_rows() > 0,
+        "client must reconstruct scrollback from the snapshot, got {}",
+        client.scrollback_rows()
+    );
 }
