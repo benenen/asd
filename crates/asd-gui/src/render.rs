@@ -96,6 +96,27 @@ pub fn abs_row(base: usize, vpy: usize) -> usize {
     base + vpy
 }
 
+/// Approximate pixel height of one wheel "line" for [`ScrollDelta::Pixels`].
+const PX_PER_LINE: f32 = 19.6;
+
+/// Convert a mouse-wheel delta into a signed scrollback line count
+/// (positive = scroll up into history). Rounds **away from zero** so that any
+/// nonzero wheel motion moves at least one line: smooth-scroll sources — the
+/// xpra HTML5 client, trackpads, hi-res wheels — deliver sub-line `Pixels`
+/// deltas (and some deliver fractional `Lines`) that a plain `as i32`
+/// truncation drops to 0, making the terminal feel unscrollable.
+pub fn wheel_lines(delta: mouse::ScrollDelta) -> i32 {
+    let raw = match delta {
+        mouse::ScrollDelta::Lines { y, .. } => y,
+        mouse::ScrollDelta::Pixels { y, .. } => y / PX_PER_LINE,
+    };
+    if raw > 0.0 {
+        raw.ceil() as i32
+    } else {
+        raw.floor() as i32
+    }
+}
+
 /// Canvas program that paints the current frame, highlights the active
 /// selection, and emits messages for mouse wheel / drag events.
 pub struct TermCanvas<'a> {
@@ -204,7 +225,7 @@ fn paint(
                 } else {
                     Metrics::narrow_font()
                 };
-                let font = styled_font(base, &cell.flags);
+                let font = styled_font(base, &cell.flags, cell.grapheme.is_ascii());
 
                 // Faint (dim) text: reduce opacity (skip when selected).
                 let fg = if !selected && cell.flags.faint {
@@ -248,14 +269,20 @@ fn paint(
 }
 
 /// Apply bold/italic weight to a base font.
-fn styled_font(base: Font, flags: &StyleFlags) -> Font {
+/// Apply bold/italic to the base font. `ascii` gates *both* synthetic bold and
+/// italic: the monospace face has bold/italic cuts, but fallback faces (CJK,
+/// symbols, emoji) frequently don't, and cosmic-text renders a *missing*
+/// bold/italic face as a tofu box rather than falling back to the regular cut.
+/// So a bold or italic non-ASCII cell (e.g. CJK in a bold-italic `###` heading)
+/// is drawn at regular weight/style — visibly correct beats an empty box.
+fn styled_font(base: Font, flags: &StyleFlags, ascii: bool) -> Font {
     Font {
-        weight: if flags.bold {
+        weight: if flags.bold && ascii {
             Weight::Bold
         } else {
             base.weight
         },
-        style: if flags.italic {
+        style: if flags.italic && ascii {
             Style::Italic
         } else {
             base.style
@@ -327,7 +354,7 @@ fn paint_cursor(frame: &mut Frame, snap: &RenderSnapshot, m: Metrics, fg: Color,
         } else {
             Metrics::narrow_font()
         };
-        let font = styled_font(base, &cell.flags);
+        let font = styled_font(base, &cell.flags, cell.grapheme.is_ascii());
         frame.fill_text(glyph(&cell.grapheme, px, py, bg, m, font));
     }
 }
@@ -339,10 +366,26 @@ fn glyph(content: &str, px: f32, py: f32, color: Color, m: Metrics, font: Font) 
         color,
         size: m.font_size.into(),
         font,
-        // Basic shaping: no kerning, no ligatures — each grapheme is placed on
-        // its own fixed cell, so complex shaping must not shift or merge them.
-        shaping: Shaping::Basic,
+        shaping: shaping_for(content),
         ..Text::default()
+    }
+}
+
+/// Pick the text-shaping strategy for a single cell's grapheme.
+///
+/// `Basic` is fast but does **no font fallback** — a glyph missing from the
+/// monospace face renders as a tofu box (`□`). That is fine for plain ASCII
+/// (which the face always covers) and keeps the fixed grid untouched, but it
+/// hides icons, powerline/box-drawing symbols, CJK, and emoji. For any
+/// non-ASCII grapheme use `Advanced`, which enables cosmic-text's font
+/// fallback so those glyphs are drawn from another installed font. Each cell is
+/// its own `fill_text` at a fixed position, so advanced shaping can't shift or
+/// merge neighbouring cells.
+fn shaping_for(content: &str) -> Shaping {
+    if content.is_ascii() {
+        Shaping::Basic
+    } else {
+        Shaping::Advanced
     }
 }
 
@@ -448,5 +491,85 @@ mod tests {
         assert_eq!(viewport_row(anchor, 38, 24), Some(5));
         // The old (buggy) `scroll + vpy` scheme would have moved the highlight
         // the *wrong* way; here the projection is purely `abs - base`.
+    }
+
+    // ── scroll: any nonzero wheel delta moves at least one line ──
+
+    #[test]
+    fn wheel_lines_discrete_notches_pass_through() {
+        // A normal mouse wheel (one line per notch) is unchanged.
+        assert_eq!(wheel_lines(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 }), 1);
+        assert_eq!(
+            wheel_lines(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+            -1
+        );
+        assert_eq!(wheel_lines(mouse::ScrollDelta::Lines { x: 0.0, y: 3.0 }), 3);
+    }
+
+    #[test]
+    fn wheel_lines_sub_line_deltas_still_scroll_one_line() {
+        // The bug: xpra HTML5 / trackpads send sub-line deltas that a plain
+        // truncation drops to 0. Round away from zero so they move one line.
+        assert_eq!(
+            wheel_lines(mouse::ScrollDelta::Pixels { x: 0.0, y: 6.0 }),
+            1
+        );
+        assert_eq!(
+            wheel_lines(mouse::ScrollDelta::Pixels { x: 0.0, y: -6.0 }),
+            -1
+        );
+        // Fractional line deltas too.
+        assert_eq!(wheel_lines(mouse::ScrollDelta::Lines { x: 0.0, y: 0.2 }), 1);
+        assert_eq!(
+            wheel_lines(mouse::ScrollDelta::Lines { x: 0.0, y: -0.2 }),
+            -1
+        );
+    }
+
+    #[test]
+    fn wheel_lines_zero_stays_zero() {
+        assert_eq!(
+            wheel_lines(mouse::ScrollDelta::Pixels { x: 0.0, y: 0.0 }),
+            0
+        );
+        assert_eq!(wheel_lines(mouse::ScrollDelta::Lines { x: 5.0, y: 0.0 }), 0);
+    }
+
+    #[test]
+    fn wheel_lines_large_pixel_deltas_scale_proportionally() {
+        // A big pixel delta still scales toward more lines (not clamped to 1).
+        let n = wheel_lines(mouse::ScrollDelta::Pixels { x: 0.0, y: 60.0 });
+        assert!(n >= 3, "expected several lines for a large delta, got {n}");
+    }
+
+    // ── icons: non-ASCII graphemes get font fallback, ASCII stays fast ──
+
+    #[test]
+    fn shaping_ascii_is_basic_non_ascii_is_advanced() {
+        assert!(matches!(shaping_for("a"), Shaping::Basic));
+        assert!(matches!(shaping_for("~"), Shaping::Basic));
+        // Powerline / box-drawing / CJK / emoji all need fallback.
+        assert!(matches!(shaping_for("\u{e0b0}"), Shaping::Advanced)); // powerline
+        assert!(matches!(shaping_for("│"), Shaping::Advanced)); // box-drawing
+        assert!(matches!(shaping_for("中"), Shaping::Advanced)); // CJK
+        assert!(matches!(shaping_for("✓"), Shaping::Advanced)); // symbol
+    }
+
+    #[test]
+    fn synthetic_bold_italic_only_for_ascii() {
+        let flags = StyleFlags {
+            bold: true,
+            italic: true,
+            ..StyleFlags::default()
+        };
+        // ASCII: keep bold+italic (the monospace face has those cuts).
+        let a = styled_font(Font::MONOSPACE, &flags, true);
+        assert_eq!(a.weight, Weight::Bold);
+        assert_eq!(a.style, Style::Italic);
+        // Non-ASCII (CJK, symbols): drop both, else the fallback face's missing
+        // bold/italic variant renders as a tofu box.
+        let n = styled_font(Font::MONOSPACE, &flags, false);
+        assert_eq!(n.weight, Font::MONOSPACE.weight);
+        assert_eq!(n.style, Font::MONOSPACE.style);
     }
 }

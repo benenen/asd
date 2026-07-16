@@ -50,6 +50,12 @@ pub fn run(session: Option<String>) -> iced::Result {
         .subscription(App::subscription)
         .title(App::title)
         .antialiasing(true)
+        // Bundled symbol fallback: the monospace face lacks media/technical
+        // glyphs (e.g. U+23F5 ⏵, arrows, misc symbols), and many systems — the
+        // Windows client especially — have no font that covers them, so those
+        // cells would render as tofu boxes. Loading Noto Sans Symbols 2 into the
+        // font DB gives cosmic-text something to fall back to on every platform.
+        .font(include_bytes!("../fonts/NotoSansSymbols2-Regular.ttf").as_slice())
         // Keep the startup size in sync with App::new's initial grid estimate.
         .window_size(iced::Size::new(960.0, 600.0))
         .run()
@@ -428,7 +434,7 @@ impl App {
                 }
             }
             Message::Keyboard(iced::keyboard::Event::KeyPressed {
-                key,
+                modified_key,
                 modifiers,
                 text,
                 ..
@@ -440,8 +446,12 @@ impl App {
                         self.send(AppCmd::Scroll(0));
                     }
                     self.selection = None;
-                    // First try the key mapping (named keys, ASCII chars).
-                    if let Some(ev) = key::map_key(&key, modifiers) {
+                    // Use `modified_key` (Shift/CapsLock/AltGr applied, Ctrl
+                    // excluded) rather than the bare `key`: the base key is
+                    // case- and layout-unshifted, so `Shift+a` would send `a`
+                    // and `Shift+1` would send `1` instead of `!`. Ctrl is kept
+                    // in `modifiers` so Ctrl+C still encodes as ^C.
+                    if let Some(ev) = key::map_key(&modified_key, modifiers) {
                         self.send(AppCmd::Key(ev));
                     } else if let Some(t) = text {
                         // IME-committed text (e.g. CJK characters) arrives as
@@ -492,13 +502,13 @@ impl App {
                 }
             }
             Message::MousePress => {
-                // When session wants the mouse (vim/htop) and we're at the
-                // live bottom, don't start a local selection — the session
-                // should receive the mouse events instead.
-                // TODO: forward mouse to session when session_wants_mouse.
-                if self.session_wants_mouse && self.scroll == 0 {
-                    return Task::none();
-                }
+                // Drag always starts a local selection, even when the session
+                // has mouse tracking on (vim/htop/claude/codex). Forwarding the
+                // mouse *to* the session isn't implemented yet, so guarding it
+                // off just made those (very common) sessions unselectable — a
+                // plain click makes a zero-width selection that copies nothing,
+                // so this costs nothing until mouse-forwarding lands (which can
+                // then gate on a modifier, e.g. Shift to select / bare to send).
                 if self.model.active.is_some()
                     && let Some((px, py)) = self.last_mouse_pos
                 {

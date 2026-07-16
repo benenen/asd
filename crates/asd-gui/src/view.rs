@@ -321,13 +321,7 @@ fn terminal_pane(app: &App, sel: Option<crate::GuiSelection>, base: usize) -> El
             .height(Length::Fill);
 
             let mouse = mouse_area(term)
-                .on_scroll(|delta| {
-                    let lines = match delta {
-                        iced::mouse::ScrollDelta::Lines { y, .. } => y as i32,
-                        iced::mouse::ScrollDelta::Pixels { y, .. } => (y / 19.6) as i32,
-                    };
-                    Message::MouseScroll(lines)
-                })
+                .on_scroll(|delta| Message::MouseScroll(crate::render::wheel_lines(delta)))
                 .on_press(Message::MousePress)
                 .on_release(Message::MouseRelease)
                 .on_move(Message::MouseMove);
@@ -401,6 +395,7 @@ fn term_head(app: &App) -> Element<'_, Message> {
     container(line)
         .width(Length::Fill)
         .height(Length::Fixed(TERMHEAD_H))
+        .align_y(Vertical::Center)
         .padding(pad2(0.0, 14.0))
         .style(|_| panel(theme::HEAD))
         .into()
