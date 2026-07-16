@@ -102,12 +102,57 @@ impl VtBackend for GhosttyVt {
             .with_protection(true)
             .with_kitty_keyboard(true)
             .with_charsets(true);
-        let mut formatter =
-            Formatter::new(&self.terminal, opts).expect("formatter allocation failed");
-        let mut out = formatter
-            .format_alloc(None)
-            .expect("formatting terminal snapshot failed")
-            .to_vec();
+
+        // Restrict the dump to the *active area* (the live screen). The
+        // formatter's default is the whole screen, which includes scrollback
+        // rows and drops trailing blank rows; re-feeding that into a same-sized
+        // terminal scrolls the content so the active-area cursor CUP below lands
+        // a few rows too high (visible as a misplaced cursor in TUIs after the
+        // screen has scrolled). Selecting exactly the active area reproduces the
+        // screen 1:1 on the client, keeping the cursor row aligned with its cell.
+        let (cols, rows) = self.cols_rows();
+        let mut out = match (
+            self.terminal
+                .grid_ref(Point::Active(PointCoordinate { x: 0, y: 0 })),
+            self.terminal.grid_ref(Point::Active(PointCoordinate {
+                x: cols.saturating_sub(1),
+                y: u32::from(rows.saturating_sub(1)),
+            })),
+        ) {
+            (Ok(start), Ok(end)) if cols > 0 && rows > 0 => {
+                let selection = Selection::new(start, end, false);
+                let mut formatter = Formatter::new(&self.terminal, opts.with_selection(&selection))
+                    .expect("formatter allocation failed");
+                formatter
+                    .format_alloc(None)
+                    .expect("formatting terminal snapshot failed")
+                    .to_vec()
+            }
+            // Degenerate size: fall back to the default whole-screen dump.
+            _ => {
+                let opts = FormatterOptions::new()
+                    .with_format(Format::Vt)
+                    .with_unwrap(false)
+                    .with_trim(false)
+                    .with_palette(true)
+                    .with_modes(true)
+                    .with_scrolling_region(true)
+                    .with_tabstops(true)
+                    .with_keyboard(true)
+                    .with_cursor(true)
+                    .with_style(true)
+                    .with_hyperlink(true)
+                    .with_protection(true)
+                    .with_kitty_keyboard(true)
+                    .with_charsets(true);
+                let mut formatter =
+                    Formatter::new(&self.terminal, opts).expect("formatter allocation failed");
+                formatter
+                    .format_alloc(None)
+                    .expect("formatting terminal snapshot failed")
+                    .to_vec()
+            }
+        };
         // The Formatter emits the tabstop/scrolling-region sequences after
         // CUP, and those sequences move the cursor (CHA, DECSTBM homing), so
         // an authoritative CUP must be appended at the end.
