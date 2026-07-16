@@ -112,9 +112,12 @@ start() {
 
   echo "starting xpra on ${DISP}..."
   # --start (not --start-child) so the server stays up even if the GUI exits.
+  # --clipboard both directions so a copy inside the GUI (which writes the
+  # server-side clipboard) reaches the viewing client's clipboard.
   xpra start "$DISP" \
     --start="$ASD gui $SESSION" \
     --bind-tcp="0.0.0.0:${PORT}" --html=on --daemon=yes --sharing=yes \
+    --clipboard=yes --clipboard-direction=both \
     --env="ASD_SOCKET=${SOCKET}" \
     --env="WGPU_BACKEND=${WGPU_BACKEND}" \
     ${VK_ICD:+--env="VK_ICD_FILENAMES=${VK_ICD}"} \
