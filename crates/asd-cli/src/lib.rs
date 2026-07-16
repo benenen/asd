@@ -47,7 +47,9 @@ enum Cmd {
     Kill { name: String },
     /// Attach to a session (detach key: Ctrl-\)
     Attach {
-        name: String,
+        /// Session name; not used (and not required) with --stdio
+        #[arg(required_unless_present = "stdio")]
+        name: Option<String>,
         /// Self-heal: start the daemon (setsid) if absent; create the session if missing
         #[arg(short = 'A', long)]
         auto: bool,
@@ -170,6 +172,8 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                 }
                 return attach::run_stdio_proxy(&socket).await;
             }
+            // clap enforces NAME unless --stdio, so this cannot fail here.
+            let name = name.expect("NAME is required without --stdio");
 
             let mut c = if auto {
                 client::connect_or_spawn(&socket, ClientKind::Cli).await?
