@@ -110,6 +110,13 @@ pub(crate) struct App {
 
     /// Session named on the command line, consumed by the first auto-select.
     preferred: Option<String>,
+    /// The previous session's last frame, shown while a switch converges so
+    /// the pane never flashes black (double buffering across attaches).
+    cache: Option<RenderSnapshot>,
+    /// Keep showing `cache` until this deadline; set generously at select
+    /// time and tightened once the new Snapshot has been fed and the size
+    /// jiggle sent (the convergence window).
+    pane_hold: Option<std::time::Instant>,
     /// Sidebar row effects (tachyonfx), keyed by session name: sweep-in on
     /// newly listed sessions, a brief accent fade on selection.
     row_fx: Vec<(String, tachyonfx::Effect)>,
@@ -167,6 +174,8 @@ fn event_loop(
         prefix: false,
         now_ms: now_ms(),
         preferred,
+        cache: None,
+        pane_hold: None,
         row_fx: Vec::new(),
         last_frame: std::time::Instant::now(),
         dirty: true,
@@ -180,9 +189,10 @@ fn event_loop(
         if app.dirty {
             app.now_ms = now_ms();
             terminal.draw(|f| ui::draw(f, &mut app))?;
-            // Effects animate frame-by-frame: stay dirty until they finish
-            // (the input poll below caps the frame rate at ~33 fps).
-            app.dirty = !app.row_fx.is_empty();
+            // Effects animate frame-by-frame, and a pane hold must expire on
+            // time: stay dirty while either is pending (the input poll below
+            // caps the frame rate at ~33 fps).
+            app.dirty = !app.row_fx.is_empty() || app.pane_hold.is_some();
         }
         if event::poll(Duration::from_millis(30))? {
             match event::read()? {
@@ -257,6 +267,18 @@ impl App {
     /// entered the alternate screen), and a stale offset would leave the
     /// scroll indicator lying about a view that is actually live.
     pub fn snapshot(&mut self) -> Option<RenderSnapshot> {
+        // Across a switch, keep the previous frame up until the new session
+        // has converged (snapshot fed + repaint jiggle done).
+        if let Some(deadline) = self.pane_hold {
+            if std::time::Instant::now() < deadline {
+                if self.cache.is_some() {
+                    return self.cache.clone();
+                }
+            } else {
+                self.pane_hold = None;
+                self.cache = None;
+            }
+        }
         if let Some(vt) = &mut self.vt {
             self.scroll = self.scroll.min(vt.scrollback_rows());
         }
@@ -281,6 +303,13 @@ impl App {
             return;
         }
         self.active = Some(name.clone());
+        // Hold the old session's last frame on screen while the new attach
+        // converges — never draw the empty terminal (a black flash).
+        self.cache = self.vt.as_mut().map(|vt| {
+            vt.set_scroll(0);
+            vt.render_snapshot()
+        });
+        self.pane_hold = Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
         self.vt = Some(GhosttyVt::new(self.grid.0, self.grid.1, SCROLLBACK));
         self.scroll = 0;
         self.sel = None;
@@ -416,6 +445,12 @@ impl App {
                             rows: rows - 1,
                         });
                         self.send(Cmd::Resize { cols, rows });
+                    }
+                    // The dump is in and the repaint requested: swap to the
+                    // live view as soon as the app has had time to redraw.
+                    if self.pane_hold.is_some() {
+                        self.pane_hold =
+                            Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
                     }
                 }
             }
