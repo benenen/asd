@@ -474,14 +474,41 @@ fn color(c: Rgb) -> Color {
     Color::Rgb(c.r, c.g, c.b)
 }
 
+/// Display width of a single char in terminal cells (CJK/wide = 2, control = 0).
+fn ch_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Display width of a string in terminal cells.
+fn str_width(s: &str) -> usize {
+    s.chars().map(ch_width).sum()
+}
+
+/// Truncate `s` to a **display-column** budget `max` (not a char count), so a
+/// row's text never overruns the columns after it (e.g. the age box). If it
+/// doesn't fit, whole characters are dropped — never splitting a wide (CJK)
+/// glyph — and a `…` (1 col) is appended, keeping the result's width `<= max`.
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
-        t.push('…');
-        t
-    } else {
-        s.to_string()
+    if str_width(s) <= max {
+        return s.to_string();
     }
+    if max == 0 {
+        return String::new();
+    }
+    // Reserve one column for the ellipsis; add whole chars while they fit.
+    let budget = max - 1;
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = ch_width(c);
+        if w + cw > budget {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
 }
 
 /// Compact a session's command for the sidebar (same rules as the GUIs): a
@@ -515,6 +542,49 @@ pub fn short_age(created_ms: u64, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_respects_display_width() {
+        // Fits → unchanged.
+        assert_eq!(truncate("abc", 5), "abc");
+        assert_eq!(truncate("abc", 3), "abc");
+        // ASCII overflow → ellipsis, width within budget.
+        let t = truncate("abcdef", 4);
+        assert_eq!(t, "abc…");
+        assert_eq!(str_width(&t), 4);
+        // CJK glyphs are 2 columns each (char count alone would under-measure).
+        assert_eq!(str_width("中文"), 4);
+        // A wide glyph is never split; result stays within the column budget.
+        for max in 1..=8 {
+            let t = truncate("中文标题", max);
+            assert!(str_width(&t) <= max, "width {} <= {max}", str_width(&t));
+        }
+        assert!(truncate("中文标题", 5).ends_with('…'));
+        assert_eq!(truncate("中", 2), "中"); // exact fit, no ellipsis
+        // Degenerate budgets.
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("abc", 1), "…");
+    }
+
+    #[test]
+    fn long_title_never_overlaps_the_age_box() {
+        // Mirror draw_sidebar's line-2 budget for a 28-wide sidebar.
+        let area_w: u16 = 28;
+        let age = "13h";
+        let inner_w = (area_w - 1) as usize;
+        let budget = inner_w.saturating_sub(ROW_TEXT_X as usize + str_width(age) + 2);
+        let title = "远端一个非常非常长的会话标题名字啊啊啊啊";
+        let shown = truncate(title, budget);
+        // The text (starting at ROW_TEXT_X) ends strictly before the age box.
+        let text_end = ROW_TEXT_X as usize + str_width(&shown);
+        let age_start = (area_w as usize) - 2 - str_width(age);
+        assert!(
+            text_end < age_start,
+            "text_end {text_end} < age_start {age_start}"
+        );
+        assert!(shown.ends_with('…'));
+        assert!(str_width(&shown) <= budget);
+    }
 
     #[test]
     fn jump_index_maps_1_9_and_ignores_others() {

@@ -14,5 +14,8 @@ asd-proto = { workspace = true }
 asd-vt = { workspace = true }
 ratatui = { workspace = true }
 tachyonfx = "0.25"
+# Display-width-aware truncation for sidebar rows (CJK glyphs are 2 cols); the
+# same crate ratatui already uses to lay out cells.
+unicode-width = "0.2"
 tokio = { workspace = true }
 tracing = { workspace = true }
