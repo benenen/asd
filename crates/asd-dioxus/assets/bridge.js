@@ -8,6 +8,11 @@
 //   binding, so the newest live channel always carries the traffic.
 // Rust → JS: window.__asdWrite(data) / window.__asdReset(), called through
 //   wry's evaluate_script (the Dioxus eval bridge is broken Rust→JS too).
+//
+// Self-healing: the terminal is built by a function so it can be recreated
+// if the WASM side ever dies (e.g. after an output storm) — repeated
+// __asdWrite failures dispose and rebuild it, and Rust re-attaches the
+// active session when it sees the 'terminal recreated' status marker.
 (async function() {
   window.__asdSend = function(m) { try { dioxus.send(m); } catch (e) {} };
   var send = function(m) { window.__asdSend(m); };
@@ -83,9 +88,9 @@
   }
   if (!el) { log('FATAL: #terminal not found'); return; }
 
-  var term, fit;
-  try {
-    term = new window.GhosttyWeb.Terminal({
+  // Build (or rebuild) the terminal inside #terminal.
+  var buildTerm = function() {
+    var term = new window.GhosttyWeb.Terminal({
       fontSize: 14,
       fontFamily: "'JetBrains Mono', Menlo, Monaco, monospace",
       theme: {
@@ -99,7 +104,7 @@
       },
       allowTransparency: false, cursorBlink: true, cursorStyle: 'bar',
     });
-
+    var fit = null;
     if (window.GhosttyWeb.FitAddon) {
       try {
         fit = new window.GhosttyWeb.FitAddon();
@@ -109,7 +114,6 @@
         log('fit addon unavailable: ' + String(e));
       }
     }
-
     term.open(el);
 
     // JS → Rust: keystrokes and size. Registered before the first fit() so
@@ -129,35 +133,78 @@
     doFit();
     // Report the initial grid even if fit() did not change it (no onResize).
     send({ type: 'resize', cols: term.cols, rows: term.rows });
+    window.__asdDoFit = doFit;
+    return term;
+  };
+
+  var recreateTerm = function() {
+    log('recreating terminal');
+    try {
+      if (window.__asdTerm && typeof window.__asdTerm.dispose === 'function') {
+        window.__asdTerm.dispose();
+      }
+    } catch (e) { /* already broken — that's why we're here */ }
+    el.innerHTML = '';
+    try {
+      window.__asdTerm = buildTerm();
+      window.__asdWriteErrors = 0;
+      // Rust re-attaches the active session on this marker (fresh Snapshot
+      // into the fresh terminal).
+      log('terminal recreated');
+    } catch (e) {
+      log('terminal recreate FAILED: ' + (e && e.message ? e.message : String(e)));
+    }
+  };
+
+  try {
+    window.__asdTerm = buildTerm();
+    window.__asdWriteErrors = 0;
 
     // Track the pane: debounce bursts of layout changes into one fit.
     var fitTimer = null;
     new ResizeObserver(function() {
       if (fitTimer) clearTimeout(fitTimer);
-      fitTimer = setTimeout(doFit, 50);
+      fitTimer = setTimeout(function() {
+        if (window.__asdDoFit) window.__asdDoFit();
+      }, 50);
     }).observe(el);
 
     // Rust → JS entry points (called via evaluate_script).
-    window.__asdTerm = term;
     window.__asdWrite = function(data) {
-      if (window.__asdTerm) { window.__asdTerm.write(data); }
+      if (!window.__asdTerm) return;
+      try {
+        window.__asdTerm.write(data);
+        window.__asdWriteErrors = 0;
+      } catch (e) {
+        window.__asdWriteErrors = (window.__asdWriteErrors || 0) + 1;
+        log('write error #' + window.__asdWriteErrors + ': '
+            + (e && e.message ? e.message : String(e)));
+        // A wedged WASM terminal never recovers on its own; rebuild it.
+        if (window.__asdWriteErrors >= 3) recreateTerm();
+      }
     };
     window.__asdReset = function() {
       if (!window.__asdTerm) return;
-      if (typeof window.__asdTerm.reset === 'function') {
-        window.__asdTerm.reset();
-      } else {
-        // RIS: full reset for terminals without an xterm-style reset().
-        window.__asdTerm.write('\x1bc');
+      try {
+        if (typeof window.__asdTerm.reset === 'function') {
+          window.__asdTerm.reset();
+        } else {
+          // RIS: full reset for terminals without an xterm-style reset().
+          window.__asdTerm.write('\x1bc');
+        }
+      } catch (e) {
+        log('reset error: ' + (e && e.message ? e.message : String(e)));
+        recreateTerm();
       }
     };
 
     el.addEventListener('mousedown', function() {
-      if (typeof term.focus === 'function') term.focus();
+      var t = window.__asdTerm;
+      if (t && typeof t.focus === 'function') t.focus();
     });
-    if (typeof term.focus === 'function') term.focus();
+    if (typeof window.__asdTerm.focus === 'function') window.__asdTerm.focus();
 
-    log('terminal ' + term.cols + 'x' + term.rows);
+    log('terminal ' + window.__asdTerm.cols + 'x' + window.__asdTerm.rows);
   } catch (e) {
     log('terminal FAILED: ' + (e && e.message ? e.message : String(e)));
     return;

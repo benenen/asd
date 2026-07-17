@@ -856,6 +856,17 @@ async fn supervisor(
                 match serde_json::from_value::<JsMessage>(val) {
                     Ok(JsMessage::Status { msg }) => {
                         tracing::info!("bridge: {msg}");
+                        // The JS side rebuilt a wedged terminal: re-attach the
+                        // active session so a fresh Snapshot repopulates it.
+                        if msg.contains("terminal recreated")
+                            && let Some((host, name)) = model.read().active.clone()
+                        {
+                            let (cols, rows) = *grid.read();
+                            route(
+                                AppCmd::SetActive { host, name, cols, rows },
+                                &ui_tx, &mut hosts, &mut kinds, &mut active,
+                            );
+                        }
                         if msg.contains("bridge ready") {
                             bridge_ready = true;
                             if let Some((host, name)) = pending_select.take() {
