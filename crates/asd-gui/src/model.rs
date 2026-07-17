@@ -252,6 +252,7 @@ mod tests {
         SessionInfo {
             name: name.to_string(),
             command: "sh".into(),
+            title: String::new(),
             created_ms,
             attached_clients: clients,
             cols: 80,

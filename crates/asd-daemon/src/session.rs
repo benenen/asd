@@ -151,6 +151,9 @@ pub struct SessionMeta {
     /// Raw fd of the pty master, for reading the foreground process group
     /// (`tcgetpgrp`). `-1` when unavailable. Read-only from the network side.
     pub pty_master_fd: AtomicI32,
+    /// The terminal title (OSC 0/2), exported by the session thread after each
+    /// output batch; the network side reads it for `SessionInfo`.
+    pub title: Mutex<String>,
 }
 
 impl SessionHandle {
@@ -160,9 +163,16 @@ impl SessionHandle {
         // resolved (session gone, or no /proc — e.g. non-Linux).
         let fd = self.meta.pty_master_fd.load(Ordering::Relaxed);
         let command = foreground_command(fd).unwrap_or_else(|| self.command.clone());
+        let title = self
+            .meta
+            .title
+            .lock()
+            .map(|t| t.clone())
+            .unwrap_or_default();
         asd_proto::SessionInfo {
             name: self.name.clone(),
             command,
+            title,
             created_ms: self.created_ms,
             attached_clients: self.meta.attached_clients.load(Ordering::Relaxed),
             cols: self.meta.cols.load(Ordering::Relaxed),
@@ -403,6 +413,7 @@ pub fn spawn_session(
         child_pid: AtomicU32::new(child_pid),
         alive: AtomicBool::new(true),
         pty_master_fd: AtomicI32::new(master_fd),
+        title: Mutex::new(String::new()),
     });
 
     let created_ms = std::time::SystemTime::now()
@@ -477,6 +488,14 @@ fn session_thread(
         match msg {
             SessionMsg::PtyOutput(bytes) => {
                 vt.feed(&bytes);
+                // Export the terminal title for the session list (cheap; only
+                // written when it actually changed).
+                let title = vt.title();
+                if let Ok(mut shared) = meta.title.lock()
+                    && *shared != title
+                {
+                    *shared = title;
+                }
                 // The terminal's replies to DA/DSR-style queries must be
                 // written back to the pty, otherwise capability probes in
                 // vim/htop hang

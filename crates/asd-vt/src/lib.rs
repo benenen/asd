@@ -85,6 +85,12 @@ pub trait VtBackend: Sized {
         false
     }
 
+    /// The terminal title as set by the program (OSC 0/2); empty when never
+    /// set. The default implementation returns empty.
+    fn title(&mut self) -> String {
+        String::new()
+    }
+
     /// The DEC private mode numbers the program currently has enabled among
     /// the mouse set — tracking level (9/1000/1002/1003) and encoding
     /// (1005/1006/1015/1016), ascending. Empty = no mouse (native selection is

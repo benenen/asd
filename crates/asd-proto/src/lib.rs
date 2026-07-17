@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 
 /// Per-frame cap: 4 MiB (postcard payload, excluding the 4-byte length prefix).
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -63,6 +63,10 @@ pub struct SessionInfo {
     /// command (the `Create` cmd or the default shell) when it can't be
     /// resolved. Display-only.
     pub command: String,
+    /// The terminal title as set by the session (OSC 0/2), e.g. a shell's
+    /// `user@host: dir` or an app's own status line. Empty when never set.
+    /// Display-only.
+    pub title: String,
     /// Creation time, Unix epoch milliseconds.
     pub created_ms: u64,
     pub attached_clients: u32,

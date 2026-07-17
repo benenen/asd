@@ -324,6 +324,12 @@ impl VtBackend for GhosttyVt {
         self.terminal.is_mouse_tracking().unwrap_or(false)
     }
 
+    fn title(&mut self) -> String {
+        // Copied out immediately: the borrow is only valid until the next
+        // `vt_write`.
+        self.terminal.title().unwrap_or_default().to_string()
+    }
+
     fn mouse_modes(&mut self) -> Vec<u16> {
         use libghostty_vt::terminal::Mode;
         // Ascending by mode number so the client's diff is deterministic.
