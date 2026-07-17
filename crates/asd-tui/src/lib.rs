@@ -130,11 +130,11 @@ pub(crate) struct App {
     /// Sidebar row effects (tachyonfx), keyed by session name: sweep-in on
     /// newly listed sessions, a brief accent fade on selection.
     row_fx: Vec<(String, tachyonfx::Effect)>,
-    /// A continuous breathing border for each *running* session (its `running`
-    /// flag is set — the agent is producing output), keyed by session name.
-    /// Added/dropped as the flag toggles; the UI's own host session is excluded
-    /// (it is always producing output — the TUI itself — so it would always
-    /// glow).
+    /// A continuous color shimmer for each *running* session's row text (its
+    /// `running` flag is set — the agent is producing output), keyed by session
+    /// name. Added/dropped as the flag toggles; the UI's own host session is
+    /// excluded (it always produces output — the TUI itself — so it would
+    /// always shimmer).
     running_fx: Vec<(String, tachyonfx::Effect)>,
     /// Previous frame instant, for effect timing.
     last_frame: std::time::Instant,
@@ -292,10 +292,11 @@ impl App {
         });
     }
 
-    /// Keep one breathing-border effect per running (non-self) session, then
-    /// advance each over its two sidebar rows. The border cells themselves are
-    /// drawn (in accent) by [`ui::draw_sidebar`]; the effect only pulses them,
-    /// via a `CellFilter::Outer` that limits it to the row's left+right edges.
+    /// Keep one color-shimmer effect per running (non-self) session, then
+    /// advance each over its two sidebar rows. The text is drawn (in accent)
+    /// by [`ui::draw_sidebar`]; the effect only rotates its hue, via a
+    /// `CellFilter::Text` limited to written cells. The right-edge rule column
+    /// is excluded from the processed area so the separator stays put.
     fn process_running_fx(
         &mut self,
         buf: &mut ratatui::buffer::Buffer,
@@ -314,7 +315,7 @@ impl App {
         self.running_fx.retain(|(n, _)| running.contains(n));
         for name in &running {
             if !self.running_fx.iter().any(|(n, _)| n == name) {
-                self.running_fx.push((name.clone(), breathing_border()));
+                self.running_fx.push((name.clone(), running_shimmer()));
             }
         }
         let sessions = &self.sessions;
@@ -326,11 +327,12 @@ impl App {
             if y + 1 >= side.bottom() {
                 continue;
             }
-            fx.process(
-                delta,
-                buf,
-                ratatui::layout::Rect::new(side.left(), y, side.width, 2),
-            );
+            // Shimmer only the interior text columns: skip the left edge (the
+            // activity dot / selection bar) and the right rule so neither the
+            // selection frame nor the separator gets hue-shifted.
+            let rect =
+                ratatui::layout::Rect::new(side.left() + 1, y, side.width.saturating_sub(2), 2);
+            fx.process(delta, buf, rect);
         }
     }
 
@@ -729,21 +731,21 @@ impl App {
     }
 }
 
-/// A slow looping "breathing" pulse for a running session's row border: the
-/// accent frame fades to a dim amber and back, forever. `CellFilter::Outer`
-/// limits it to the row rect's left+right edge columns, so only the border
-/// glyphs (drawn in accent by [`ui::draw_sidebar`]) pulse — the row's text is
-/// untouched.
-fn breathing_border() -> tachyonfx::Effect {
-    use ratatui::layout::Margin;
-    use ratatui::style::Color;
+/// A looping color shimmer for a running session's row: the text's hue rotates
+/// a full turn, forever, so the (saturated-accent) row text cycles through the
+/// rainbow. A left-to-right sweep pattern staggers the hue across columns, so
+/// the color travels along the text rather than changing everywhere at once.
+/// Foreground only — the background is never touched — and restricted to text
+/// cells (`CellFilter::Text`) so blank cells stay put. Linear timing keeps the
+/// rotation at a constant, non-strobing speed.
+fn running_shimmer() -> tachyonfx::Effect {
+    use tachyonfx::pattern::SweepPattern;
     use tachyonfx::{CellFilter, Interpolation, fx};
-    let dim = Color::Rgb(0x6B, 0x50, 0x25);
-    fx::repeating(fx::ping_pong(fx::fade_to_fg(
-        dim,
-        (900, Interpolation::SineInOut),
-    )))
-    .with_filter(CellFilter::Outer(Margin::new(1, 0)))
+    fx::repeating(
+        fx::hsl_shift_fg([360.0, 0.0, 0.0], (2000, Interpolation::Linear))
+            .with_pattern(SweepPattern::left_to_right(160)),
+    )
+    .with_filter(CellFilter::Text)
 }
 
 fn now_ms() -> u64 {

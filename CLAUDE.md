@@ -20,7 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | asd-vt | `VtBackend` trait + libghostty-vt 实现（逃生门边界） | GUI 框架、portable-pty、asd-proto |
 | asd-daemon（lib） | session 管理、UDS 服务 | GUI 框架（含传递依赖） |
 | asd-cli（**lib**，`pub fn run`） | 调试客户端、`attach --stdio` 代理、内嵌 daemon（`asd daemon`）；被根 bin 的 `local` feature 组合 | GUI 框架（GUI 启动器由 bin 注入） |
-| asd-tui（**lib**，`pub fn run`，ratatui） | `asd ui`：session 侧栏+实时终端面板的 TUI（对应 images/image.png），Ctrl+A 前缀切换/新建/杀 session，本地 vt 渲染（同 attach 客户端），OSC52 选区复制；被 asd-cli 依赖 | GUI 框架、portable-pty/进程管理；OSC52/base64 用共享的 `asd_vt::clip` |
+| asd-tui（**lib**，`pub fn run`，ratatui 0.30） | `asd ui`：session 侧栏+实时终端面板的 TUI（对应 images/image.png），Ctrl+A 前缀切换/新建/杀 session，本地 vt 渲染（同 attach 客户端），OSC52 选区复制；被 asd-cli 依赖。侧栏视觉（tachyonfx 0.25）：**running session 行文字彩色流光**（`running_shimmer`=`repeating(hsl_shift_fg([360,0,0]).with_pattern(SweepPattern::left_to_right(160)))`+`CellFilter::Text`，只转前景 hue、背景不动，行文字底色画成 accent 才有色可转；`SweepPattern`/`with_pattern` 要 tachyonfx≥0.22，但 0.22 起转 ratatui 0.30，所以整体升到 ratatui 0.30.2+tachyonfx 0.25）；**选中 session 行左右加 accent `│` 边框**；shimmer 处理区内缩 1 列避开边框与右分隔线 | GUI 框架、portable-pty/进程管理；OSC52/base64 用共享的 `asd_vt::clip` |
 | asd-dioxus（**lib**，`pub fn run`，Dioxus Desktop+ghostty-web） | GUI：host 分组侧栏/SSH remote/设置，渲染交给 webview 里的 ghostty-web（吃原始 PTY 字节，无 asd-vt）；被根 bin 的 `dioxus` feature（默认）组合 | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基）。**SSH 走纯 Rust `russh`（网络客户端，不 spawn 进程/不用 ssh.exe，不违反边界）**。JS 依赖由 npm+esbuild 打包（build.rs 驱动，见 crate README），产物 include_str! 内嵌保单二进制 |
 | asd（**根 package**，唯一 bin `asd`） | 组合上面的 lib 成单一可执行文件（feature `local`/`dioxus`）；除组合外无逻辑 | 直接依赖 GUI 框架或 portable-pty（应经由 feature 拉对应 lib，保持边界纯净） |
 

@@ -130,9 +130,14 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
         let dot = if s.attached_clients > 0 { "•" } else { " " };
         let name = truncate(&s.name, inner_w.saturating_sub(5));
         buf.set_string(area.left(), y, dot, row_bg.fg(ACCENT));
-        // The session hosting this UI is shown but not selectable: dim it.
+        // The session hosting this UI is shown but not selectable: dim it. A
+        // running session's text is drawn in the saturated accent so the hue
+        // shimmer (`App::process_running_fx`) has color to rotate — hue-shifting
+        // near-white text would barely change it.
         let name_style = if is_self {
             row_bg.fg(DIM)
+        } else if s.running {
+            row_bg.fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
             row_bg.fg(TEXT).add_modifier(Modifier::BOLD)
         };
@@ -148,18 +153,17 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
             s.title.trim().to_string()
         };
         let cmd = truncate(&label, cmd_w);
-        buf.set_string(area.left() + 2, y + 1, &cmd, row_bg.fg(MUTED));
+        let cmd_fg = if s.running && !is_self { ACCENT } else { MUTED };
+        buf.set_string(area.left() + 2, y + 1, &cmd, row_bg.fg(cmd_fg));
         buf.set_string(
             area.right() - 2 - age.len() as u16,
             y + 1,
             &age,
             row_bg.fg(DIM),
         );
-        // A running session (its agent is producing output) gets a side-frame:
-        // accent bars on the row's left and right edges. Drawn here as the base;
-        // `App::process_running_fx` breathes them. The UI's own host session is
-        // excluded — it always produces output, so it would always glow.
-        if s.running && !is_self {
+        // The selected session's row is framed with a vertical bar on each
+        // edge (left column and the right rule column).
+        if selected {
             for line in 0..2 {
                 buf.set_string(area.left(), y + line, "│", row_bg.fg(ACCENT));
                 buf.set_string(area.right() - 1, y + line, "│", Style::new().fg(ACCENT));
