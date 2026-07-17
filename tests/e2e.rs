@@ -768,6 +768,61 @@ async fn running_flag_tracks_activity() {
     );
 }
 
+/// v6 `inspect` dumps one session's metadata + live terminal state, as a
+/// labeled block or JSON; a missing session fails.
+#[tokio::test]
+async fn inspect_dumps_session_detail() {
+    let daemon = Daemon::start("inspect");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "insp"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let out = daemon.cli().args(["inspect", "insp"]).output().unwrap();
+    assert!(out.status.success(), "inspect failed: {out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Default create size, primary screen (a plain shell), and the labeled
+    // internals are all present.
+    assert!(text.contains("insp"), "text: {text}");
+    assert!(text.contains("80x24"), "text: {text}");
+    assert!(text.contains("primary"), "text: {text}");
+    assert!(text.contains("scrollback"), "text: {text}");
+    assert!(text.contains("cursor"), "text: {text}");
+
+    let out = daemon
+        .cli()
+        .args(["inspect", "insp", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "inspect --json failed: {out:?}");
+    let json = String::from_utf8_lossy(&out.stdout);
+    assert!(json.contains("\"session\":\"insp\""), "json: {json}");
+    assert!(json.contains("\"cols\":80"), "json: {json}");
+    assert!(json.contains("\"alt_screen\":false"), "json: {json}");
+    assert!(json.contains("\"pid\":"), "json: {json}");
+    assert!(json.contains("\"cursor\":{\"col\":"), "json: {json}");
+    assert!(
+        !json.contains("\"pid\":0"),
+        "child pid should be live: {json}"
+    );
+
+    // Missing session → non-zero exit.
+    assert!(
+        !daemon
+            .cli()
+            .args(["inspect", "nope"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
 /// Find a named session in the next `SessionList` reply.
 async fn list_find(c: &mut ProtoClient, name: &str) -> asd_proto::SessionInfo {
     match c.recv_skipping_output().await {

@@ -12,7 +12,8 @@
 //! (`FetchHistory`/`History`) and `Refresh`; v2 added `SessionInfo.command`;
 //! v3 added `SessionInfo.title`; v4 added the attach-free scripting frames
 //! (`SendInput`/`Ack`, `Peek`/`PeekReply`) and `SessionInfo.idle_ms`; v5 added
-//! `SessionInfo.running` (idle-derived activity flag).
+//! `SessionInfo.running` (idle-derived activity flag); v6 added the
+//! `Inspect`/`InspectReply` frames (detailed single-session dump).
 
 mod codec;
 pub mod paths;
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 5;
+pub const PROTO_VERSION: u32 = 6;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -194,6 +195,31 @@ pub enum Frame {
         cursor_row: u16,
         title: String,
         screen: Vec<u8>,
+    },
+    /// client → daemon: request a detailed dump of session `name` (`asd
+    /// inspect`), gathered on the session thread (metadata + live VT state).
+    Inspect {
+        name: String,
+    },
+    /// daemon → client: everything known about one session — its `SessionInfo`
+    /// metadata plus live internals (child pid, alternate-screen, scrollback
+    /// depth, mouse tracking, cursor).
+    InspectReply {
+        info: SessionInfo,
+        /// The session child's process id (0 once it has exited).
+        child_pid: u32,
+        /// Whether the terminal is on its alternate screen (a full-screen TUI).
+        alt_screen: bool,
+        /// Scrollback lines held above the live screen.
+        scrollback_rows: u32,
+        /// Whether the program is requesting mouse events.
+        mouse_tracking: bool,
+        /// The active DEC mouse modes (e.g. 1002, 1006), ascending.
+        mouse_modes: Vec<u16>,
+        /// Cursor viewport position (0-based) and visibility.
+        cursor_col: u16,
+        cursor_row: u16,
+        cursor_visible: bool,
     },
     // Errors
     Error {

@@ -123,6 +123,119 @@ pub async fn peek(socket: &Path, name: String, scrollback: bool, json: bool) -> 
     Ok(())
 }
 
+/// `asd inspect`: print everything the daemon knows about one session —
+/// metadata plus live terminal internals — as a labeled block or, with
+/// `--json`, a machine-readable object.
+pub async fn inspect(socket: &Path, name: String, json: bool) -> anyhow::Result<()> {
+    let mut c = client::connect(socket, ClientKind::Cli).await?;
+    c.writer.write_frame(&Frame::Inspect { name }).await?;
+    let reply = match c.reader.read_frame().await? {
+        Some(f @ Frame::InspectReply { .. }) => f,
+        Some(Frame::Error { code, msg }) => bail!("inspect failed ({code}): {msg}"),
+        other => bail!("unexpected reply: {other:?}"),
+    };
+    let Frame::InspectReply {
+        info,
+        child_pid,
+        alt_screen,
+        scrollback_rows,
+        mouse_tracking,
+        mouse_modes,
+        cursor_col,
+        cursor_row,
+        cursor_visible,
+    } = reply
+    else {
+        unreachable!("matched InspectReply above")
+    };
+
+    let status = if info.running { "running" } else { "idle" };
+    let screen = if alt_screen { "alternate" } else { "primary" };
+    let mouse = if mouse_tracking {
+        format!("on {mouse_modes:?}")
+    } else {
+        "off".to_string()
+    };
+    let cursor_vis = if cursor_visible { "visible" } else { "hidden" };
+
+    if json {
+        let mut s = String::from(r#"{"session":"#);
+        json_string(&info.name, &mut s);
+        s.push_str(r#","status":"#);
+        json_string(status, &mut s);
+        s.push_str(r#","command":"#);
+        json_string(&info.command, &mut s);
+        s.push_str(r#","title":"#);
+        json_string(&info.title, &mut s);
+        let modes = mouse_modes
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        s.push_str(&format!(
+            r#","pid":{child_pid},"cols":{cols},"rows":{rows},"created_ms":{created},"idle_ms":{idle},"running":{running},"attached_clients":{clients},"alt_screen":{alt},"scrollback_rows":{sb},"mouse_tracking":{mt},"mouse_modes":[{modes}],"cursor":{{"col":{cc},"row":{cr},"visible":{cv}}}}}"#,
+            cols = info.cols,
+            rows = info.rows,
+            created = info.created_ms,
+            idle = info.idle_ms,
+            running = info.running,
+            clients = info.attached_clients,
+            alt = alt_screen,
+            sb = scrollback_rows,
+            mt = mouse_tracking,
+            cc = cursor_col,
+            cr = cursor_row,
+            cv = cursor_visible,
+        ));
+        s.push('\n');
+        print!("{s}");
+        return Ok(());
+    }
+
+    // Labeled block; `title` only prints when the session set one.
+    let mut out = format!(
+        "session    {name}\n\
+         status     {status}\n\
+         command    {command}\n",
+        name = info.name,
+        command = info.command,
+    );
+    if !info.title.trim().is_empty() {
+        out.push_str(&format!("title      {}\n", info.title));
+    }
+    out.push_str(&format!(
+        "pid        {pid}\n\
+         size       {cols}x{rows}\n\
+         created    {created}\n\
+         idle       {idle}\n\
+         clients    {clients}\n\
+         screen     {screen}\n\
+         scrollback {sb} lines\n\
+         mouse      {mouse}\n\
+         cursor     ({cc}, {cr}) {cursor_vis}\n",
+        pid = child_pid,
+        cols = info.cols,
+        rows = info.rows,
+        created = crate::format_age(info.created_ms),
+        idle = fmt_idle(info.idle_ms),
+        clients = info.attached_clients,
+        sb = scrollback_rows,
+        cc = cursor_col,
+        cr = cursor_row,
+    ));
+    print!("{out}");
+    Ok(())
+}
+
+/// Format an idle duration compactly: `420ms` under a second, else `3.4s`.
+fn fmt_idle(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
 /// `asd wait`: block until the session's screen contains `text`, or output has
 /// been idle for [`IDLE_SETTLE_MS`], then exit 0. On timeout, exit
 /// [`EXIT_TIMEOUT`]. One persistent connection is polled every [`POLL_MS`].
@@ -293,6 +406,15 @@ mod tests {
         assert!(named_key("C-1").is_none());
         assert!(named_key("C-ab").is_none());
         assert!(named_key("ctrl-a").is_none());
+    }
+
+    #[test]
+    fn fmt_idle_compacts() {
+        assert_eq!(fmt_idle(0), "0ms");
+        assert_eq!(fmt_idle(420), "420ms");
+        assert_eq!(fmt_idle(999), "999ms");
+        assert_eq!(fmt_idle(1000), "1.0s");
+        assert_eq!(fmt_idle(3450), "3.5s");
     }
 
     #[test]

@@ -129,6 +129,13 @@ pub enum SessionMsg {
         sink: ClientSink,
         scrollback: bool,
     },
+    /// Detailed single-session dump (v6, `asd inspect`); replies with an
+    /// `InspectReply` on `sink`. `info` is the metadata gathered on the network
+    /// thread; the session thread adds the live VT state.
+    Inspect {
+        sink: ClientSink,
+        info: asd_proto::SessionInfo,
+    },
     /// Kill the session: SIGHUP the child, then SIGKILL if it is still alive
     /// after 2s.
     Kill,
@@ -587,6 +594,21 @@ fn session_thread(
             }
             SessionMsg::Peek { sink, scrollback } => {
                 sink.send(render_peek(&mut vt, scrollback));
+            }
+            SessionMsg::Inspect { sink, info } => {
+                let snap = vt.render_snapshot();
+                let (cursor_col, cursor_row) = snap.cursor.position.unwrap_or((0, 0));
+                sink.send(Frame::InspectReply {
+                    info,
+                    child_pid: meta.child_pid.load(Ordering::Relaxed),
+                    alt_screen: vt.is_alt_screen(),
+                    scrollback_rows: vt.scrollback_rows() as u32,
+                    mouse_tracking: vt.is_mouse_tracking(),
+                    mouse_modes: vt.mouse_modes(),
+                    cursor_col,
+                    cursor_row,
+                    cursor_visible: snap.cursor.visible,
+                });
             }
             SessionMsg::Kill => {
                 info!(session = %name, "kill requested");

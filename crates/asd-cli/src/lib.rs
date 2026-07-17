@@ -78,6 +78,15 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show detailed information about one session (metadata + live terminal
+    /// state: pid, alt-screen, scrollback, mouse tracking, cursor)
+    Inspect {
+        /// Session name
+        name: String,
+        /// Emit a JSON object instead of a labeled block
+        #[arg(long)]
+        json: bool,
+    },
     /// Block until the session's screen matches or its output settles, then
     /// exit 0 (exit 4 on timeout). Replaces sleep-and-poll loops in scripts.
     #[command(group(clap::ArgGroup::new("wait_cond").required(true).args(["text", "idle"])))]
@@ -300,6 +309,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             scrollback,
             json,
         } => control::peek(&socket, name, scrollback, json).await?,
+        Cmd::Inspect { name, json } => control::inspect(&socket, name, json).await?,
         Cmd::Wait {
             name,
             text,
@@ -330,7 +340,7 @@ async fn session_exists(c: &mut client::Client, name: &str) -> anyhow::Result<bo
     }
 }
 
-fn format_age(created_ms: u64) -> String {
+pub(crate) fn format_age(created_ms: u64) -> String {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

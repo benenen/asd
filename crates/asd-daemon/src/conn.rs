@@ -220,6 +220,18 @@ pub async fn handle_conn(stream: UnixStream, registry: Arc<Mutex<Registry>>, con
                     msg: format!("no such session '{name}'"),
                 }),
             },
+            Frame::Inspect { name } => match registry.lock().unwrap().get(&name) {
+                Some(handle) => {
+                    // Metadata is gathered here; the session thread adds VT state.
+                    let info = handle.info();
+                    let sink = ClientSink::new(conn_id, out_tx.clone(), Arc::clone(&queued));
+                    let _ = handle.tx.send(SessionMsg::Inspect { sink, info });
+                }
+                None => reply(Frame::Error {
+                    code: code::NO_SUCH_SESSION,
+                    msg: format!("no such session '{name}'"),
+                }),
+            },
             other => {
                 warn!(conn = conn_id, frame = ?other, "unexpected frame from client");
                 reply(Frame::Error {
