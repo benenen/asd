@@ -39,6 +39,11 @@ pub enum Cmd {
     Kill {
         name: String,
     },
+    /// Rename session `name` to `new_name`.
+    Rename {
+        name: String,
+        new_name: String,
+    },
     /// Disconnect and end the actor.
     Shutdown,
 }
@@ -62,6 +67,8 @@ pub enum Ev {
         name: String,
         msg: String,
     },
+    /// A `Rename` completed (`Ok`) or was rejected by the daemon (`Err(msg)`).
+    Renamed(Result<(), String>),
 }
 
 /// Handle to the running actor thread.
@@ -175,6 +182,10 @@ async fn drive(
                     let _ = ev_tx.send(Ev::Created(name));
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
+                // The only `Ack` this client can receive is a Rename success.
+                Ok(Some(Frame::Ack)) => {
+                    let _ = ev_tx.send(Ev::Renamed(Ok(())));
+                }
                 Ok(Some(Frame::Error { code, msg })) => {
                     // SESSION_EXITED carries no session name: it can only be
                     // pinned on the current attach when no switch is in
@@ -202,6 +213,11 @@ async fn drive(
                         {
                             let _ = ev_tx.send(Ev::SessionEnded { name, msg });
                         }
+                    }
+                    // Rename rejections (only this client's Rename produces
+                    // these codes: bad name, or the target name already taken).
+                    else if code == code::INVALID_NAME || code == code::SESSION_EXISTS {
+                        let _ = ev_tx.send(Ev::Renamed(Err(msg)));
                     } else {
                         tracing::debug!(code, %msg, "daemon error");
                     }
@@ -244,6 +260,13 @@ async fn drive(
                     if writer.write_frame(&Frame::Kill { name }).await.is_err() {
                         return Err("kill write failed".to_string());
                     }
+                    let _ = writer.write_frame(&Frame::ListSessions).await;
+                }
+                Some(Cmd::Rename { name, new_name }) => {
+                    if writer.write_frame(&Frame::Rename { name, new_name }).await.is_err() {
+                        return Err("rename write failed".to_string());
+                    }
+                    // Refresh the list so the new name shows promptly.
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(Cmd::Shutdown) | None => {

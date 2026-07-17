@@ -55,6 +55,10 @@ fn all_frames() -> Vec<Frame> {
         },
         Frame::Created { name: "s0".into() },
         Frame::Kill { name: "s0".into() },
+        Frame::Rename {
+            name: "s0".into(),
+            new_name: "build".into(),
+        },
         Frame::Attach {
             name: "s0".into(),
             cols: 120,

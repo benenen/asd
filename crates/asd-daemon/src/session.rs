@@ -173,6 +173,11 @@ pub struct SessionMeta {
     /// thread each output batch. The network side derives `idle_ms` from it for
     /// `SessionInfo` (drives `asd wait --idle`). Initialized to `created_ms`.
     pub last_output_ms: AtomicU64,
+    /// The session's current name — the single source of truth once a `Rename`
+    /// can change it. The registry updates this under its lock when it moves the
+    /// map key; `info()` reports it and the session thread removes by it at exit,
+    /// so a rename stays consistent even as the session ends.
+    pub name: Mutex<String>,
 }
 
 impl SessionHandle {
@@ -189,8 +194,15 @@ impl SessionHandle {
             .map(|t| t.clone())
             .unwrap_or_default();
         let idle_ms = now_ms().saturating_sub(self.meta.last_output_ms.load(Ordering::Relaxed));
+        // The current name lives in `meta` so a rename is reflected here.
+        let name = self
+            .meta
+            .name
+            .lock()
+            .map(|n| n.clone())
+            .unwrap_or_else(|_| self.name.clone());
         asd_proto::SessionInfo {
-            name: self.name.clone(),
+            name,
             command,
             title,
             created_ms: self.created_ms,
@@ -454,6 +466,7 @@ pub fn spawn_session(
         pty_master_fd: AtomicI32::new(master_fd),
         title: Mutex::new(String::new()),
         last_output_ms: AtomicU64::new(created_ms),
+        name: Mutex::new(name.clone()),
     });
 
     // pty read thread: blocking reads → feed into the session thread
@@ -635,7 +648,14 @@ fn session_thread(
     let _ = child.wait();
     meta.alive.store(false, Ordering::Relaxed);
     meta.child_pid.store(0, Ordering::Relaxed);
-    registry.lock().unwrap().remove(&name);
+    // Remove by the current name — a rename may have changed the map key since
+    // spawn (the canonical name lives in `meta`).
+    let current = meta
+        .name
+        .lock()
+        .map(|n| n.clone())
+        .unwrap_or_else(|_| name.clone());
+    registry.lock().unwrap().remove(&current);
     for c in clients.drain(..) {
         c.send(Frame::Error {
             code: code::SESSION_EXITED,

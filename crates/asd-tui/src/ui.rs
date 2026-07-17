@@ -7,8 +7,10 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, Borders, Clear};
 
 use crate::App;
+use crate::modal::Modal;
 
 /// Sidebar width in cells (incl. its 1-cell right border).
 pub const SIDEBAR_W: u16 = 28;
@@ -22,6 +24,7 @@ const ALERT: Color = Color::Rgb(0xE5, 0x59, 0x5E);
 const OK: Color = Color::Rgb(0x79, 0xD1, 0x8C);
 const SELECT_BG: Color = Color::Rgb(0x2E, 0x2A, 0x20);
 const RULE: Color = Color::Rgb(0x23, 0x2A, 0x34);
+const MODAL_BG: Color = Color::Rgb(0x14, 0x18, 0x20);
 
 /// Split the frame: sidebar | terminal pane, with a full-width keybind/status
 /// bar along the bottom.
@@ -65,10 +68,13 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     app.process_fx(f.buffer_mut(), side);
 
     let sel = app.sel_viewport();
+    let modal_open = app.modal.is_some();
     if let Some(snap) = app.snapshot() {
         render_pane(f.buffer_mut(), pane, &snap, sel);
-        // A real terminal cursor when following live output.
-        if app.scroll == 0
+        // A real terminal cursor when following live output — suppressed under a
+        // modal (the modal owns the cursor).
+        if !modal_open
+            && app.scroll == 0
             && snap.cursor.visible
             && let Some((cx, cy)) = snap.cursor.position
             && cx < pane.width
@@ -91,6 +97,87 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
         let y = pane.y + pane.height / 2;
         let x = pane.x + (pane.width.saturating_sub(hint.len() as u16)) / 2;
         f.buffer_mut().set_string(x, y, hint, Style::new().fg(DIM));
+    }
+
+    if let Some(modal) = &app.modal {
+        draw_modal(f, modal);
+    }
+}
+
+/// A centered overlay: the rename input box or the kill confirmation.
+fn draw_modal(f: &mut Frame<'_>, modal: &Modal) {
+    let area = f.area();
+    let w = 54u16.clamp(24, area.width.saturating_sub(4).max(24));
+    let h = 6u16.min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 3;
+    let m = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, m);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(ACCENT).bg(MODAL_BG))
+        .style(Style::new().bg(MODAL_BG));
+    let inner = block.inner(m);
+    f.render_widget(block, m);
+
+    let bg = Style::new().bg(MODAL_BG);
+    let ix = inner.x;
+    let iw = inner.width as usize;
+    let buf = f.buffer_mut();
+    let mut cursor: Option<Position> = None;
+    match modal {
+        Modal::KillConfirm { target } => {
+            let title = format!(
+                "Kill session \"{}\"?",
+                truncate(target, iw.saturating_sub(16))
+            );
+            buf.set_string(
+                ix,
+                inner.y,
+                &title,
+                bg.fg(TEXT).add_modifier(Modifier::BOLD),
+            );
+            buf.set_string(
+                ix,
+                inner.y + 2,
+                truncate("[y / Enter] confirm    [n / Esc] cancel", iw),
+                bg.fg(MUTED),
+            );
+        }
+        Modal::Rename(input) => {
+            buf.set_string(
+                ix,
+                inner.y,
+                format!(
+                    "Rename \"{}\"",
+                    truncate(&input.target, iw.saturating_sub(10))
+                ),
+                bg.fg(TEXT).add_modifier(Modifier::BOLD),
+            );
+            // Input field on the next line: a leading marker + the edited text.
+            let fy = inner.y + 1;
+            let text = input.text();
+            let field = Style::new().bg(SELECT_BG).fg(TEXT);
+            for xx in ix..inner.right() {
+                if let Some(c) = buf.cell_mut(Position::new(xx, fy)) {
+                    c.set_symbol(" ").set_style(field);
+                }
+            }
+            buf.set_string(ix + 1, fy, truncate(&text, iw.saturating_sub(2)), field);
+            // Caret at the char index (exact for the valid ASCII name set).
+            let cx = ix + 1 + (input.cursor() as u16).min(inner.width.saturating_sub(2));
+            cursor = Some(Position::new(cx, fy));
+            // Error, or the key hint.
+            let (line, style) = match &input.error {
+                Some(e) => (format!("! {e}"), bg.fg(ALERT)),
+                None => ("[Enter] rename    [Esc] cancel".to_string(), bg.fg(MUTED)),
+            };
+            buf.set_string(ix, inner.y + 3, truncate(&line, iw), style);
+        }
+    }
+    if let Some(pos) = cursor {
+        f.set_cursor_position(pos);
     }
 }
 
@@ -190,7 +277,7 @@ fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
     }
     let (hint, style) = if app.prefix {
         (
-            "PREFIX  j/k switch · 1-9 jump · c new · x kill · r reconnect · q quit · Ctrl+A literal",
+            "PREFIX  j/k switch · 1-9 jump · c new · r rename · x kill · R reconnect · q quit · Ctrl+A literal",
             Style::new().fg(ACCENT).bg(RULE),
         )
     } else {
@@ -212,7 +299,7 @@ fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
         )
     } else {
         (
-            "daemon down — Ctrl+A r".to_string(),
+            "daemon down — Ctrl+A R".to_string(),
             Style::new().fg(ALERT).bg(RULE),
         )
     };

@@ -823,6 +823,70 @@ async fn inspect_dumps_session_detail() {
     );
 }
 
+/// v7 rename: a `Rename` moves the session's name across list + attach;
+/// invalid / duplicate / missing names are rejected with the right codes.
+#[tokio::test]
+async fn rename_session() {
+    let daemon = Daemon::start("rename");
+    for n in ["old", "other"] {
+        assert!(
+            daemon
+                .cli()
+                .args(["new", n])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let mut c = ProtoClient::connect(&daemon.socket).await;
+
+    // old → newname, acked.
+    c.send(Frame::Rename {
+        name: "old".into(),
+        new_name: "newname".into(),
+    })
+    .await;
+    match c.recv_skipping_output().await {
+        Frame::Ack => {}
+        other => panic!("expected Ack, got {other:?}"),
+    }
+
+    // The list shows the new name and not the old.
+    c.send(Frame::ListSessions).await;
+    match c.recv_skipping_output().await {
+        Frame::SessionList { sessions } => {
+            assert!(
+                sessions.iter().any(|s| s.name == "newname"),
+                "new name present"
+            );
+            assert!(!sessions.iter().any(|s| s.name == "old"), "old name gone");
+        }
+        other => panic!("expected SessionList, got {other:?}"),
+    }
+
+    // Rejections: duplicate target, invalid chars, missing source.
+    for (name, new_name, want) in [
+        ("newname", "other", code::SESSION_EXISTS),
+        ("newname", "bad name", code::INVALID_NAME),
+        ("ghost", "whatever", code::NO_SUCH_SESSION),
+    ] {
+        c.send(Frame::Rename {
+            name: name.into(),
+            new_name: new_name.into(),
+        })
+        .await;
+        match c.recv_skipping_output().await {
+            Frame::Error { code, .. } => assert_eq!(code, want, "{name}->{new_name}"),
+            other => panic!("expected Error {want}, got {other:?}"),
+        }
+    }
+
+    // Attach by the new name works — the map key really moved.
+    let snap = c.attach("newname").await;
+    assert!(!snap.is_empty());
+}
+
 /// Find a named session in the next `SessionList` reply.
 async fn list_find(c: &mut ProtoClient, name: &str) -> asd_proto::SessionInfo {
     match c.recv_skipping_output().await {

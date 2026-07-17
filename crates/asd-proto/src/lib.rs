@@ -13,7 +13,8 @@
 //! v3 added `SessionInfo.title`; v4 added the attach-free scripting frames
 //! (`SendInput`/`Ack`, `Peek`/`PeekReply`) and `SessionInfo.idle_ms`; v5 added
 //! `SessionInfo.running` (idle-derived activity flag); v6 added the
-//! `Inspect`/`InspectReply` frames (detailed single-session dump).
+//! `Inspect`/`InspectReply` frames (detailed single-session dump); v7 added
+//! `Rename` (rename a session; replies `Ack`).
 
 mod codec;
 pub mod paths;
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 6;
+pub const PROTO_VERSION: u32 = 7;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -126,6 +127,12 @@ pub enum Frame {
     },
     Kill {
         name: String,
+    },
+    /// client → daemon: rename session `name` to `new_name` (v7). Replies `Ack`
+    /// on success, or `Error` (invalid/duplicate name, or no such session).
+    Rename {
+        name: String,
+        new_name: String,
     },
     // Attach and data plane
     Attach {

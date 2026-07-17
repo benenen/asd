@@ -123,6 +123,12 @@ pub async fn handle_conn(stream: UnixStream, registry: Arc<Mutex<Registry>>, con
                     reply(Frame::Error { code, msg });
                 }
             }
+            Frame::Rename { name, new_name } => {
+                match registry.lock().unwrap().rename(&name, &new_name) {
+                    Ok(()) => reply(Frame::Ack),
+                    Err((code, msg)) => reply(Frame::Error { code, msg }),
+                }
+            }
             Frame::Attach { name, cols, rows } => {
                 if attached.is_some() {
                     reply(Frame::Error {

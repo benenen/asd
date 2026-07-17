@@ -8,9 +8,10 @@
 //!
 //! Keys: everything is forwarded to the attached session except the `Ctrl+A`
 //! prefix (screen-style): `j/k` or arrows switch sessions, `1-9` jump, `c`
-//! creates, `x` kills, `r` reconnects, `q` quits, `Ctrl+A` sends a literal
-//! Ctrl+A. The mouse selects/kills in the sidebar and scrolls the pane
-//! (local scrollback, like `asd attach`); Shift+PageUp/PageDown scroll too.
+//! creates, `r` renames (input modal), `x` kills (confirmation modal), `R`
+//! reconnects, `q` quits, `Ctrl+A` sends a literal Ctrl+A. The mouse
+//! selects/kills in the sidebar and scrolls the pane (local scrollback, like
+//! `asd attach`); Shift+PageUp/PageDown scroll too.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -25,9 +26,11 @@ use ratatui::crossterm::execute;
 
 mod conn;
 mod key;
+mod modal;
 mod ui;
 
 use conn::{Cmd, Conn, Ev};
+use modal::{Modal, RenameInput, validate_rename};
 
 /// Scrollback kept by the local terminal.
 const SCROLLBACK: usize = 10_000;
@@ -107,6 +110,9 @@ pub(crate) struct App {
 
     pub daemon_up: bool,
     pub notice: Option<String>,
+    /// An open modal overlay (rename input or kill confirmation); captures all
+    /// keys until it closes.
+    pub modal: Option<Modal>,
     /// True while waiting for the key after Ctrl+A.
     pub prefix: bool,
     pub now_ms: u64,
@@ -200,6 +206,7 @@ fn event_loop(
         selecting: false,
         daemon_up: false,
         notice: None,
+        modal: None,
         prefix: false,
         now_ms: now_ms(),
         preferred,
@@ -610,12 +617,24 @@ impl App {
                     self.cache = None;
                 }
             }
+            Ev::Renamed(res) => {
+                // Success is already reflected optimistically; the poll that
+                // followed the rename confirms it. Surface a rejection.
+                if let Err(msg) = res {
+                    self.notice = Some(format!("rename failed: {msg}"));
+                }
+            }
         }
         self.dirty = true;
     }
 
     fn on_key(&mut self, k: CtKey) {
         self.dirty = true;
+        // An open modal captures every key until it closes.
+        if self.modal.is_some() {
+            self.on_modal_key(k);
+            return;
+        }
         let ctrl_a = k.code == KeyCode::Char('a') && k.modifiers.contains(KeyModifiers::CONTROL);
 
         if self.prefix {
@@ -630,12 +649,19 @@ impl App {
                     }
                 }
                 KeyCode::Char('c') => self.send(Cmd::Create),
+                // Kill asks first (confirmation modal); rename opens an input.
                 KeyCode::Char('x') => {
                     if let Some(name) = self.active.clone() {
-                        self.send(Cmd::Kill { name });
+                        self.modal = Some(Modal::KillConfirm { target: name });
                     }
                 }
-                KeyCode::Char('r') => self.reconnect(),
+                KeyCode::Char('r') => {
+                    if let Some(name) = self.active.clone() {
+                        self.modal = Some(Modal::Rename(RenameInput::new(name)));
+                    }
+                }
+                // Reconnect moved to R (r now renames).
+                KeyCode::Char('R') => self.reconnect(),
                 KeyCode::Char('q') | KeyCode::Char('d') => self.quit = true,
                 // Ctrl+A twice sends a literal Ctrl+A to the session.
                 KeyCode::Char('a') if ctrl_a => self.forward(KeyEvent {
@@ -668,6 +694,105 @@ impl App {
         if let Some(ev) = key::map_key(&k) {
             self.forward(ev);
         }
+    }
+
+    /// Route a key to the open modal. Editing keys mutate the input in place;
+    /// terminal decisions (submit / cancel / kill) are taken after the borrow
+    /// ends so `self` is free to act on.
+    fn on_modal_key(&mut self, k: CtKey) {
+        enum Act {
+            Keep,
+            Close,
+            Kill(String),
+            TryRename(String, String),
+        }
+        let act = match self.modal.as_mut() {
+            Some(Modal::KillConfirm { target }) => match k.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    Act::Kill(target.clone())
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Act::Close,
+                _ => Act::Keep,
+            },
+            Some(Modal::Rename(input)) => match k.code {
+                KeyCode::Esc => Act::Close,
+                KeyCode::Enter => Act::TryRename(input.target.clone(), input.text()),
+                KeyCode::Char(c) => {
+                    input.insert(c);
+                    Act::Keep
+                }
+                KeyCode::Backspace => {
+                    input.backspace();
+                    Act::Keep
+                }
+                KeyCode::Delete => {
+                    input.delete();
+                    Act::Keep
+                }
+                KeyCode::Left => {
+                    input.left();
+                    Act::Keep
+                }
+                KeyCode::Right => {
+                    input.right();
+                    Act::Keep
+                }
+                KeyCode::Home => {
+                    input.home();
+                    Act::Keep
+                }
+                KeyCode::End => {
+                    input.end();
+                    Act::Keep
+                }
+                _ => Act::Keep,
+            },
+            None => Act::Keep,
+        };
+        match act {
+            Act::Keep => {}
+            Act::Close => self.modal = None,
+            Act::Kill(name) => {
+                self.modal = None;
+                self.send(Cmd::Kill { name });
+            }
+            Act::TryRename(target, new) => {
+                let existing: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
+                match validate_rename(&new, &existing, &target) {
+                    Ok(()) => {
+                        self.modal = None;
+                        self.submit_rename(target, new);
+                    }
+                    Err(e) => {
+                        if let Some(Modal::Rename(input)) = self.modal.as_mut() {
+                            input.error = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send a rename and optimistically update the local sidebar/active name so
+    /// it reflects immediately; the daemon's follow-up `ListSessions` confirms
+    /// (or a `Renamed(Err)` reverts it via a notice).
+    fn submit_rename(&mut self, target: String, new: String) {
+        if target == new {
+            return;
+        }
+        if self.active.as_deref() == Some(&target) {
+            self.active = Some(new.clone());
+        }
+        for s in &mut self.sessions {
+            if s.name == target {
+                s.name = new.clone();
+            }
+        }
+        self.send(Cmd::Rename {
+            name: target,
+            new_name: new,
+        });
+        self.dirty = true;
     }
 
     fn forward(&mut self, ev: KeyEvent) {

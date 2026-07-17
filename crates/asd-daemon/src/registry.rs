@@ -83,6 +83,36 @@ impl Registry {
         self.sessions.remove(name);
     }
 
+    /// Rename `old` to `new`: validate the new name, move the map key, and
+    /// update the session's canonical name in `meta` (so `info()` and the
+    /// session thread's self-removal follow it).
+    pub fn rename(&mut self, old: &str, new: &str) -> Result<(), (u32, String)> {
+        if !paths::is_valid_session_name(new) {
+            return Err((
+                code::INVALID_NAME,
+                format!("invalid session name '{new}' (want [A-Za-z0-9_-]{{1,64}})"),
+            ));
+        }
+        if new == old {
+            return Ok(()); // no-op rename to the same name
+        }
+        if self.sessions.contains_key(new) {
+            return Err((
+                code::SESSION_EXISTS,
+                format!("session '{new}' already exists"),
+            ));
+        }
+        let Some(handle) = self.sessions.remove(old) else {
+            return Err((code::NO_SUCH_SESSION, format!("no such session '{old}'")));
+        };
+        if let Ok(mut n) = handle.meta.name.lock() {
+            *n = new.to_string();
+        }
+        self.sessions.insert(new.to_string(), handle);
+        info!(from = %old, to = %new, "session renamed");
+        Ok(())
+    }
+
     pub fn kill(&self, name: &str) -> Result<(), (u32, String)> {
         match self.sessions.get(name) {
             Some(h) => {
