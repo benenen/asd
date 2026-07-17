@@ -117,10 +117,17 @@ pub(crate) struct App {
     /// The previous session's last frame, shown while a switch converges so
     /// the pane never flashes black (double buffering across attaches).
     cache: Option<RenderSnapshot>,
-    /// Keep showing `cache` until this deadline; set generously at select
-    /// time and tightened once the new Snapshot has been fed and the size
-    /// jiggle sent (the convergence window).
+    /// Terminals of recently viewed sessions, parked on switch-away (small
+    /// LRU). Switching back shows the parked terminal's last frame instantly
+    /// — the boo-style feel — while the fresh attach converges behind it.
+    parked: Vec<(String, GhosttyVt)>,
+    /// Keep showing `cache` until this deadline. The deadline is adaptive:
+    /// opened generously at select time, then re-armed to "shortly after the
+    /// most recent output byte" once the Snapshot is in — so the swap happens
+    /// as soon as the repaint jiggle's output settles, not after a fixed
+    /// delay. `hold_cap` is the absolute upper bound.
     pane_hold: Option<std::time::Instant>,
+    hold_cap: std::time::Instant,
     /// Sidebar row effects (tachyonfx), keyed by session name: sweep-in on
     /// newly listed sessions, a brief accent fade on selection.
     row_fx: Vec<(String, tachyonfx::Effect)>,
@@ -180,7 +187,9 @@ fn event_loop(
         preferred,
         self_session: std::env::var("ASD_SESSION").ok(),
         cache: None,
+        parked: Vec::new(),
         pane_hold: None,
+        hold_cap: std::time::Instant::now(),
         row_fx: Vec::new(),
         last_frame: std::time::Instant::now(),
         dirty: true,
@@ -199,7 +208,15 @@ fn event_loop(
             // caps the frame rate at ~33 fps).
             app.dirty = !app.row_fx.is_empty() || app.pane_hold.is_some();
         }
-        if event::poll(Duration::from_millis(30))? {
+        // Tighten the loop while a switch converges or effects animate:
+        // conn events are only drained between polls, so a long poll adds
+        // whole quanta of latency to the dump/repaint pipeline.
+        let poll_ms = if app.pane_hold.is_some() || !app.row_fx.is_empty() {
+            5
+        } else {
+            30
+        };
+        if event::poll(Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
                 Event::Mouse(m) => app.on_mouse(m, terminal.size()?),
@@ -314,14 +331,37 @@ impl App {
             self.dirty = true;
             return;
         }
-        self.active = Some(name.clone());
-        // Hold the old session's last frame on screen while the new attach
-        // converges — never draw the empty terminal (a black flash).
-        self.cache = self.vt.as_mut().map(|vt| {
+        // What's on screen right now, as the fallback hold frame.
+        let old_frame = self.vt.as_mut().map(|vt| {
             vt.set_scroll(0);
             vt.render_snapshot()
         });
-        self.pane_hold = Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
+        // Park the terminal we're leaving (its last frame is the instant
+        // preview when the user switches back).
+        if let (Some(old_name), Some(old_vt)) = (self.active.take(), self.vt.take()) {
+            self.parked.retain(|(n, _)| n != &old_name);
+            self.parked.push((old_name, old_vt));
+            const PARKED_MAX: usize = 4;
+            if self.parked.len() > PARKED_MAX {
+                self.parked.remove(0);
+            }
+        }
+        self.active = Some(name.clone());
+        // Hold a frame on screen while the new attach converges — never draw
+        // the empty terminal (a black flash). Prefer the target session's own
+        // parked frame (instant, boo-style); fall back to what was showing.
+        self.cache = self
+            .parked
+            .iter_mut()
+            .find(|(n, _)| n == &name)
+            .map(|(_, vt)| {
+                vt.set_scroll(0);
+                vt.render_snapshot()
+            })
+            .or(old_frame);
+        let now = std::time::Instant::now();
+        self.hold_cap = now + std::time::Duration::from_millis(400);
+        self.pane_hold = Some(self.hold_cap);
         self.vt = Some(GhosttyVt::new(self.grid.0, self.grid.1, SCROLLBACK));
         self.scroll = 0;
         self.sel = None;
@@ -376,6 +416,9 @@ impl App {
                 self.vt = None;
             }
             Ev::Sessions(list) => {
+                // Drop parked terminals of sessions that no longer exist.
+                self.parked
+                    .retain(|(n, _)| list.iter().any(|s| &s.name == n));
                 // Newly listed sessions sweep into the sidebar.
                 for s in &list {
                     if !self.sessions.iter().any(|old| old.name == s.name) {
@@ -442,6 +485,14 @@ impl App {
                         self.send(Cmd::Input(replies));
                     }
                 }
+                // While a switch is converging, every output byte re-arms a
+                // short settle timer: the swap to the live view happens as
+                // soon as the repaint stream pauses (or at the hard cap).
+                if !snapshot && self.pane_hold.is_some() {
+                    let now = std::time::Instant::now();
+                    self.pane_hold =
+                        Some((now + std::time::Duration::from_millis(35)).min(self.hold_cap));
+                }
                 if snapshot {
                     // The attach dump carries the daemon Formatter's known
                     // drift (trailing blank rows are dropped), which can leave
@@ -472,11 +523,15 @@ impl App {
                         });
                         self.send(Cmd::Resize { cols, rows });
                     }
-                    // The dump is in and the repaint requested: swap to the
-                    // live view as soon as the app has had time to redraw.
+                    // The dump is in and the repaint requested: from here the
+                    // hold ends as soon as the output settles (see the Output
+                    // arm), with a hard cap so a chatty session can't pin the
+                    // old frame.
                     if self.pane_hold.is_some() {
+                        let now = std::time::Instant::now();
+                        self.hold_cap = now + std::time::Duration::from_millis(150);
                         self.pane_hold =
-                            Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                            Some((now + std::time::Duration::from_millis(60)).min(self.hold_cap));
                     }
                 }
             }
