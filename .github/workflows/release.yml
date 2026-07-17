@@ -31,6 +31,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # asd-dioxus (GUI, in the default features) pulls webkit2gtk-4.1 via
+      # Dioxus Desktop → wry; its -sys crates need the GTK dev libraries. Both
+      # matrix entries here are Linux (x86_64 + aarch64), so install
+      # unconditionally.
+      - name: Install GUI system deps (webkit2gtk-4.1)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
