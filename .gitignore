@@ -35,3 +35,5 @@ target
 /images
 
 node_modules
+
+crates/asd-dioxus/dist

@@ -1,13 +1,9 @@
 [package]
 name = "asd-dioxus"
-description = "asd GPU terminal client (Dioxus + ghostty-web)"
+description = "asd GPU terminal client (Dioxus + ghostty-web), library entry for the root `asd` binary"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[[bin]]
-name = "asd-dioxus"
-path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }

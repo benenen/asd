@@ -1,149 +1,303 @@
-//! Daemon connection: Unix socket + handshake + session management.
+//! Per-host connection actors (mirrors `asd-gui`'s conn.rs, minus the local
+//! VT: ghostty-web consumes the raw PTY bytes, so each host actor is a plain
+//! tokio task that speaks the framed protocol and forwards bytes).
+//!
+//! Each host — the local daemon or an SSH remote — gets one actor that:
+//!   * handshakes, then polls `ListSessions` on an interval → the sidebar;
+//!   * while attached, forwards Snapshot/Output bytes tagged with the session
+//!     they belong to;
+//!   * obeys [`HostCmd`]s (attach/detach/input/resize/create/kill).
+//!
+//! The transport is boxed so one `drive` loop serves both a local `UnixStream`
+//! and a remote russh `ChannelStream` (see [`crate::ssh`]).
 
-use anyhow::Context;
+use std::time::Duration;
+
 use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, PROTO_VERSION, code};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-pub async fn connect_local() -> anyhow::Result<(FrameReader<BoxRead>, FrameWriter<BoxWrite>)> {
-    let socket = asd_proto::paths::socket_path();
-    let stream = tokio::net::UnixStream::connect(&socket)
-        .await
-        .with_context(|| format!("connect {}", socket.display()))?;
-    let (r, w) = tokio::io::split(stream);
-    Ok((FrameReader::new(Box::new(r)), FrameWriter::new(Box::new(w))))
-}
+use crate::model::{HostId, HostKind, HostState};
 
+/// How often each host re-polls its session list.
+const LIST_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// A boxed transport half, so local and SSH connections share one code path.
 pub type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
 pub type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
-pub async fn handshake(
-    writer: &mut FrameWriter<BoxWrite>,
-    reader: &mut FrameReader<BoxRead>,
-) -> anyhow::Result<()> {
+/// Commands the supervisor sends to a single host actor.
+#[derive(Debug, Clone)]
+pub enum HostCmd {
+    /// Attach to (or switch to) `name`, sizing the pty to `cols`×`rows`.
+    Attach {
+        name: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// Stop viewing the current session (stay connected for the list).
+    Detach,
+    /// Raw input bytes for the attached session (ghostty-web already encoded
+    /// keys/mouse — no client-side key encoding needed).
+    Input(Vec<u8>),
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    /// Create a new session (daemon auto-names it).
+    Create,
+    Kill {
+        name: String,
+    },
+    /// Disconnect and end the actor.
+    Shutdown,
+}
+
+/// Events a host actor sends toward the app, tagged with its host id.
+#[derive(Debug, Clone)]
+pub enum UiEvent {
+    State {
+        host: HostId,
+        state: HostState,
+    },
+    Sessions {
+        host: HostId,
+        sessions: Vec<asd_proto::SessionInfo>,
+    },
+    /// A `Create` completed; the app may auto-select `name`.
+    Created {
+        host: HostId,
+        name: String,
+    },
+    /// PTY bytes for the session named `name`. The app drops bytes whose
+    /// session is no longer the active one (stale frames in flight across a
+    /// switch). `snapshot` marks the full attach dump: the app resets the
+    /// terminal before writing it.
+    Bytes {
+        host: HostId,
+        name: String,
+        data: Vec<u8>,
+        snapshot: bool,
+    },
+    SessionEnded {
+        host: HostId,
+        name: String,
+        msg: String,
+    },
+}
+
+/// Task entry point for one host: establish the transport and drive the
+/// connection to completion. A failure is reported as a `Down` state.
+pub async fn run_host(
+    id: HostId,
+    kind: HostKind,
+    cmd_rx: UnboundedReceiver<HostCmd>,
+    ev_tx: UnboundedSender<UiEvent>,
+) {
+    let opened = match &kind {
+        HostKind::Local => connect_local().await,
+        HostKind::Ssh(spec) => crate::ssh::open(spec).await,
+    };
+    let (reader, writer) = match opened {
+        Ok(rw) => rw,
+        Err(e) => {
+            let _ = ev_tx.send(UiEvent::State {
+                host: id,
+                state: HostState::Down(e.to_string()),
+            });
+            return;
+        }
+    };
+    if let Err(reason) = drive(id, reader, writer, cmd_rx, &ev_tx).await {
+        let _ = ev_tx.send(UiEvent::State {
+            host: id,
+            state: HostState::Down(reason),
+        });
+    }
+}
+
+/// Open the local daemon socket and box the halves. Unix only: the local
+/// daemon speaks over a Unix socket (tokio has no `UnixStream` on Windows),
+/// and the Windows client is GUI-only with no bundled daemon — it reaches
+/// sessions through SSH remotes instead.
+#[cfg(unix)]
+async fn connect_local() -> anyhow::Result<(BoxRead, BoxWrite)> {
+    let socket = asd_proto::paths::socket_path();
+    let stream = tokio::net::UnixStream::connect(&socket)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect {}: {e}", socket.display()))?;
+    let (r, w) = tokio::io::split(stream);
+    Ok((Box::new(r), Box::new(w)))
+}
+
+#[cfg(not(unix))]
+async fn connect_local() -> anyhow::Result<(BoxRead, BoxWrite)> {
+    anyhow::bail!("no local daemon on this platform — connect an SSH remote instead")
+}
+
+/// The per-host event loop. Returns `Err(reason)` if the connection ends
+/// abnormally; a clean `Shutdown` returns `Ok(())`.
+async fn drive(
+    id: HostId,
+    reader: BoxRead,
+    writer: BoxWrite,
+    mut cmd_rx: UnboundedReceiver<HostCmd>,
+    ev_tx: &UnboundedSender<UiEvent>,
+) -> Result<(), String> {
+    let mut reader = FrameReader::new(reader);
+    let mut writer = FrameWriter::new(writer);
+
+    // Handshake.
     writer
         .write_frame(&Frame::Hello {
             proto_version: PROTO_VERSION,
             kind: ClientKind::Gui,
         })
-        .await?;
-    match reader.read_frame().await? {
-        Some(Frame::HelloAck { .. }) => Ok(()),
-        Some(Frame::Error { code, msg }) => {
-            anyhow::bail!("handshake rejected ({code}): {msg}")
+        .await
+        .map_err(|_| "handshake write failed".to_string())?;
+    match reader.read_frame().await {
+        Ok(Some(Frame::HelloAck { .. })) => {}
+        Ok(Some(Frame::Error { code, msg })) => {
+            return Err(format!("handshake rejected ({code}): {msg}"));
         }
-        other => anyhow::bail!("unexpected handshake response: {other:?}"),
+        _ => return Err("no handshake ack".to_string()),
     }
-}
+    let _ = ev_tx.send(UiEvent::State {
+        host: id,
+        state: HostState::Up,
+    });
 
-#[derive(Debug)]
-pub enum DaemonEvent {
-    Sessions(Vec<asd_proto::SessionInfo>),
-    Output(Vec<u8>),
-    Snapshot(Vec<u8>),
-    SessionEnded { name: String, msg: String },
-    Created { name: String },
-}
-
-pub async fn run(
-    ev_tx: mpsc::UnboundedSender<DaemonEvent>,
-    mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
-) -> anyhow::Result<()> {
-    let (mut reader, mut writer) = connect_local().await?;
-    handshake(&mut writer, &mut reader).await?;
-    tracing::info!("connected to daemon");
-
+    // Attach frames sent whose Snapshot has not arrived yet. While > 0, Output
+    // belongs to a session we already left and is dropped. While > 1, arriving
+    // Snapshots belong to superseded attaches (the user switched again before
+    // the reply landed) and are dropped too — feeding them would paint the old
+    // session over the new one (same race as asd-gui's A→B→A switch scramble).
+    let mut pending_attach: usize = 0;
     let mut attached: Option<String> = None;
-    let mut attaching = false;
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(1500));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    writer.write_frame(&Frame::ListSessions).await?;
+    let mut ticker = tokio::time::interval(LIST_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let _ = writer.write_frame(&Frame::ListSessions).await;
+                if writer.write_frame(&Frame::ListSessions).await.is_err() {
+                    return Err("list write failed".to_string());
+                }
             }
             frame = reader.read_frame() => match frame {
                 Ok(Some(Frame::SessionList { sessions })) => {
-                    let _ = ev_tx.send(DaemonEvent::Sessions(sessions));
+                    let _ = ev_tx.send(UiEvent::Sessions { host: id, sessions });
                 }
                 Ok(Some(Frame::Snapshot { vt: dump })) => {
-                    tracing::debug!("conn: Snapshot {} bytes", dump.len());
-                    attaching = false;
-                    let _ = ev_tx.send(DaemonEvent::Snapshot(dump));
+                    if pending_attach > 1 {
+                        pending_attach -= 1; // superseded attach — not our view
+                        continue;
+                    }
+                    pending_attach = 0;
+                    if let Some(name) = &attached {
+                        let _ = ev_tx.send(UiEvent::Bytes {
+                            host: id,
+                            name: name.clone(),
+                            data: dump,
+                            snapshot: true,
+                        });
+                    }
                 }
                 Ok(Some(Frame::Output { bytes })) => {
-                    if attaching { continue; }
-                    let _ = ev_tx.send(DaemonEvent::Output(bytes));
+                    if pending_attach > 0 { continue; } // belongs to a session we just left
+                    if let Some(name) = &attached {
+                        let _ = ev_tx.send(UiEvent::Bytes {
+                            host: id,
+                            name: name.clone(),
+                            data: bytes,
+                            snapshot: false,
+                        });
+                    }
                 }
                 Ok(Some(Frame::Created { name })) => {
-                    let _ = ev_tx.send(DaemonEvent::Created { name });
+                    let _ = ev_tx.send(UiEvent::Created { host: id, name });
+                    // Refresh the list promptly so the new session shows up.
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Ok(Some(Frame::Error { code, msg })) => {
                     if code == code::SESSION_EXITED {
                         if let Some(name) = attached.take() {
-                            let _ = ev_tx.send(DaemonEvent::SessionEnded { name, msg });
+                            let _ = ev_tx.send(UiEvent::SessionEnded { host: id, name, msg });
                         }
-                    } else {
-                        tracing::debug!(code, %msg, "daemon error");
+                    }
+                    // A failed Attach (the session died before the daemon saw
+                    // it) sends this instead of a Snapshot — drain the count
+                    // or every later Snapshot would be taken for a stale one.
+                    else if code == code::NO_SUCH_SESSION && pending_attach > 0 {
+                        pending_attach -= 1;
+                    }
+                    // Other errors are logged and ignored; the next list poll
+                    // reconciles.
+                    else {
+                        tracing::debug!(host = id, code, %msg, "daemon error");
                     }
                 }
                 Ok(Some(_)) => {}
-                Ok(None) | Err(_) => anyhow::bail!("connection closed"),
+                Ok(None) | Err(_) => return Err("connection closed".to_string()),
             },
             cmd = cmd_rx.recv() => match cmd {
-                Some(Cmd::Attach { name, cols, rows }) => {
-                    tracing::info!("conn: Attach to {name} {cols}x{rows}");
+                Some(HostCmd::Attach { name, cols, rows }) => {
+                    // Switching sessions on one connection means detach first.
                     if attached.is_some() {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
-                    attaching = true;
+                    pending_attach += 1;
                     attached = Some(name.clone());
-                    writer.write_frame(&Frame::Attach { name, cols, rows }).await?;
+                    if writer.write_frame(&Frame::Attach { name, cols, rows }).await.is_err() {
+                        return Err("attach write failed".to_string());
+                    }
                 }
-                Some(Cmd::Detach) => {
+                Some(HostCmd::Detach) => {
                     if attached.take().is_some() {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
-                    attaching = false;
+                    // pending_attach stays: any Snapshot still in flight must
+                    // drain through the Snapshot branch (attached is None,
+                    // nothing is forwarded) so the count stays aligned.
                 }
-                Some(Cmd::Input { bytes }) => {
-                    writer.write_frame(&Frame::Input { bytes }).await?;
+                Some(HostCmd::Input(bytes)) => {
+                    if attached.is_some()
+                        && writer.write_frame(&Frame::Input { bytes }).await.is_err()
+                    {
+                        return Err("input write failed".to_string());
+                    }
                 }
-                Some(Cmd::Resize { cols, rows }) => {
-                    writer.write_frame(&Frame::Resize { cols, rows }).await?;
+                Some(HostCmd::Resize { cols, rows }) => {
+                    if attached.is_some()
+                        && writer.write_frame(&Frame::Resize { cols, rows }).await.is_err()
+                    {
+                        return Err("resize write failed".to_string());
+                    }
                 }
-                Some(Cmd::Create) => {
-                    tracing::info!("conn: Create");
-                    writer.write_frame(&Frame::Create { name: None, cmd: None }).await?;
+                Some(HostCmd::Create) => {
+                    if writer.write_frame(&Frame::Create { name: None, cmd: None }).await.is_err() {
+                        return Err("create write failed".to_string());
+                    }
                 }
-                Some(Cmd::Kill { name }) => {
-                    writer.write_frame(&Frame::Kill { name }).await?;
+                Some(HostCmd::Kill { name }) => {
+                    if writer.write_frame(&Frame::Kill { name }).await.is_err() {
+                        return Err("kill write failed".to_string());
+                    }
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
-                Some(Cmd::Shutdown) | None => {
-                    tracing::info!("conn: Shutdown");
-                    break;
+                Some(HostCmd::Shutdown) | None => {
+                    if attached.is_some() {
+                        let _ = writer.write_frame(&Frame::Detach).await;
+                    }
+                    return Ok(());
                 }
             },
         }
     }
-    if attached.is_some() {
-        let _ = writer.write_frame(&Frame::Detach).await;
-    }
-    Ok(())
 }
 
-#[derive(Debug)]
-pub enum Cmd {
-    Attach { name: String, cols: u16, rows: u16 },
-    Detach,
-    Input { bytes: Vec<u8> },
-    Resize { cols: u16, rows: u16 },
-    Create,
-    Kill { name: String },
-    Shutdown,
+/// A supervisor-side handle to one running host actor.
+pub struct HostHandle {
+    pub cmd_tx: UnboundedSender<HostCmd>,
 }

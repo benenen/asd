@@ -1,16 +1,14 @@
 {
   "name": "asd-dioxus",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "private": true,
+  "description": "Webview JS dependencies for the asd Dioxus client, bundled into one minified file",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "esbuild assets/vendor-entry.js --bundle --minify --format=iife --outfile=dist/vendor.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "ghostty-web": "^0.4.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
   }
 }

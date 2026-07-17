@@ -1,106 +1,86 @@
 # asd-dioxus
 
-GPU terminal client built with [Dioxus Desktop][dioxus] + [ghostty-web][ghostty-web], replacing the earlier `asd-gui` (iced/wgpu).
+GPU terminal client built with [Dioxus Desktop][dioxus] + [ghostty-web][ghostty-web] — the webview-based sibling of `asd-gui` (iced/wgpu), with the same M2 feature set: a host-grouped session sidebar, saved SSH connections, a settings overlay, and pure-Rust SSH remotes.
 
-The webview hosts ghostty-web — Ghostty's WASM terminal emulator with an xterm.js-compatible API — while Rust handles daemon communication, session management, and SSH via russh.
+This is a **library crate**: the root `asd` binary combines it via the `dioxus` feature (the default GUI; `--features iced` selects `asd-gui` instead). Entry point: `asd_dioxus::run(session: Option<String>)`.
 
 ## Architecture
 
 ```
-┌─ Rust (Dioxus Desktop) ─────────────────────────┐
-│                                                  │
-│  app.rs          ┌─ conn.rs ──┐                  │
-│  (sidebar +      │ UDS / SSH  │    asd-daemon    │
-│   terminal pane) │ protocol   │◄═════════════════│
-│       │          └────────────┘   Unix socket    │
-│       │                                          │
-│  use_coroutine                                   │
-│       │                                          │
-│       ├── document::eval(BRIDGE_JS) ──────┐      │
-│       │   (JS→Rust: keystrokes/resize)    │      │
-│       │                                   ▼      │
-│       └── desktop.webview.evaluate_script()      │
-│           (Rust→JS: PTY output)          ┌───────┤
-│                                          │       │
-└──────────────────────────────────────────┼───────┘
-                                           ▼
-┌─ JS (wry WebView) ───────────────────────────────┐
-│                                                   │
-│  window.GhosttyWeb  ← bundled IIFE (682 KB)       │
-│       │                                           │
-│       ├── init()  → loads WASM (base64 inlined)  │
-│       └── Terminal → renders to <canvas>          │
-│                                                   │
-│  window.__asdWrite(data)  ← Rust→JS PTY output   │
-│  dioxus.send({...})       → JS→Rust events        │
-│                                                   │
-└───────────────────────────────────────────────────┘
+┌─ Rust ────────────────────────────────────────────────────────┐
+│  app.rs                                                        │
+│   ├─ App (rsx): sidebar + terminal pane + status bar +         │
+│   │             settings overlay                               │
+│   └─ supervisor (use_coroutine):                               │
+│        routes AppCmd → per-host actors, folds UiEvent → signals│
+│                                                                │
+│  conn.rs — one actor per host on a dedicated tokio runtime     │
+│   ├─ local: UnixStream → asd-daemon                            │
+│   └─ remote: ssh.rs (russh) → `asd attach --stdio` far end     │
+│                                                                │
+│  model.rs / settings.rs — Send data: hosts, sessions,          │
+│   saved SSH connections (~/.local/share/asd/config.json,       │
+│   shared with asd-gui)                                         │
+└────────────┬───────────────────────────────────▲───────────────┘
+             │ evaluate_script:                  │ dioxus.send:
+             │  __asdWrite / __asdReset          │  input/resize/status
+┌────────────▼───────────────────────────────────┴───────────────┐
+│  JS (wry WebView)                                              │
+│   window.GhosttyWeb ← vendor bundle (npm + esbuild, minified)  │
+│   assets/bridge.js  ← terminal setup, FitAddon, callbacks      │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-### Bridge direction
-
-| Direction | Mechanism | Notes |
-|---|---|---|
-| JS → Rust | `dioxus.send()` via Dioxus eval bridge | Keystrokes (`onData`), resize (`onResize`), status messages |
-| Rust → JS | `DesktopContext::webview.evaluate_script()` → `window.__asdWrite()` | PTY output (Snapshot / Output frames). Bypasses Dioxus eval bridge because `eval.send()` is broken in 0.8-alpha (returns `Ok` but JS never receives) |
-
-### Why direct evaluate_script for Rust→JS
-
-Dioxus 0.8-alpha's `eval.send()` calls `Query::send()` which generates `window.getQuery(N).rustSend(data)` and executes it via wry's `evaluate_script`. The call returns `Ok`, but the data never arrives in the JS `dioxus.recv()` loop. Root cause is unclear (possible channel mismatch or GC timing in the native eval bridge). The workaround: call `window.__asdWrite(JSON.parse(json))` directly through the same `evaluate_script` API, which works reliably. JSON serialization via `serde_json` handles all control-character escaping.
-
-### Offline ghostty-web bundle
-
-The `ghostty-web` npm package (0.4.0, 682 KB) is processed and embedded at compile time:
-
-1. The ESM bundle at `node_modules/ghostty-web/dist/ghostty-web.js` has WASM already base64-inlined — no separate `.wasm` file needed.
-2. The `export { ... }` statement is stripped and the code is wrapped in an IIFE that exposes `window.GhosttyWeb = { Terminal, init, Ghostty, FitAddon }`.
-3. The resulting `src/ghostty-web-bundle.js` is embedded via `include_str!()` in `main.rs` and injected as the first `<script>` tag in `CUSTOM_HEAD`.
-
-To update ghostty-web: `npm install ghostty-web@latest` then re-run the bundle processing (see `src/ghostty-web-bundle.js` generation in the build notes).
+Session semantics mirror `asd-gui`: one connection per host, polling `ListSessions` for the sidebar; only the viewed session is attached; switching sends `Detach`+`Attach` on the same connection. The `pending_attach` counter drops Snapshots/Output of superseded attaches so a quick A→B→A switch can't paint stale content, and every `UiEvent::Bytes` carries its session name so the app discards in-flight bytes from a session it just left.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | Entry point: Dioxus Desktop config, custom head (CSS + ghostty-web bundle) |
-| `src/app.rs` | App component: sidebar (hosts/sessions), terminal pane, coroutine wiring |
-| `src/bridge.rs` | `BRIDGE_JS` — self-contained JS bridge that creates the terminal and runs the receive loop |
-| `src/conn.rs` | Daemon connection: UDS handshake, session polling, attach/detach, PTY I/O |
-| `src/model.rs` | `Session` struct (from `asd_proto::SessionInfo`) |
-| `src/ghostty-web-bundle.js` | Processed ghostty-web IIFE (682 KB, embedded at compile time) |
+| `src/lib.rs` | `run(session)` — Dioxus Desktop launch, embeds the vendor bundle + CSS |
+| `src/app.rs` | `App` component, supervisor loop, settings overlay, connect menu |
+| `src/conn.rs` | Per-host actor: handshake, list polling, attach/detach, raw PTY bytes |
+| `src/ssh.rs` | russh transport: known_hosts check, password/key auth, `asd attach --stdio` exec |
+| `src/model.rs` | Hosts/sessions/selection model (+ unit tests) |
+| `src/settings.rs` | Saved SSH connections, config persistence, form validation (+ unit tests) |
+| `src/bridge.rs` | `JsMessage` types + `include_str!` of the bridge script |
+| `assets/bridge.js` | Terminal setup, fit-to-pane, JS→Rust events, `__asdWrite`/`__asdReset` |
+| `assets/vendor-entry.js` | npm dependency roll-up: imports each package, assigns to `window` |
+| `assets/app.css` | App stylesheet (palette mirrors asd-gui's theme.rs) |
+| `build.rs` | Drives `npm install` + `npm run build`, copies `dist/vendor.js` into `OUT_DIR` |
+| `package.json` | npm dependency list + the esbuild bundling command |
+
+## JS dependency workflow
+
+npm owns the JS dependencies; esbuild bundles + minifies them into **one IIFE** (`dist/vendor.js`, WASM base64-inlined) which is `include_str!`-ed so the shipped `asd` stays a single self-contained binary.
+
+To add a webview dependency:
+
+```bash
+cd crates/asd-dioxus
+npm install <pkg>                  # updates package.json + lock
+# then import it in assets/vendor-entry.js and assign to window
+```
+
+`build.rs` needs no changes — it just runs `npm install` + `npm run build` when the inputs change. Prerequisites: `node`/`npm` on PATH (use `.npmrc` for a registry mirror if needed).
+
+## Bridge notes (Dioxus 0.8-alpha)
+
+* **Rust→JS** uses `webview.evaluate_script()` calling `window.__asdWrite(...)` / `__asdReset()` — the eval bridge's `send()` is broken in this direction.
+* **JS→Rust** uses `dioxus.send()`, but the *first* eval can race the page load and its channel goes deaf. Rust re-issues the eval until it hears something; every bridge run rebinds `window.__asdSend` to its own channel and all sends route through that binding, so the newest live channel carries the traffic.
+* State that must survive re-renders (the AppCmd channel) lives in `use_hook` — a per-render channel drops its sender on the first re-render and silently unwinds the supervisor.
+* Host actors run on a dedicated tokio runtime (`app.rs::bg`), keeping their timers/IO independent of the embedded runtime.
 
 ## Build & run
 
 ```bash
-# Build
-cargo build -p asd-dioxus
-
-# Run (requires a running asd daemon)
-cargo run -p asd-dioxus
-
-# With debug logging
-RUST_LOG=debug cargo run -p asd-dioxus
+cargo build                        # workspace default = local + dioxus
+cargo run                          # bare `asd` opens this GUI
+cargo run -- gui demo              # preselect session "demo"
+cargo test -p asd-dioxus           # model + settings unit tests
 ```
 
-### Prerequisites
-
-- **asd daemon** must be running (`asd daemon` or `cargo run -- daemon` from workspace root).
-- **macOS**: wry uses WKWebView — works out of the box.
-- **Windows/Linux**: wry uses WebView2 / WebKitGTK respectively.
-
-### Debugging the webview
-
-Right-click the terminal area and select "Inspect" to open WebKit developer tools (enabled by default in debug builds). JS console logs appear there, not in the Rust terminal output.
-
-## Key design decisions
-
-**Single connection, multi-attach**: The `conn::run` task holds one UDS connection to the daemon. Switching sessions sends `Detach` + `Attach` on the same connection. The `attaching` flag drops stale `Output` frames during the switch.
-
-**Eager channel creation**: The `daemon_cmd_tx`/`daemon_cmd_rx` channel pair is created before the coroutine, so sidebar click handlers always have a valid sender — no `None`-then-`Some` race condition.
-
-**Deferred auto-attach**: Session auto-attach waits for the JS bridge to signal readiness (`"bridge ready"` status message). This prevents `evaluate_script` calls from racing with `window.__asdWrite` setup.
-
-**Terminal test banner**: The bridge writes `=== asd ready ===` in green immediately after creation. If this renders but shell content doesn't, the issue is in the data path (daemon/Rust→JS). If nothing renders at all, the issue is in ghostty-web (WASM init, canvas, font).
+Linux needs WebKitGTK (`libwebkit2gtk-4.1-dev` to build, the runtime lib to run); macOS/Windows use the system webview. Servers that only need the daemon/CLI should build `--no-default-features --features local` — no GUI libraries linked.
 
 [dioxus]: https://dioxuslabs.com
 [ghostty-web]: https://www.npmjs.com/package/ghostty-web
