@@ -354,11 +354,15 @@ impl App {
             if y + 1 >= side.bottom() {
                 continue;
             }
-            // Shimmer only the interior text columns: skip the left edge (the
-            // activity dot / selection bar) and the right rule so neither the
-            // selection frame nor the separator gets hue-shifted.
-            let rect =
-                ratatui::layout::Rect::new(side.left() + 1, y, side.width.saturating_sub(2), 2);
+            // Shimmer only the name/title text: skip the marker + ordinal on
+            // the left (up to ROW_TEXT_X) and the right rule, so neither the
+            // ordinal, the selection frame, nor the separator is hue-shifted.
+            let rect = ratatui::layout::Rect::new(
+                side.left() + ui::ROW_TEXT_X,
+                y,
+                side.width.saturating_sub(ui::ROW_TEXT_X + 1),
+                2,
+            );
             fx.process(delta, buf, rect);
         }
     }
@@ -643,8 +647,9 @@ impl App {
                 KeyCode::Char('j') | KeyCode::Down => self.select_by_offset(1),
                 KeyCode::Char('k') | KeyCode::Up => self.select_by_offset(-1),
                 KeyCode::Char(c @ '1'..='9') => {
-                    let i = (c as usize) - ('1' as usize);
-                    if let Some(s) = self.sessions.get(i) {
+                    if let Some(i) = ui::jump_index(c)
+                        && let Some(s) = self.sessions.get(i)
+                    {
                         self.select(s.name.clone());
                     }
                 }

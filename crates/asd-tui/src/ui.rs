@@ -14,6 +14,19 @@ use crate::modal::Modal;
 
 /// Sidebar width in cells (incl. its 1-cell right border).
 pub const SIDEBAR_W: u16 = 28;
+/// Column (relative to the sidebar's left) where a row's name/title text
+/// starts, after the 1-col marker and the 2-col ordinal. Shared with the
+/// running-shimmer so only the text — not the ordinal — is hue-shifted.
+pub const ROW_TEXT_X: u16 = 4;
+
+/// The session index that the `Ctrl+A <digit>` quick-switch selects, or `None`
+/// for a digit with no target. Only `1..=9` map (to the 1st..9th session); the
+/// 10th and later have an ordinal but no shortcut.
+pub fn jump_index(digit: char) -> Option<usize> {
+    ('1'..='9')
+        .contains(&digit)
+        .then(|| digit as usize - '1' as usize)
+}
 
 // Palette (the asd theme, same values as asd-dioxus's app.css).
 const TEXT: Color = Color::Rgb(0xE7, 0xE2, 0xD6);
@@ -213,10 +226,22 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
                 }
             }
         }
-        // Line 1: activity dot + name … kill mark.
+        let text_x = area.left() + ROW_TEXT_X;
+        // Line 1: [marker][ordinal][name] … kill mark. The marker is the
+        // activity dot (or the selection bar, drawn below).
         let dot = if s.attached_clients > 0 { "•" } else { " " };
-        let name = truncate(&s.name, inner_w.saturating_sub(5));
         buf.set_string(area.left(), y, dot, row_bg.fg(ACCENT));
+        // 1-based ordinal, right-aligned in 2 cols — it matches the Ctrl+A <n>
+        // quick-switch for the first nine rows (dimmer past nine: no shortcut).
+        let n = i + 1;
+        let num_style = if selected {
+            row_bg.fg(ACCENT)
+        } else if i < 9 {
+            row_bg.fg(MUTED)
+        } else {
+            row_bg.fg(DIM)
+        };
+        buf.set_string(area.left() + 1, y, format!("{n:>2}"), num_style);
         // The session hosting this UI is shown but not selectable: dim it. A
         // running session's text is drawn in the saturated accent so the hue
         // shimmer (`App::process_running_fx`) has color to rotate — hue-shifting
@@ -228,12 +253,13 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
         } else {
             row_bg.fg(TEXT).add_modifier(Modifier::BOLD)
         };
-        buf.set_string(area.left() + 1, y, &name, name_style);
+        let name = truncate(&s.name, inner_w.saturating_sub(ROW_TEXT_X as usize + 3));
+        buf.set_string(text_x, y, &name, name_style);
         buf.set_string(area.right() - 3, y, "x", row_bg.fg(DIM));
         // Line 2: the terminal title (what the session says it's doing),
         // falling back to the foreground command; plus the age, dim.
         let age = short_age(s.created_ms, app.now_ms);
-        let cmd_w = inner_w.saturating_sub(age.len() + 4);
+        let cmd_w = inner_w.saturating_sub(ROW_TEXT_X as usize + age.len() + 2);
         let label = if s.title.trim().is_empty() {
             short_cmd(&s.command)
         } else {
@@ -241,7 +267,7 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
         };
         let cmd = truncate(&label, cmd_w);
         let cmd_fg = if s.running && !is_self { ACCENT } else { MUTED };
-        buf.set_string(area.left() + 2, y + 1, &cmd, row_bg.fg(cmd_fg));
+        buf.set_string(text_x, y + 1, &cmd, row_bg.fg(cmd_fg));
         buf.set_string(
             area.right() - 2 - age.len() as u16,
             y + 1,
@@ -451,6 +477,17 @@ pub fn short_age(created_ms: u64, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jump_index_maps_1_9_and_ignores_others() {
+        assert_eq!(jump_index('1'), Some(0)); // 1 → first session
+        assert_eq!(jump_index('9'), Some(8)); // 9 → ninth session
+        assert_eq!(jump_index('0'), None);
+        assert_eq!(jump_index('a'), None);
+        // Only the first nine rows are reachable; the 10th (index 9) and beyond
+        // have an ordinal but no digit shortcut.
+        assert!(('1'..='9').all(|d| jump_index(d).unwrap() < 9));
+    }
 
     #[test]
     fn short_cmd_basenames_paths_but_keeps_args() {
