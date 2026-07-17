@@ -1,7 +1,6 @@
-//! Saved SSH connections and their persistence — the data layer shared with
-//! `asd-gui` (same `config.json`, same JSON shape). The settings UI itself is
-//! plain RSX in [`crate::app`]; this module holds only `Send` data and the
-//! form-validation rules.
+//! Saved SSH connections and their persistence (`config.json` under the asd
+//! data dir). The settings UI itself is plain RSX in [`crate::app`]; this
+//! module holds only `Send` data and the form-validation rules.
 
 use serde::{Deserialize, Serialize};
 

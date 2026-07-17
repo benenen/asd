@@ -1,9 +1,9 @@
 //! `asd-dioxus`: GPU terminal client built with Dioxus Desktop + ghostty-web.
 //!
 //! Library crate combined into the single `asd` binary by the root package's
-//! `dioxus` feature (the iced client `asd-gui` sits behind `iced`). Same
-//! boundary contract as `asd-gui`: no PTY/process management — remote hosts go
-//! through pure-Rust SSH ([`russh`]), the local daemon through its socket.
+//! `dioxus` feature. Boundary contract: no PTY/process management — remote
+//! hosts go through pure-Rust SSH ([`russh`]), the local daemon through its
+//! socket.
 
 #![allow(non_snake_case)]
 
@@ -25,8 +25,8 @@ use dioxus::prelude::*;
 /// `asset!()` file so the shipped `asd` stays one self-contained binary.
 pub(crate) const VENDOR_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/vendor.js"));
 
-/// App stylesheet (palette mirrors asd-gui's theme.rs), injected with
-/// `document::Style` in [`app::App`].
+/// App stylesheet (the asd palette: dark bg, amber local / cyan remote
+/// rails), injected with `document::Style` in [`app::App`].
 pub(crate) const APP_CSS: &str = include_str!("../assets/app.css");
 
 /// The session named on the command line, auto-selected once the local list

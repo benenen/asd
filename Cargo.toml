@@ -29,13 +29,10 @@ assets = [
 default = ["local", "dioxus"]
 # Terminal side: CLI subcommands + embedded daemon (pulls in portable-pty).
 local = ["dep:asd-cli"]
-# GUI flavors — `dioxus` (webview + ghostty-web, the default) or `iced`
-# (wgpu-rendered). When both are enabled, the explicitly requested `iced`
-# wins (it can only be on by explicit request since the default is dioxus).
-# Build `--no-default-features --features dioxus` (or `gui`) for a PTY-free,
+# The GUI: Dioxus Desktop + ghostty-web in a webview. Build
+# `--no-default-features --features dioxus` (or `gui`) for a PTY-free,
 # GUI-only client (the basis of a viable Windows client).
 dioxus = ["dep:asd-dioxus"]
-iced = ["dep:asd-gui"]
 # Compat alias for older build scripts/CI: "the default GUI".
 gui = ["dioxus"]
 
@@ -43,7 +40,6 @@ gui = ["dioxus"]
 anyhow = { workspace = true }
 asd-cli = { workspace = true, optional = true }
 asd-dioxus = { workspace = true, optional = true }
-asd-gui = { workspace = true, optional = true }
 
 [dev-dependencies]
 asd-proto = { workspace = true }
@@ -63,7 +59,6 @@ repository = ""
 [workspace.dependencies]
 asd-cli = { path = "crates/asd-cli" }
 asd-dioxus = { path = "crates/asd-dioxus" }
-asd-gui = { path = "crates/asd-gui" }
 asd-daemon = { path = "crates/asd-daemon" }
 asd-proto = { path = "crates/asd-proto" }
 asd-tui = { path = "crates/asd-tui" }

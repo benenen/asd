@@ -13,7 +13,7 @@ use crate::App;
 /// Sidebar width in cells (incl. its 1-cell right border).
 pub const SIDEBAR_W: u16 = 28;
 
-// Palette (mirrors asd-gui's theme.rs).
+// Palette (the asd theme, same values as asd-dioxus's app.css).
 const TEXT: Color = Color::Rgb(0xE7, 0xE2, 0xD6);
 const DIM: Color = Color::Rgb(0x5A, 0x64, 0x72);
 const MUTED: Color = Color::Rgb(0x8B, 0x94, 0xA2);
@@ -420,8 +420,12 @@ mod tests {
             end: (3, 0),
         });
         render_pane(&mut buf, area, &snap, sel);
-        let reversed =
-            |x: u16| buf[(x, 0)].style().add_modifier.contains(Modifier::REVERSED);
+        let reversed = |x: u16| {
+            buf[(x, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        };
         // Text and a written space take the highlight...
         assert!(reversed(0));
         assert!(reversed(1));

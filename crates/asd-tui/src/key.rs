@@ -1,6 +1,6 @@
-//! Map crossterm key events to asd-vt [`KeyEvent`]s (the counterpart of
-//! asd-gui's key.rs for iced). Pure and unit-testable; the terminal's own
-//! `encode_key` then applies mode state (DECCKM etc.) when producing bytes.
+//! Map crossterm key events to asd-vt [`KeyEvent`]s. Pure and unit-testable;
+//! the terminal's own `encode_key` then applies mode state (DECCKM etc.)
+//! when producing bytes.
 
 use asd_vt::{Key as VtKey, KeyEvent, Mods};
 use ratatui::crossterm::event::{KeyCode, KeyEvent as CtKey, KeyModifiers};

@@ -1,6 +1,6 @@
-//! Per-host connection actors (mirrors `asd-gui`'s conn.rs, minus the local
-//! VT: ghostty-web consumes the raw PTY bytes, so each host actor is a plain
-//! tokio task that speaks the framed protocol and forwards bytes).
+//! Per-host connection actors. ghostty-web consumes the raw PTY bytes (no
+//! local VT), so each host actor is a plain tokio task that speaks the framed
+//! protocol and forwards bytes.
 //!
 //! Each host — the local daemon or an SSH remote — gets one actor that:
 //!   * handshakes, then polls `ListSessions` on an interval → the sidebar;
@@ -171,7 +171,8 @@ async fn drive(
     // belongs to a session we already left and is dropped. While > 1, arriving
     // Snapshots belong to superseded attaches (the user switched again before
     // the reply landed) and are dropped too — feeding them would paint the old
-    // session over the new one (same race as asd-gui's A→B→A switch scramble).
+    // session over the new one (the A→B→A switch scramble; all asd clients
+    // guard it the same way).
     let mut pending_attach: usize = 0;
     let mut attached: Option<String> = None;
 

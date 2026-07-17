@@ -1,8 +1,8 @@
 # asd-dioxus
 
-GPU terminal client built with [Dioxus Desktop][dioxus] + [ghostty-web][ghostty-web] — the webview-based sibling of `asd-gui` (iced/wgpu), with the same M2 feature set: a host-grouped session sidebar, saved SSH connections, a settings overlay, and pure-Rust SSH remotes.
+GPU terminal client built with [Dioxus Desktop][dioxus] + [ghostty-web][ghostty-web]: a host-grouped session sidebar, saved SSH connections, a settings overlay, and pure-Rust SSH remotes (the M2 feature set).
 
-This is a **library crate**: the root `asd` binary combines it via the `dioxus` feature (the default GUI; `--features iced` selects `asd-gui` instead). Entry point: `asd_dioxus::run(session: Option<String>)`.
+This is a **library crate**: the root `asd` binary combines it via the `dioxus` feature. Entry point: `asd_dioxus::run(session: Option<String>)`.
 
 ## Architecture
 
@@ -19,8 +19,7 @@ This is a **library crate**: the root `asd` binary combines it via the `dioxus` 
 │   └─ remote: ssh.rs (russh) → `asd attach --stdio` far end     │
 │                                                                │
 │  model.rs / settings.rs — Send data: hosts, sessions,          │
-│   saved SSH connections (~/.local/share/asd/config.json,       │
-│   shared with asd-gui)                                         │
+│   saved SSH connections (~/.local/share/asd/config.json)       │
 └────────────┬───────────────────────────────────▲───────────────┘
              │ evaluate_script:                  │ dioxus.send:
              │  __asdWrite / __asdReset          │  input/resize/status
@@ -31,7 +30,7 @@ This is a **library crate**: the root `asd` binary combines it via the `dioxus` 
 └────────────────────────────────────────────────────────────────┘
 ```
 
-Session semantics mirror `asd-gui`: one connection per host, polling `ListSessions` for the sidebar; only the viewed session is attached; switching sends `Detach`+`Attach` on the same connection. The `pending_attach` counter drops Snapshots/Output of superseded attaches so a quick A→B→A switch can't paint stale content, and every `UiEvent::Bytes` carries its session name so the app discards in-flight bytes from a session it just left.
+Session semantics: one connection per host, polling `ListSessions` for the sidebar; only the viewed session is attached; switching sends `Detach`+`Attach` on the same connection. The `pending_attach` counter drops Snapshots/Output of superseded attaches so a quick A→B→A switch can't paint stale content, and every `UiEvent::Bytes` carries its session name so the app discards in-flight bytes from a session it just left.
 
 ## Files
 
@@ -46,7 +45,7 @@ Session semantics mirror `asd-gui`: one connection per host, polling `ListSessio
 | `src/bridge.rs` | `JsMessage` types + `include_str!` of the bridge script |
 | `assets/bridge.js` | Terminal setup, fit-to-pane, JS→Rust events, `__asdWrite`/`__asdReset` |
 | `assets/vendor-entry.js` | npm dependency roll-up: imports each package, assigns to `window` |
-| `assets/app.css` | App stylesheet (palette mirrors asd-gui's theme.rs) |
+| `assets/app.css` | App stylesheet (the asd palette: dark bg, amber local / cyan remote rails) |
 | `build.rs` | Drives `npm install` + `npm run build`, copies `dist/vendor.js` into `OUT_DIR` |
 | `package.json` | npm dependency list + the esbuild bundling command |
 

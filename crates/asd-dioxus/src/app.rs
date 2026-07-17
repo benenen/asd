@@ -1,6 +1,6 @@
 //! Main application component: host-grouped session sidebar + ghostty-web
 //! terminal pane + status bar, plus the settings overlay (saved SSH
-//! connections). Mirrors `asd-gui`'s M2 layout and semantics.
+//! connections) — the M2 two-pane layout (spec §7, boo `boo ui` parity).
 //!
 //! Architecture: UI handlers send [`AppCmd`]s to the supervisor loop inside
 //! the app coroutine. The supervisor spawns one [`conn::run_host`] task per
@@ -987,7 +987,7 @@ async fn supervisor(
     }
 }
 
-/// Route one app command to the right host actor (mirrors `asd-gui`'s route).
+/// Route one app command to the right host actor.
 fn route(
     cmd: AppCmd,
     ui_tx: &UnboundedSender<UiEvent>,
