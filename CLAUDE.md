@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `asd` = GPU 终端客户端 + headless mux daemon，定位 **shpool 而非 tmux**：一个 session 即一个 PTY，不做 pane/window 分屏。规格与里程碑文档在 Obsidian：`idea/spacs/gmux GPU 终端 Spec`、`idea/plans/gmux GPU 终端计划`（文档用 `gmux-*` 命名，本仓库对应为 `asd-*`）。M0 五个模块 asd-proto / asd-vt / asd-daemon / asd-cli / asd-gui 均已落地。
 
-**单二进制分发（有意偏离 spec §2，用户决定）**：只产出**一个** `asd` 可执行文件，CLI + 内嵌 daemon + GUI 全在里面。**bin 是 workspace 根 package `asd`（`Cargo.toml` 既是 `[workspace]` 又是 `[package]`，`src/main.rs`）**；asd-daemon/asd-cli/asd-gui 都是 **library crate**，根 bin 用 **feature** 组合：`local`（=asd-cli，带 daemon/portable-pty）+ `gui`（=asd-gui，iced），`default=["local","gui"]`。**裸 `asd` 开 GUI**，`asd gui [session]` 也开 GUI，`new/attach/list/kill/daemon/restart` 是 CLI 子命令。**Windows 客户端 = `--no-default-features --features gui`**（纯 GUI、无 portable-pty，边界靠 feature 守住，`cargo tree` 验证 gui-only 0 个 portable-pty）。daemon 仍以 `asd daemon` 子命令运行，自愈拉起 = re-exec `current_exe()` + `daemon`。GUI 入口 `asd_gui::run(session)`；CLI 入口 `asd_cli::run(gui: Option<GuiLauncher>)`（GUI 启动器由 bin 注入，asd-cli 因此不碰 iced）。
+**单二进制分发（有意偏离 spec §2，用户决定）**：只产出**一个** `asd` 可执行文件，CLI + 内嵌 daemon + GUI 全在里面。**bin 是 workspace 根 package `asd`（`Cargo.toml` 既是 `[workspace]` 又是 `[package]`，`src/main.rs`）**；asd-daemon/asd-cli/asd-gui/asd-dioxus 都是 **library crate**，根 bin 用 **feature** 组合：`local`（=asd-cli，带 daemon/portable-pty）+ GUI 二选一——**`dioxus`（=asd-dioxus，webview+ghostty-web，默认）或 `iced`（=asd-gui，wgpu）**，`default=["local","dioxus"]`；两个 GUI feature 同开时 **iced 优先**（默认已含 dioxus，iced 出现即显式要求；`gui` 是兼容别名=dioxus）。**裸 `asd` 开 GUI**，`asd gui [session]` 也开 GUI，`new/attach/list/kill/daemon/restart` 是 CLI 子命令。**Windows/纯客户端 = `--no-default-features --features dioxus`（或 iced）**（无 portable-pty，`cargo tree` 验证 0 个）；**服务器端只装 daemon/CLI 用 `--no-default-features --features local`**（不链 GUI 库——dioxus 版链 libwebkit2gtk，拷到没有 WebKitGTK 的服务器会起不来）。daemon 仍以 `asd daemon` 子命令运行，自愈拉起 = re-exec `current_exe()` + `daemon`。GUI 入口 `asd_gui::run(session)` / `asd_dioxus::run(session)`；CLI 入口 `asd_cli::run(gui: Option<GuiLauncher>)`（GUI 启动器由 bin 注入，asd-cli 不碰任何 GUI 框架）。
 
 ## 代码规范
 
@@ -20,13 +20,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | asd-vt | `VtBackend` trait + libghostty-vt 实现（逃生门边界） | iced/wgpu、portable-pty、asd-proto |
 | asd-daemon（lib） | session 管理、UDS 服务 | iced/wgpu（含传递依赖） |
 | asd-cli（**lib**，`pub fn run`） | 调试客户端、`attach --stdio` 代理、内嵌 daemon（`asd daemon`）；被根 bin 的 `local` feature 组合 | iced/wgpu（GUI 启动器由 bin 注入，不直接依赖 iced） |
-| asd-gui（**lib**，`pub fn run`，iced/wgpu） | 渲染、输入、拨号、SSH remote；被根 bin 的 `gui` feature 组合 | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基）；可依赖 asd-vt/asd-proto。**SSH 走纯 Rust `russh`（网络客户端，不 spawn 进程/不用 ssh.exe，不违反边界）**，不是 spawn `ssh` 子进程 |
-| asd（**根 package**，唯一 bin `asd`） | 组合上面两个 lib 成单一可执行文件（feature `local`/`gui`）；除组合外无逻辑 | 直接依赖 iced 或 portable-pty（应经由 feature 拉 asd-gui/asd-cli，保持两 lib 边界纯净） |
+| asd-gui（**lib**，`pub fn run`，iced/wgpu） | 渲染、输入、拨号、SSH remote；被根 bin 的 `iced` feature 组合 | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基）；可依赖 asd-vt/asd-proto。**SSH 走纯 Rust `russh`（网络客户端，不 spawn 进程/不用 ssh.exe，不违反边界）**，不是 spawn `ssh` 子进程 |
+| asd-dioxus（**lib**，`pub fn run`，Dioxus Desktop+ghostty-web） | 同 asd-gui 的功能面（host 侧栏/SSH remote/设置），渲染交给 webview 里的 ghostty-web（吃原始 PTY 字节，无 asd-vt）；被根 bin 的 `dioxus` feature（默认）组合 | 与 asd-gui 同边界：**无 portable-pty/进程管理**，SSH 走 russh。JS 依赖由 npm+esbuild 打包（build.rs 驱动，见 crate README），产物 include_str! 内嵌保单二进制 |
+| asd（**根 package**，唯一 bin `asd`） | 组合上面的 lib 成单一可执行文件（feature `local`/`dioxus`/`iced`）；除组合外无逻辑 | 直接依赖 GUI 框架或 portable-pty（应经由 feature 拉对应 lib，保持边界纯净） |
 
 ## 常用命令
 
 ```bash
-cargo build --workspace              # 首次构建会用 Zig 编译 libghostty-vt-sys（vendored），需 PATH 里有 zig 0.15.x
+cargo build --workspace              # 首次构建会用 Zig 编译 libghostty-vt-sys（vendored），需 PATH 里有 zig 0.15.x；asd-dioxus 的 build.rs 会跑 npm install + esbuild（需 node/npm）
 cargo test --workspace               # e2e 测试会真实拉起 asd-daemon 进程（独立 socket，互不干扰）
 cargo test -p asd-vt                 # 单 crate
 cargo test --test e2e sigterm        # 单个 e2e（e2e 在根 package tests/，非 asd-cli）

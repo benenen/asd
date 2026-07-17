@@ -1,12 +1,14 @@
 //! The single `asd` binary: the terminal-mux CLI + embedded daemon (`local`
-//! feature) and the GPU GUI (`gui` feature) combined into one executable.
+//! feature) and a GPU GUI combined into one executable.
 //!
 //! Running `asd` with no subcommand opens the GUI; the terminal commands
 //! (`new` / `attach` / `list` / `kill` / `daemon` / `restart`) live under
-//! `local`. The features keep the crate boundaries intact — `asd-cli` (which
-//! pulls portable-pty via the daemon) and `asd-gui` (iced) stay separate
-//! libraries, and only this binary combines them. Build with
-//! `--no-default-features --features gui` for a PTY-free, GUI-only client.
+//! `local`. Two GUI flavors exist as features: `dioxus` (webview +
+//! ghostty-web, the default) and `iced` (wgpu-rendered). The features keep
+//! the crate boundaries intact — `asd-cli` (which pulls portable-pty via the
+//! daemon) and the GUI crates stay separate libraries, and only this binary
+//! combines them. Build with `--no-default-features --features dioxus` for a
+//! PTY-free, GUI-only client.
 
 fn main() -> anyhow::Result<()> {
     run()
@@ -16,16 +18,16 @@ fn main() -> anyhow::Result<()> {
 /// launcher for a no-subcommand / `gui` invocation.
 #[cfg(feature = "local")]
 fn run() -> anyhow::Result<()> {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "iced", feature = "dioxus"))]
     let gui: Option<asd_cli::GuiLauncher> = Some(launch_gui);
-    #[cfg(not(feature = "gui"))]
+    #[cfg(not(any(feature = "iced", feature = "dioxus")))]
     let gui: Option<asd_cli::GuiLauncher> = None;
     asd_cli::run(gui)
 }
 
 /// GUI-only build (e.g. Windows): no CLI/daemon. Bare `asd`, or
 /// `asd [gui] <session>`, opens the window.
-#[cfg(all(not(feature = "local"), feature = "gui"))]
+#[cfg(all(not(feature = "local"), any(feature = "iced", feature = "dioxus")))]
 fn run() -> anyhow::Result<()> {
     let session = std::env::args()
         .skip(1)
@@ -33,10 +35,18 @@ fn run() -> anyhow::Result<()> {
     launch_gui(session)
 }
 
-#[cfg(not(any(feature = "local", feature = "gui")))]
-compile_error!("enable at least one of the `local` or `gui` features");
+#[cfg(not(any(feature = "local", feature = "iced", feature = "dioxus")))]
+compile_error!("enable at least one of the `local`, `dioxus`, or `iced` features");
 
-#[cfg(feature = "gui")]
+/// `iced` wins when both GUI features are enabled: the default GUI is dioxus,
+/// so iced being on at all means it was requested explicitly
+/// (`--features iced` adds to the default set without disabling it).
+#[cfg(feature = "iced")]
 fn launch_gui(session: Option<String>) -> anyhow::Result<()> {
     asd_gui::run(session).map_err(|e| anyhow::anyhow!("gui error: {e:?}"))
+}
+
+#[cfg(all(feature = "dioxus", not(feature = "iced")))]
+fn launch_gui(session: Option<String>) -> anyhow::Result<()> {
+    asd_dioxus::run(session)
 }
