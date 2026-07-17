@@ -66,6 +66,7 @@ asd-dioxus = { path = "crates/asd-dioxus" }
 asd-gui = { path = "crates/asd-gui" }
 asd-daemon = { path = "crates/asd-daemon" }
 asd-proto = { path = "crates/asd-proto" }
+asd-tui = { path = "crates/asd-tui" }
 asd-vt = { path = "crates/asd-vt" }
 
 anyhow = "1"
@@ -75,6 +76,7 @@ libghostty-vt = "0.2"
 nix = { version = "0.30", features = ["signal", "process", "term", "fs"] }
 portable-pty = "0.9"
 postcard = { version = "1", features = ["use-std"] }
+ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = [

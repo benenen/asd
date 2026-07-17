@@ -1,0 +1,384 @@
+//! Drawing: session sidebar (two-line rows: name + kill mark, command + age)
+//! on the left, the live terminal pane on the right, a keybind hint at the
+//! bottom of the sidebar — the layout in `images/image.png`.
+
+use asd_vt::{CellWidth, RenderSnapshot, Rgb, UnderlineKind};
+use ratatui::Frame;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+
+use crate::App;
+
+/// Sidebar width in cells (incl. its 1-cell right border).
+pub const SIDEBAR_W: u16 = 28;
+
+// Palette (mirrors asd-gui's theme.rs).
+const TEXT: Color = Color::Rgb(0xE7, 0xE2, 0xD6);
+const DIM: Color = Color::Rgb(0x5A, 0x64, 0x72);
+const MUTED: Color = Color::Rgb(0x8B, 0x94, 0xA2);
+const ACCENT: Color = Color::Rgb(0xF3, 0xB2, 0x4C);
+const ALERT: Color = Color::Rgb(0xE5, 0x59, 0x5E);
+const OK: Color = Color::Rgb(0x79, 0xD1, 0x8C);
+const SELECT_BG: Color = Color::Rgb(0x2E, 0x2A, 0x20);
+const RULE: Color = Color::Rgb(0x23, 0x2A, 0x34);
+
+/// Split the frame: sidebar | terminal pane, with a full-width keybind/status
+/// bar along the bottom.
+pub fn areas(total: Rect) -> (Rect, Rect, Rect) {
+    let body_h = total.height.saturating_sub(1);
+    let side_w = SIDEBAR_W.min(total.width);
+    let side = Rect::new(total.x, total.y, side_w, body_h);
+    let pane = Rect::new(
+        total.x + side_w,
+        total.y,
+        total.width.saturating_sub(side_w),
+        body_h,
+    );
+    let bar = Rect::new(
+        total.x,
+        total.y + body_h,
+        total.width,
+        total.height - body_h,
+    );
+    (side, pane, bar)
+}
+
+/// The terminal grid the pane offers (what `Attach`/`Resize` request).
+pub fn pane_grid(total: Rect) -> (u16, u16) {
+    let (_, pane, _) = areas(total);
+    (pane.width.max(1), pane.height.max(1))
+}
+
+/// A selection projected into viewport coordinates: `start`..=`end`,
+/// row-major, both inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+}
+
+pub fn draw(f: &mut Frame<'_>, app: &mut App) {
+    let (side, pane, bar) = areas(f.area());
+    draw_sidebar(f.buffer_mut(), side, app);
+    draw_bar(f.buffer_mut(), bar, app);
+
+    let sel = app.sel_viewport();
+    if let Some(snap) = app.snapshot() {
+        render_pane(f.buffer_mut(), pane, &snap, sel);
+        // A real terminal cursor when following live output.
+        if app.scroll == 0
+            && snap.cursor.visible
+            && let Some((cx, cy)) = snap.cursor.position
+            && cx < pane.width
+            && cy < pane.height
+        {
+            f.set_cursor_position(Position::new(pane.x + cx, pane.y + cy));
+        }
+        if app.scroll > 0 {
+            let tag = format!("[+{}] ", app.scroll);
+            let x = pane.right().saturating_sub(tag.len() as u16);
+            f.buffer_mut()
+                .set_string(x, pane.y, tag, Style::new().fg(ACCENT));
+        }
+    } else {
+        let hint = if app.sessions.is_empty() {
+            "no sessions — Ctrl+A c creates one"
+        } else {
+            "select a session (Ctrl+A j/k)"
+        };
+        let y = pane.y + pane.height / 2;
+        let x = pane.x + (pane.width.saturating_sub(hint.len() as u16)) / 2;
+        f.buffer_mut().set_string(x, y, hint, Style::new().fg(DIM));
+    }
+}
+
+fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    // Right border rule.
+    for y in area.top()..area.bottom() {
+        buf.set_string(area.right() - 1, y, "│", Style::new().fg(RULE));
+    }
+    let inner_w = (area.width - 1) as usize;
+
+    // Session rows: two lines each.
+    let list_bottom = area.bottom();
+    let mut y = area.top();
+    for (i, s) in app.sessions.iter().enumerate() {
+        if y + 1 >= list_bottom {
+            break;
+        }
+        let selected = app.active.as_deref() == Some(&s.name);
+        let row_bg = if selected {
+            Style::new().bg(SELECT_BG)
+        } else {
+            Style::new()
+        };
+        // Paint the row background.
+        for line in 0..2 {
+            for x in area.left()..area.right() - 1 {
+                if let Some(c) = buf.cell_mut(Position::new(x, y + line)) {
+                    c.set_style(row_bg);
+                }
+            }
+        }
+        // Line 1: activity dot + name … kill mark.
+        let dot = if s.attached_clients > 0 { "•" } else { " " };
+        let name = truncate(&s.name, inner_w.saturating_sub(5));
+        buf.set_string(area.left(), y, dot, row_bg.fg(ACCENT));
+        buf.set_string(
+            area.left() + 1,
+            y,
+            &name,
+            row_bg.fg(TEXT).add_modifier(Modifier::BOLD),
+        );
+        buf.set_string(area.right() - 3, y, "x", row_bg.fg(DIM));
+        // Line 2: command + age, dim.
+        let age = short_age(s.created_ms, app.now_ms);
+        let cmd_w = inner_w.saturating_sub(age.len() + 4);
+        let cmd = truncate(&short_cmd(&s.command), cmd_w);
+        buf.set_string(area.left() + 2, y + 1, &cmd, row_bg.fg(MUTED));
+        buf.set_string(
+            area.right() - 2 - age.len() as u16,
+            y + 1,
+            &age,
+            row_bg.fg(DIM),
+        );
+        // Remember the row for mouse hit-testing.
+        let _ = i;
+        y += 2;
+    }
+}
+
+/// Full-width bottom bar: keybind hint on the left, daemon status / notice on
+/// the right.
+fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
+    if area.height == 0 || area.width < 8 {
+        return;
+    }
+    let y = area.top();
+    // Bar background.
+    for x in area.left()..area.right() {
+        if let Some(c) = buf.cell_mut(Position::new(x, y)) {
+            c.set_style(Style::new().bg(RULE));
+        }
+    }
+    let (hint, style) = if app.prefix {
+        (
+            "PREFIX  j/k switch · 1-9 jump · c new · x kill · r reconnect · q quit · Ctrl+A literal",
+            Style::new().fg(ACCENT).bg(RULE),
+        )
+    } else {
+        ("Keybinds: Ctrl+A", Style::new().fg(DIM).bg(RULE))
+    };
+    buf.set_string(
+        area.left() + 1,
+        y,
+        truncate(hint, area.width.saturating_sub(2) as usize),
+        style,
+    );
+
+    let (status, sstyle) = if let Some(notice) = &app.notice {
+        (notice.clone(), Style::new().fg(ALERT).bg(RULE))
+    } else if app.daemon_up {
+        (
+            format!("● {} sessions", app.sessions.len()),
+            Style::new().fg(OK).bg(RULE),
+        )
+    } else {
+        (
+            "daemon down — Ctrl+A r".to_string(),
+            Style::new().fg(ALERT).bg(RULE),
+        )
+    };
+    let max = (area.width / 2) as usize;
+    let status = truncate(&status, max);
+    let x = area
+        .right()
+        .saturating_sub(status.chars().count() as u16 + 1);
+    // Only draw the status when it doesn't collide with the hint.
+    if x > area.left() + 1 + hint.chars().count().min(max) as u16 {
+        buf.set_string(x, y, status, sstyle);
+    }
+}
+
+/// Which sidebar session row (and whether its kill mark) a click lands on.
+pub fn sidebar_hit(area: Rect, sessions: usize, col: u16, row: u16) -> Option<(usize, bool)> {
+    let (side, _, _) = areas(area);
+    if col >= side.right() - 1 || row >= side.bottom() {
+        return None;
+    }
+    let idx = ((row.checked_sub(side.top())?) / 2) as usize;
+    if idx >= sessions {
+        return None;
+    }
+    let on_kill = row.saturating_sub(side.top()) % 2 == 0 && col >= side.right().saturating_sub(4);
+    Some((idx, on_kill))
+}
+
+/// Whether viewport cell `(x, y)` falls inside the row-major selection.
+fn in_selection(sel: Option<Selection>, x: u16, y: u16) -> bool {
+    let Some(s) = sel else { return false };
+    let after_start = y > s.start.1 || (y == s.start.1 && x >= s.start.0);
+    let before_end = y < s.end.1 || (y == s.end.1 && x <= s.end.0);
+    after_start && before_end
+}
+
+/// Paint a [`RenderSnapshot`] into the pane area, reversing the cells covered
+/// by the drag selection (the CLI attach client's self-drawn highlight).
+fn render_pane(buf: &mut Buffer, area: Rect, snap: &RenderSnapshot, sel: Option<Selection>) {
+    let rows = snap.rows.min(area.height);
+    let cols = snap.cols.min(area.width);
+    for y in 0..rows {
+        for x in 0..cols {
+            let cell = &snap.cells[y as usize][x as usize];
+            if matches!(cell.width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
+                continue;
+            }
+            let Some(target) = buf.cell_mut(Position::new(area.x + x, area.y + y)) else {
+                continue;
+            };
+            if cell.grapheme.is_empty() {
+                target.set_symbol(" ");
+            } else {
+                target.set_symbol(&cell.grapheme);
+            }
+            let mut style = cell_style(cell);
+            if in_selection(sel, x, y) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            target.set_style(style);
+        }
+        // Clear any pane cells right of the snapshot (after shrink).
+        for x in cols..area.width {
+            if let Some(t) = buf.cell_mut(Position::new(area.x + x, area.y + y)) {
+                t.reset();
+            }
+        }
+    }
+}
+
+fn cell_style(cell: &asd_vt::CellSnapshot) -> Style {
+    let mut style = Style::new()
+        .fg(cell.fg.map(color).unwrap_or(Color::Reset))
+        .bg(cell.bg.map(color).unwrap_or(Color::Reset));
+    let f = &cell.flags;
+    if f.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if f.italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if f.faint {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if f.inverse {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    if f.blink {
+        style = style.add_modifier(Modifier::SLOW_BLINK);
+    }
+    if f.invisible {
+        style = style.add_modifier(Modifier::HIDDEN);
+    }
+    if f.strikethrough {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if f.underline != UnderlineKind::None {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    style
+}
+
+fn color(c: Rgb) -> Color {
+    Color::Rgb(c.r, c.g, c.b)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    } else {
+        s.to_string()
+    }
+}
+
+/// Compact a session's command for the sidebar (same rules as the GUIs): a
+/// bare path shows its basename; anything with arguments is kept whole.
+pub fn short_cmd(cmd: &str) -> String {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return String::new();
+    }
+    if !cmd.contains(char::is_whitespace) && cmd.contains('/') {
+        cmd.rsplit('/').next().unwrap_or(cmd).to_string()
+    } else {
+        cmd.to_string()
+    }
+}
+
+/// Compact "time since creation": `now`, `5m`, `2h`, `3d`.
+pub fn short_age(created_ms: u64, now_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(created_ms) / 1000;
+    if secs < 60 {
+        "now".to_string()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_cmd_basenames_paths_but_keeps_args() {
+        assert_eq!(short_cmd("/usr/bin/bash"), "bash");
+        assert_eq!(short_cmd("journalctl -f"), "journalctl -f");
+        assert_eq!(short_cmd(""), "");
+    }
+
+    #[test]
+    fn short_age_buckets() {
+        let m = 60_000;
+        assert_eq!(short_age(0, 30 * 1000), "now");
+        assert_eq!(short_age(0, 5 * m), "5m");
+        assert_eq!(short_age(0, 120 * m), "2h");
+        assert_eq!(short_age(1_000, 0), "now"); // clock skew never panics
+    }
+
+    #[test]
+    fn pane_grid_reserves_the_sidebar_and_bottom_bar() {
+        let (cols, rows) = pane_grid(Rect::new(0, 0, 120, 40));
+        assert_eq!(cols, 120 - SIDEBAR_W);
+        assert_eq!(rows, 39); // one row goes to the full-width keybind bar
+    }
+
+    #[test]
+    fn bar_spans_the_full_width() {
+        let (_, _, bar) = areas(Rect::new(0, 0, 120, 40));
+        assert_eq!(bar, Rect::new(0, 39, 120, 1));
+    }
+
+    #[test]
+    fn sidebar_hits_map_rows_and_kill_marks() {
+        let area = Rect::new(0, 0, 120, 40);
+        // First session row, name area → select.
+        assert_eq!(sidebar_hit(area, 3, 2, 0), Some((0, false)));
+        assert_eq!(sidebar_hit(area, 3, 2, 1), Some((0, false)));
+        // Second session row.
+        assert_eq!(sidebar_hit(area, 3, 2, 2), Some((1, false)));
+        // Kill mark: first line of a row, near the right edge.
+        assert_eq!(sidebar_hit(area, 3, SIDEBAR_W - 3, 0), Some((0, true)));
+        // Beyond the list or in the pane → no hit.
+        assert_eq!(sidebar_hit(area, 3, 2, 12), None);
+        assert_eq!(sidebar_hit(area, 3, SIDEBAR_W + 5, 0), None);
+    }
+}

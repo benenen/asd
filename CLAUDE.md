@@ -20,6 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | asd-vt | `VtBackend` trait + libghostty-vt 实现（逃生门边界） | iced/wgpu、portable-pty、asd-proto |
 | asd-daemon（lib） | session 管理、UDS 服务 | iced/wgpu（含传递依赖） |
 | asd-cli（**lib**，`pub fn run`） | 调试客户端、`attach --stdio` 代理、内嵌 daemon（`asd daemon`）；被根 bin 的 `local` feature 组合 | iced/wgpu（GUI 启动器由 bin 注入，不直接依赖 iced） |
+| asd-tui（**lib**，`pub fn run`，ratatui） | `asd ui`：session 侧栏+实时终端面板的 TUI（对应 images/image.png），Ctrl+A 前缀切换/新建/杀 session，本地 vt 渲染（同 attach 客户端），OSC52 选区复制；被 asd-cli 依赖 | GUI 框架、portable-pty/进程管理；OSC52/base64 用共享的 `asd_vt::clip` |
 | asd-gui（**lib**，`pub fn run`，iced/wgpu） | 渲染、输入、拨号、SSH remote；被根 bin 的 `iced` feature 组合 | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基）；可依赖 asd-vt/asd-proto。**SSH 走纯 Rust `russh`（网络客户端，不 spawn 进程/不用 ssh.exe，不违反边界）**，不是 spawn `ssh` 子进程 |
 | asd-dioxus（**lib**，`pub fn run`，Dioxus Desktop+ghostty-web） | 同 asd-gui 的功能面（host 侧栏/SSH remote/设置），渲染交给 webview 里的 ghostty-web（吃原始 PTY 字节，无 asd-vt）；被根 bin 的 `dioxus` feature（默认）组合 | 与 asd-gui 同边界：**无 portable-pty/进程管理**，SSH 走 russh。JS 依赖由 npm+esbuild 打包（build.rs 驱动，见 crate README），产物 include_str! 内嵌保单二进制 |
 | asd（**根 package**，唯一 bin `asd`） | 组合上面的 lib 成单一可执行文件（feature `local`/`dioxus`/`iced`）；除组合外无逻辑 | 直接依赖 GUI 框架或 portable-pty（应经由 feature 拉对应 lib，保持边界纯净） |
@@ -35,7 +36,7 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-手工冒烟：`cargo run -- attach -A demo`（根 bin `asd`；自动拉起 daemon + 创建 session；detach 键 Ctrl-\）。`cargo run` 裸跑 = 开 GUI。`cargo build --workspace` 编所有 crate；`cargo test --workspace` 跑所有测试（`cargo test` 不带 `--workspace` 只测根 package）。
+手工冒烟：`cargo run -- attach -A demo`（根 bin `asd`；自动拉起 daemon + 创建 session；detach 键 Ctrl-\）；TUI 客户端 `cargo run -- ui [session]`（ratatui 版侧栏+实时终端，Ctrl+A 前缀键切换/新建/杀 session，自动拉起 daemon）。`cargo run` 裸跑 = 开 GUI。`cargo build --workspace` 编所有 crate；`cargo test --workspace` 跑所有测试（`cargo test` 不带 `--workspace` 只测根 package）。
 
 **`asd attach` 是 VT 渲染客户端（2026-07-14，对标 boo 的 `boo ui`）**，不是哑管道：客户端自带一份 `GhosttyVt`（asd-cli 因此依赖 asd-vt），把 daemon 的 Snapshot+Output 喂进去、自己渲染（`render.rs`：RenderSnapshot→ANSI）。本地 VT 模型让 live 视图同时有：① 交替屏（`1049h`）detach 恢复原屏；② 滚回历史（滚自己的视口 `set_scroll`，**滚轮** 或键盘 `Shift+PageUp/PageDown/Home/End`；**客户端本地、不影响其他 attach 的人**）；③ 拖选复制。
 

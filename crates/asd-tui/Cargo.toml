@@ -1,0 +1,17 @@
+[package]
+name = "asd-tui"
+description = "asd terminal UI client (ratatui): session sidebar + live terminal pane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Contract (spec §3): a terminal-side client like asd-cli — no GUI frameworks,
+# no portable-pty/process management. asd-vt renders the attached session; the
+# daemon connection speaks asd-proto over the Unix socket.
+[dependencies]
+anyhow = { workspace = true }
+asd-proto = { workspace = true }
+asd-vt = { workspace = true }
+ratatui = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

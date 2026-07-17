@@ -69,6 +69,12 @@ enum Cmd {
         /// Session to pre-select.
         session: Option<String>,
     },
+    /// Open the terminal UI: a session sidebar next to a live terminal pane
+    /// (switch with Ctrl+A; starts the daemon if it is not running)
+    Ui {
+        /// Session to pre-select.
+        session: Option<String>,
+    },
 }
 
 /// Parse the CLI and run the requested command. A `None`/`gui` invocation opens
@@ -83,9 +89,28 @@ pub fn run(gui: Option<GuiLauncher>) -> anyhow::Result<()> {
         // No subcommand or `gui` → hand off to the injected GUI launcher.
         None => return launch_gui(gui, None),
         Some(Cmd::Gui { session }) => return launch_gui(gui, session.clone()),
+        // The TUI runs its own event loop + conn thread; keep it off the
+        // client runtime as well (its session preselect rides along).
+        Some(Cmd::Ui { session }) => return run_ui(args.socket, session.clone()),
         _ => {}
     }
     client_main(args)
+}
+
+/// Ensure the daemon is up (self-heal, like `attach -A`), then hand the
+/// terminal to the TUI.
+fn run_ui(socket: Option<PathBuf>, session: Option<String>) -> anyhow::Result<()> {
+    let socket = socket.unwrap_or_else(paths::socket_path);
+    // One probe connection on a scratch runtime; dropped before the TUI runs.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            client::connect_or_spawn(&socket, ClientKind::Cli)
+                .await
+                .map(drop)
+        })?;
+    asd_tui::run(socket, session)
 }
 
 fn launch_gui(gui: Option<GuiLauncher>, session: Option<String>) -> anyhow::Result<()> {
@@ -212,7 +237,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                 asd_proto::PROTO_VERSION
             );
         }
-        Cmd::Daemon | Cmd::Gui { .. } => {
+        Cmd::Daemon | Cmd::Gui { .. } | Cmd::Ui { .. } => {
             unreachable!("dispatched in `run` before the runtime starts")
         }
     }
