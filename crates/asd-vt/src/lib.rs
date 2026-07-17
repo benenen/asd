@@ -9,6 +9,7 @@
 //!
 //! Dependency contract: iced/wgpu, portable-pty, and asd-proto are forbidden.
 
+pub mod clip;
 mod ghostty;
 mod types;
 
