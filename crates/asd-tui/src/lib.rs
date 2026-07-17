@@ -103,6 +103,15 @@ pub(crate) struct App {
     pub scroll: usize,
     /// Terminal grid offered by the pane.
     grid: (u16, u16),
+    /// Whole-terminal size (cols, rows), for recomputing the layout on a
+    /// sidebar resize/toggle without a `Resize` event.
+    term_size: (u16, u16),
+    /// Current sidebar width (draggable; [`ui::MIN_SIDEBAR`]..[`ui::MAX_SIDEBAR`]).
+    sidebar_w: u16,
+    /// Sidebar hidden (Ctrl+A b) — the pane takes the full width.
+    sidebar_hidden: bool,
+    /// True while dragging the sidebar↔pane divider with the mouse.
+    dragging_divider: bool,
     /// Drag selection over the pane, if any.
     sel: Option<Sel>,
     /// True between mouse press and release while dragging a selection.
@@ -190,7 +199,12 @@ fn event_loop(
     let (ev_tx, ev_rx) = channel::<Ev>();
     let conn = Conn::spawn(socket.clone(), ev_tx.clone());
     let size = terminal.size()?;
-    let grid = ui::pane_grid(ratatui::layout::Rect::new(0, 0, size.width, size.height));
+    let sidebar_w = ui::SIDEBAR_W;
+    let grid = ui::pane_grid(
+        ratatui::layout::Rect::new(0, 0, size.width, size.height),
+        sidebar_w,
+        false,
+    );
 
     let mut app = App {
         socket,
@@ -202,6 +216,10 @@ fn event_loop(
         vt: None,
         scroll: 0,
         grid,
+        term_size: (size.width, size.height),
+        sidebar_w,
+        sidebar_hidden: false,
+        dragging_divider: false,
         sel: None,
         selecting: false,
         daemon_up: false,
@@ -258,19 +276,8 @@ fn event_loop(
                     app.send(Cmd::Input(text.into_bytes()));
                 }
                 Event::Resize(w, h) => {
-                    let grid = ui::pane_grid(ratatui::layout::Rect::new(0, 0, w, h));
-                    if grid != app.grid {
-                        app.grid = grid;
-                        if let Some(vt) = &mut app.vt {
-                            vt.resize(grid.0, grid.1);
-                        }
-                        app.pane_needs_render = true;
-                        app.send(Cmd::Resize {
-                            cols: grid.0,
-                            rows: grid.1,
-                        });
-                    }
-                    app.dirty = true;
+                    app.term_size = (w, h);
+                    app.apply_layout();
                 }
                 _ => {}
             }
@@ -654,6 +661,11 @@ impl App {
                     }
                 }
                 KeyCode::Char('c') => self.send(Cmd::Create),
+                // Toggle the sidebar; the pane grid + session resize follow.
+                KeyCode::Char('b') => {
+                    self.sidebar_hidden = !self.sidebar_hidden;
+                    self.apply_layout();
+                }
                 // Kill asks first (confirmation modal); rename opens an input.
                 KeyCode::Char('x') => {
                     if let Some(name) = self.active.clone() {
@@ -827,17 +839,30 @@ impl App {
 
     fn on_mouse(&mut self, m: MouseEvent, size: ratatui::layout::Size) {
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        let (_, pane, _) = ui::areas(area);
+        let (_, pane, _) = ui::areas(area, self.sidebar_w, self.sidebar_hidden);
         let in_pane = m.column >= pane.left()
             && m.column < pane.right()
             && m.row >= pane.top()
             && m.row < pane.bottom();
+        let on_divider = ui::divider_col(self.sidebar_w, self.sidebar_hidden) == Some(m.column);
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_by(WHEEL_STEP as isize),
             MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_STEP as isize)),
+            // Grabbing the divider begins a live sidebar resize (consumed by the
+            // TUI — never a selection).
+            MouseEventKind::Down(_) if on_divider => {
+                self.dragging_divider = true;
+                self.dirty = true;
+            }
             MouseEventKind::Down(_) => {
-                if let Some((i, kill)) = ui::sidebar_hit(area, self.sessions.len(), m.column, m.row)
-                {
+                if let Some((i, kill)) = ui::sidebar_hit(
+                    area,
+                    self.sidebar_w,
+                    self.sidebar_hidden,
+                    self.sessions.len(),
+                    m.column,
+                    m.row,
+                ) {
                     let name = self.sessions[i].name.clone();
                     if kill {
                         self.send(Cmd::Kill { name });
@@ -861,6 +886,18 @@ impl App {
                     self.selecting = true;
                     self.dirty = true;
                 }
+            }
+            // Live sidebar resize: the divider follows the mouse, clamped.
+            MouseEventKind::Drag(_) if self.dragging_divider => {
+                let w = ui::sidebar_from_drag(m.column, self.term_size.0);
+                if w != self.sidebar_w {
+                    self.sidebar_w = w;
+                    self.apply_layout();
+                }
+            }
+            MouseEventKind::Up(_) if self.dragging_divider => {
+                self.dragging_divider = false;
+                self.dirty = true;
             }
             MouseEventKind::Drag(_) if self.selecting => {
                 if let Some(sel) = &mut self.sel {
@@ -902,6 +939,27 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Recompute the pane grid from the current terminal size + sidebar state;
+    /// if it changed, resize the local VT and tell the daemon. Called after a
+    /// sidebar drag, an `Ctrl+A b` toggle, or a terminal resize. Reuses the
+    /// tear-free pane path (`pane_needs_render`) so no half-frame shows.
+    fn apply_layout(&mut self) {
+        let total = ratatui::layout::Rect::new(0, 0, self.term_size.0, self.term_size.1);
+        let grid = ui::pane_grid(total, self.sidebar_w, self.sidebar_hidden);
+        if grid != self.grid {
+            self.grid = grid;
+            if let Some(vt) = &mut self.vt {
+                vt.resize(grid.0, grid.1);
+            }
+            self.send(Cmd::Resize {
+                cols: grid.0,
+                rows: grid.1,
+            });
+        }
+        self.pane_needs_render = true;
+        self.dirty = true;
     }
 
     /// Tear down the old connection actor and start a fresh one.

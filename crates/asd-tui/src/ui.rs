@@ -39,11 +39,21 @@ const SELECT_BG: Color = Color::Rgb(0x2E, 0x2A, 0x20);
 const RULE: Color = Color::Rgb(0x23, 0x2A, 0x34);
 const MODAL_BG: Color = Color::Rgb(0x14, 0x18, 0x20);
 
+/// Narrowest / widest the sidebar may be dragged.
+pub const MIN_SIDEBAR: u16 = 12;
+pub const MAX_SIDEBAR: u16 = 50;
+/// The pane is never squeezed below this many columns by a wide sidebar.
+const MIN_PANE: u16 = 20;
+
 /// Split the frame: sidebar | terminal pane, with a full-width keybind/status
-/// bar along the bottom.
-pub fn areas(total: Rect) -> (Rect, Rect, Rect) {
+/// bar along the bottom. A hidden sidebar gives the pane the full width.
+pub fn areas(total: Rect, sidebar_w: u16, hidden: bool) -> (Rect, Rect, Rect) {
     let body_h = total.height.saturating_sub(1);
-    let side_w = SIDEBAR_W.min(total.width);
+    let side_w = if hidden {
+        0
+    } else {
+        sidebar_w.min(total.width)
+    };
     let side = Rect::new(total.x, total.y, side_w, body_h);
     let pane = Rect::new(
         total.x + side_w,
@@ -61,9 +71,30 @@ pub fn areas(total: Rect) -> (Rect, Rect, Rect) {
 }
 
 /// The terminal grid the pane offers (what `Attach`/`Resize` request).
-pub fn pane_grid(total: Rect) -> (u16, u16) {
-    let (_, pane, _) = areas(total);
+pub fn pane_grid(total: Rect, sidebar_w: u16, hidden: bool) -> (u16, u16) {
+    let (_, pane, _) = areas(total, sidebar_w, hidden);
     (pane.width.max(1), pane.height.max(1))
+}
+
+/// Clamp a desired sidebar width into a usable range for a `total_w`-wide
+/// terminal: at least [`MIN_SIDEBAR`], and never so wide the pane drops below
+/// [`MIN_PANE`] (capped at [`MAX_SIDEBAR`]).
+pub fn clamp_sidebar(desired: i32, total_w: u16) -> u16 {
+    let max = MAX_SIDEBAR
+        .min(total_w.saturating_sub(MIN_PANE))
+        .max(MIN_SIDEBAR);
+    desired.clamp(MIN_SIDEBAR as i32, max as i32) as u16
+}
+
+/// The column of the draggable divider (the sidebar's right separator), or
+/// `None` when the sidebar is hidden (nothing to grab).
+pub fn divider_col(sidebar_w: u16, hidden: bool) -> Option<u16> {
+    (!hidden).then(|| sidebar_w.saturating_sub(1))
+}
+
+/// The sidebar width that puts the divider under mouse column `x`, clamped.
+pub fn sidebar_from_drag(x: u16, total_w: u16) -> u16 {
+    clamp_sidebar(x as i32 + 1, total_w)
 }
 
 /// A selection projected into viewport coordinates: `start`..=`end`,
@@ -75,7 +106,7 @@ pub struct Selection {
 }
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
-    let (side, pane, bar) = areas(f.area());
+    let (side, pane, bar) = areas(f.area(), app.sidebar_w, app.sidebar_hidden);
     draw_sidebar(f.buffer_mut(), side, app);
     draw_bar(f.buffer_mut(), bar, app);
     app.process_fx(f.buffer_mut(), side);
@@ -303,7 +334,7 @@ fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
     }
     let (hint, style) = if app.prefix {
         (
-            "PREFIX  j/k switch · 1-9 jump · c new · r rename · x kill · R reconnect · q quit · Ctrl+A literal",
+            "PREFIX  j/k switch · 1-9 jump · c new · r rename · x kill · b sidebar · R reconnect · q quit",
             Style::new().fg(ACCENT).bg(RULE),
         )
     } else {
@@ -341,9 +372,16 @@ fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
 }
 
 /// Which sidebar session row (and whether its kill mark) a click lands on.
-pub fn sidebar_hit(area: Rect, sessions: usize, col: u16, row: u16) -> Option<(usize, bool)> {
-    let (side, _, _) = areas(area);
-    if col >= side.right() - 1 || row >= side.bottom() {
+pub fn sidebar_hit(
+    area: Rect,
+    sidebar_w: u16,
+    hidden: bool,
+    sessions: usize,
+    col: u16,
+    row: u16,
+) -> Option<(usize, bool)> {
+    let (side, _, _) = areas(area, sidebar_w, hidden);
+    if side.width == 0 || col >= side.right().saturating_sub(1) || row >= side.bottom() {
         return None;
     }
     let idx = ((row.checked_sub(side.top())?) / 2) as usize;
@@ -507,30 +545,49 @@ mod tests {
 
     #[test]
     fn pane_grid_reserves_the_sidebar_and_bottom_bar() {
-        let (cols, rows) = pane_grid(Rect::new(0, 0, 120, 40));
+        let (cols, rows) = pane_grid(Rect::new(0, 0, 120, 40), SIDEBAR_W, false);
         assert_eq!(cols, 120 - SIDEBAR_W);
         assert_eq!(rows, 39); // one row goes to the full-width keybind bar
+        // Hidden: the pane takes the whole width.
+        let (cols, _) = pane_grid(Rect::new(0, 0, 120, 40), SIDEBAR_W, true);
+        assert_eq!(cols, 120);
     }
 
     #[test]
     fn bar_spans_the_full_width() {
-        let (_, _, bar) = areas(Rect::new(0, 0, 120, 40));
+        let (_, _, bar) = areas(Rect::new(0, 0, 120, 40), SIDEBAR_W, false);
         assert_eq!(bar, Rect::new(0, 39, 120, 1));
     }
 
     #[test]
     fn sidebar_hits_map_rows_and_kill_marks() {
         let area = Rect::new(0, 0, 120, 40);
+        let hit = |col, row| sidebar_hit(area, SIDEBAR_W, false, 3, col, row);
         // First session row, name area → select.
-        assert_eq!(sidebar_hit(area, 3, 2, 0), Some((0, false)));
-        assert_eq!(sidebar_hit(area, 3, 2, 1), Some((0, false)));
+        assert_eq!(hit(2, 0), Some((0, false)));
+        assert_eq!(hit(2, 1), Some((0, false)));
         // Second session row.
-        assert_eq!(sidebar_hit(area, 3, 2, 2), Some((1, false)));
+        assert_eq!(hit(2, 2), Some((1, false)));
         // Kill mark: first line of a row, near the right edge.
-        assert_eq!(sidebar_hit(area, 3, SIDEBAR_W - 3, 0), Some((0, true)));
+        assert_eq!(hit(SIDEBAR_W - 3, 0), Some((0, true)));
         // Beyond the list or in the pane → no hit.
-        assert_eq!(sidebar_hit(area, 3, 2, 12), None);
-        assert_eq!(sidebar_hit(area, 3, SIDEBAR_W + 5, 0), None);
+        assert_eq!(hit(2, 12), None);
+        assert_eq!(hit(SIDEBAR_W + 5, 0), None);
+        // Hidden sidebar swallows nothing.
+        assert_eq!(sidebar_hit(area, SIDEBAR_W, true, 3, 2, 0), None);
+    }
+
+    #[test]
+    fn divider_hit_and_drag_width() {
+        // The divider sits at the sidebar's last column.
+        assert_eq!(divider_col(28, false), Some(27));
+        assert_eq!(divider_col(28, true), None);
+        // Dragging to column x puts the divider there (width = x + 1), clamped.
+        assert_eq!(sidebar_from_drag(20, 120), 21);
+        assert_eq!(sidebar_from_drag(3, 120), MIN_SIDEBAR); // too narrow → min
+        assert_eq!(sidebar_from_drag(200, 120), MAX_SIDEBAR); // capped
+        // A wide sidebar never squeezes the pane below MIN_PANE.
+        assert_eq!(clamp_sidebar(45, 50), 50 - MIN_PANE);
     }
 
     #[test]
