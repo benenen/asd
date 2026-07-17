@@ -390,6 +390,10 @@ pub fn spawn_session(
         None => CommandBuilder::new_default_prog(), // $SHELL
     };
     builder.env("TERM", "xterm-256color");
+    // Which session a process runs inside (tmux's $TMUX idea): render clients
+    // check it to refuse attaching the session that hosts them — attaching
+    // yourself is a render feedback loop that floods the pty.
+    builder.env("ASD_SESSION", &name);
     if let Some(home) = std::env::var_os("HOME") {
         builder.cwd(home);
     }

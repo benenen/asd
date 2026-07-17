@@ -200,6 +200,15 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             // clap enforces NAME unless --stdio, so this cannot fail here.
             let name = name.expect("NAME is required without --stdio");
 
+            // tmux's $TMUX idea: attaching the session this shell runs inside
+            // is a render feedback loop that floods the pty for everyone.
+            if std::env::var("ASD_SESSION").as_deref() == Ok(name.as_str()) {
+                bail!(
+                    "refusing to attach '{name}': this shell runs inside it \
+                     (unset ASD_SESSION to force)"
+                );
+            }
+
             let mut c = if auto {
                 client::connect_or_spawn(&socket, ClientKind::Cli).await?
             } else {

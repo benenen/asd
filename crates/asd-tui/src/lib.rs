@@ -110,6 +110,10 @@ pub(crate) struct App {
 
     /// Session named on the command line, consumed by the first auto-select.
     preferred: Option<String>,
+    /// The session this UI itself runs inside ($ASD_SESSION, set by the
+    /// daemon at spawn): attaching it would be a render feedback loop, so it
+    /// is never selectable here.
+    pub self_session: Option<String>,
     /// The previous session's last frame, shown while a switch converges so
     /// the pane never flashes black (double buffering across attaches).
     cache: Option<RenderSnapshot>,
@@ -174,6 +178,7 @@ fn event_loop(
         prefix: false,
         now_ms: now_ms(),
         preferred,
+        self_session: std::env::var("ASD_SESSION").ok(),
         cache: None,
         pane_hold: None,
         row_fx: Vec::new(),
@@ -302,6 +307,13 @@ impl App {
         if self.active.as_deref() == Some(&name) {
             return;
         }
+        // tmux's $TMUX idea: never attach the session hosting this UI — the
+        // render feedback loop floods the pty (and everyone watching).
+        if self.self_session.as_deref() == Some(&name) {
+            self.notice = Some(format!("{name} hosts this UI — not attachable"));
+            self.dirty = true;
+            return;
+        }
         self.active = Some(name.clone());
         // Hold the old session's last frame on screen while the new attach
         // converges — never draw the empty terminal (a black flash).
@@ -340,8 +352,15 @@ impl App {
             .and_then(|a| self.sessions.iter().position(|s| s.name == a))
             .unwrap_or(0) as isize;
         let n = self.sessions.len() as isize;
-        let next = (cur + delta).rem_euclid(n) as usize;
-        self.select(self.sessions[next].name.clone());
+        // Step over the session hosting this UI (see `select`).
+        let mut next = cur;
+        for _ in 0..self.sessions.len() {
+            next = (next + delta).rem_euclid(n);
+            let candidate = &self.sessions[next as usize].name;
+            if self.self_session.as_deref() != Some(candidate) {
+                return self.select(candidate.clone());
+            }
+        }
     }
 
     fn on_conn_event(&mut self, ev: Ev) {
@@ -382,10 +401,17 @@ impl App {
                     self.vt = None;
                 }
                 if self.active.is_none() {
+                    let not_self = |name: &str| self.self_session.as_deref() != Some(name);
                     let pick = self
                         .preferred
                         .take_if(|p| self.sessions.iter().any(|s| &s.name == p))
-                        .or_else(|| self.sessions.first().map(|s| s.name.clone()));
+                        .filter(|p| not_self(p))
+                        .or_else(|| {
+                            self.sessions
+                                .iter()
+                                .find(|s| not_self(&s.name))
+                                .map(|s| s.name.clone())
+                        });
                     if let Some(name) = pick {
                         self.select(name);
                     }

@@ -112,6 +112,7 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
             break;
         }
         let selected = app.active.as_deref() == Some(&s.name);
+        let is_self = app.self_session.as_deref() == Some(&s.name);
         let row_bg = if selected {
             Style::new().bg(SELECT_BG)
         } else {
@@ -129,12 +130,13 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
         let dot = if s.attached_clients > 0 { "•" } else { " " };
         let name = truncate(&s.name, inner_w.saturating_sub(5));
         buf.set_string(area.left(), y, dot, row_bg.fg(ACCENT));
-        buf.set_string(
-            area.left() + 1,
-            y,
-            &name,
-            row_bg.fg(TEXT).add_modifier(Modifier::BOLD),
-        );
+        // The session hosting this UI is shown but not selectable: dim it.
+        let name_style = if is_self {
+            row_bg.fg(DIM)
+        } else {
+            row_bg.fg(TEXT).add_modifier(Modifier::BOLD)
+        };
+        buf.set_string(area.left() + 1, y, &name, name_style);
         buf.set_string(area.right() - 3, y, "x", row_bg.fg(DIM));
         // Line 2: the terminal title (what the session says it's doing),
         // falling back to the foreground command; plus the age, dim.
