@@ -130,6 +130,12 @@ pub(crate) struct App {
     /// Sidebar row effects (tachyonfx), keyed by session name: sweep-in on
     /// newly listed sessions, a brief accent fade on selection.
     row_fx: Vec<(String, tachyonfx::Effect)>,
+    /// A continuous breathing border for each *running* session (its `running`
+    /// flag is set — the agent is producing output), keyed by session name.
+    /// Added/dropped as the flag toggles; the UI's own host session is excluded
+    /// (it is always producing output — the TUI itself — so it would always
+    /// glow).
+    running_fx: Vec<(String, tachyonfx::Effect)>,
     /// Previous frame instant, for effect timing.
     last_frame: std::time::Instant,
     dirty: bool,
@@ -189,6 +195,7 @@ fn event_loop(
         parked: Vec::new(),
         pane_hold: None,
         row_fx: Vec::new(),
+        running_fx: Vec::new(),
         last_frame: std::time::Instant::now(),
         dirty: true,
         quit: false,
@@ -202,9 +209,11 @@ fn event_loop(
             app.now_ms = now_ms();
             terminal.draw(|f| ui::draw(f, &mut app))?;
             // Effects animate frame-by-frame, and a pane hold must expire on
-            // time: stay dirty while either is pending (the input poll below
-            // caps the frame rate at ~33 fps).
-            app.dirty = !app.row_fx.is_empty() || app.pane_hold.is_some();
+            // time: stay dirty while any is pending (the input poll below caps
+            // the frame rate at ~33 fps). The running borders breathe as long
+            // as some session is producing output.
+            app.dirty =
+                !app.row_fx.is_empty() || !app.running_fx.is_empty() || app.pane_hold.is_some();
         }
         // Tighten the loop while a switch converges or effects animate:
         // conn events are only drained between polls, so a long poll adds
@@ -251,7 +260,9 @@ impl App {
         self.row_fx.push((name, fx));
     }
 
-    /// Advance and paint the sidebar row effects; called once per drawn frame.
+    /// Advance and paint the sidebar effects; called once per drawn frame.
+    /// Two layers: the transient row effects (sweep-in / selection fade) and
+    /// the continuous breathing border on every running session's row.
     pub(crate) fn process_fx(
         &mut self,
         buf: &mut ratatui::buffer::Buffer,
@@ -260,6 +271,9 @@ impl App {
         let now = std::time::Instant::now();
         let delta: tachyonfx::Duration = now.duration_since(self.last_frame).into();
         self.last_frame = now;
+
+        self.process_running_fx(buf, side, delta);
+
         if self.row_fx.is_empty() {
             return;
         }
@@ -276,6 +290,48 @@ impl App {
             fx.process(delta, buf, rect);
             !fx.done()
         });
+    }
+
+    /// Keep one breathing-border effect per running (non-self) session, then
+    /// advance each over its two sidebar rows. The border cells themselves are
+    /// drawn (in accent) by [`ui::draw_sidebar`]; the effect only pulses them,
+    /// via a `CellFilter::Outer` that limits it to the row's left+right edges.
+    fn process_running_fx(
+        &mut self,
+        buf: &mut ratatui::buffer::Buffer,
+        side: ratatui::layout::Rect,
+        delta: tachyonfx::Duration,
+    ) {
+        let self_name = self.self_session.clone();
+        let running: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| s.running && self_name.as_deref() != Some(s.name.as_str()))
+            .map(|s| s.name.clone())
+            .collect();
+        // Drop effects for sessions that stopped running (or vanished); add one
+        // for each newly running session.
+        self.running_fx.retain(|(n, _)| running.contains(n));
+        for name in &running {
+            if !self.running_fx.iter().any(|(n, _)| n == name) {
+                self.running_fx.push((name.clone(), breathing_border()));
+            }
+        }
+        let sessions = &self.sessions;
+        for (name, fx) in self.running_fx.iter_mut() {
+            let Some(i) = sessions.iter().position(|s| &s.name == name) else {
+                continue;
+            };
+            let y = side.top() + (i as u16) * 2;
+            if y + 1 >= side.bottom() {
+                continue;
+            }
+            fx.process(
+                delta,
+                buf,
+                ratatui::layout::Rect::new(side.left(), y, side.width, 2),
+            );
+        }
     }
 
     fn send(&self, cmd: Cmd) {
@@ -671,6 +727,23 @@ impl App {
         self.vt = None;
         self.dirty = true;
     }
+}
+
+/// A slow looping "breathing" pulse for a running session's row border: the
+/// accent frame fades to a dim amber and back, forever. `CellFilter::Outer`
+/// limits it to the row rect's left+right edge columns, so only the border
+/// glyphs (drawn in accent by [`ui::draw_sidebar`]) pulse — the row's text is
+/// untouched.
+fn breathing_border() -> tachyonfx::Effect {
+    use ratatui::layout::Margin;
+    use ratatui::style::Color;
+    use tachyonfx::{CellFilter, Interpolation, fx};
+    let dim = Color::Rgb(0x6B, 0x50, 0x25);
+    fx::repeating(fx::ping_pong(fx::fade_to_fg(
+        dim,
+        (900, Interpolation::SineInOut),
+    )))
+    .with_filter(CellFilter::Outer(Margin::new(1, 0)))
 }
 
 fn now_ms() -> u64 {

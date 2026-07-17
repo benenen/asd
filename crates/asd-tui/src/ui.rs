@@ -155,6 +155,16 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
             &age,
             row_bg.fg(DIM),
         );
+        // A running session (its agent is producing output) gets a side-frame:
+        // accent bars on the row's left and right edges. Drawn here as the base;
+        // `App::process_running_fx` breathes them. The UI's own host session is
+        // excluded — it always produces output, so it would always glow.
+        if s.running && !is_self {
+            for line in 0..2 {
+                buf.set_string(area.left(), y + line, "│", row_bg.fg(ACCENT));
+                buf.set_string(area.right() - 1, y + line, "│", Style::new().fg(ACCENT));
+            }
+        }
         // Remember the row for mouse hit-testing.
         let _ = i;
         y += 2;
