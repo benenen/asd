@@ -9,7 +9,9 @@
 //! [`PROTO_VERSION`], with both ends upgraded together; the protocol does not
 //! run multi-version compatible, a version mismatch always gets `Error{code=1}`
 //! followed by disconnect. v1 added the scrollback frames
-//! (`FetchHistory`/`History`) and `Refresh`; v2 added `SessionInfo.command`.
+//! (`FetchHistory`/`History`) and `Refresh`; v2 added `SessionInfo.command`;
+//! v3 added `SessionInfo.title`; v4 added the attach-free scripting frames
+//! (`SendInput`/`Ack`, `Peek`/`PeekReply`) and `SessionInfo.idle_ms`.
 
 mod codec;
 pub mod paths;
@@ -20,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 
 /// Per-frame cap: 4 MiB (postcard payload, excluding the 4-byte length prefix).
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -69,6 +71,9 @@ pub struct SessionInfo {
     pub title: String,
     /// Creation time, Unix epoch milliseconds.
     pub created_ms: u64,
+    /// Milliseconds since the session last produced pty output; 0 while it is
+    /// actively producing (or just created). Drives `asd wait --idle`.
+    pub idle_ms: u64,
     pub attached_clients: u32,
     pub cols: u16,
     pub rows: u16,
@@ -151,6 +156,33 @@ pub enum Frame {
     /// client → daemon: request a fresh `Snapshot` of the live screen (used
     /// to resync after leaving the client's local scrollback view).
     Refresh,
+    // Scripting (v4). Name-addressed and attach-free: `send`/`peek` act on a
+    // session by name without joining its broadcast list, so they work while
+    // others are attached or with nobody attached.
+    /// client → daemon: write raw bytes to session `name`'s pty (`asd send`).
+    SendInput {
+        name: String,
+        bytes: Vec<u8>,
+    },
+    /// daemon → client: generic success reply (answers `SendInput`).
+    Ack,
+    /// client → daemon: request a rendered plain-text dump of session `name`
+    /// (`asd peek`). `scrollback` includes the full history above the screen.
+    Peek {
+        name: String,
+        scrollback: bool,
+    },
+    /// daemon → client: the rendered screen plus geometry. `screen` is plain
+    /// UTF-8 (one screen row per line, trailing blank lines trimmed); cursor
+    /// coordinates are 0-based viewport cells.
+    PeekReply {
+        cols: u16,
+        rows: u16,
+        cursor_col: u16,
+        cursor_row: u16,
+        title: String,
+        screen: Vec<u8>,
+    },
     // Errors
     Error {
         code: u32,

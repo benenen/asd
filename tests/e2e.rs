@@ -574,3 +574,143 @@ async fn refresh_returns_fresh_snapshot() {
         other => panic!("expected Snapshot from Refresh, got {other:?}"),
     }
 }
+
+/// v4 scripting: `send` types into a session (bytes reach the pty and run),
+/// `wait --text` blocks until the rendered screen matches, and `peek` prints
+/// that screen — all attach-free, over the CLI.
+#[tokio::test]
+async fn send_wait_peek_round_trip() {
+    let daemon = Daemon::start("sendpeek");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // The marker lives only in the command's *output*, not the echoed command
+    // line ($((6*7)) is typed, 42 only appears once the pty runs it) — so a
+    // match proves `send` delivered the bytes and the trailing Enter.
+    let out = daemon
+        .cli()
+        .args([
+            "send",
+            "work",
+            "--text",
+            "echo sendmark-$((6*7))",
+            "--enter",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "send failed: {out:?}");
+
+    // wait --text polls peek until the screen contains the output.
+    let out = daemon
+        .cli()
+        .args(["wait", "work", "--text", "sendmark-42", "--timeout", "10s"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "wait --text failed: {out:?}");
+
+    // peek prints the rendered screen, which now carries the marker.
+    let out = daemon.cli().args(["peek", "work"]).output().unwrap();
+    assert!(out.status.success(), "peek failed: {out:?}");
+    let screen = String::from_utf8_lossy(&out.stdout);
+    assert!(screen.contains("sendmark-42"), "peek screen: {screen}");
+}
+
+/// `wait --idle` returns once output settles; a condition that never holds
+/// times out with the documented exit code 4.
+#[tokio::test]
+async fn wait_idle_and_timeout() {
+    let daemon = Daemon::start("waitidle");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "quiet"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // A fresh shell prints its prompt then goes quiet: --idle fires within the
+    // 2s settle window.
+    let out = daemon
+        .cli()
+        .args(["wait", "quiet", "--idle", "--timeout", "10s"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "wait --idle failed: {out:?}");
+
+    // A never-satisfied condition times out → exit 4 (boo's code).
+    let out = daemon
+        .cli()
+        .args([
+            "wait",
+            "quiet",
+            "--text",
+            "never-appears",
+            "--timeout",
+            "500ms",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "expected timeout exit 4: {out:?}"
+    );
+}
+
+/// `peek --json` emits geometry + screen as one JSON object; `peek`/`send` on a
+/// missing session fail.
+#[tokio::test]
+async fn peek_json_and_missing_session() {
+    let daemon = Daemon::start("peekjson");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "js"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let out = daemon
+        .cli()
+        .args(["peek", "js", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "peek --json failed: {out:?}");
+    let json = String::from_utf8_lossy(&out.stdout);
+    // Default create size is 80x24, and peek does not attach/resize.
+    assert!(json.contains("\"session\":\"js\""), "json: {json}");
+    assert!(json.contains("\"rows\":24"), "json: {json}");
+    assert!(json.contains("\"cols\":80"), "json: {json}");
+    assert!(json.contains("\"screen\":"), "json: {json}");
+
+    // Missing session → non-zero exit for both scripting commands.
+    assert!(
+        !daemon
+            .cli()
+            .args(["peek", "nope"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        !daemon
+            .cli()
+            .args(["send", "nope", "--text", "x"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}

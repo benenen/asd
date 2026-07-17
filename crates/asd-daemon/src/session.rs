@@ -7,7 +7,9 @@
 
 use std::io::Write;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Mutex, mpsc};
 
 use asd_proto::{Frame, code};
@@ -121,6 +123,12 @@ pub enum SessionMsg {
     Refresh {
         sink: ClientSink,
     },
+    /// Render a plain-text dump of the screen (v4, `asd peek`); replies with a
+    /// `PeekReply` on `sink`. `scrollback` prepends the full history.
+    Peek {
+        sink: ClientSink,
+        scrollback: bool,
+    },
     /// Kill the session: SIGHUP the child, then SIGKILL if it is still alive
     /// after 2s.
     Kill,
@@ -154,6 +162,10 @@ pub struct SessionMeta {
     /// The terminal title (OSC 0/2), exported by the session thread after each
     /// output batch; the network side reads it for `SessionInfo`.
     pub title: Mutex<String>,
+    /// Unix-epoch ms of the session's last pty output, stamped by the session
+    /// thread each output batch. The network side derives `idle_ms` from it for
+    /// `SessionInfo` (drives `asd wait --idle`). Initialized to `created_ms`.
+    pub last_output_ms: AtomicU64,
 }
 
 impl SessionHandle {
@@ -169,16 +181,27 @@ impl SessionHandle {
             .lock()
             .map(|t| t.clone())
             .unwrap_or_default();
+        let idle_ms = now_ms().saturating_sub(self.meta.last_output_ms.load(Ordering::Relaxed));
         asd_proto::SessionInfo {
             name: self.name.clone(),
             command,
             title,
             created_ms: self.created_ms,
+            idle_ms,
             attached_clients: self.meta.attached_clients.load(Ordering::Relaxed),
             cols: self.meta.cols.load(Ordering::Relaxed),
             rows: self.meta.rows.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Current Unix-epoch time in milliseconds (0 if the clock is before the
+/// epoch, which never happens in practice).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The terminal's foreground command: the process group in the foreground of
@@ -409,6 +432,8 @@ pub fn spawn_session(
     let pty_writer = master.take_writer()?;
     let pty_reader = master.try_clone_reader()?;
 
+    let created_ms = now_ms();
+
     let (tx, rx) = mpsc::channel::<SessionMsg>();
     let meta = Arc::new(SessionMeta {
         cols: AtomicU16::new(cols),
@@ -418,12 +443,8 @@ pub fn spawn_session(
         alive: AtomicBool::new(true),
         pty_master_fd: AtomicI32::new(master_fd),
         title: Mutex::new(String::new()),
+        last_output_ms: AtomicU64::new(created_ms),
     });
-
-    let created_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
 
     // pty read thread: blocking reads → feed into the session thread
     {
@@ -492,6 +513,9 @@ fn session_thread(
         match msg {
             SessionMsg::PtyOutput(bytes) => {
                 vt.feed(&bytes);
+                // Stamp the output time so the network side can report idle_ms
+                // (drives `asd wait --idle`).
+                meta.last_output_ms.store(now_ms(), Ordering::Relaxed);
                 // Export the terminal title for the session list (cheap; only
                 // written when it actually changed).
                 let title = vt.title();
@@ -558,6 +582,9 @@ fn session_thread(
                 let snapshot = vt.snapshot_vt();
                 sink.send(Frame::Snapshot { vt: snapshot });
             }
+            SessionMsg::Peek { sink, scrollback } => {
+                sink.send(render_peek(&mut vt, scrollback));
+            }
             SessionMsg::Kill => {
                 info!(session = %name, "kill requested");
                 signal_child(&meta, Signal::SIGHUP);
@@ -620,6 +647,36 @@ fn apply_resize(
     vt.resize(cols, rows);
     meta.cols.store(cols, Ordering::Relaxed);
     meta.rows.store(rows, Ordering::Relaxed);
+}
+
+/// Render the session's screen as a plain-text `PeekReply` (`asd peek`). The
+/// visible screen is the bottom `rows` of screen space; `scrollback` prepends
+/// the whole history. Rows come from the same screen-space plain-text path as
+/// the scrollback fetch; trailing blank lines are trimmed (boo's peek behavior).
+fn render_peek(vt: &mut GhosttyVt, scrollback: bool) -> Frame {
+    let snap = vt.render_snapshot();
+    let (cursor_col, cursor_row) = snap.cursor.position.unwrap_or((0, 0));
+    let (cols, rows) = (snap.cols, snap.rows);
+    let (start, count) = if scrollback {
+        (0u32, vt.history_len() as u32)
+    } else {
+        (vt.scrollback_rows() as u32, u32::from(rows))
+    };
+    let lines = vt.fetch_history(start, count);
+    // Trim trailing blank lines (empty or all-spaces), then join with '\n'.
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].iter().all(|&b| b == b' ') {
+        end -= 1;
+    }
+    let screen = lines[..end].join(&b'\n');
+    Frame::PeekReply {
+        cols,
+        rows,
+        cursor_col,
+        cursor_row,
+        title: vt.title(),
+        screen,
+    }
 }
 
 fn broadcast(clients: &mut Vec<ClientSink>, meta: &SessionMeta, frame: Frame) {

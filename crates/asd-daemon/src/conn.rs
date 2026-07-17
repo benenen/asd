@@ -198,6 +198,28 @@ pub async fn handle_conn(stream: UnixStream, registry: Arc<Mutex<Registry>>, con
                     });
                 }
             }
+            // Scripting (v4): name-addressed, attach-free — the connection's
+            // `attached` state is untouched.
+            Frame::SendInput { name, bytes } => match registry.lock().unwrap().get(&name) {
+                Some(handle) => {
+                    let _ = handle.tx.send(SessionMsg::Input(bytes));
+                    reply(Frame::Ack);
+                }
+                None => reply(Frame::Error {
+                    code: code::NO_SUCH_SESSION,
+                    msg: format!("no such session '{name}'"),
+                }),
+            },
+            Frame::Peek { name, scrollback } => match registry.lock().unwrap().get(&name) {
+                Some(handle) => {
+                    let sink = ClientSink::new(conn_id, out_tx.clone(), Arc::clone(&queued));
+                    let _ = handle.tx.send(SessionMsg::Peek { sink, scrollback });
+                }
+                None => reply(Frame::Error {
+                    code: code::NO_SUCH_SESSION,
+                    msg: format!("no such session '{name}'"),
+                }),
+            },
             other => {
                 warn!(conn = conn_id, frame = ?other, "unexpected frame from client");
                 reply(Frame::Error {

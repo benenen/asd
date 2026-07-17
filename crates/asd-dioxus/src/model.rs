@@ -267,6 +267,7 @@ mod tests {
             command: "sh".into(),
             title: String::new(),
             created_ms,
+            idle_ms: 0,
             attached_clients: clients,
             cols: 80,
             rows: 24,

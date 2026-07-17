@@ -6,6 +6,7 @@
 
 mod attach;
 mod client;
+mod control;
 mod render;
 
 use std::path::PathBuf;
@@ -45,6 +46,54 @@ enum Cmd {
     },
     /// Kill a session (SIGHUP, with SIGKILL fallback after 2s)
     Kill { name: String },
+    /// Type into a session, exactly as if typed at the keyboard. --text is sent
+    /// literally (no escaping, no implicit newline); with neither --text nor
+    /// --key, bytes are read from stdin (binary-safe, NUL excluded).
+    Send {
+        /// Session name
+        name: String,
+        /// The text to type (sent literally)
+        #[arg(long, conflicts_with_all = ["key", "stdin"])]
+        text: Option<String>,
+        /// Named keys, comma-separated: Enter, Tab, Escape, Space, Backspace,
+        /// Up, Down, Left, Right, Home, End, C-a..C-z
+        #[arg(long, conflicts_with = "stdin")]
+        key: Option<String>,
+        /// Append Enter (carriage return) after everything else
+        #[arg(long)]
+        enter: bool,
+        /// Force reading the payload from stdin
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Print the session's rendered screen (reconstructed from terminal state,
+    /// not a raw byte log); safe to run while attached
+    Peek {
+        /// Session name
+        name: String,
+        /// Include the full scrollback history above the screen
+        #[arg(long)]
+        scrollback: bool,
+        /// Emit a JSON object instead of raw text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Block until the session's screen matches or its output settles, then
+    /// exit 0 (exit 4 on timeout). Replaces sleep-and-poll loops in scripts.
+    #[command(group(clap::ArgGroup::new("wait_cond").required(true).args(["text", "idle"])))]
+    Wait {
+        /// Session name
+        name: String,
+        /// Until the rendered screen contains this text (plain substring)
+        #[arg(long)]
+        text: Option<String>,
+        /// Until the session has produced no output for 2 seconds
+        #[arg(long)]
+        idle: bool,
+        /// Give up and exit 4 after this long (500ms, 2s, 1m, 4h, 1d)
+        #[arg(long, default_value = "30s")]
+        timeout: String,
+    },
     /// Attach to a session (detach key: Ctrl-\)
     Attach {
         /// Session name; not used (and not required) with --stdio
@@ -238,6 +287,24 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
 
             attach::run(c, &name).await?;
         }
+        Cmd::Send {
+            name,
+            text,
+            key,
+            enter,
+            stdin,
+        } => control::send(&socket, name, text, key, enter, stdin).await?,
+        Cmd::Peek {
+            name,
+            scrollback,
+            json,
+        } => control::peek(&socket, name, scrollback, json).await?,
+        Cmd::Wait {
+            name,
+            text,
+            idle,
+            timeout,
+        } => control::wait(&socket, name, text, idle, timeout).await?,
         Cmd::Restart => {
             let c = client::restart(&socket).await?;
             println!(
