@@ -130,7 +130,10 @@ pub fn App() -> Element {
     let select_session = {
         let tx = tx.clone();
         move |host: HostId, name: String| {
-            if model.read().is_active(host, &name) {
+            // Re-selecting the live active session is a no-op, but when its
+            // stream ended (killed/exited — possibly recreated under the same
+            // name) a click must re-attach.
+            if model.read().is_active(host, &name) && *status.read() == Status::Live {
                 return;
             }
             let (cols, rows) = *grid.read();

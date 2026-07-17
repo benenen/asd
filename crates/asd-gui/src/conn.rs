@@ -251,8 +251,15 @@ async fn drive(
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Ok(Some(Frame::Error { code, msg })) => {
+                    // SESSION_EXITED carries no session name: only pin it on
+                    // the current attach when no switch is in flight. With
+                    // pending_attach > 0 it belongs to the session we just
+                    // left — taking `attached` then would drop the incoming
+                    // Snapshot of the new session.
                     if code == code::SESSION_EXITED {
-                        if let Some(name) = attached.take() {
+                        if pending_attach == 0
+                            && let Some(name) = attached.take()
+                        {
                             vt = None;
                             let _ = ev_tx.send(UiEvent::SessionEnded { host: id, name, msg });
                         }
