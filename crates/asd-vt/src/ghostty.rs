@@ -86,28 +86,98 @@ impl VtBackend for GhosttyVt {
     }
 
     fn snapshot_vt(&mut self) -> Vec<u8> {
-        let opts = FormatterOptions::new()
-            .with_format(Format::Vt)
-            .with_unwrap(false)
-            .with_trim(false)
-            // All terminal state required for snapshot fidelity (spec §8 item 2)
-            .with_palette(true)
-            .with_modes(true)
-            .with_scrolling_region(true)
-            .with_tabstops(true)
-            .with_keyboard(true)
-            .with_cursor(true)
-            .with_style(true)
-            .with_hyperlink(true)
-            .with_protection(true)
-            .with_kitty_keyboard(true)
-            .with_charsets(true);
-        let mut formatter =
-            Formatter::new(&self.terminal, opts).expect("formatter allocation failed");
-        let mut out = formatter
-            .format_alloc(None)
-            .expect("formatting terminal snapshot failed")
-            .to_vec();
+        // History and screen are dumped as two formatter passes. A single
+        // whole-terminal pass emits them as one continuous line stream and
+        // always trims trailing blank lines (formatter.zig: "Trailing blank
+        // lines are always trimmed", regardless of the trim option), so
+        // whenever the screen ends in blank rows the replay scrolls short and
+        // every screen row lands shifted — content misplaced, cursor on the
+        // wrong text, stray history where the real screen is blank. The
+        // split makes the replay exact by construction (same fix as boo's
+        // window.zig historyReplay/repaint pair, which hit the identical
+        // formatter behavior).
+        let cols = self.terminal.cols().unwrap_or(1);
+        let rows = self.terminal.rows().unwrap_or(1);
+        let mut out: Vec<u8> = Vec::new();
+
+        // Pass 1: scrollback history as a content-only styled stream. The
+        // alternate screen keeps no history; its grid refs fail and the pass
+        // is skipped (matching the old dump, which had no history there).
+        let hist = self.terminal.scrollback_rows().unwrap_or(0);
+        if hist > 0 {
+            let refs = (
+                self.terminal
+                    .grid_ref(Point::History(PointCoordinate { x: 0, y: 0 })),
+                self.terminal.grid_ref(Point::History(PointCoordinate {
+                    x: cols.saturating_sub(1),
+                    y: (hist - 1) as u32,
+                })),
+            );
+            if let (Ok(tl), Ok(br)) = refs {
+                let sel = Selection::new(tl, br, false);
+                let opts = FormatterOptions::new()
+                    .with_format(Format::Vt)
+                    .with_unwrap(false)
+                    .with_trim(false)
+                    .with_selection(&sel);
+                let mut formatter =
+                    Formatter::new(&self.terminal, opts).expect("formatter allocation failed");
+                out.extend_from_slice(
+                    &formatter
+                        .format_alloc(None)
+                        .expect("formatting history failed"),
+                );
+                // Scroll the replay fully off the visible area so every
+                // history row lands in scrollback; the screen pass repaints
+                // the visible area from scratch. Style reset first so an
+                // open background does not bleed into the scrolled-in rows.
+                out.extend_from_slice(b"\x1b[0m");
+                out.extend_from_slice("\r\n".repeat(rows as usize).as_bytes());
+            }
+        }
+
+        // Pass 2: the visible screen only, painted onto a cleared screen from
+        // home — absolute placement, so the formatter's trailing-blank
+        // trimming is harmless (trimmed rows simply stay erased).
+        out.extend_from_slice(b"\x1b[2J\x1b[H");
+        let refs = (
+            self.terminal
+                .grid_ref(Point::Active(PointCoordinate { x: 0, y: 0 })),
+            self.terminal.grid_ref(Point::Active(PointCoordinate {
+                x: cols.saturating_sub(1),
+                y: u32::from(rows.saturating_sub(1)),
+            })),
+        );
+        if let (Ok(tl), Ok(br)) = refs {
+            let sel = Selection::new(tl, br, false);
+            let opts = FormatterOptions::new()
+                .with_format(Format::Vt)
+                .with_unwrap(false)
+                .with_trim(false)
+                .with_selection(&sel)
+                // All terminal state required for snapshot fidelity (spec §8
+                // item 2). Mode emission (including the alternate-screen
+                // switch) precedes the content, so alt content lands on the
+                // alt screen.
+                .with_palette(true)
+                .with_modes(true)
+                .with_scrolling_region(true)
+                .with_tabstops(true)
+                .with_keyboard(true)
+                .with_cursor(true)
+                .with_style(true)
+                .with_hyperlink(true)
+                .with_protection(true)
+                .with_kitty_keyboard(true)
+                .with_charsets(true);
+            let mut formatter =
+                Formatter::new(&self.terminal, opts).expect("formatter allocation failed");
+            out.extend_from_slice(
+                &formatter
+                    .format_alloc(None)
+                    .expect("formatting terminal snapshot failed"),
+            );
+        }
         // The Formatter emits the tabstop/scrolling-region sequences after
         // CUP, and those sequences move the cursor (CHA, DECSTBM homing), so
         // an authoritative CUP must be appended at the end.

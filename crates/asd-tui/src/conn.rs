@@ -191,9 +191,17 @@ async fn drive(
                     }
                     // A failed Attach (the session died first) sends this
                     // instead of a Snapshot — drain the count or later
-                    // Snapshots would be taken for stale ones.
+                    // Snapshots would be taken for stale ones. When it was
+                    // the newest attach that failed, tell the TUI so it
+                    // stops holding the pane for a Snapshot that will never
+                    // come.
                     else if code == code::NO_SUCH_SESSION && pending_attach > 0 {
                         pending_attach -= 1;
+                        if pending_attach == 0
+                            && let Some(name) = attached.take()
+                        {
+                            let _ = ev_tx.send(Ev::SessionEnded { name, msg });
+                        }
                     } else {
                         tracing::debug!(code, %msg, "daemon error");
                     }

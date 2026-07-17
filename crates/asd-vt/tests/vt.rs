@@ -402,3 +402,77 @@ fn mouse_modes_reflect_enabled_dec_modes() {
     vt.feed(b"\x1b[?1000l\x1b[?1002l\x1b[?1006l");
     assert!(vt.mouse_modes().is_empty());
 }
+
+// The formatter emits history + screen as one line stream and always trims
+// trailing blank lines, which used to mis-scroll the replay whenever the
+// screen ended in blanks (content shifted, cursor on the wrong text). The
+// two-pass dump (history, then the screen absolutely positioned) must keep
+// these exact; scrollback depth is asserted too because the alignment
+// depends on every history row landing in scrollback.
+
+fn assert_fidelity_with_scrollback(sample: &[u8], cols: u16, rows: u16) {
+    let mut original = term(cols, rows);
+    original.feed(sample);
+    let dump = original.snapshot_vt();
+    let mut replica = term(cols, rows);
+    replica.feed(&dump);
+    let _ = replica.take_pty_responses();
+    assert_eq!(
+        original.scrollback_rows(),
+        replica.scrollback_rows(),
+        "scrollback depth after replay"
+    );
+    let a = original.render_snapshot();
+    let b = replica.render_snapshot();
+    assert_eq!(a.cells, b.cells, "grid mismatch after snapshot replay");
+    assert_eq!(a.cursor.position, b.cursor.position, "cursor position");
+}
+
+#[test]
+fn snapshot_fidelity_scrollback_overflow() {
+    // 30 lines through a 10-row screen: 21 lines scroll into history and the
+    // screen ends in one blank row (the trimmed-newline off-by-one shape).
+    let mut sample = Vec::new();
+    for i in 1..=30 {
+        sample.extend_from_slice(format!("line {i}\r\n").as_bytes());
+    }
+    assert_fidelity_with_scrollback(&sample, 40, 10);
+}
+
+#[test]
+fn snapshot_fidelity_overflow_then_clear() {
+    // Scrollback overflow, then the app clears and repaints only the top —
+    // most of the screen is trailing blanks (a shell prompt after clear).
+    let mut sample = Vec::new();
+    for i in 1..=30 {
+        sample.extend_from_slice(format!("line {i}\r\n").as_bytes());
+    }
+    sample.extend_from_slice(b"\x1b[2J\x1b[Hfresh top\r\nfresh second\x1b[1;4H");
+    assert_fidelity_with_scrollback(&sample, 40, 10);
+}
+
+#[test]
+fn snapshot_fidelity_alt_screen_after_history() {
+    // Shell history on the primary screen, then a vim-like alternate-screen
+    // app: the dump must land the alt content on the alt screen with the
+    // cursor exact.
+    let mut sample = Vec::new();
+    for i in 1..=8 {
+        sample.extend_from_slice(format!("line {i}\r\n").as_bytes());
+    }
+    sample.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[Halt line 1\r\nalt line 2\x1b[2;3H");
+    let mut original = term(20, 4);
+    original.feed(&sample);
+    let dump = original.snapshot_vt();
+    let mut replica = term(20, 4);
+    replica.feed(&dump);
+    let _ = replica.take_pty_responses();
+    assert!(
+        replica.is_alt_screen(),
+        "replica must end on the alt screen"
+    );
+    let a = original.render_snapshot();
+    let b = replica.render_snapshot();
+    assert_eq!(a.cells, b.cells, "grid mismatch after snapshot replay");
+    assert_eq!(a.cursor.position, b.cursor.position, "cursor position");
+}

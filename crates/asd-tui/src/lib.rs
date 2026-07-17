@@ -121,13 +121,12 @@ pub(crate) struct App {
     /// LRU). Switching back shows the parked terminal's last frame instantly
     /// — the boo-style feel — while the fresh attach converges behind it.
     parked: Vec<(String, GhosttyVt)>,
-    /// Keep showing `cache` until this deadline. The deadline is adaptive:
-    /// opened generously at select time, then re-armed to "shortly after the
-    /// most recent output byte" once the Snapshot is in — so the swap happens
-    /// as soon as the repaint jiggle's output settles, not after a fixed
-    /// delay. `hold_cap` is the absolute upper bound.
+    /// Keep showing `cache` while a switch is in flight. The attach Snapshot
+    /// is a complete, exact replay (single frame), so the reveal is
+    /// deterministic — the moment the dump is fed (boo's `.screen` marker,
+    /// no settle heuristics). The deadline only bounds a switch whose
+    /// Snapshot never arrives.
     pane_hold: Option<std::time::Instant>,
-    hold_cap: std::time::Instant,
     /// Sidebar row effects (tachyonfx), keyed by session name: sweep-in on
     /// newly listed sessions, a brief accent fade on selection.
     row_fx: Vec<(String, tachyonfx::Effect)>,
@@ -189,7 +188,6 @@ fn event_loop(
         cache: None,
         parked: Vec::new(),
         pane_hold: None,
-        hold_cap: std::time::Instant::now(),
         row_fx: Vec::new(),
         last_frame: std::time::Instant::now(),
         dirty: true,
@@ -289,8 +287,8 @@ impl App {
     /// entered the alternate screen), and a stale offset would leave the
     /// scroll indicator lying about a view that is actually live.
     pub fn snapshot(&mut self) -> Option<RenderSnapshot> {
-        // Across a switch, keep the previous frame up until the new session
-        // has converged (snapshot fed + repaint jiggle done).
+        // Across a switch, keep the previous frame up until the new attach's
+        // Snapshot has been fed (or the safety deadline expires).
         if let Some(deadline) = self.pane_hold {
             if std::time::Instant::now() < deadline {
                 if self.cache.is_some() {
@@ -359,9 +357,11 @@ impl App {
                 vt.render_snapshot()
             })
             .or(old_frame);
-        let now = std::time::Instant::now();
-        self.hold_cap = now + std::time::Duration::from_millis(400);
-        self.pane_hold = Some(self.hold_cap);
+        // Safety bound only — the real reveal is the Snapshot arriving. A
+        // heavy session's dump can take a while to generate and feed, so the
+        // bound is generous; a failed attach clears the hold via its own
+        // event well before this.
+        self.pane_hold = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
         self.vt = Some(GhosttyVt::new(self.grid.0, self.grid.1, SCROLLBACK));
         self.scroll = 0;
         self.sel = None;
@@ -485,59 +485,21 @@ impl App {
                         self.send(Cmd::Input(replies));
                     }
                 }
-                // While a switch is converging, every output byte re-arms a
-                // short settle timer: the swap to the live view happens as
-                // soon as the repaint stream pauses (or at the hard cap).
-                if !snapshot && self.pane_hold.is_some() {
-                    let now = std::time::Instant::now();
-                    self.pane_hold =
-                        Some((now + std::time::Duration::from_millis(35)).min(self.hold_cap));
-                }
                 if snapshot {
-                    // The attach dump carries the daemon Formatter's known
-                    // drift (trailing blank rows are dropped), which can leave
-                    // stray content on rows the real screen has blank. Nothing
-                    // sits BELOW the cursor for shells and inline TUIs on the
-                    // real screen (and alt-screen apps repaint fully after the
-                    // jiggle below), so erase below it locally.
-                    if let Some(vt) = &mut self.vt {
-                        let snap = vt.render_snapshot();
-                        if let Some((cx, cy)) = snap.cursor.position
-                            && cy + 1 < snap.rows
-                        {
-                            // Move below the cursor, erase to end of screen,
-                            // put the cursor back (all local; CSI is 1-based).
-                            let seq =
-                                format!("\x1b[{};1H\x1b[J\x1b[{};{}H", cy + 2, cy + 1, cx + 1);
-                            vt.feed(seq.as_bytes());
-                        }
-                    }
-                    // Then jiggle the pty size so the session app repaints
-                    // absolutely — the follow-up Output converges the terminal
-                    // (and the cursor) to the truth.
-                    let (cols, rows) = self.grid;
-                    if rows > 2 {
-                        self.send(Cmd::Resize {
-                            cols,
-                            rows: rows - 1,
-                        });
-                        self.send(Cmd::Resize { cols, rows });
-                    }
-                    // The dump is in and the repaint requested: from here the
-                    // hold ends as soon as the output settles (see the Output
-                    // arm), with a hard cap so a chatty session can't pin the
-                    // old frame.
-                    if self.pane_hold.is_some() {
-                        let now = std::time::Instant::now();
-                        self.hold_cap = now + std::time::Duration::from_millis(150);
-                        self.pane_hold =
-                            Some((now + std::time::Duration::from_millis(60)).min(self.hold_cap));
-                    }
+                    // The dump is an exact replay of the daemon's terminal
+                    // (asd-vt's two-pass snapshot), generated at this pane's
+                    // size — feeding it IS convergence. Reveal immediately,
+                    // boo's `.screen`-marker semantics.
+                    self.pane_hold = None;
+                    self.cache = None;
                 }
             }
             Ev::SessionEnded { name, msg } => {
                 if self.active.as_deref() == Some(&name) {
-                    self.notice = Some(format!("{name} ended — {msg}"));
+                    self.notice = Some(format!("{name} — {msg}"));
+                    // Whatever the pane was holding for is not coming.
+                    self.pane_hold = None;
+                    self.cache = None;
                 }
             }
         }
