@@ -255,7 +255,11 @@ fn render_pane(buf: &mut Buffer, area: Rect, snap: &RenderSnapshot, sel: Option<
                 target.set_symbol(&cell.grapheme);
             }
             let mut style = cell_style(cell);
-            if in_selection(sel, x, y) {
+            // Only cells with written content take the selection highlight —
+            // blank (never-written) cells stay plain, so clicking or dragging
+            // over empty areas shows no reverse-video block (same rule as the
+            // CLI attach client's render).
+            if !cell.grapheme.is_empty() && in_selection(sel, x, y) {
                 style = style.add_modifier(Modifier::REVERSED);
             }
             target.set_style(style);
@@ -389,5 +393,40 @@ mod tests {
         // Beyond the list or in the pane → no hit.
         assert_eq!(sidebar_hit(area, 3, 2, 12), None);
         assert_eq!(sidebar_hit(area, 3, SIDEBAR_W + 5, 0), None);
+    }
+
+    #[test]
+    fn selection_highlights_text_but_not_blank_cells() {
+        use asd_vt::{CellSnapshot, CursorSnapshot, RenderSnapshot};
+        let cell = |g: &str| CellSnapshot {
+            grapheme: g.to_string(),
+            ..CellSnapshot::default()
+        };
+        // Row: text, written space, two never-written blanks.
+        let snap = RenderSnapshot {
+            cols: 4,
+            rows: 1,
+            cells: vec![vec![cell("a"), cell(" "), cell(""), cell("")]],
+            row_dirty: vec![true],
+            cursor: CursorSnapshot::default(),
+            palette: [Rgb::default(); 256],
+            foreground: Rgb::default(),
+            background: Rgb::default(),
+        };
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+        let sel = Some(Selection {
+            start: (0, 0),
+            end: (3, 0),
+        });
+        render_pane(&mut buf, area, &snap, sel);
+        let reversed =
+            |x: u16| buf[(x, 0)].style().add_modifier.contains(Modifier::REVERSED);
+        // Text and a written space take the highlight...
+        assert!(reversed(0));
+        assert!(reversed(1));
+        // ...never-written blanks do not (clicking empty areas shows nothing).
+        assert!(!reversed(2));
+        assert!(!reversed(3));
     }
 }
