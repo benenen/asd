@@ -188,6 +188,9 @@ impl SessionHandle {
             title,
             created_ms: self.created_ms,
             idle_ms,
+            // "Running" = recently producing output; for an agent this tracks
+            // working vs done (see `SessionInfo.running`).
+            running: idle_ms < asd_proto::IDLE_SETTLE_MS,
             attached_clients: self.meta.attached_clients.load(Ordering::Relaxed),
             cols: self.meta.cols.load(Ordering::Relaxed),
             rows: self.meta.rows.load(Ordering::Relaxed),

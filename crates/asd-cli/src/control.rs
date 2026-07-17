@@ -6,15 +6,13 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
-use asd_proto::{ClientKind, Frame, MAX_FRAME_LEN};
+use asd_proto::{ClientKind, Frame, IDLE_SETTLE_MS, MAX_FRAME_LEN};
 use tokio::io::AsyncReadExt;
 
 use crate::client;
 
 /// Poll interval for `wait` (matches boo).
 const POLL_MS: u64 = 50;
-/// How long output must stay quiet for `wait --idle` to fire (matches boo).
-const IDLE_SETTLE_MS: u64 = 2000;
 /// Process exit code on `wait` timeout (matches boo's documented code).
 const EXIT_TIMEOUT: i32 = 4;
 

@@ -11,7 +11,8 @@
 //! followed by disconnect. v1 added the scrollback frames
 //! (`FetchHistory`/`History`) and `Refresh`; v2 added `SessionInfo.command`;
 //! v3 added `SessionInfo.title`; v4 added the attach-free scripting frames
-//! (`SendInput`/`Ack`, `Peek`/`PeekReply`) and `SessionInfo.idle_ms`.
+//! (`SendInput`/`Ack`, `Peek`/`PeekReply`) and `SessionInfo.idle_ms`; v5 added
+//! `SessionInfo.running` (idle-derived activity flag).
 
 mod codec;
 pub mod paths;
@@ -22,7 +23,13 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
+
+/// Output-quiescence threshold, in milliseconds. A session is considered
+/// **idle** once its pty has produced no output for this long, and **running**
+/// otherwise. Shared so `SessionInfo.running` (daemon) and `asd wait --idle`
+/// (client) agree on one definition.
+pub const IDLE_SETTLE_MS: u64 = 2000;
 
 /// Per-frame cap: 4 MiB (postcard payload, excluding the 4-byte length prefix).
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -74,6 +81,11 @@ pub struct SessionInfo {
     /// Milliseconds since the session last produced pty output; 0 while it is
     /// actively producing (or just created). Drives `asd wait --idle`.
     pub idle_ms: u64,
+    /// Whether the session is actively producing output — `idle_ms <
+    /// IDLE_SETTLE_MS`. For an agent (claude/codex/opencode) this reads as
+    /// "working" vs "done / waiting for input"; the title only labels *what*
+    /// it is, it does not flip with activity. Daemon-derived.
+    pub running: bool,
     pub attached_clients: u32,
     pub cols: u16,
     pub rows: u16,

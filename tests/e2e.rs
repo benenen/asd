@@ -714,3 +714,67 @@ async fn peek_json_and_missing_session() {
             .success()
     );
 }
+
+/// v5: `SessionInfo.running` tracks output activity — true while the session is
+/// producing output, false once it has been idle past `IDLE_SETTLE_MS`.
+#[tokio::test]
+async fn running_flag_tracks_activity() {
+    let daemon = Daemon::start("running");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "act"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let mut c = ProtoClient::connect(&daemon.socket).await;
+
+    // Trigger a fresh burst of output without attaching (v4 SendInput).
+    c.send(Frame::SendInput {
+        name: "act".into(),
+        bytes: b"printf act-running\n".to_vec(),
+    })
+    .await;
+    match c.recv().await {
+        Frame::Ack => {}
+        other => panic!("expected Ack, got {other:?}"),
+    }
+
+    // running is true while that output is fresh (idle_ms < IDLE_SETTLE_MS).
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let saw_running = loop {
+        c.send(Frame::ListSessions).await;
+        if list_find(&mut c, "act").await.running {
+            break true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(TICK).await;
+    };
+    assert!(saw_running, "session never reported running after a burst");
+
+    // After the settle window with no further output, running clears.
+    tokio::time::sleep(Duration::from_millis(asd_proto::IDLE_SETTLE_MS + 700)).await;
+    c.send(Frame::ListSessions).await;
+    let s = list_find(&mut c, "act").await;
+    assert!(
+        !s.running,
+        "session still running after settling: idle_ms={}",
+        s.idle_ms
+    );
+}
+
+/// Find a named session in the next `SessionList` reply.
+async fn list_find(c: &mut ProtoClient, name: &str) -> asd_proto::SessionInfo {
+    match c.recv_skipping_output().await {
+        Frame::SessionList { sessions } => sessions
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("session {name} not listed")),
+        other => panic!("expected SessionList, got {other:?}"),
+    }
+}
