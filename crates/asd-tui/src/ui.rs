@@ -62,6 +62,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     let (side, pane, bar) = areas(f.area());
     draw_sidebar(f.buffer_mut(), side, app);
     draw_bar(f.buffer_mut(), bar, app);
+    app.process_fx(f.buffer_mut(), side);
 
     let sel = app.sel_viewport();
     if let Some(snap) = app.snapshot() {
@@ -135,10 +136,16 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
             row_bg.fg(TEXT).add_modifier(Modifier::BOLD),
         );
         buf.set_string(area.right() - 3, y, "x", row_bg.fg(DIM));
-        // Line 2: command + age, dim.
+        // Line 2: the terminal title (what the session says it's doing),
+        // falling back to the foreground command; plus the age, dim.
         let age = short_age(s.created_ms, app.now_ms);
         let cmd_w = inner_w.saturating_sub(age.len() + 4);
-        let cmd = truncate(&short_cmd(&s.command), cmd_w);
+        let label = if s.title.trim().is_empty() {
+            short_cmd(&s.command)
+        } else {
+            s.title.trim().to_string()
+        };
+        let cmd = truncate(&label, cmd_w);
         buf.set_string(area.left() + 2, y + 1, &cmd, row_bg.fg(MUTED));
         buf.set_string(
             area.right() - 2 - age.len() as u16,

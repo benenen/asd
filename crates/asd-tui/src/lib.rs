@@ -110,6 +110,11 @@ pub(crate) struct App {
 
     /// Session named on the command line, consumed by the first auto-select.
     preferred: Option<String>,
+    /// Sidebar row effects (tachyonfx), keyed by session name: sweep-in on
+    /// newly listed sessions, a brief accent fade on selection.
+    row_fx: Vec<(String, tachyonfx::Effect)>,
+    /// Previous frame instant, for effect timing.
+    last_frame: std::time::Instant,
     dirty: bool,
     quit: bool,
 }
@@ -162,6 +167,8 @@ fn event_loop(
         prefix: false,
         now_ms: now_ms(),
         preferred,
+        row_fx: Vec::new(),
+        last_frame: std::time::Instant::now(),
         dirty: true,
         quit: false,
     };
@@ -173,7 +180,9 @@ fn event_loop(
         if app.dirty {
             app.now_ms = now_ms();
             terminal.draw(|f| ui::draw(f, &mut app))?;
-            app.dirty = false;
+            // Effects animate frame-by-frame: stay dirty until they finish
+            // (the input poll below caps the frame rate at ~33 fps).
+            app.dirty = !app.row_fx.is_empty();
         }
         if event::poll(Duration::from_millis(30))? {
             match event::read()? {
@@ -206,6 +215,39 @@ fn event_loop(
 }
 
 impl App {
+    /// Schedule (or replace) a sidebar effect for a session row.
+    fn add_fx(&mut self, name: String, fx: tachyonfx::Effect) {
+        self.row_fx.retain(|(n, _)| n != &name);
+        self.row_fx.push((name, fx));
+    }
+
+    /// Advance and paint the sidebar row effects; called once per drawn frame.
+    pub(crate) fn process_fx(
+        &mut self,
+        buf: &mut ratatui::buffer::Buffer,
+        side: ratatui::layout::Rect,
+    ) {
+        let now = std::time::Instant::now();
+        let delta: tachyonfx::Duration = now.duration_since(self.last_frame).into();
+        self.last_frame = now;
+        if self.row_fx.is_empty() {
+            return;
+        }
+        let sessions = &self.sessions;
+        self.row_fx.retain_mut(|(name, fx)| {
+            let Some(i) = sessions.iter().position(|s| &s.name == name) else {
+                return false;
+            };
+            let y = side.top() + (i as u16) * 2;
+            if y + 1 >= side.bottom() {
+                return false;
+            }
+            let rect = ratatui::layout::Rect::new(side.left(), y, side.width.saturating_sub(1), 2);
+            fx.process(delta, buf, rect);
+            !fx.done()
+        });
+    }
+
     fn send(&self, cmd: Cmd) {
         let _ = self.conn.cmd_tx.send(cmd);
     }
@@ -244,6 +286,13 @@ impl App {
         self.sel = None;
         self.selecting = false;
         self.notice = None;
+        self.add_fx(
+            name.clone(),
+            tachyonfx::fx::fade_from_fg(
+                ratatui::style::Color::Rgb(0xF3, 0xB2, 0x4C),
+                (250, tachyonfx::Interpolation::SineOut),
+            ),
+        );
         self.send(Cmd::Attach {
             name,
             cols: self.grid.0,
@@ -279,6 +328,21 @@ impl App {
                 self.vt = None;
             }
             Ev::Sessions(list) => {
+                // Newly listed sessions sweep into the sidebar.
+                for s in &list {
+                    if !self.sessions.iter().any(|old| old.name == s.name) {
+                        self.add_fx(
+                            s.name.clone(),
+                            tachyonfx::fx::sweep_in(
+                                tachyonfx::Motion::LeftToRight,
+                                10,
+                                0,
+                                ratatui::style::Color::Rgb(0x0B, 0x0D, 0x11),
+                                (350, tachyonfx::Interpolation::QuadOut),
+                            ),
+                        );
+                    }
+                }
                 self.sessions = list;
                 // The attached session vanished (killed elsewhere): fall back
                 // to the first remaining one.
@@ -325,10 +389,26 @@ impl App {
                 }
                 if snapshot {
                     // The attach dump carries the daemon Formatter's known
-                    // cursor drift (trailing blank rows are dropped). Jiggle
-                    // the pty size so the session app repaints absolutely —
-                    // the follow-up Output converges the terminal (and the
-                    // cursor) to the truth.
+                    // drift (trailing blank rows are dropped), which can leave
+                    // stray content on rows the real screen has blank. Nothing
+                    // sits BELOW the cursor for shells and inline TUIs on the
+                    // real screen (and alt-screen apps repaint fully after the
+                    // jiggle below), so erase below it locally.
+                    if let Some(vt) = &mut self.vt {
+                        let snap = vt.render_snapshot();
+                        if let Some((cx, cy)) = snap.cursor.position
+                            && cy + 1 < snap.rows
+                        {
+                            // Move below the cursor, erase to end of screen,
+                            // put the cursor back (all local; CSI is 1-based).
+                            let seq =
+                                format!("\x1b[{};1H\x1b[J\x1b[{};{}H", cy + 2, cy + 1, cx + 1);
+                            vt.feed(seq.as_bytes());
+                        }
+                    }
+                    // Then jiggle the pty size so the session app repaints
+                    // absolutely — the follow-up Output converges the terminal
+                    // (and the cursor) to the truth.
                     let (cols, rows) = self.grid;
                     if rows > 2 {
                         self.send(Cmd::Resize {

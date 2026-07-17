@@ -13,5 +13,6 @@ anyhow = { workspace = true }
 asd-proto = { workspace = true }
 asd-vt = { workspace = true }
 ratatui = { workspace = true }
+tachyonfx = "0.17"
 tokio = { workspace = true }
 tracing = { workspace = true }
