@@ -33,6 +33,9 @@ use conn::{Cmd, Conn, Ev};
 const SCROLLBACK: usize = 10_000;
 /// Wheel scroll step in lines.
 const WHEEL_STEP: usize = 3;
+/// Longest the pane defers a repaint while a program holds a synchronized-output
+/// (`?2026`) update open, bounding a lost `?2026l` (matches typical terminals).
+const SYNC_MAX: Duration = Duration::from_millis(150);
 
 /// A drag selection anchored in **absolute screen-space rows** (0 = oldest
 /// scrollback line, same coordinate system as `scrollback_rows`) so the
@@ -127,6 +130,16 @@ pub(crate) struct App {
     /// no settle heuristics). The deadline only bounds a switch whose
     /// Snapshot never arrives.
     pane_hold: Option<std::time::Instant>,
+    /// The last fully-rendered pane frame. Reused for redraws that don't change
+    /// the terminal (e.g. sidebar shimmer ticks) and while the program is mid
+    /// atomic-update (`synchronized_output`), so the pane is regenerated only on
+    /// real output/scroll/switch and never painted half-drawn.
+    pane_cache: Option<RenderSnapshot>,
+    /// The pane's terminal content changed since `pane_cache` was built.
+    pane_needs_render: bool,
+    /// When the current synchronized-output (`?2026`) window started, bounding
+    /// how long the pane defers a repaint if a lost `?2026l` never clears it.
+    sync_since: Option<std::time::Instant>,
     /// Sidebar row effects (tachyonfx), keyed by session name: sweep-in on
     /// newly listed sessions, a brief accent fade on selection.
     row_fx: Vec<(String, tachyonfx::Effect)>,
@@ -194,6 +207,9 @@ fn event_loop(
         cache: None,
         parked: Vec::new(),
         pane_hold: None,
+        pane_cache: None,
+        pane_needs_render: true,
+        sync_since: None,
         row_fx: Vec::new(),
         running_fx: Vec::new(),
         last_frame: std::time::Instant::now(),
@@ -228,6 +244,9 @@ fn event_loop(
                 Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
                 Event::Mouse(m) => app.on_mouse(m, terminal.size()?),
                 Event::Paste(text) => {
+                    if app.scroll != 0 {
+                        app.pane_needs_render = true;
+                    }
                     app.scroll = 0;
                     app.send(Cmd::Input(text.into_bytes()));
                 }
@@ -238,6 +257,7 @@ fn event_loop(
                         if let Some(vt) = &mut app.vt {
                             vt.resize(grid.0, grid.1);
                         }
+                        app.pane_needs_render = true;
                         app.send(Cmd::Resize {
                             cols: grid.0,
                             rows: grid.1,
@@ -357,14 +377,34 @@ impl App {
                 self.cache = None;
             }
         }
-        if let Some(vt) = &mut self.vt {
-            self.scroll = self.scroll.min(vt.scrollback_rows());
+        let vt = self.vt.as_mut()?;
+        self.scroll = self.scroll.min(vt.scrollback_rows());
+
+        // Defer a repaint while the program is mid atomic-update (synchronized
+        // output, `?2026`): keep showing the last complete frame so the pane is
+        // never painted half-drawn. A deadline bounds a stuck/lost `?2026l`.
+        let in_sync = if vt.synchronized_output() {
+            let now = std::time::Instant::now();
+            let since = *self.sync_since.get_or_insert(now);
+            now.duration_since(since) < SYNC_MAX
+        } else {
+            self.sync_since = None;
+            false
+        };
+
+        // Reuse the cache when the terminal hasn't changed (e.g. a sidebar
+        // shimmer tick redrew the frame) or while an atomic update is in flight;
+        // only regenerate on a real output/scroll/switch change.
+        if (!self.pane_needs_render || in_sync) && self.pane_cache.is_some() {
+            return self.pane_cache.clone();
         }
+
         let scroll = self.scroll;
-        self.vt.as_mut().map(|vt| {
-            vt.set_scroll(scroll);
-            vt.render_snapshot()
-        })
+        vt.set_scroll(scroll);
+        let snap = vt.render_snapshot();
+        self.pane_needs_render = false;
+        self.pane_cache = Some(snap.clone());
+        Some(snap)
     }
 
     /// The drag selection projected into pane-viewport coordinates.
@@ -425,6 +465,10 @@ impl App {
         self.sel = None;
         self.selecting = false;
         self.notice = None;
+        // The new terminal has no cached frame yet; force a fresh render.
+        self.pane_cache = None;
+        self.pane_needs_render = true;
+        self.sync_since = None;
         self.add_fx(
             name.clone(),
             tachyonfx::fx::fade_from_fg(
@@ -472,6 +516,7 @@ impl App {
                 self.notice = Some(reason);
                 self.active = None;
                 self.vt = None;
+                self.pane_cache = None;
             }
             Ev::Sessions(list) => {
                 // Drop parked terminals of sessions that no longer exist.
@@ -533,6 +578,9 @@ impl App {
                     self.vt = Some(GhosttyVt::new(self.grid.0, self.grid.1, SCROLLBACK));
                     self.scroll = 0;
                     self.sel = None;
+                    // The old cache belongs to a different terminal — drop it.
+                    self.pane_cache = None;
+                    self.sync_since = None;
                 }
                 if let Some(vt) = &mut self.vt {
                     vt.feed(&data);
@@ -543,6 +591,8 @@ impl App {
                         self.send(Cmd::Input(replies));
                     }
                 }
+                // The terminal changed: the pane must regenerate next draw.
+                self.pane_needs_render = true;
                 if snapshot {
                     // The dump is an exact replay of the daemon's terminal
                     // (asd-vt's two-pass snapshot), generated at this pane's
@@ -622,6 +672,9 @@ impl App {
 
     fn forward(&mut self, ev: KeyEvent) {
         // Typing snaps back to the live bottom and clears any selection.
+        if self.scroll != 0 {
+            self.pane_needs_render = true;
+        }
         self.scroll = 0;
         self.sel = None;
         if let Some(vt) = &mut self.vt {
@@ -637,6 +690,7 @@ impl App {
         let next = (self.scroll as isize + delta).clamp(0, max as isize) as usize;
         if next != self.scroll {
             self.scroll = next;
+            self.pane_needs_render = true;
             self.dirty = true;
         }
     }

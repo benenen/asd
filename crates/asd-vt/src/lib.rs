@@ -85,6 +85,15 @@ pub trait VtBackend: Sized {
         false
     }
 
+    /// Whether the program is currently inside a synchronized-output update
+    /// (DEC private mode 2026, `?2026h` … `?2026l`) — i.e. mid-way through an
+    /// atomic screen repaint. A renderer should keep showing the previous
+    /// complete frame until this clears, so it never paints a half-drawn one.
+    /// Default returns false (never synchronized).
+    fn synchronized_output(&mut self) -> bool {
+        false
+    }
+
     /// The terminal title as set by the program (OSC 0/2); empty when never
     /// set. The default implementation returns empty.
     fn title(&mut self) -> String {

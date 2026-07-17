@@ -394,6 +394,11 @@ impl VtBackend for GhosttyVt {
         self.terminal.is_mouse_tracking().unwrap_or(false)
     }
 
+    fn synchronized_output(&mut self) -> bool {
+        use libghostty_vt::terminal::Mode;
+        self.terminal.mode(Mode::SYNC_OUTPUT).unwrap_or(false)
+    }
+
     fn title(&mut self) -> String {
         // Copied out immediately: the borrow is only valid until the next
         // `vt_write`.

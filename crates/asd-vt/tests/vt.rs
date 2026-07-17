@@ -476,3 +476,21 @@ fn snapshot_fidelity_alt_screen_after_history() {
     assert_eq!(a.cells, b.cells, "grid mismatch after snapshot replay");
     assert_eq!(a.cursor.position, b.cursor.position, "cursor position");
 }
+
+#[test]
+fn synchronized_output_tracks_mode_2026() {
+    let mut vt = term(80, 24);
+    assert!(!vt.synchronized_output(), "no sync at rest");
+    // Begin a synchronized update (DECSET 2026).
+    vt.feed(b"\x1b[?2026h");
+    assert!(
+        vt.synchronized_output(),
+        "?2026h opens a synchronized update"
+    );
+    // Content written mid-update keeps it open.
+    vt.feed(b"partial redraw");
+    assert!(vt.synchronized_output(), "still synchronized until reset");
+    // End it (DECRST 2026).
+    vt.feed(b"\x1b[?2026l");
+    assert!(!vt.synchronized_output(), "?2026l closes the update");
+}
