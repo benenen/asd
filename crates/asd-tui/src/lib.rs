@@ -20,7 +20,8 @@ use std::time::Duration;
 use asd_proto::SessionInfo;
 use asd_vt::{GhosttyVt, Key as VtKey, KeyEvent, Mods, RenderSnapshot, VtBackend};
 use ratatui::crossterm::event::{
-    self, Event, KeyCode, KeyEvent as CtKey, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent as CtKey, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::crossterm::execute;
 
@@ -679,7 +680,11 @@ impl App {
                 }
                 // Reconnect moved to R (r now renames).
                 KeyCode::Char('R') => self.reconnect(),
-                KeyCode::Char('q') | KeyCode::Char('d') => self.quit = true,
+                // `q` quits; `Esc` (and any other unmapped key) just cancels the
+                // prefix. `d` is intentionally not a quit alias — in screen/tmux
+                // muscle memory it means detach, which here would read as an
+                // accidental quit.
+                KeyCode::Char('q') => self.quit = true,
                 // Ctrl+A twice sends a literal Ctrl+A to the session.
                 KeyCode::Char('a') if ctrl_a => self.forward(KeyEvent {
                     key: VtKey::Char('a'),
@@ -849,12 +854,13 @@ impl App {
             MouseEventKind::ScrollUp => self.scroll_by(WHEEL_STEP as isize),
             MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_STEP as isize)),
             // Grabbing the divider begins a live sidebar resize (consumed by the
-            // TUI — never a selection).
-            MouseEventKind::Down(_) if on_divider => {
+            // TUI — never a selection). Left button only: right/middle clicks
+            // must not select, kill, or start a drag-selection.
+            MouseEventKind::Down(MouseButton::Left) if on_divider => {
                 self.dragging_divider = true;
                 self.dirty = true;
             }
-            MouseEventKind::Down(_) => {
+            MouseEventKind::Down(MouseButton::Left) => {
                 if let Some((i, kill)) = ui::sidebar_hit(
                     area,
                     self.sidebar_w,

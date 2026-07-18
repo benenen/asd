@@ -49,10 +49,13 @@ const MIN_PANE: u16 = 20;
 /// bar along the bottom. A hidden sidebar gives the pane the full width.
 pub fn areas(total: Rect, sidebar_w: u16, hidden: bool) -> (Rect, Rect, Rect) {
     let body_h = total.height.saturating_sub(1);
-    let side_w = if hidden {
+    // Keep the pane usable on a narrow terminal: never let the sidebar squeeze
+    // it below MIN_PANE, and drop the sidebar entirely when even the sidebar's
+    // own minimum plus MIN_PANE won't fit (rather than swallow the pane whole).
+    let side_w = if hidden || total.width < MIN_SIDEBAR + MIN_PANE {
         0
     } else {
-        sidebar_w.min(total.width)
+        sidebar_w.min(total.width - MIN_PANE)
     };
     let side = Rect::new(total.x, total.y, side_w, body_h);
     let pane = Rect::new(
@@ -126,18 +129,16 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
         {
             f.set_cursor_position(Position::new(pane.x + cx, pane.y + cy));
         }
-        if app.scroll > 0 {
-            let tag = format!("[+{}] ", app.scroll);
-            let x = pane.right().saturating_sub(tag.len() as u16);
-            f.buffer_mut()
-                .set_string(x, pane.y, tag, Style::new().fg(ACCENT));
-        }
+        // The scrollback offset is shown in the status bar (next to the session
+        // count), not over the pane's top row — see `draw_bar`.
     } else {
-        let hint = if app.sessions.is_empty() {
-            "no sessions — Ctrl+A c creates one"
-        } else {
-            "select a session (Ctrl+A j/k)"
-        };
+        // Whether any listed session can actually be selected here (the session
+        // hosting this UI is shown but not attachable).
+        let selectable = app
+            .sessions
+            .iter()
+            .any(|s| app.self_session.as_deref() != Some(&s.name));
+        let hint = empty_pane_hint(app.sessions.is_empty(), selectable);
         let y = pane.y + pane.height / 2;
         let x = pane.x + (pane.width.saturating_sub(hint.len() as u16)) / 2;
         f.buffer_mut().set_string(x, y, hint, Style::new().fg(DIM));
@@ -334,7 +335,7 @@ fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
     }
     let (hint, style) = if app.prefix {
         (
-            "PREFIX  j/k switch · 1-9 jump · c new · r rename · x kill · b sidebar · R reconnect · q quit",
+            "PREFIX  j/k ↑/↓ switch · 1-9 jump · c new · r rename · x kill · b sidebar · R reconnect · q quit · Esc cancel",
             Style::new().fg(ACCENT).bg(RULE),
         )
     } else {
@@ -350,8 +351,15 @@ fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
     let (status, sstyle) = if let Some(notice) = &app.notice {
         (notice.clone(), Style::new().fg(ALERT).bg(RULE))
     } else if app.daemon_up {
+        // Exclude the session hosting this UI — it can't be attached here, so
+        // counting it would overstate what the user can switch to.
+        let count = app
+            .sessions
+            .iter()
+            .filter(|s| app.self_session.as_deref() != Some(&s.name))
+            .count();
         (
-            format!("● {} sessions", app.sessions.len()),
+            session_status(count, app.scroll),
             Style::new().fg(OK).bg(RULE),
         )
     } else {
@@ -362,11 +370,11 @@ fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
     };
     let max = (area.width / 2) as usize;
     let status = truncate(&status, max);
-    let x = area
-        .right()
-        .saturating_sub(status.chars().count() as u16 + 1);
-    // Only draw the status when it doesn't collide with the hint.
-    if x > area.left() + 1 + hint.chars().count().min(max) as u16 {
+    let x = area.right().saturating_sub(str_width(&status) as u16 + 1);
+    // Only draw the status when it clears the hint actually painted on the left
+    // (the *truncated* hint width, not the full string).
+    let hint_w = str_width(&truncate(hint, area.width.saturating_sub(2) as usize));
+    if x > area.left() + 1 + hint_w as u16 {
         buf.set_string(x, y, status, sstyle);
     }
 }
@@ -539,6 +547,30 @@ pub fn short_age(created_ms: u64, now_ms: u64) -> String {
     }
 }
 
+/// The centered pane hint when no session is being viewed. Distinguishes "no
+/// sessions at all" from "the only session is this UI's own host" (which `j/k`
+/// can't select) — the latter must point at creating one, not at selecting.
+fn empty_pane_hint(is_empty: bool, any_selectable: bool) -> &'static str {
+    if is_empty {
+        "no sessions — Ctrl+A c creates one"
+    } else if !any_selectable {
+        "only this UI's own session — Ctrl+A c for a new one"
+    } else {
+        "select a session (Ctrl+A j/k)"
+    }
+}
+
+/// The right-side status string: the session count, prefixed with the local
+/// scrollback offset when scrolled back (shown here, next to the count, rather
+/// than over the pane's top row).
+fn session_status(count: usize, scroll: usize) -> String {
+    if scroll > 0 {
+        format!("[+{scroll}] ● {count} sessions")
+    } else {
+        format!("● {count} sessions")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +616,48 @@ mod tests {
         );
         assert!(shown.ends_with('…'));
         assert!(str_width(&shown) <= budget);
+    }
+
+    #[test]
+    fn narrow_terminal_keeps_a_usable_pane() {
+        // Wide: sidebar honored, the pane gets the rest.
+        let (side, pane, _) = areas(Rect::new(0, 0, 100, 40), SIDEBAR_W, false);
+        assert_eq!(side.width, SIDEBAR_W);
+        assert_eq!(pane.width, 100 - SIDEBAR_W);
+        // Medium-narrow: the sidebar shrinks so the pane never drops below
+        // MIN_PANE (28-wide sidebar can't fit alongside a 20-wide pane in 40).
+        let (side, pane, _) = areas(Rect::new(0, 0, 40, 40), SIDEBAR_W, false);
+        assert!(pane.width >= MIN_PANE, "pane {} >= {MIN_PANE}", pane.width);
+        assert!(side.width > 0);
+        // Too narrow for both: the sidebar drops out; the pane takes it all.
+        let w = MIN_SIDEBAR + MIN_PANE - 1;
+        let (side, pane, _) = areas(Rect::new(0, 0, w, 40), SIDEBAR_W, false);
+        assert_eq!(side.width, 0);
+        assert_eq!(pane.width, w);
+    }
+
+    #[test]
+    fn session_status_prefixes_scroll_offset() {
+        assert_eq!(session_status(3, 0), "● 3 sessions");
+        assert_eq!(session_status(3, 12), "[+12] ● 3 sessions");
+        assert_eq!(session_status(0, 0), "● 0 sessions");
+    }
+
+    #[test]
+    fn empty_pane_hint_distinguishes_self_only() {
+        assert_eq!(
+            empty_pane_hint(true, false),
+            "no sessions — Ctrl+A c creates one"
+        );
+        // Sessions exist but none selectable (only the UI's own host): point at
+        // creating one, not selecting — j/k can't reach it.
+        let self_only = empty_pane_hint(false, false);
+        assert!(self_only.contains("Ctrl+A c"));
+        assert!(self_only.contains("own session"));
+        assert_eq!(
+            empty_pane_hint(false, true),
+            "select a session (Ctrl+A j/k)"
+        );
     }
 
     #[test]
