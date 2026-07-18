@@ -130,12 +130,20 @@ pub async fn handle_conn(stream: UnixStream, registry: Arc<Mutex<Registry>>, con
                 }
             }
             Frame::Attach { name, cols, rows } => {
-                if attached.is_some() {
-                    reply(Frame::Error {
-                        code: code::ALREADY_ATTACHED,
-                        msg: "connection already attached to a session".into(),
+                // Attaching supersedes any prior attachment on this connection.
+                // A session that dies while attached cannot clear this
+                // read-side bookkeeping — the session thread only reaches the
+                // outbound sink (§session.rs endpoint) — so a leftover
+                // `attached` can point at an already-dead session. Rejecting the
+                // next Attach as ALREADY_ATTACHED would then wedge the
+                // connection: the client's pane stays blank until it reconnects
+                // (the asd-tui "blank after kill-then-new-session" bug). Release
+                // the old attachment first; a Detach to a dead session thread is
+                // harmlessly dropped.
+                if let Some(a) = attached.take() {
+                    let _ = a.session_tx.send(SessionMsg::Detach {
+                        client_id: a.client_id,
                     });
-                    continue;
                 }
                 let Some(handle) = registry.lock().unwrap().get(&name) else {
                     reply(Frame::Error {

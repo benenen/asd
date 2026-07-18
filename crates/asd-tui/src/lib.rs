@@ -865,7 +865,9 @@ impl App {
                 ) {
                     let name = self.sessions[i].name.clone();
                     if kill {
-                        self.send(Cmd::Kill { name });
+                        // Same path as Ctrl+A x: a click on the row's kill mark
+                        // asks first (confirmation modal), never kills outright.
+                        self.modal = Some(Modal::KillConfirm { target: name });
                     } else {
                         self.select(name);
                     }

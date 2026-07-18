@@ -71,6 +71,80 @@ pub enum Ev {
     Renamed(Result<(), String>),
 }
 
+/// The connection actor's attach bookkeeping, as a small pure state machine so
+/// the frame-routing rules — which Snapshot/Output belongs to the current view,
+/// and when a switch is still converging — are unit-testable (the
+/// "active-session / frame-filter" logic).
+///
+/// `pending` counts Attach frames whose Snapshot has not arrived yet: while
+/// `> 0` a live Output is stale (belongs to a session we just left), and while
+/// `> 1` an arriving Snapshot belongs to a superseded attach (a quick switch).
+/// `showing` names the session the forwarded frames are tagged with — the
+/// current view; the TUI drops frames tagged with anything else.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Attach {
+    pending: usize,
+    showing: Option<String>,
+}
+
+impl Attach {
+    /// Begin an Attach to `name`. Returns whether the connection was already
+    /// attached (so the caller writes a `Detach` first — switching sessions on
+    /// one connection is detach-then-attach).
+    fn begin(&mut self, name: String) -> bool {
+        let was_attached = self.showing.is_some();
+        self.pending += 1;
+        self.showing = Some(name);
+        was_attached
+    }
+
+    /// A Snapshot arrived: the session name to tag it with, or `None` when it
+    /// belongs to a superseded attach and must be dropped.
+    fn on_snapshot(&mut self) -> Option<String> {
+        if self.pending > 1 {
+            self.pending -= 1; // superseded attach — not our view
+            return None;
+        }
+        self.pending = 0;
+        self.showing.clone()
+    }
+
+    /// An Output arrived: the session name to tag it with, or `None` while a
+    /// switch is still converging (the bytes belong to a session we just left).
+    fn on_output(&self) -> Option<String> {
+        if self.pending > 0 {
+            return None;
+        }
+        self.showing.clone()
+    }
+
+    /// The attached session exited (`SESSION_EXITED` carries no name). Returns
+    /// the ended session's name only when it can be pinned on the current view —
+    /// with no switch in flight; with one pending, the exit belongs to the
+    /// session we just left and taking `showing` would drop the incoming
+    /// Snapshot of the new one.
+    fn on_session_exited(&mut self) -> Option<String> {
+        if self.pending == 0 {
+            self.showing.take()
+        } else {
+            None
+        }
+    }
+
+    /// A pending Attach failed (`NO_SUCH_SESSION`: the session died before we
+    /// attached). Drains one pending count; returns the ended name only if that
+    /// was the newest attach, so the client stops holding the pane for a
+    /// Snapshot that will never come. Caller guards `pending > 0`.
+    fn on_attach_failed(&mut self) -> Option<String> {
+        self.pending -= 1;
+        if self.pending == 0 {
+            self.showing.take()
+        } else {
+            None
+        }
+    }
+}
+
 /// Handle to the running actor thread.
 pub struct Conn {
     pub cmd_tx: UnboundedSender<Cmd>,
@@ -135,10 +209,9 @@ async fn drive(
     }
     let _ = ev_tx.send(Ev::Up);
 
-    // Attach frames sent whose Snapshot has not arrived yet: while > 0 Output
-    // is stale, while > 1 arriving Snapshots belong to superseded attaches.
-    let mut pending_attach: usize = 0;
-    let mut attached: Option<String> = None;
+    // Attach bookkeeping (see `Attach`): which session's frames to forward and
+    // whether a switch is still converging.
+    let mut at = Attach::default();
 
     let mut ticker = tokio::time::interval(LIST_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -155,24 +228,18 @@ async fn drive(
                     let _ = ev_tx.send(Ev::Sessions(sessions));
                 }
                 Ok(Some(Frame::Snapshot { vt: dump })) => {
-                    if pending_attach > 1 {
-                        pending_attach -= 1; // superseded attach — not our view
-                        continue;
-                    }
-                    pending_attach = 0;
-                    if let Some(name) = &attached {
+                    if let Some(name) = at.on_snapshot() {
                         let _ = ev_tx.send(Ev::Bytes {
-                            name: name.clone(),
+                            name,
                             data: dump,
                             snapshot: true,
                         });
                     }
                 }
                 Ok(Some(Frame::Output { bytes })) => {
-                    if pending_attach > 0 { continue; } // belongs to a session we just left
-                    if let Some(name) = &attached {
+                    if let Some(name) = at.on_output() {
                         let _ = ev_tx.send(Ev::Bytes {
-                            name: name.clone(),
+                            name,
                             data: bytes,
                             snapshot: false,
                         });
@@ -194,9 +261,7 @@ async fn drive(
                     // away) — taking `attached` then would drop the incoming
                     // Snapshot of the new session.
                     if code == code::SESSION_EXITED {
-                        if pending_attach == 0
-                            && let Some(name) = attached.take()
-                        {
+                        if let Some(name) = at.on_session_exited() {
                             let _ = ev_tx.send(Ev::SessionEnded { name, msg });
                         }
                     }
@@ -206,11 +271,8 @@ async fn drive(
                     // the newest attach that failed, tell the TUI so it
                     // stops holding the pane for a Snapshot that will never
                     // come.
-                    else if code == code::NO_SUCH_SESSION && pending_attach > 0 {
-                        pending_attach -= 1;
-                        if pending_attach == 0
-                            && let Some(name) = attached.take()
-                        {
+                    else if code == code::NO_SUCH_SESSION && at.pending > 0 {
+                        if let Some(name) = at.on_attach_failed() {
                             let _ = ev_tx.send(Ev::SessionEnded { name, msg });
                         }
                     }
@@ -228,24 +290,22 @@ async fn drive(
             cmd = cmd_rx.recv() => match cmd {
                 Some(Cmd::Attach { name, cols, rows }) => {
                     // Switching sessions on one connection means detach first.
-                    if attached.is_some() {
+                    if at.begin(name.clone()) {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
-                    pending_attach += 1;
-                    attached = Some(name.clone());
                     if writer.write_frame(&Frame::Attach { name, cols, rows }).await.is_err() {
                         return Err("attach write failed".to_string());
                     }
                 }
                 Some(Cmd::Input(bytes)) => {
-                    if attached.is_some()
+                    if at.showing.is_some()
                         && writer.write_frame(&Frame::Input { bytes }).await.is_err()
                     {
                         return Err("input write failed".to_string());
                     }
                 }
                 Some(Cmd::Resize { cols, rows }) => {
-                    if attached.is_some()
+                    if at.showing.is_some()
                         && writer.write_frame(&Frame::Resize { cols, rows }).await.is_err()
                     {
                         return Err("resize write failed".to_string());
@@ -270,12 +330,116 @@ async fn drive(
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(Cmd::Shutdown) | None => {
-                    if attached.is_some() {
+                    if at.showing.is_some() {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
                     return Ok(());
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Attach;
+
+    fn s(name: &str) -> Option<String> {
+        Some(name.to_string())
+    }
+
+    #[test]
+    fn first_attach_needs_no_detach_switch_does() {
+        let mut at = Attach::default();
+        // Nothing attached yet → no Detach precedes the first Attach.
+        assert!(!at.begin("a".into()));
+        at.on_snapshot(); // converges
+        // Now attached → switching sends a Detach first.
+        assert!(at.begin("b".into()));
+    }
+
+    #[test]
+    fn snapshot_then_output_tag_the_current_view() {
+        let mut at = Attach::default();
+        at.begin("a".into());
+        assert_eq!(at.on_snapshot(), s("a")); // reveal a
+        assert_eq!(at.on_output(), s("a")); // live output belongs to a
+    }
+
+    #[test]
+    fn output_is_dropped_until_the_snapshot_converges() {
+        let mut at = Attach::default();
+        at.begin("a".into());
+        // A switch is in flight: Output before the Snapshot is stale, dropped.
+        assert_eq!(at.on_output(), None);
+        assert_eq!(at.on_snapshot(), s("a"));
+        assert_eq!(at.on_output(), s("a"));
+    }
+
+    #[test]
+    fn quick_switch_drops_the_superseded_snapshot() {
+        let mut at = Attach::default();
+        at.begin("a".into());
+        at.begin("b".into()); // switched before a's snapshot arrived
+        // a's snapshot arrives first — superseded, dropped (not shown as b).
+        assert_eq!(at.on_snapshot(), None);
+        // b's snapshot arrives — this is the view.
+        assert_eq!(at.on_snapshot(), s("b"));
+        assert_eq!(at.on_output(), s("b"));
+    }
+
+    #[test]
+    fn session_exit_pins_the_name_only_when_settled() {
+        // No switch in flight: the exit is the current view's.
+        let mut at = Attach::default();
+        at.begin("a".into());
+        at.on_snapshot();
+        assert_eq!(at.on_session_exited(), s("a"));
+        // After the exit nothing is shown.
+        assert_eq!(at.on_output(), None);
+
+        // Switch in flight: a stray exit belongs to the session we left, so it
+        // must NOT take the pending view (that would drop the new Snapshot).
+        let mut at = Attach::default();
+        at.begin("a".into());
+        at.on_snapshot();
+        at.begin("b".into()); // switching to b, snapshot pending
+        assert_eq!(at.on_session_exited(), None);
+        assert_eq!(at.on_snapshot(), s("b")); // b still reveals
+    }
+
+    #[test]
+    fn failed_attach_drains_and_reports_only_the_newest() {
+        // Single failed attach → report so the pane stops holding.
+        let mut at = Attach::default();
+        at.begin("gone".into());
+        assert_eq!(at.on_attach_failed(), s("gone"));
+
+        // Two in flight, the older attach fails: drain the count but keep the
+        // newer view; its Snapshot still reveals.
+        let mut at = Attach::default();
+        at.begin("a".into());
+        at.begin("b".into());
+        assert_eq!(at.on_attach_failed(), None); // a failed, b still pending
+        assert_eq!(at.on_snapshot(), s("b"));
+    }
+
+    /// Bug regression (client side): after the attached session is killed and
+    /// exits, attaching a brand-new session routes that session's Snapshot to
+    /// the pane — the frame is NOT filtered out. (The daemon-side fix is what
+    /// makes the Snapshot actually arrive; this pins the client's routing.)
+    #[test]
+    fn reattach_after_kill_routes_the_new_sessions_snapshot() {
+        let mut at = Attach::default();
+        at.begin("a".into());
+        assert_eq!(at.on_snapshot(), s("a"));
+        // a is killed and exits under us.
+        assert_eq!(at.on_session_exited(), s("a"));
+        assert_eq!(at.showing, None);
+        // Create + attach a new session b.
+        assert!(!at.begin("b".into())); // not attached (a exited) → no Detach
+        // b's Snapshot must reveal as b — not dropped, not tagged a.
+        assert_eq!(at.on_snapshot(), s("b"));
+        assert_eq!(at.on_output(), s("b"));
     }
 }

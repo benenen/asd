@@ -897,3 +897,66 @@ async fn list_find(c: &mut ProtoClient, name: &str) -> asd_proto::SessionInfo {
         other => panic!("expected SessionList, got {other:?}"),
     }
 }
+
+/// A session that dies while a connection is attached must not wedge that
+/// connection: re-attaching to a different session on the same connection has
+/// to succeed (a fresh Snapshot), never be rejected as "already attached".
+///
+/// Regression for the asd-tui "blank pane after kill-then-new-session" bug. The
+/// daemon leaked the per-connection `attached` state when the session died
+/// under it (the session thread can't reach the connection's read-side
+/// bookkeeping), so the *next* Attach on that connection saw a stale attachment
+/// and replied `ALREADY_ATTACHED` with no Snapshot — leaving the client's pane
+/// permanently blank until it reconnected. Attaching now supersedes any prior
+/// attachment.
+#[tokio::test]
+async fn attach_after_attached_session_dies_is_not_wedged() {
+    let daemon = Daemon::start("reattach");
+
+    // Session A, created and attached.
+    assert!(
+        daemon.cli().args(["new", "a"]).status().unwrap().success(),
+        "create a failed"
+    );
+    let mut c = ProtoClient::connect(&daemon.socket).await;
+    let _ = c.attach("a").await;
+
+    // Kill A out from under the attached connection (a separate CLI client).
+    assert!(
+        daemon.cli().args(["kill", "a"]).status().unwrap().success(),
+        "kill a failed"
+    );
+
+    // The attached connection is told the session exited (drain any trailing
+    // Output first). Like asd-tui, we treat this as "detached" and do NOT send
+    // a Detach — exactly the path that used to wedge the connection.
+    loop {
+        match c.recv().await {
+            Frame::Output { .. } => continue,
+            Frame::Error { code, .. } => {
+                assert_eq!(code, code::SESSION_EXITED, "expected SESSION_EXITED");
+                break;
+            }
+            other => panic!("expected SESSION_EXITED, got {other:?}"),
+        }
+    }
+
+    // Session B, then re-attach on the SAME connection without a Detach.
+    assert!(
+        daemon.cli().args(["new", "b"]).status().unwrap().success(),
+        "create b failed"
+    );
+    c.send(Frame::Attach {
+        name: "b".into(),
+        cols: 80,
+        rows: 24,
+    })
+    .await;
+    match c.recv_skipping_output().await {
+        Frame::Snapshot { .. } => {} // re-attach succeeded
+        Frame::Error { code, msg } => panic!(
+            "re-attach rejected (code {code}): {msg} — connection wedged by the dead session"
+        ),
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+}
