@@ -49,6 +49,11 @@ pub enum HostCmd {
     Kill {
         name: String,
     },
+    /// Rename session `name` to `new_name` (daemon validates + acks).
+    Rename {
+        name: String,
+        new_name: String,
+    },
     /// Disconnect and end the actor.
     Shutdown,
 }
@@ -292,6 +297,14 @@ async fn drive(
                     if writer.write_frame(&Frame::Kill { name }).await.is_err() {
                         return Err("kill write failed".to_string());
                     }
+                    let _ = writer.write_frame(&Frame::ListSessions).await;
+                }
+                Some(HostCmd::Rename { name, new_name }) => {
+                    if writer.write_frame(&Frame::Rename { name, new_name }).await.is_err() {
+                        return Err("rename write failed".to_string());
+                    }
+                    // Refresh promptly so the new name shows even if the
+                    // optimistic local update was reverted.
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(HostCmd::Shutdown) | None => {

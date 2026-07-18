@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SshConnection {
+    /// Stable identity, assigned on creation and persisted. Edit/Delete match on
+    /// this, never on the render-time list position (which can shift under a
+    /// concurrent add/remove). `0` marks an entry from an older config that
+    /// predates the field; [`SettingsConfig::load`] assigns it a real id.
+    #[serde(default)]
+    pub id: u64,
     pub name: String,
     pub host: String,
     pub user: String,
@@ -94,10 +100,13 @@ pub struct SettingsConfig {
 impl SettingsConfig {
     pub fn load() -> Self {
         let path = config_path();
-        match std::fs::read_to_string(&path) {
+        let mut cfg: Self = match std::fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             Err(_) => Self::default(),
-        }
+        };
+        // Backfill stable ids for entries written before the field existed.
+        assign_ids(&mut cfg.ssh_connections);
+        cfg
     }
 
     pub fn save(&self) {
@@ -115,14 +124,45 @@ fn config_path() -> std::path::PathBuf {
     asd_proto::paths::data_dir().join("config.json")
 }
 
-/// Remove the saved connection at `index`, returning the new list. An
-/// out-of-range index leaves the list unchanged (the click's index can lag a
-/// concurrent edit). Pure so the delete path stays unit-testable.
-pub fn remove_at(list: &[SshConnection], index: usize) -> Vec<SshConnection> {
-    let mut out = list.to_vec();
-    if index < out.len() {
-        out.remove(index);
+/// The next free connection id (max + 1, never 0 — `0` marks "unassigned").
+pub fn next_id(list: &[SshConnection]) -> u64 {
+    list.iter().map(|c| c.id).max().unwrap_or(0) + 1
+}
+
+/// Give every id-less (`id == 0`) entry a fresh unique id. Run on load so
+/// pre-id configs — and any hand-edited file — get stable identities.
+pub fn assign_ids(list: &mut [SshConnection]) {
+    let mut next = list.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+    for c in list.iter_mut() {
+        if c.id == 0 {
+            c.id = next;
+            next += 1;
+        }
     }
+}
+
+/// Remove the connection with `id`, returning the new list. Matching on the
+/// stable id (not a render-time index) means a concurrent add/remove can't make
+/// the click land on the wrong row; an unknown id leaves the list unchanged.
+pub fn remove_by_id(list: &[SshConnection], id: u64) -> Vec<SshConnection> {
+    list.iter().filter(|c| c.id != id).cloned().collect()
+}
+
+/// Insert or update `conn` by id: replace the entry sharing its id, or append it
+/// (assigning a fresh id when it has none). Returns the new list — the single
+/// save path for both "Add" and "Edit", identity-based so an edit can't
+/// overwrite the wrong row.
+pub fn upsert(list: &[SshConnection], mut conn: SshConnection) -> Vec<SshConnection> {
+    if conn.id != 0
+        && let Some(pos) = list.iter().position(|c| c.id == conn.id)
+    {
+        let mut out = list.to_vec();
+        out[pos] = conn;
+        return out;
+    }
+    conn.id = next_id(list);
+    let mut out = list.to_vec();
+    out.push(conn);
     out
 }
 
@@ -135,11 +175,11 @@ pub enum SettingsPage {
     Connections,
 }
 
-/// The add/edit connection form. `index` is `Some` when editing an existing
-/// entry.
+/// The add/edit connection form. `id` is `Some(existing id)` when editing an
+/// existing entry, `None` for a new one (id assigned on save).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SshForm {
-    pub index: Option<usize>,
+    pub id: Option<u64>,
     pub name: String,
     pub host: String,
     pub user: String,
@@ -153,7 +193,7 @@ pub struct SshForm {
 impl Default for SshForm {
     fn default() -> Self {
         Self {
-            index: None,
+            id: None,
             name: String::new(),
             host: String::new(),
             user: String::new(),
@@ -167,7 +207,7 @@ impl Default for SshForm {
 }
 
 impl SshForm {
-    pub fn from_conn(c: &SshConnection, i: usize) -> Self {
+    pub fn from_conn(c: &SshConnection) -> Self {
         let (password, key_path, passphrase) = match &c.auth {
             SshAuth::Password { password } => (password.clone(), String::new(), String::new()),
             SshAuth::Key {
@@ -176,7 +216,7 @@ impl SshForm {
             } => (String::new(), key_path.clone(), passphrase.clone()),
         };
         Self {
-            index: Some(i),
+            id: Some(c.id),
             name: c.name.clone(),
             host: c.host.clone(),
             user: c.user.clone(),
@@ -233,6 +273,9 @@ impl SshForm {
             return None;
         }
         Some(SshConnection {
+            // `0` when adding — `upsert` assigns a fresh id; the existing id
+            // when editing, so the update lands on the right entry.
+            id: self.id.unwrap_or(0),
             name: self.name.trim().to_string(),
             host: self.host.trim().to_string(),
             user: self.user.trim().to_string(),
@@ -273,24 +316,57 @@ mod tests {
         assert_eq!(conn.auth.tag(), "password");
     }
 
-    #[test]
-    fn remove_at_drops_one_and_ignores_out_of_range() {
-        let c = |n: &str| SshConnection {
+    fn conn(id: u64, n: &str) -> SshConnection {
+        SshConnection {
+            id,
             name: n.into(),
             host: "h".into(),
             user: "u".into(),
             port: 22,
             auth: SshAuth::default(),
-        };
-        let list = vec![c("a"), c("b"), c("d")];
-        let after = remove_at(&list, 1);
+        }
+    }
+
+    #[test]
+    fn remove_by_id_targets_identity_not_position() {
+        let list = vec![conn(1, "a"), conn(2, "b"), conn(3, "d")];
+        // Removing id 2 drops "b" wherever it sits, regardless of index.
+        let after = remove_by_id(&list, 2);
         assert_eq!(
             after.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             ["a", "d"]
         );
-        // Out-of-range index leaves the list untouched (no panic).
-        assert_eq!(remove_at(&list, 9), list);
-        assert_eq!(remove_at(&list, 0).len(), 2);
+        // Unknown id → unchanged (no panic, no wrong-row deletion).
+        assert_eq!(remove_by_id(&list, 99), list);
+    }
+
+    #[test]
+    fn upsert_edits_by_id_and_appends_new_with_fresh_id() {
+        let list = vec![conn(1, "a"), conn(2, "b")];
+        // Edit id 1 → replaces in place, keeps the id, doesn't grow the list.
+        let edited = upsert(&list, conn(1, "a2"));
+        assert_eq!(edited.len(), 2);
+        assert_eq!(edited[0].name, "a2");
+        assert_eq!(edited[0].id, 1);
+        // Add (id 0) → appended with the next free id (3), never colliding.
+        let added = upsert(&list, conn(0, "c"));
+        assert_eq!(added.len(), 3);
+        assert_eq!(added[2].name, "c");
+        assert_eq!(added[2].id, 3);
+        // An edit whose id no longer exists is treated as an add (bounds-safe).
+        assert_eq!(upsert(&list, conn(9, "x")).len(), 3);
+    }
+
+    #[test]
+    fn assign_ids_backfills_only_zero_ids_uniquely() {
+        let mut list = vec![conn(0, "a"), conn(5, "b"), conn(0, "c")];
+        assign_ids(&mut list);
+        let ids: Vec<u64> = list.iter().map(|c| c.id).collect();
+        assert_eq!(ids[1], 5); // existing id preserved
+        assert_ne!(ids[0], 0); // backfilled
+        assert_ne!(ids[2], 0);
+        assert_ne!(ids[0], ids[2]); // and unique
+        assert!(ids[0] > 5 && ids[2] > 5); // above the max existing
     }
 
     #[test]

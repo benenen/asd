@@ -194,6 +194,24 @@ impl Model {
         self.active = Some((host, name));
     }
 
+    /// Optimistically rename a session locally so the sidebar (and the active
+    /// selection, if it was the renamed one) update immediately; the next list
+    /// poll confirms it, or reverts it if the daemon rejected the rename.
+    pub fn rename_session(&mut self, host: HostId, old: &str, new: &str) {
+        if let Some(h) = self.host_mut(host)
+            && let Some(s) = h.sessions.iter_mut().find(|s| s.name == old)
+        {
+            s.name = new.to_string();
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(h, n)| *h == host && n == old)
+        {
+            self.active = Some((host, new.to_string()));
+        }
+    }
+
     pub fn is_active(&self, host: HostId, name: &str) -> bool {
         self.active
             .as_ref()
@@ -242,6 +260,28 @@ pub fn short_age(created_ms: u64, now_ms: u64) -> String {
     } else {
         format!("{}d", secs / 86_400)
     }
+}
+
+/// Whether a proposed session `new` name can be submitted, given the sibling
+/// session names on that host (`existing`) and the `current` (old) name.
+/// `Err(message)` is shown inline under the rename field. Mirrors the daemon's
+/// own validation (`asd_proto::paths::is_valid_session_name`) so most rejections
+/// are caught before the round-trip.
+pub fn validate_rename(new: &str, existing: &[String], current: &str) -> Result<(), String> {
+    let new = new.trim();
+    if new == current {
+        return Ok(()); // no-op rename is harmless
+    }
+    if new.is_empty() {
+        return Err("name can't be empty".into());
+    }
+    if !asd_proto::paths::is_valid_session_name(new) {
+        return Err("letters, digits, '_' or '-' (max 64)".into());
+    }
+    if existing.iter().any(|n| n == new) {
+        return Err(format!("'{new}' already exists"));
+    }
+    Ok(())
 }
 
 /// Truncate a host-down reason to fit the sidebar's reason line.
@@ -343,5 +383,43 @@ mod tests {
         let mut m = Model::with_local();
         m.remove_host(LOCAL_ID);
         assert_eq!(m.hosts.len(), 1);
+    }
+
+    #[test]
+    fn validate_rename_rejects_empty_invalid_dup_but_allows_noop() {
+        let existing = vec!["web".to_string(), "logs".to_string()];
+        assert!(validate_rename("", &existing, "web").is_err()); // empty
+        assert!(validate_rename("a b", &existing, "web").is_err()); // space
+        assert!(validate_rename("中文", &existing, "web").is_err()); // non-ascii
+        assert!(validate_rename("logs", &existing, "web").is_err()); // duplicate
+        assert!(validate_rename("web", &existing, "web").is_ok()); // no-op
+        assert!(validate_rename("api", &existing, "web").is_ok()); // fresh + valid
+        assert!(validate_rename("  api  ", &existing, "web").is_ok()); // trimmed
+    }
+
+    #[test]
+    fn rename_session_updates_row_and_active() {
+        let mut m = Model::with_local();
+        m.set_sessions(LOCAL_ID, vec![info("web", 0, 1), info("logs", 0, 0)]);
+        m.select(LOCAL_ID, "web".into());
+        m.rename_session(LOCAL_ID, "web", "api");
+        assert!(
+            m.host(LOCAL_ID)
+                .unwrap()
+                .sessions
+                .iter()
+                .any(|s| s.name == "api")
+        );
+        assert!(
+            !m.host(LOCAL_ID)
+                .unwrap()
+                .sessions
+                .iter()
+                .any(|s| s.name == "web")
+        );
+        assert!(m.is_active(LOCAL_ID, "api")); // active followed the rename
+        // Renaming a non-active session leaves the selection untouched.
+        m.rename_session(LOCAL_ID, "logs", "journal");
+        assert!(m.is_active(LOCAL_ID, "api"));
     }
 }

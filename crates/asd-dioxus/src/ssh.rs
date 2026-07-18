@@ -14,7 +14,7 @@
 //! 2FA prompts are still a follow-up.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, anyhow};
 use russh::client;
@@ -30,18 +30,32 @@ const REMOTE_CMD: &str = "asd attach --stdio";
 /// Dial `spec` over SSH and return the boxed protocol stream halves.
 pub async fn open(spec: &RemoteSpec) -> anyhow::Result<(BoxRead, BoxWrite)> {
     let config = Arc::new(client::Config::default());
+    // The handler records a specific reason (unknown vs changed host key) so a
+    // rejection surfaces as an actionable message rather than russh's generic
+    // handshake error.
+    let host_key_issue = Arc::new(Mutex::new(None::<String>));
     let handler = HostKeyVerifier {
         host: spec.host.clone(),
         port: spec.port,
+        issue: Arc::clone(&host_key_issue),
     };
     // russh does the TCP connect + SSH handshake from the address.
-    let mut handle = client::connect(config, (spec.host.as_str(), spec.port), handler)
-        .await
-        .with_context(|| format!("ssh connect {}:{}", spec.host, spec.port))?;
+    let mut handle = match client::connect(config, (spec.host.as_str(), spec.port), handler).await {
+        Ok(h) => h,
+        Err(e) => {
+            // A host-key rejection aborts the handshake here — prefer the
+            // handler's specific reason over the opaque russh error.
+            if let Some(reason) = host_key_issue.lock().unwrap().take() {
+                return Err(anyhow!(reason));
+            }
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("ssh connect {}:{}", spec.host, spec.port));
+        }
+    };
 
     authenticate(&mut handle, spec)
         .await
-        .with_context(|| format!("ssh auth as {}@{}", spec.user, spec.host))?;
+        .with_context(|| format!("ssh auth as {}@{} rejected", spec.user, spec.host))?;
 
     let channel = handle
         .channel_open_session()
@@ -58,9 +72,12 @@ pub async fn open(spec: &RemoteSpec) -> anyhow::Result<(BoxRead, BoxWrite)> {
 
 /// Verifies the server host key against `~/.ssh/known_hosts`, rejecting
 /// unknown or changed keys (default russh behavior would reject everything).
+/// On rejection it records a specific, actionable reason in `issue` so the UI
+/// can tell "unknown host" (safe to add) from "key CHANGED" (possible MITM).
 struct HostKeyVerifier {
     host: String,
     port: u16,
+    issue: Arc<Mutex<Option<String>>>,
 }
 
 impl client::Handler for HostKeyVerifier {
@@ -70,15 +87,24 @@ impl client::Handler for HostKeyVerifier {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        match russh::keys::check_known_hosts(&self.host, self.port, server_public_key) {
-            Ok(known) => Ok(known),
-            // A key that mismatches a recorded one, or an unreadable
-            // known_hosts, is a hard reject — do not trust on error.
-            Err(e) => {
-                tracing::warn!(host = %self.host, error = %e, "known_hosts check failed");
-                Ok(false)
-            }
-        }
+        let reason = match russh::keys::check_known_hosts(&self.host, self.port, server_public_key)
+        {
+            Ok(true) => return Ok(true), // known and matches
+            Ok(false) => format!(
+                "unknown host key for {} — not in ~/.ssh/known_hosts. Verify the key, then add it (`ssh-keyscan -p {} {} >> ~/.ssh/known_hosts`) and reconnect.",
+                self.host, self.port, self.host
+            ),
+            // A recorded key that no longer matches: never trust on a change.
+            Err(russh::keys::Error::KeyChanged { .. }) => format!(
+                "host key CHANGED for {} — possible man-in-the-middle. Not connecting. If the change is expected, fix ~/.ssh/known_hosts.",
+                self.host
+            ),
+            // Unreadable known_hosts etc.: reject, don't trust on error.
+            Err(e) => format!("known_hosts check failed for {}: {e}", self.host),
+        };
+        tracing::warn!(host = %self.host, %reason, "host key rejected");
+        *self.issue.lock().unwrap() = Some(reason);
+        Ok(false)
     }
 }
 

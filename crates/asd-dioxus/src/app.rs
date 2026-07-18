@@ -53,6 +53,11 @@ pub enum AppCmd {
         host: HostId,
         name: String,
     },
+    Rename {
+        host: HostId,
+        name: String,
+        new_name: String,
+    },
 }
 
 /// State of the active session's stream, shown in the terminal header.
@@ -61,6 +66,16 @@ enum Status {
     Live,
     Ended(String),
     Disconnected(String),
+}
+
+/// Inline session-rename state: which session (`host` + its current `old` name)
+/// is being edited, the edited `text`, and the last validation error.
+#[derive(Debug, Clone, PartialEq)]
+struct Rename {
+    host: HostId,
+    old: String,
+    text: String,
+    error: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -105,7 +120,10 @@ pub fn App() -> Element {
     // killing a session pops a confirm overlay; deleting a saved connection
     // shows an inline confirm on that row (`Some(index)`).
     let mut confirm_kill = use_signal(|| None::<(HostId, String)>);
-    let confirm_delete = use_signal(|| None::<usize>);
+    // Which saved connection (by stable id) is mid inline-delete confirm.
+    let confirm_delete = use_signal(|| None::<u64>);
+    // The session row (if any) whose name is being edited inline.
+    let rename = use_signal(|| None::<Rename>);
 
     // The command channel must be created ONCE and cached across renders
     // (use_hook): a per-render channel drops the previous sender on the first
@@ -246,14 +264,14 @@ pub fn App() -> Element {
                         if saved_list.is_empty() {
                             div { class: "connect-empty", "No saved connections yet." }
                         }
-                        for (i, conn) in saved_list.iter().enumerate() {
+                        for conn in saved_list.iter() {
                             {
                                 let added = model.read().has_remote(&conn.user, &conn.host, conn.port);
                                 let conn2 = conn.clone();
                                 let mut add = add_saved.clone();
                                 rsx! {
                                     div {
-                                        key: "conn-{i}",
+                                        key: "conn-{conn.id}",
                                         class: if added { "connect-row added" } else { "connect-row" },
                                         onclick: move |_| {
                                             if !added { add(conn2.clone()); }
@@ -280,7 +298,7 @@ pub fn App() -> Element {
                 }
                 div { class: "host-list",
                     for host in hosts_view.iter() {
-                        {host_group(host, &active, now, select_session.clone(), tx.clone(), model, status, confirm_kill)}
+                        {host_group(host, &active, now, select_session.clone(), tx.clone(), model, status, confirm_kill, rename)}
                     }
                 }
                 div { class: "sidebar-footer",
@@ -445,8 +463,11 @@ fn host_group(
     mut model: Signal<Model>,
     _status: Signal<Status>,
     mut confirm_kill: Signal<Option<(HostId, String)>>,
+    mut rename: Signal<Option<Rename>>,
 ) -> Element {
     let id = host.id;
+    // Sibling names on this host, for the inline rename's dup check.
+    let sibling_names: Vec<String> = host.sessions.iter().map(|s| s.name.clone()).collect();
     let remote = host.is_remote();
     let label = host.label();
     let sub = host.sublabel();
@@ -458,11 +479,12 @@ fn host_group(
         HostState::Connecting => "host-dot connecting",
         HostState::Down(_) => "host-dot down",
     };
-    let down_reason = match &state {
-        HostState::Down(msg) => Some(short_reason(msg)),
+    // The truncated reason for the line plus the full text for the tooltip.
+    let down = match &state {
+        HostState::Down(msg) => Some((short_reason(msg), msg.clone())),
         _ => None,
     };
-    let is_down = down_reason.is_some();
+    let is_down = down.is_some();
 
     rsx! {
         div { class: "host-group", key: "host-{id}",
@@ -509,8 +531,21 @@ fn host_group(
                     }
                 }
             }
-            if let Some(reason) = down_reason {
-                div { class: "host-reason", "{reason}" }
+            if let Some((short, full)) = down {
+                div {
+                    class: "host-reason",
+                    // Hover shows the full (untruncated) reason; the whole line
+                    // is a reconnect affordance, not just the tiny status dot.
+                    title: "{full} — click to reconnect",
+                    onclick: {
+                        let tx = tx.clone();
+                        move |_| {
+                            model.write().set_state(id, HostState::Connecting);
+                            let _ = tx.send(AppCmd::Reconnect { id });
+                        }
+                    },
+                    "{short} · reconnect"
+                }
             }
             for s in host.sessions.iter() {
                 {
@@ -524,6 +559,16 @@ fn host_group(
                     let mut select = select.clone();
                     let name_click = name.clone();
                     let name_kill = name.clone();
+                    let name_dbl = name.clone();
+                    let name_kbd = name.clone();
+                    let siblings = sibling_names.clone();
+                    let tx_rename = tx.clone();
+                    // This row's inline-rename state, if it is the one being edited.
+                    let renaming = rename
+                        .read()
+                        .as_ref()
+                        .filter(|r| r.host == id && r.old == name)
+                        .cloned();
                     let row = if is_active { "session-row active" } else { "session-row" };
                     let sdot = if attached { "session-dot attached" } else { "session-dot" };
                     let sdot = if remote { format!("{sdot} remote") } else { sdot.to_string() };
@@ -533,7 +578,70 @@ fn host_group(
                             key: "s-{id}-{name}",
                             onclick: move |_| select(id, name_click.clone()),
                             span { class: "{sdot}" }
-                            span { class: "session-name", "{name}" }
+                            if let Some(rn) = renaming {
+                                input {
+                                    class: "session-rename",
+                                    value: "{rn.text}",
+                                    autofocus: true,
+                                    onclick: move |e| e.stop_propagation(),
+                                    oninput: move |e| {
+                                        if let Some(r) = rename.write().as_mut() {
+                                            r.text = e.value();
+                                            r.error = None;
+                                        }
+                                    },
+                                    onkeydown: move |e| match e.key() {
+                                        Key::Enter => {
+                                            let new = rename
+                                                .read()
+                                                .as_ref()
+                                                .map(|r| r.text.clone())
+                                                .unwrap_or_default();
+                                            match crate::model::validate_rename(&new, &siblings, &name_kbd) {
+                                                Ok(()) => {
+                                                    let newt = new.trim().to_string();
+                                                    if newt != name_kbd {
+                                                        // Optimistic: update locally now; the
+                                                        // list poll confirms (or reverts).
+                                                        model.write().rename_session(id, &name_kbd, &newt);
+                                                        let _ = tx_rename.send(AppCmd::Rename {
+                                                            host: id,
+                                                            name: name_kbd.clone(),
+                                                            new_name: newt,
+                                                        });
+                                                    }
+                                                    rename.set(None);
+                                                }
+                                                Err(msg) => {
+                                                    if let Some(r) = rename.write().as_mut() {
+                                                        r.error = Some(msg);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Key::Escape => rename.set(None),
+                                        _ => {}
+                                    },
+                                }
+                                if let Some(err) = rn.error {
+                                    span { class: "rename-error", title: "{err}", "!" }
+                                }
+                            } else {
+                                span {
+                                    class: "session-name",
+                                    title: "double-click to rename",
+                                    ondoubleclick: move |e| {
+                                        e.stop_propagation();
+                                        rename.set(Some(Rename {
+                                            host: id,
+                                            old: name_dbl.clone(),
+                                            text: name_dbl.clone(),
+                                            error: None,
+                                        }));
+                                    },
+                                    "{name}"
+                                }
+                            }
                             span { class: "session-cmd", "{cmd}" }
                             span { class: "session-age", "{age}" }
                             button {
@@ -563,7 +671,7 @@ fn settings_view(
     _tx: UnboundedSender<AppCmd>,
     mut open: Signal<bool>,
     save_config: impl Fn(&[SshConnection]) + Clone + 'static,
-    mut confirm_delete: Signal<Option<usize>>,
+    mut confirm_delete: Signal<Option<u64>>,
 ) -> Element {
     let cur = *page.read();
     let nav_item = |p: SettingsPage, label: &'static str| {
@@ -634,7 +742,7 @@ fn connections_page(
     mut saved: Signal<Vec<SshConnection>>,
     model: Signal<Model>,
     save_config: impl Fn(&[SshConnection]) + Clone + 'static,
-    mut confirm_delete: Signal<Option<usize>>,
+    mut confirm_delete: Signal<Option<u64>>,
 ) -> Element {
     if let Some(f) = form.read().clone() {
         return connection_form(f, form, saved, save_config);
@@ -654,13 +762,14 @@ fn connections_page(
                 "No connections yet. Add one to reach a remote asd daemon over SSH."
             }
         }
-        for (i, c) in list.iter().enumerate() {
+        for c in list.iter() {
             {
                 let added = model.read().has_remote(&c.user, &c.host, c.port);
                 let edit = c.clone();
+                let cid = c.id;
                 let save_del = save_config.clone();
                 rsx! {
-                    div { class: "conn-row", key: "saved-{i}",
+                    div { class: "conn-row", key: "saved-{cid}",
                         div { class: "conn-main",
                             div { class: "conn-name", "{c.name}" }
                             div { class: "conn-sub", "{c.label()}" }
@@ -669,12 +778,12 @@ fn connections_page(
                         if added {
                             span { class: "connect-tag", "added" }
                         }
-                        if *confirm_delete.read() == Some(i) {
+                        if *confirm_delete.read() == Some(cid) {
                             span { class: "conn-confirm", "Delete?" }
                             button {
                                 class: "bar-btn danger",
                                 onclick: move |_| {
-                                    let next = crate::settings::remove_at(&saved.read(), i);
+                                    let next = crate::settings::remove_by_id(&saved.read(), cid);
                                     saved.set(next.clone());
                                     save_del(&next);
                                     confirm_delete.set(None);
@@ -689,12 +798,12 @@ fn connections_page(
                         } else {
                             button {
                                 class: "bar-btn",
-                                onclick: move |_| form.set(Some(SshForm::from_conn(&edit, i))),
+                                onclick: move |_| form.set(Some(SshForm::from_conn(&edit))),
                                 "Edit"
                             }
                             button {
                                 class: "bar-btn danger",
-                                onclick: move |_| confirm_delete.set(Some(i)),
+                                onclick: move |_| confirm_delete.set(Some(cid)),
                                 "Delete"
                             }
                         }
@@ -714,7 +823,7 @@ fn connection_form(
     save_config: impl Fn(&[SshConnection]) + Clone + 'static,
 ) -> Element {
     let reason = f.invalid_reason();
-    let editing = f.index.is_some();
+    let editing = f.id.is_some();
     let title = if editing {
         "Edit connection"
     } else {
@@ -829,17 +938,14 @@ fn connection_form(
                     onclick: {
                         let save = save_config.clone();
                         move |_| {
-                            let built = form.read().as_ref().and_then(|f| {
-                                f.into_connection().map(|c| (f.index, c))
-                            });
-                            if let Some((index, conn)) = built {
-                                let mut list = saved.write();
-                                match index {
-                                    Some(i) if i < list.len() => list[i] = conn,
-                                    _ => list.push(conn),
-                                }
-                                save(&list);
-                                drop(list);
+                            let built = form.read().as_ref().and_then(|f| f.into_connection());
+                            if let Some(conn) = built {
+                                // Identity-based upsert: edit replaces the entry
+                                // sharing its id, add appends with a fresh id —
+                                // never keyed on a render-time index.
+                                let next = crate::settings::upsert(&saved.read(), conn);
+                                saved.set(next.clone());
+                                save(&next);
                                 form.set(None);
                             }
                         }
@@ -1110,6 +1216,15 @@ fn route(
         AppCmd::Kill { host, name } => {
             if let Some(h) = hosts.get(&host) {
                 let _ = h.cmd_tx.send(HostCmd::Kill { name });
+            }
+        }
+        AppCmd::Rename {
+            host,
+            name,
+            new_name,
+        } => {
+            if let Some(h) = hosts.get(&host) {
+                let _ = h.cmd_tx.send(HostCmd::Rename { name, new_name });
             }
         }
     }

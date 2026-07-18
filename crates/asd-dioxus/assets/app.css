@@ -49,7 +49,8 @@ button { font-family: inherit; }
 .host-label { font-weight:bold; color:#C7CDD6; }
 .host-sub { color:#5A6472; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
 .host-count { color:#5A6472; }
-.host-reason { padding:0 6px 2px 18px; font-size:10px; color:#D98A8D; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.host-reason { padding:0 6px 2px 18px; font-size:10px; color:#D98A8D; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
+.host-reason:hover { color:#E5595E; text-decoration:underline; }
 .session-row { padding:6px 8px 6px 14px; margin:2px 0 2px 4px; border-radius:6px; cursor:pointer; display:flex; align-items:center; gap:8px; font-size:13px; }
 .session-row:hover { background:#171D25; }
 .session-row.active { background:rgba(243,178,76,0.12); }
@@ -58,6 +59,8 @@ button { font-family: inherit; }
 .session-dot.remote { border-color:#54C7DA; }
 .session-dot.remote.attached { background:#54C7DA; }
 .session-name { font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.session-rename { font:inherit; font-weight:bold; background:#0B0D11; border:1px solid #54C7DA; border-radius:4px; color:#E7E2D6; padding:0 4px; outline:none; width:120px; }
+.rename-error { color:#E5595E; font-weight:bold; cursor:help; }
 .session-cmd { font-size:11px; color:#8B94A2; margin-left:auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .session-age { font-size:10px; color:#5A6472; flex:none; }
 .sidebar-footer { padding:10px 16px; border-top:1px solid #232A34; font-size:11px; color:#5A6472; }
