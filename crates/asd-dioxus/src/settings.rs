@@ -241,7 +241,10 @@ impl SshForm {
         if self.user.trim().is_empty() {
             return Some("User is required.");
         }
-        if self.port.trim().parse::<u16>().is_err() {
+        // An empty port is fine — it defaults to 22 on save. Only a non-empty,
+        // non-numeric value is an error.
+        let port = self.port.trim();
+        if !port.is_empty() && port.parse::<u16>().is_err() {
             return Some("Port must be a number (1–65535).");
         }
         if self.auth_kind == AuthKind::Password && self.password.is_empty() {
@@ -299,6 +302,22 @@ mod tests {
         assert_eq!(f.invalid_reason(), Some("Name is required."));
         f.name = "dev".into();
         assert!(f.valid());
+    }
+
+    #[test]
+    fn empty_port_is_valid_and_defaults_to_22() {
+        let mut f = SshForm {
+            name: "dev".into(),
+            host: "h".into(),
+            user: "u".into(),
+            port: String::new(), // cleared field
+            ..Default::default()
+        };
+        assert_eq!(f.invalid_reason(), None); // empty is not an error
+        assert_eq!(f.into_connection().unwrap().port, 22); // falls back
+        // A non-empty, non-numeric port is still rejected.
+        f.port = "abc".into();
+        assert!(f.invalid_reason().is_some());
     }
 
     #[test]

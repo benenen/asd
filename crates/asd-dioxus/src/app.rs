@@ -176,13 +176,14 @@ pub fn App() -> Element {
         let tx = tx.clone();
         move |conn: SshConnection| {
             let spec = RemoteSpec {
+                conn_id: conn.id,
                 user: conn.user.clone(),
                 host: conn.host.clone(),
                 port: conn.port,
                 auth: conn.auth.clone(),
                 name: conn.name.clone(),
             };
-            if model.read().has_remote(&spec.user, &spec.host, spec.port) {
+            if model.read().has_connection(conn.id) {
                 return;
             }
             let id = model.write().add_remote(spec.clone());
@@ -266,7 +267,7 @@ pub fn App() -> Element {
                         }
                         for conn in saved_list.iter() {
                             {
-                                let added = model.read().has_remote(&conn.user, &conn.host, conn.port);
+                                let added = model.read().has_connection(conn.id);
                                 let conn2 = conn.clone();
                                 let mut add = add_saved.clone();
                                 rsx! {
@@ -764,7 +765,7 @@ fn connections_page(
         }
         for c in list.iter() {
             {
-                let added = model.read().has_remote(&c.user, &c.host, c.port);
+                let added = model.read().has_connection(c.id);
                 let edit = c.clone();
                 let cid = c.id;
                 let save_del = save_config.clone();
@@ -863,6 +864,8 @@ fn connection_form(
                     label { class: "form-label", "Port" }
                     input {
                         class: "form-input",
+                        r#type: "number",
+                        placeholder: "22",
                         value: "{f.port}",
                         oninput: move |e| upd(|f, v| f.port = v, e.value()),
                     }
@@ -993,6 +996,9 @@ async fn supervisor(
     // A session picked before the JS bridge was ready (auto-select on the
     // first local list): attached once the bridge reports in.
     let mut pending_select: Option<(HostId, String)> = None;
+    // Set when the user asks for a new session, cleared when they select any
+    // session first: gates whether an arriving `Created` steals focus.
+    let mut pending_create = false;
     // The session named on the command line, consumed by the first auto-select.
     let mut preferred = crate::preferred_session();
 
@@ -1055,6 +1061,13 @@ async fn supervisor(
             }
             cmd = app_rx.recv() => {
                 let Some(cmd) = cmd else { break };
+                // Track whether the user is waiting for a fresh session: a
+                // manual select cancels the pending "+ new" focus jump.
+                match &cmd {
+                    AppCmd::Create { .. } => pending_create = true,
+                    AppCmd::SetActive { .. } => pending_create = false,
+                    _ => {}
+                }
                 route(cmd, &ui_tx, &mut hosts, &mut kinds, &mut active);
             }
             ev = ui_rx.recv() => {
@@ -1071,7 +1084,14 @@ async fn supervisor(
                         model.write().set_state(host, state);
                     }
                     UiEvent::Sessions { host, sessions } => {
+                        let had_active = model.read().active.is_some();
                         model.write().set_sessions(host, sessions);
+                        // The viewed session vanished (killed/exited elsewhere)
+                        // → its selection was cleared; blank the pane so its
+                        // last frame doesn't linger.
+                        if had_active && model.read().active.is_none() {
+                            let _ = desktop.webview.evaluate_script("window.__asdReset&&window.__asdReset();");
+                        }
                         // On the local host's first populate, auto-select
                         // something so the window isn't empty.
                         if model.read().active.is_none()
@@ -1101,15 +1121,21 @@ async fn supervisor(
                         }
                     }
                     UiEvent::Created { host, name } => {
-                        // The user asked for it — show it.
-                        model.write().select(host, name.clone());
-                        status.set(Status::Live);
-                        let (cols, rows) = *grid.read();
-                        let _ = desktop.webview.evaluate_script("window.__asdReset&&window.__asdReset();");
-                        route(
-                            AppCmd::SetActive { host, name, cols, rows },
-                            &ui_tx, &mut hosts, &mut kinds, &mut active,
-                        );
+                        // Only jump to the new session if the user is still
+                        // waiting for it — if they clicked another session after
+                        // "+ new", don't yank the view away. The list poll shows
+                        // the new session either way. No reset here: the attach
+                        // Snapshot resets before it repopulates the pane.
+                        if pending_create {
+                            pending_create = false;
+                            model.write().select(host, name.clone());
+                            status.set(Status::Live);
+                            let (cols, rows) = *grid.read();
+                            route(
+                                AppCmd::SetActive { host, name, cols, rows },
+                                &ui_tx, &mut hosts, &mut kinds, &mut active,
+                            );
+                        }
                     }
                     UiEvent::Bytes { host, name, data, snapshot } => {
                         // Gate on the session too: bytes from the one we just
@@ -1137,6 +1163,9 @@ async fn supervisor(
                     UiEvent::SessionEnded { host, name, msg } => {
                         if model.read().is_active(host, &name) {
                             status.set(Status::Ended(msg));
+                            // Blank the pane — the dead session's last frame
+                            // must not linger under the "ended" note.
+                            let _ = desktop.webview.evaluate_script("window.__asdReset&&window.__asdReset();");
                         }
                     }
                 }

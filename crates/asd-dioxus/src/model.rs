@@ -25,6 +25,11 @@ pub enum HostKind {
 /// Where and as whom to connect over SSH.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSpec {
+    /// The saved [`crate::settings::SshConnection`] this came from (its stable
+    /// id). Identity is by this, not the address, so two saved connections to
+    /// the same `user@host:port` with different credentials are both reachable.
+    /// `0` for an ad-hoc spec with no saved entry.
+    pub conn_id: u64,
     pub user: String,
     pub host: String,
     pub port: u16,
@@ -126,25 +131,30 @@ impl Model {
         self.hosts.iter_mut().find(|h| h.id == id)
     }
 
-    /// Whether a remote host with this address (user@host:port) is already in
-    /// the list. Ignores auth/name so re-adding the same host is caught even if
-    /// its saved credentials or label were edited.
-    pub fn has_remote(&self, user: &str, host: &str, port: u16) -> bool {
-        self.hosts.iter().any(|h| {
-            matches!(&h.kind, HostKind::Ssh(s)
-                if s.user == user && s.host == host && s.port == port)
-        })
+    /// Whether the saved connection with this stable id is already added as a
+    /// host. Identity is the saved-connection id (not the address), so a second
+    /// saved connection to the same box — with different credentials — is not
+    /// falsely reported as already added.
+    pub fn has_connection(&self, conn_id: u64) -> bool {
+        conn_id != 0
+            && self
+                .hosts
+                .iter()
+                .any(|h| matches!(&h.kind, HostKind::Ssh(s) if s.conn_id == conn_id))
     }
 
-    /// Add a remote host (or return the existing one with the same address).
-    /// Returns the host id.
+    /// Add a remote host (or return the existing one for the same saved
+    /// connection). Returns the host id.
     pub fn add_remote(&mut self, spec: RemoteSpec) -> HostId {
-        // Dedup by address, not the whole spec: the same host must not be added
-        // twice even if the saved auth or display name differs.
-        if let Some(h) = self.hosts.iter().find(|h| {
-            matches!(&h.kind, HostKind::Ssh(s)
-                if s.user == spec.user && s.host == spec.host && s.port == spec.port)
-        }) {
+        // Dedup by the saved connection's identity, not the address: the same
+        // saved entry must not spawn two hosts, but two distinct entries to the
+        // same address (different creds) each get their own.
+        if spec.conn_id != 0
+            && let Some(h) = self
+                .hosts
+                .iter()
+                .find(|h| matches!(&h.kind, HostKind::Ssh(s) if s.conn_id == spec.conn_id))
+        {
             return h.id;
         }
         let id = self.next_id;
@@ -316,7 +326,12 @@ mod tests {
     }
 
     fn spec(user: &str, host: &str, port: u16) -> RemoteSpec {
+        spec_id(1, user, host, port)
+    }
+
+    fn spec_id(conn_id: u64, user: &str, host: &str, port: u16) -> RemoteSpec {
         RemoteSpec {
+            conn_id,
             user: user.into(),
             host: host.into(),
             port,
@@ -345,17 +360,22 @@ mod tests {
     }
 
     #[test]
-    fn add_remote_is_idempotent_per_address() {
+    fn add_remote_dedups_by_connection_id_not_address() {
         let mut m = Model::with_local();
-        let id1 = m.add_remote(spec("me", "b", 22));
-        // Same address with a different name still dedupes.
-        let mut renamed = spec("me", "b", 22);
+        let id1 = m.add_remote(spec_id(1, "me", "b", 22));
+        // The same saved connection (id 1), even with an edited name, dedupes.
+        let mut renamed = spec_id(1, "me", "b", 22);
         renamed.name = "renamed".into();
-        let id2 = m.add_remote(renamed);
-        assert_eq!(id1, id2);
+        assert_eq!(m.add_remote(renamed), id1);
         assert_eq!(m.hosts.len(), 2); // local + one remote
-        assert!(m.has_remote("me", "b", 22));
-        assert!(!m.has_remote("me", "b", 2200));
+        assert!(m.has_connection(1));
+        assert!(!m.has_connection(2));
+        // A *different* saved connection to the same address (id 2) is its own
+        // host — different credentials must both be reachable.
+        let id2 = m.add_remote(spec_id(2, "me", "b", 22));
+        assert_ne!(id1, id2);
+        assert_eq!(m.hosts.len(), 3);
+        assert!(m.has_connection(2));
     }
 
     #[test]

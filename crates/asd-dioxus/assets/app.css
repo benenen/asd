@@ -1,5 +1,5 @@
-/* asd-dioxus app stylesheet, injected as a <style> tag by src/main.rs.
-   Palette mirrors asd-gui's theme.rs: amber = local, cyan = remote. */
+/* asd-dioxus app stylesheet, injected via document::Style in src/app.rs.
+   Palette: amber = local host, cyan = SSH remote. */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { height: 100%; overflow: hidden; }
@@ -73,7 +73,7 @@ button { font-family: inherit; }
 /* ── terminal pane ───────────────────────────────────────────────── */
 .terminal-pane { flex:1; display:flex; flex-direction:column; min-width:0; }
 .term-head { height:40px; display:flex; align-items:center; padding:0 14px; background:#0E1218; border-bottom:1px solid #1B212A; font-size:12px; gap:10px; }
-.term-title { font-weight:bold; }
+.term-title { font-weight:bold; min-width:0; flex-shrink:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .host-tag { font-size:9px; letter-spacing:1px; color:#F3B24C; border:1px solid rgba(243,178,76,0.4); border-radius:8px; padding:1px 7px; }
 .host-tag.remote { color:#54C7DA; border-color:rgba(84,199,218,0.4); }
 .term-note { font-size:11px; color:#D98A8D; }
