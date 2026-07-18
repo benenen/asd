@@ -115,6 +115,17 @@ fn config_path() -> std::path::PathBuf {
     asd_proto::paths::data_dir().join("config.json")
 }
 
+/// Remove the saved connection at `index`, returning the new list. An
+/// out-of-range index leaves the list unchanged (the click's index can lag a
+/// concurrent edit). Pure so the delete path stays unit-testable.
+pub fn remove_at(list: &[SshConnection], index: usize) -> Vec<SshConnection> {
+    let mut out = list.to_vec();
+    if index < out.len() {
+        out.remove(index);
+    }
+    out
+}
+
 // ── UI state ──────────────────────────────────────────────────────────
 
 /// Which settings page is showing.
@@ -260,6 +271,26 @@ mod tests {
         f.password = "s3cret".into();
         let conn = f.into_connection().expect("valid");
         assert_eq!(conn.auth.tag(), "password");
+    }
+
+    #[test]
+    fn remove_at_drops_one_and_ignores_out_of_range() {
+        let c = |n: &str| SshConnection {
+            name: n.into(),
+            host: "h".into(),
+            user: "u".into(),
+            port: 22,
+            auth: SshAuth::default(),
+        };
+        let list = vec![c("a"), c("b"), c("d")];
+        let after = remove_at(&list, 1);
+        assert_eq!(
+            after.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["a", "d"]
+        );
+        // Out-of-range index leaves the list untouched (no panic).
+        assert_eq!(remove_at(&list, 9), list);
+        assert_eq!(remove_at(&list, 0).len(), 2);
     }
 
     #[test]

@@ -101,6 +101,11 @@ pub fn App() -> Element {
     let form = use_signal(|| None::<SshForm>);
     // Last grid reported by ghostty-web; used to size Attach requests.
     let grid = use_signal(|| (120u16, 40u16));
+    // Destructive actions confirm before acting (both were one-click before):
+    // killing a session pops a confirm overlay; deleting a saved connection
+    // shows an inline confirm on that row (`Some(index)`).
+    let mut confirm_kill = use_signal(|| None::<(HostId, String)>);
+    let confirm_delete = use_signal(|| None::<usize>);
 
     // The command channel must be created ONCE and cached across renders
     // (use_hook): a per-render channel drops the previous sender on the first
@@ -275,7 +280,7 @@ pub fn App() -> Element {
                 }
                 div { class: "host-list",
                     for host in hosts_view.iter() {
-                        {host_group(host, &active, now, select_session.clone(), tx.clone(), model, status)}
+                        {host_group(host, &active, now, select_session.clone(), tx.clone(), model, status, confirm_kill)}
                     }
                 }
                 div { class: "sidebar-footer",
@@ -360,12 +365,9 @@ pub fn App() -> Element {
                         button {
                             class: "bar-btn",
                             title: "kill the active session",
-                            onclick: {
-                                let tx = tx.clone();
-                                move |_| {
-                                    if let Some((host, name)) = model.read().active.clone() {
-                                        let _ = tx.send(AppCmd::Kill { host, name });
-                                    }
+                            onclick: move |_| {
+                                if let Some((host, name)) = model.read().active.clone() {
+                                    confirm_kill.set(Some((host, name)));
                                 }
                             },
                             "× kill"
@@ -385,7 +387,40 @@ pub fn App() -> Element {
 
             // ── settings overlay ────────────────────────────────────
             if *settings_open.read() {
-                {settings_view(settings_page, form, saved_ssh, model, tx.clone(), settings_open, save_config)}
+                {settings_view(settings_page, form, saved_ssh, model, tx.clone(), settings_open, save_config, confirm_delete)}
+            }
+
+            // ── kill confirmation overlay ───────────────────────────
+            if let Some((host, name)) = confirm_kill.read().clone() {
+                {
+                    let name_btn = name.clone();
+                    let tx = tx.clone();
+                    rsx! {
+                        div { class: "confirm-overlay",
+                            div { class: "confirm-card",
+                                div { class: "confirm-title", "Kill session \"{name}\"?" }
+                                div { class: "confirm-msg",
+                                    "The session and its processes are terminated (SIGHUP). This can't be undone."
+                                }
+                                div { class: "confirm-actions",
+                                    button {
+                                        class: "bar-btn",
+                                        onclick: move |_| confirm_kill.set(None),
+                                        "Cancel"
+                                    }
+                                    button {
+                                        class: "bar-btn danger",
+                                        onclick: move |_| {
+                                            let _ = tx.send(AppCmd::Kill { host, name: name_btn.clone() });
+                                            confirm_kill.set(None);
+                                        },
+                                        "Kill"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -400,6 +435,7 @@ fn reset_terminal() {
 
 /// One host group in the sidebar: header (rail + dot + label + actions) and
 /// its session rows.
+#[allow(clippy::too_many_arguments)]
 fn host_group(
     host: &crate::model::Host,
     active: &Option<(HostId, String)>,
@@ -408,6 +444,7 @@ fn host_group(
     tx: UnboundedSender<AppCmd>,
     mut model: Signal<Model>,
     _status: Signal<Status>,
+    mut confirm_kill: Signal<Option<(HostId, String)>>,
 ) -> Element {
     let id = host.id;
     let remote = host.is_remote();
@@ -487,7 +524,6 @@ fn host_group(
                     let mut select = select.clone();
                     let name_click = name.clone();
                     let name_kill = name.clone();
-                    let tx_kill = tx.clone();
                     let row = if is_active { "session-row active" } else { "session-row" };
                     let sdot = if attached { "session-dot attached" } else { "session-dot" };
                     let sdot = if remote { format!("{sdot} remote") } else { sdot.to_string() };
@@ -505,7 +541,7 @@ fn host_group(
                                 title: "kill {name}",
                                 onclick: move |e| {
                                     e.stop_propagation();
-                                    let _ = tx_kill.send(AppCmd::Kill { host: id, name: name_kill.clone() });
+                                    confirm_kill.set(Some((id, name_kill.clone())));
                                 },
                                 "×"
                             }
@@ -527,6 +563,7 @@ fn settings_view(
     _tx: UnboundedSender<AppCmd>,
     mut open: Signal<bool>,
     save_config: impl Fn(&[SshConnection]) + Clone + 'static,
+    mut confirm_delete: Signal<Option<usize>>,
 ) -> Element {
     let cur = *page.read();
     let nav_item = |p: SettingsPage, label: &'static str| {
@@ -537,6 +574,7 @@ fn settings_view(
                 onclick: move |_| {
                     page.set(p);
                     form.set(None);
+                    confirm_delete.set(None);
                 },
                 span { class: "nav-rail" }
                 span { "{label}" }
@@ -557,6 +595,7 @@ fn settings_view(
                         onclick: move |_| {
                             open.set(false);
                             form.set(None);
+                            confirm_delete.set(None);
                         },
                         "Close"
                     }
@@ -579,7 +618,7 @@ fn settings_view(
                             }
                         },
                         SettingsPage::Connections => {
-                            connections_page(form, saved, model, save_config.clone())
+                            connections_page(form, saved, model, save_config.clone(), confirm_delete)
                         }
                     }
                 }
@@ -595,6 +634,7 @@ fn connections_page(
     mut saved: Signal<Vec<SshConnection>>,
     model: Signal<Model>,
     save_config: impl Fn(&[SshConnection]) + Clone + 'static,
+    mut confirm_delete: Signal<Option<usize>>,
 ) -> Element {
     if let Some(f) = form.read().clone() {
         return connection_form(f, form, saved, save_config);
@@ -629,21 +669,34 @@ fn connections_page(
                         if added {
                             span { class: "connect-tag", "added" }
                         }
-                        button {
-                            class: "bar-btn",
-                            onclick: move |_| form.set(Some(SshForm::from_conn(&edit, i))),
-                            "Edit"
-                        }
-                        button {
-                            class: "bar-btn danger",
-                            onclick: move |_| {
-                                let mut list = saved.write();
-                                if i < list.len() {
-                                    list.remove(i);
-                                }
-                                save_del(&list);
-                            },
-                            "Delete"
+                        if *confirm_delete.read() == Some(i) {
+                            span { class: "conn-confirm", "Delete?" }
+                            button {
+                                class: "bar-btn danger",
+                                onclick: move |_| {
+                                    let next = crate::settings::remove_at(&saved.read(), i);
+                                    saved.set(next.clone());
+                                    save_del(&next);
+                                    confirm_delete.set(None);
+                                },
+                                "Yes"
+                            }
+                            button {
+                                class: "bar-btn",
+                                onclick: move |_| confirm_delete.set(None),
+                                "Cancel"
+                            }
+                        } else {
+                            button {
+                                class: "bar-btn",
+                                onclick: move |_| form.set(Some(SshForm::from_conn(&edit, i))),
+                                "Edit"
+                            }
+                            button {
+                                class: "bar-btn danger",
+                                onclick: move |_| confirm_delete.set(Some(i)),
+                                "Delete"
+                            }
                         }
                     }
                 }

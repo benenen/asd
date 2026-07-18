@@ -128,3 +128,12 @@ button { font-family: inherit; }
 .auth-opt.active { background:rgba(84,199,218,0.15); color:#54C7DA; }
 .form-hint { margin-top:12px; font-size:11px; color:#D98A8D; }
 .form-actions { display:flex; gap:8px; margin-top:16px; justify-content:flex-end; }
+/* inline delete confirmation on a saved-connection row */
+.conn-confirm { font-size:11px; color:#E5595E; }
+
+/* ── kill confirmation overlay ───────────────────────────────────── */
+.confirm-overlay { position:fixed; inset:0; background:rgba(4,6,9,0.6); display:flex; align-items:center; justify-content:center; z-index:20; }
+.confirm-card { width:340px; background:#12161C; border:1px solid #2C3542; border-radius:10px; padding:18px 20px; }
+.confirm-title { font-size:14px; font-weight:bold; color:#E7E2D6; }
+.confirm-msg { font-size:12px; color:#8B94A2; margin:10px 0 16px; line-height:1.5; }
+.confirm-actions { display:flex; gap:8px; justify-content:flex-end; }
