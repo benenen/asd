@@ -294,6 +294,14 @@ pub fn validate_rename(new: &str, existing: &[String], current: &str) -> Result<
     Ok(())
 }
 
+/// Whether a host-down reason is a host-key problem (unknown or changed key, or
+/// an unreadable known_hosts) — the cases the "Trust host key" action can fix.
+/// Matched against the messages [`crate::ssh`] produces on rejection.
+pub fn is_host_key_issue(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("host key") || r.contains("known_hosts")
+}
+
 /// Truncate a host-down reason to fit the sidebar's reason line.
 pub fn short_reason(msg: &str) -> String {
     const MAX: usize = 52;
@@ -396,6 +404,22 @@ mod tests {
         assert_eq!(short_age(0, 120 * m), "2h");
         assert_eq!(short_age(0, 3 * 24 * 60 * m), "3d");
         assert_eq!(short_age(1_000, 0), "just now");
+    }
+
+    #[test]
+    fn host_key_issue_detection() {
+        assert!(is_host_key_issue(
+            "unknown host key for gpu-01 — not in ~/.ssh/known_hosts."
+        ));
+        assert!(is_host_key_issue(
+            "host key CHANGED for gpu-01 — possible MITM"
+        ));
+        assert!(is_host_key_issue("known_hosts check failed for h: bad"));
+        // Auth / network failures are NOT host-key issues (no Trust button).
+        assert!(!is_host_key_issue("password authentication rejected"));
+        assert!(!is_host_key_issue(
+            "ssh connect gpu-01:22: connection refused"
+        ));
     }
 
     #[test]

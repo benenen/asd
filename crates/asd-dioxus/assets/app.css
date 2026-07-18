@@ -51,6 +51,8 @@ button { font-family: inherit; }
 .host-count { color:#5A6472; }
 .host-reason { padding:0 6px 2px 18px; font-size:10px; color:#D98A8D; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
 .host-reason:hover { color:#E5595E; text-decoration:underline; }
+.trust-btn { margin:0 0 4px 18px; background:none; border:1px solid rgba(229,89,94,0.5); border-radius:4px; color:#E5595E; padding:1px 8px; cursor:pointer; font-size:10px; }
+.trust-btn:hover { background:rgba(229,89,94,0.12); }
 .session-row { padding:6px 8px 6px 14px; margin:2px 0 2px 4px; border-radius:6px; cursor:pointer; display:flex; align-items:center; gap:8px; font-size:13px; }
 .session-row:hover { background:#171D25; }
 .session-row.active { background:rgba(243,178,76,0.12); }

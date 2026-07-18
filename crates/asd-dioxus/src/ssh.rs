@@ -37,6 +37,7 @@ pub async fn open(spec: &RemoteSpec) -> anyhow::Result<(BoxRead, BoxWrite)> {
     let handler = HostKeyVerifier {
         host: spec.host.clone(),
         port: spec.port,
+        trust: false,
         issue: Arc::clone(&host_key_issue),
     };
     // russh does the TCP connect + SSH handshake from the address.
@@ -70,13 +71,15 @@ pub async fn open(spec: &RemoteSpec) -> anyhow::Result<(BoxRead, BoxWrite)> {
     Ok((Box::new(rr), Box::new(ww)))
 }
 
-/// Verifies the server host key against `~/.ssh/known_hosts`, rejecting
-/// unknown or changed keys (default russh behavior would reject everything).
-/// On rejection it records a specific, actionable reason in `issue` so the UI
-/// can tell "unknown host" (safe to add) from "key CHANGED" (possible MITM).
+/// Verifies the server host key against `~/.ssh/known_hosts`. In normal mode an
+/// unknown or changed key is rejected and a specific, actionable reason is
+/// recorded in `issue` so the UI can tell "unknown host" (safe to add) from
+/// "key CHANGED" (possible MITM). In `trust` mode the offered key is recorded
+/// (replacing any stale entry) and accepted — the "Trust host key" action.
 struct HostKeyVerifier {
     host: String,
     port: u16,
+    trust: bool,
     issue: Arc<Mutex<Option<String>>>,
 }
 
@@ -87,16 +90,29 @@ impl client::Handler for HostKeyVerifier {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        let reason = match russh::keys::check_known_hosts(&self.host, self.port, server_public_key)
-        {
-            Ok(true) => return Ok(true), // known and matches
+        let status = russh::keys::check_known_hosts(&self.host, self.port, server_public_key);
+        if matches!(status, Ok(true)) {
+            return Ok(true); // known and matches
+        }
+        if self.trust {
+            // The user chose to trust: record (or replace) the key and accept.
+            match write_known_host(&self.host, self.port, server_public_key) {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    *self.issue.lock().unwrap() = Some(format!("couldn't write known_hosts: {e}"));
+                    return Ok(false);
+                }
+            }
+        }
+        let reason = match status {
+            Ok(true) => unreachable!("handled above"),
             Ok(false) => format!(
-                "unknown host key for {} — not in ~/.ssh/known_hosts. Verify the key, then add it (`ssh-keyscan -p {} {} >> ~/.ssh/known_hosts`) and reconnect.",
-                self.host, self.port, self.host
+                "unknown host key for {} — not in ~/.ssh/known_hosts. Verify it, then click \"Trust host key\".",
+                self.host
             ),
-            // A recorded key that no longer matches: never trust on a change.
+            // A recorded key that no longer matches: possible MITM.
             Err(russh::keys::Error::KeyChanged { .. }) => format!(
-                "host key CHANGED for {} — possible man-in-the-middle. Not connecting. If the change is expected, fix ~/.ssh/known_hosts.",
+                "host key CHANGED for {} — possible man-in-the-middle. Only click \"Trust host key\" if this change is expected.",
                 self.host
             ),
             // Unreadable known_hosts etc.: reject, don't trust on error.
@@ -105,6 +121,83 @@ impl client::Handler for HostKeyVerifier {
         tracing::warn!(host = %self.host, %reason, "host key rejected");
         *self.issue.lock().unwrap() = Some(reason);
         Ok(false)
+    }
+}
+
+/// Record the server's host key in `~/.ssh/known_hosts` (mirroring OpenSSH's
+/// line format), dropping any stale plain entry for the host first so a changed
+/// key is replaced rather than duplicated. Then `check_known_hosts` accepts it.
+fn write_known_host(host: &str, port: u16, key: &PublicKey) -> anyhow::Result<()> {
+    let path = known_hosts_file()?;
+    let field = host_field(host, port);
+    let openssh = key
+        .to_openssh()
+        .map_err(|e| anyhow!("encode host key: {e}"))?;
+    let new_line = format!("{field} {openssh}");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut out: String = existing
+        .lines()
+        .filter(|line| !line_matches_host(line, &field))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    out.push_str(&new_line);
+    out.push('\n');
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&path, out)?;
+    Ok(())
+}
+
+/// The known_hosts host token: `host`, or `[host]:port` for a non-default port.
+fn host_field(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+/// Whether a known_hosts line's host token matches `field` (skips comments and
+/// hashed `|1|` entries, which can't be matched by plain comparison).
+fn line_matches_host(line: &str, field: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return false;
+    }
+    match line.split_whitespace().next() {
+        Some(hosts) if !hosts.starts_with("|1|") => hosts.split(',').any(|h| h == field),
+        _ => false,
+    }
+}
+
+fn known_hosts_file() -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
+    Ok(PathBuf::from(home).join(".ssh").join("known_hosts"))
+}
+
+/// Trust the server's current host key: record it in known_hosts, then future
+/// connects verify. Re-dials so we capture the key actually offered now; the
+/// handshake completing proves it verifies. The channel is dropped — the caller
+/// reconnects for the real session.
+pub async fn trust_host_key(spec: &RemoteSpec) -> anyhow::Result<()> {
+    let config = Arc::new(client::Config::default());
+    let issue = Arc::new(Mutex::new(None::<String>));
+    let handler = HostKeyVerifier {
+        host: spec.host.clone(),
+        port: spec.port,
+        trust: true,
+        issue: Arc::clone(&issue),
+    };
+    match client::connect(config, (spec.host.as_str(), spec.port), handler).await {
+        Ok(_handle) => Ok(()),
+        Err(e) => {
+            if let Some(reason) = issue.lock().unwrap().take() {
+                return Err(anyhow!(reason));
+            }
+            Err(anyhow::Error::new(e))
+                .with_context(|| format!("ssh connect {}:{}", spec.host, spec.port))
+        }
     }
 }
 

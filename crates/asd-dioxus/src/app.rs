@@ -17,7 +17,8 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use crate::bridge::{BRIDGE_JS, JsMessage};
 use crate::conn::{self, HostCmd, HostHandle, UiEvent};
 use crate::model::{
-    HostId, HostKind, HostState, LOCAL_ID, Model, RemoteSpec, short_age, short_cmd, short_reason,
+    HostId, HostKind, HostState, LOCAL_ID, Model, RemoteSpec, is_host_key_issue, short_age,
+    short_cmd, short_reason,
 };
 use crate::settings::{AuthKind, SettingsConfig, SettingsPage, SshConnection, SshForm};
 
@@ -486,6 +487,11 @@ fn host_group(
         _ => None,
     };
     let is_down = down.is_some();
+    // When a remote is down on a host-key problem, offer to trust the key.
+    let trust_spec = match (&down, &host.kind) {
+        (Some((_, full)), HostKind::Ssh(spec)) if is_host_key_issue(full) => Some(spec.clone()),
+        _ => None,
+    };
 
     rsx! {
         div { class: "host-group", key: "host-{id}",
@@ -546,6 +552,29 @@ fn host_group(
                         }
                     },
                     "{short} · reconnect"
+                }
+                if let Some(spec) = trust_spec {
+                    button {
+                        class: "trust-btn",
+                        title: "add this host's key to ~/.ssh/known_hosts, then reconnect",
+                        onclick: {
+                            let tx = tx.clone();
+                            let spec = spec.clone();
+                            move |_| {
+                                model.write().set_state(id, HostState::Connecting);
+                                let tx = tx.clone();
+                                let spec = spec.clone();
+                                bg().spawn(async move {
+                                    // Record the key (best-effort); reconnect
+                                    // either way — success verifies, failure
+                                    // re-surfaces the reason.
+                                    let _ = crate::ssh::trust_host_key(&spec).await;
+                                    let _ = tx.send(AppCmd::Reconnect { id });
+                                });
+                            }
+                        },
+                        "Trust host key"
+                    }
                 }
             }
             for s in host.sessions.iter() {
