@@ -89,6 +89,15 @@ fn screen_row(scrollback: usize, scroll: usize, y: u16) -> usize {
     scrollback.saturating_sub(scroll) + usize::from(y)
 }
 
+/// The top screen row for sidebar session index `i` given the scroll `offset`,
+/// or `None` if that session is scrolled out of the `side` viewport (each row
+/// is two lines tall).
+fn row_y(side: ratatui::layout::Rect, i: usize, offset: usize) -> Option<u16> {
+    let pos = i.checked_sub(offset)?;
+    let y = side.top() + (pos as u16) * 2;
+    (y + 1 < side.bottom()).then_some(y)
+}
+
 pub(crate) struct App {
     socket: PathBuf,
     conn: Conn,
@@ -270,11 +279,21 @@ fn event_loop(
                 Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
                 Event::Mouse(m) => app.on_mouse(m, terminal.size()?),
                 Event::Paste(text) => {
-                    if app.scroll != 0 {
-                        app.pane_needs_render = true;
+                    // A modal owns input: route a paste into the rename field,
+                    // swallow it under the kill-confirm — never leak it to the
+                    // session.
+                    if let Some(Modal::Rename(input)) = app.modal.as_mut() {
+                        for c in text.chars() {
+                            input.insert(c);
+                        }
+                        app.dirty = true;
+                    } else if app.modal.is_none() {
+                        if app.scroll != 0 {
+                            app.pane_needs_render = true;
+                        }
+                        app.scroll = 0;
+                        app.send(Cmd::Input(text.into_bytes()));
                     }
-                    app.scroll = 0;
-                    app.send(Cmd::Input(text.into_bytes()));
                 }
                 Event::Resize(w, h) => {
                     app.term_size = (w, h);
@@ -295,6 +314,20 @@ impl App {
         self.row_fx.push((name, fx));
     }
 
+    /// Sessions scrolled off the top of the sidebar so the active row stays
+    /// visible (see [`ui::sidebar_offset`]). Drawing, effects, and mouse
+    /// hit-testing all use this, so a click maps to the row the user sees.
+    pub(crate) fn sidebar_offset(&self) -> usize {
+        // The sidebar spans the body height (whole height minus the bottom bar).
+        let cap = (self.term_size.1.saturating_sub(1) / 2) as usize;
+        let active_idx = self
+            .active
+            .as_deref()
+            .and_then(|a| self.sessions.iter().position(|s| s.name == a))
+            .unwrap_or(0);
+        ui::sidebar_offset(active_idx, self.sessions.len(), cap)
+    }
+
     /// Advance and paint the sidebar effects; called once per drawn frame.
     /// Two layers: the transient row effects (sweep-in / selection fade) and
     /// the continuous breathing border on every running session's row.
@@ -312,16 +345,19 @@ impl App {
         if self.row_fx.is_empty() {
             return;
         }
+        let offset = self.sidebar_offset();
         let sessions = &self.sessions;
         self.row_fx.retain_mut(|(name, fx)| {
             let Some(i) = sessions.iter().position(|s| &s.name == name) else {
-                return false;
+                return false; // session gone
             };
-            let y = side.top() + (i as u16) * 2;
-            if y + 1 >= side.bottom() {
-                return false;
-            }
-            let rect = ratatui::layout::Rect::new(side.left(), y, side.width.saturating_sub(1), 2);
+            // Scrolled out of view: advance the effect into an empty rect so it
+            // still expires (and gets dropped), but paint nothing off-screen.
+            let rect = row_y(side, i, offset)
+                .map(|y| {
+                    ratatui::layout::Rect::new(side.left(), y, side.width.saturating_sub(1), 2)
+                })
+                .unwrap_or_else(|| ratatui::layout::Rect::new(side.left(), side.top(), 0, 0));
             fx.process(delta, buf, rect);
             !fx.done()
         });
@@ -353,15 +389,15 @@ impl App {
                 self.running_fx.push((name.clone(), running_shimmer()));
             }
         }
+        let offset = self.sidebar_offset();
         let sessions = &self.sessions;
         for (name, fx) in self.running_fx.iter_mut() {
             let Some(i) = sessions.iter().position(|s| &s.name == name) else {
                 continue;
             };
-            let y = side.top() + (i as u16) * 2;
-            if y + 1 >= side.bottom() {
-                continue;
-            }
+            let Some(y) = row_y(side, i, offset) else {
+                continue; // scrolled out of view
+            };
             // Shimmer only the name/title text: skip the marker + ordinal on
             // the left (up to ROW_TEXT_X) and the right rule, so neither the
             // ordinal, the selection frame, nor the separator is hue-shifted.
@@ -843,6 +879,12 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent, size: ratatui::layout::Size) {
+        // A modal owns all input while open: swallow mouse events (there are no
+        // modal-relevant mouse actions) so a click can't select/kill/scroll or
+        // start a selection behind the overlay.
+        if self.modal.is_some() {
+            return;
+        }
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let (_, pane, _) = ui::areas(area, self.sidebar_w, self.sidebar_hidden);
         let in_pane = m.column >= pane.left()
@@ -866,14 +908,22 @@ impl App {
                     self.sidebar_w,
                     self.sidebar_hidden,
                     self.sessions.len(),
+                    self.sidebar_offset(),
                     m.column,
                     m.row,
                 ) {
                     let name = self.sessions[i].name.clone();
                     if kill {
-                        // Same path as Ctrl+A x: a click on the row's kill mark
-                        // asks first (confirmation modal), never kills outright.
-                        self.modal = Some(Modal::KillConfirm { target: name });
+                        if self.self_session.as_deref() == Some(&name) {
+                            // Never kill the session hosting this UI (same guard
+                            // as `select`) — it would tear the UI down.
+                            self.notice =
+                                Some(format!("{name} hosts this UI — can't kill it here"));
+                        } else {
+                            // Same path as Ctrl+A x: confirm first, never kill
+                            // outright.
+                            self.modal = Some(Modal::KillConfirm { target: name });
+                        }
                     } else {
                         self.select(name);
                     }

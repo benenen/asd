@@ -100,6 +100,23 @@ pub fn sidebar_from_drag(x: u16, total_w: u16) -> u16 {
     clamp_sidebar(x as i32 + 1, total_w)
 }
 
+/// How many sessions are scrolled past the top of the sidebar so the active row
+/// (`active_idx`) stays visible in a viewport `cap` rows tall (each session is
+/// one row here). Derived from the active index every frame — no stored scroll
+/// position — so the list simply follows the selection.
+pub fn sidebar_offset(active_idx: usize, len: usize, cap: usize) -> usize {
+    if cap == 0 || len <= cap {
+        return 0; // everything fits — no scroll
+    }
+    let max_off = len - cap;
+    if active_idx < cap {
+        0 // active is within the first page
+    } else {
+        // Pin the active row to the bottom of the viewport, never past the end.
+        (active_idx + 1 - cap).min(max_off)
+    }
+}
+
 /// A selection projected into viewport coordinates: `start`..=`end`,
 /// row-major, both inclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,10 +253,11 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
     }
     let inner_w = (area.width - 1) as usize;
 
-    // Session rows: two lines each.
+    // Session rows: two lines each, scrolled so the active row stays visible.
+    let offset = app.sidebar_offset();
     let list_bottom = area.bottom();
     let mut y = area.top();
-    for (i, s) in app.sessions.iter().enumerate() {
+    for (i, s) in app.sessions.iter().enumerate().skip(offset) {
         if y + 1 >= list_bottom {
             break;
         }
@@ -380,11 +398,14 @@ fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
 }
 
 /// Which sidebar session row (and whether its kill mark) a click lands on.
+/// `offset` is the current scroll offset (see [`sidebar_offset`]) so a click
+/// maps to the true session index, not the on-screen row.
 pub fn sidebar_hit(
     area: Rect,
     sidebar_w: u16,
     hidden: bool,
     sessions: usize,
+    offset: usize,
     col: u16,
     row: u16,
 ) -> Option<(usize, bool)> {
@@ -392,7 +413,7 @@ pub fn sidebar_hit(
     if side.width == 0 || col >= side.right().saturating_sub(1) || row >= side.bottom() {
         return None;
     }
-    let idx = ((row.checked_sub(side.top())?) / 2) as usize;
+    let idx = offset + ((row.checked_sub(side.top())?) / 2) as usize;
     if idx >= sessions {
         return None;
     }
@@ -706,7 +727,7 @@ mod tests {
     #[test]
     fn sidebar_hits_map_rows_and_kill_marks() {
         let area = Rect::new(0, 0, 120, 40);
-        let hit = |col, row| sidebar_hit(area, SIDEBAR_W, false, 3, col, row);
+        let hit = |col, row| sidebar_hit(area, SIDEBAR_W, false, 3, 0, col, row);
         // First session row, name area → select.
         assert_eq!(hit(2, 0), Some((0, false)));
         assert_eq!(hit(2, 1), Some((0, false)));
@@ -718,7 +739,27 @@ mod tests {
         assert_eq!(hit(2, 12), None);
         assert_eq!(hit(SIDEBAR_W + 5, 0), None);
         // Hidden sidebar swallows nothing.
-        assert_eq!(sidebar_hit(area, SIDEBAR_W, true, 3, 2, 0), None);
+        assert_eq!(sidebar_hit(area, SIDEBAR_W, true, 3, 0, 2, 0), None);
+        // With a scroll offset, the top on-screen row maps to the true index.
+        let scrolled = |col, row| sidebar_hit(area, SIDEBAR_W, false, 30, 5, col, row);
+        assert_eq!(scrolled(2, 0), Some((5, false))); // first visible = index 5
+        assert_eq!(scrolled(SIDEBAR_W - 3, 2), Some((6, true))); // its kill mark
+    }
+
+    #[test]
+    fn sidebar_offset_follows_the_active_row() {
+        // Everything fits (len <= cap) → no scroll.
+        assert_eq!(sidebar_offset(0, 5, 10), 0);
+        assert_eq!(sidebar_offset(4, 5, 10), 0);
+        // Active within the first page → still no scroll.
+        assert_eq!(sidebar_offset(9, 30, 10), 0);
+        // Active past the fold → pinned to the viewport bottom.
+        assert_eq!(sidebar_offset(10, 30, 10), 1);
+        assert_eq!(sidebar_offset(15, 30, 10), 6);
+        // Never scroll past the end.
+        assert_eq!(sidebar_offset(29, 30, 10), 20);
+        // Degenerate: zero-height viewport.
+        assert_eq!(sidebar_offset(5, 30, 0), 0);
     }
 
     #[test]
