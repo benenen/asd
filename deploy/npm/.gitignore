@@ -1,0 +1,5 @@
+# The native binary is downloaded by postinstall at install time — never commit it.
+/lib/asd
+/lib/asd.exe
+node_modules/
+*.tgz
