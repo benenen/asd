@@ -184,6 +184,20 @@ pub(crate) struct App {
 /// daemon must already be running (the `asd ui` wrapper ensures it).
 pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
+    // `ratatui::init` installs a panic hook that restores the screen (leaves the
+    // alt screen, disables raw mode) — but it doesn't know about the mouse
+    // capture + bracketed paste we enable below. Chain a hook that turns those
+    // back off first, so a panic can't leave the terminal in mouse-tracking mode
+    // spewing `ESC[<..M` reports on every mouse move (garbage at the shell).
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(
+            std::io::stdout(),
+            event::DisableBracketedPaste,
+            event::DisableMouseCapture
+        );
+        prev_hook(info);
+    }));
     let _ = execute!(
         std::io::stdout(),
         event::EnableMouseCapture,
