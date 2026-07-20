@@ -94,6 +94,14 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # asd-dioxus's build.rs shells out to npm (esbuild vendor bundle). Pin a
+      # Node so npm is on PATH; the build.rs invokes it via `cmd /C npm` because
+      # `Command::new("npm")` can't resolve the `.cmd` shim on Windows.
+      - name: Install Node (asd-dioxus build.rs runs npm)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:

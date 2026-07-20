@@ -19,22 +19,31 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR must be set"));
 
     run(
-        Command::new("npm")
-            .arg("install")
-            .current_dir(&manifest_dir),
+        npm().arg("install").current_dir(&manifest_dir),
         "npm install (node/npm are required to build asd-dioxus; \
          configure a registry mirror via .npmrc if the default is unreachable)",
     );
     run(
-        Command::new("npm")
-            .args(["run", "build"])
-            .current_dir(&manifest_dir),
+        npm().args(["run", "build"]).current_dir(&manifest_dir),
         "npm run build (esbuild vendor bundle)",
     );
 
     let bundle = manifest_dir.join("dist/vendor.js");
     std::fs::copy(&bundle, out_dir.join("vendor.js"))
         .unwrap_or_else(|e| panic!("copying {}: {e}", bundle.display()));
+}
+
+/// `npm`, invoked so it resolves on every platform. On Windows `npm` is a
+/// `.cmd` shim that `Command::new("npm")` can't find (CreateProcess does no
+/// PATHEXT resolution), so go through `cmd /C npm`; elsewhere run it directly.
+fn npm() -> Command {
+    if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg("npm");
+        c
+    } else {
+        Command::new("npm")
+    }
 }
 
 fn run(command: &mut Command, context: &str) {
