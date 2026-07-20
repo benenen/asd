@@ -1,1 +1,10 @@
 [env]
+# Build the vendored libghostty-vt (Zig) in ReleaseFast even for cargo's `dev`
+# profile. Cargo's dev profile sets DEBUG=true, which libghostty-vt-sys maps to
+# Zig `Debug` mode — and that turns on ghostty's per-mutation
+# `Page.verifyIntegrity` safety walk (an O(page) scan on every cell clear).
+# Under erase-heavy TUIs (codex/claude/vim) that pegs the session thread, so the
+# `asd ui` pane goes blank and `peek`/`inspect` hang while the thread spins.
+# ReleaseFast compiles the check out; Rust-side debug info is unaffected.
+# Override with `LIBGHOSTTY_VT_SYS_OPTIMIZE=Debug` to debug the VT itself.
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"
