@@ -277,10 +277,8 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
             }
         }
         let text_x = area.left() + ROW_TEXT_X;
-        // Line 1: [marker][ordinal][name] … kill mark. The marker is the
-        // activity dot (or the selection bar, drawn below).
-        let dot = if s.attached_clients > 0 { "•" } else { " " };
-        buf.set_string(area.left(), y, dot, row_bg.fg(ACCENT));
+        // Line 1: [ordinal][name] … kill mark. Column 0 is left blank (it only
+        // ever carries the selected row's accent bar, drawn below).
         // 1-based ordinal, right-aligned in 2 cols — it matches the Ctrl+A <n>
         // quick-switch for the first nine rows (dimmer past nine: no shortcut).
         let n = i + 1;
