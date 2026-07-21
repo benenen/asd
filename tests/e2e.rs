@@ -1198,6 +1198,23 @@ async fn killed_session_is_not_restored() {
             .success()
     );
 
+    // `asd kill` is asynchronous (SIGHUP -> child EOF -> registry removal +
+    // persist on the session thread). Wait until "doomed" has actually left the
+    // live set before stopping, otherwise the shutdown freeze could snapshot it
+    // while it's still live and resurrect it.
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let out = daemon.cli().args(["list"]).output().unwrap();
+        if !String::from_utf8_lossy(&out.stdout).contains("doomed") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "doomed never left the session list after kill"
+        );
+        std::thread::sleep(TICK);
+    }
+
     daemon.stop_and_wait();
     let mut successor = daemon.respawn_successor();
 
