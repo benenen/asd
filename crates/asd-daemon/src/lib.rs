@@ -12,8 +12,8 @@
 mod config;
 mod conn;
 mod registry;
-mod restart;
 mod session;
+mod store;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -68,23 +68,26 @@ async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
     // falls back to defaults. It governs every session this daemon spawns —
     // change it and `asd restart` to apply.
     let config = config::Config::load(&paths::config_path());
-    let registry = Arc::new(Mutex::new(Registry::new(config.scrollback_lines)));
+    let persist_path = paths::session_list_path();
+    let registry = Arc::new(Mutex::new(Registry::new(
+        config.scrollback_lines,
+        persist_path.clone(),
+    )));
 
-    // Restart workspace restore: if a predecessor daemon was asked to restart
-    // (SIGUSR1) it left a state file — recreate each session as a fresh shell in
-    // its saved cwd, then consume the file so a later normal start doesn't
-    // resurrect stale sessions.
-    let state_path = paths::restart_state_path(&socket_path);
-    for st in restart::take(&state_path) {
+    // Restore the persisted session list on every startup (fresh boot, crash
+    // recovery, or `asd restart`): recreate each saved session as a fresh shell
+    // `cd`'d to its saved cwd. Each create re-persists the file.
+    for st in store::read(&persist_path) {
         match Registry::create(&registry, Some(st.name.clone()), None, st.cwd) {
-            Ok(_) => info!(session = %st.name, "session workspace restored"),
+            Ok(_) => info!(session = %st.name, "session restored"),
             Err((code, msg)) => warn!(session = %st.name, code, %msg, "restore failed"),
         }
     }
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    // `asd restart` sends SIGUSR1: save each session's workspace, then shut down.
+    // `asd restart` sends SIGUSR1: shut down (the session list is already kept
+    // up to date on disk, so no special handling is needed here).
     let mut sigusr1 =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
 
@@ -102,19 +105,17 @@ async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
             },
             _ = sigterm.recv() => { info!("SIGTERM received"); break; }
             _ = sigint.recv() => { info!("SIGINT received"); break; }
-            _ = sigusr1.recv() => {
-                info!("SIGUSR1 received — saving session workspaces for restart");
-                let states = registry.lock().unwrap().capture_restart_state();
-                restart::write(&state_path, &states);
-                break;
-            }
+            _ = sigusr1.recv() => { info!("SIGUSR1 received"); break; }
         }
     }
 
+    // Capture final cwds and freeze the session list before killing children:
+    // the SIGHUP-driven `Registry::remove` calls below must not erase the file,
+    // so the next daemon can restore from it.
+    registry.lock().unwrap().freeze_and_persist();
+
     // Shutdown contract (spec §5): SIGHUP each child → wait 2s → SIGKILL
     // stragglers → remove socket.
-    // Sessions are not persisted: restarting the daemon = all sessions gone
-    // (explicitly so in v1).
     let reg = Arc::clone(&registry);
     tokio::task::spawn_blocking(move || Registry::shutdown_all(&reg)).await?;
     if let Err(e) = std::fs::remove_file(&socket_path) {

@@ -1,6 +1,7 @@
 //! Session registry: daemon-wide unique naming, create/list/kill.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use asd_proto::{SessionInfo, code, paths};
@@ -21,16 +22,23 @@ pub struct Registry {
     /// Scrollback depth (lines) applied to every session this registry spawns;
     /// comes from the daemon config, resolved once at startup.
     scrollback_lines: usize,
+    /// Where the live session list is persisted; rewritten on every mutation.
+    persist_path: PathBuf,
+    /// Once set (at shutdown), `persist` is a no-op — so the SIGHUP-driven
+    /// session removals during shutdown don't wipe the file before restart.
+    persist_frozen: bool,
 }
 
 impl Registry {
-    /// Create an empty registry whose sessions will each keep `scrollback_lines`
-    /// lines of scrollback history.
-    pub fn new(scrollback_lines: usize) -> Self {
+    /// Create an empty registry whose sessions each keep `scrollback_lines` lines
+    /// of scrollback and whose live set is persisted to `persist_path`.
+    pub fn new(scrollback_lines: usize, persist_path: PathBuf) -> Self {
         Self {
             sessions: HashMap::new(),
             next_auto: 0,
             scrollback_lines,
+            persist_path,
+            persist_frozen: false,
         }
     }
 
@@ -80,13 +88,14 @@ impl Registry {
         )
         .map_err(|e| (code::INTERNAL, format!("failed to spawn session: {e}")))?;
         reg.sessions.insert(name.clone(), handle);
+        reg.persist();
         info!(session = %name, "session created");
         Ok(name)
     }
 
-    /// Snapshot each session's workspace (name + cwd read from its child) for a
-    /// restart handoff. Reads `/proc/<pid>/cwd` under the lock — a cheap readlink.
-    pub fn capture_restart_state(&self) -> Vec<crate::restart::SessionState> {
+    /// Snapshot each live session's name + cwd for persistence/restore. Reads
+    /// `/proc/<pid>/cwd` under the lock — a cheap readlink.
+    pub fn snapshot(&self) -> Vec<crate::store::SessionState> {
         self.sessions
             .values()
             .map(|h| {
@@ -97,12 +106,27 @@ impl Registry {
                     .map(|n| n.clone())
                     .unwrap_or_else(|_| h.name.clone());
                 let pid = h.meta.child_pid.load(std::sync::atomic::Ordering::Relaxed);
-                crate::restart::SessionState {
+                crate::store::SessionState {
                     name,
-                    cwd: crate::restart::read_cwd(pid),
+                    cwd: crate::store::read_cwd(pid),
                 }
             })
             .collect()
+    }
+
+    /// Rewrite the persisted session list from the live set (no-op while frozen).
+    fn persist(&self) {
+        if self.persist_frozen {
+            return;
+        }
+        crate::store::write_atomic(&self.persist_path, &self.snapshot());
+    }
+
+    /// Final persist (capturing live cwds), then freeze so the shutdown SIGHUPs'
+    /// session removals don't clobber the file. Called once on the way out.
+    pub fn freeze_and_persist(&mut self) {
+        crate::store::write_atomic(&self.persist_path, &self.snapshot());
+        self.persist_frozen = true;
     }
 
     pub fn get(&self, name: &str) -> Option<SessionHandle> {
@@ -115,9 +139,12 @@ impl Registry {
         infos
     }
 
-    /// Callback at the session thread's endpoint: deregister.
+    /// Callback at the session thread's endpoint: deregister and re-persist (so a
+    /// killed or self-exited session drops off the list). A no-op on the file
+    /// during shutdown, where `persist_frozen` is set.
     pub fn remove(&mut self, name: &str) {
         self.sessions.remove(name);
+        self.persist();
     }
 
     /// Rename `old` to `new`: validate the new name, move the map key, and
@@ -146,6 +173,7 @@ impl Registry {
             *n = new.to_string();
         }
         self.sessions.insert(new.to_string(), handle);
+        self.persist();
         info!(from = %old, to = %new, "session renamed");
         Ok(())
     }

@@ -66,6 +66,11 @@ impl Daemon {
     fn cli(&self) -> Command {
         let mut cmd = Command::new(cli_exe());
         cmd.arg("--socket").arg(&self.socket);
+        // Match Daemon::start's data dir so CLI subcommands that spawn a daemon
+        // (e.g. `asd restart` re-exec'ing a successor) use the test's isolated
+        // sessions.tsv, mirroring production where the daemon and CLI share the
+        // shell's XDG_DATA_HOME.
+        cmd.env("XDG_DATA_HOME", self.dir.join("data"));
         cmd
     }
 
@@ -1003,7 +1008,8 @@ async fn restart_preserves_session_workspace() {
         "session never reached READY"
     );
 
-    // Restart: SIGUSR1 makes the daemon record workspaces, then shut down.
+    // Restart: SIGUSR1 shuts the daemon down (the session list is already kept
+    // persisted on disk continuously, so no special save-on-signal step needed).
     unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR1) };
     let deadline = std::time::Instant::now() + WAIT;
     while daemon.socket.exists() {
@@ -1014,9 +1020,9 @@ async fn restart_preserves_session_workspace() {
         std::thread::sleep(TICK);
     }
 
-    // The state file records name + cwd.
-    let state = std::fs::read_to_string(asd_proto::paths::restart_state_path(&daemon.socket))
-        .expect("restart state file written");
+    // The persisted session list records name + cwd (in the daemon's data dir).
+    let state = std::fs::read_to_string(daemon.dir.join("data/asd/sessions.tsv"))
+        .expect("session list written");
     assert!(
         state.contains(&format!("work\t{}", workdir.display())),
         "state should record work's cwd, got: {state:?}"

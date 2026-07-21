@@ -1,10 +1,10 @@
-//! `asd restart` workspace preservation. On SIGUSR1 the daemon records each
-//! session's name + working directory to a per-socket state file, then shuts
-//! down normally; the successor daemon reads that file and recreates the
-//! sessions — a fresh shell `cd`'d to the saved directory. Only the cwd is
-//! restored, not the live process or the screen.
+//! Persistent session list. The daemon keeps `{name, cwd}` for every live
+//! session in a data-dir file (`paths::session_list_path`), rewritten on every
+//! create/rename/kill and restored on every startup — each session comes back as
+//! a fresh shell `cd`'d to its saved directory. Only the cwd is restored, not the
+//! live process or the screen.
 //!
-//! Spec: docs/superpowers/specs/2026-07-21-restart-preserve-workspace-design.md
+//! Spec: docs/superpowers/specs/2026-07-21-persistent-session-list-design.md
 
 use std::path::{Path, PathBuf};
 
@@ -64,23 +64,29 @@ pub fn parse(text: &str) -> Vec<SessionState> {
         .collect()
 }
 
-/// Write the state file (best effort; a failure just means workspaces aren't
-/// restored on the next start).
-pub fn write(path: &Path, states: &[SessionState]) {
-    if let Err(e) = std::fs::write(path, serialize(states)) {
-        tracing::warn!(path = %path.display(), error = %e, "failed to write restart state");
+/// Atomically write the session list: write a sibling temp file, then `rename`
+/// it over `path` (atomic on the same filesystem), so a crash mid-write cannot
+/// leave a torn file. Best effort — a failure only logs a warning.
+pub fn write_atomic(path: &Path, states: &[SessionState]) {
+    let tmp = path.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp, serialize(states)) {
+        tracing::warn!(path = %tmp.display(), error = %e, "failed to write session list");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!(path = %path.display(), error = %e, "failed to install session list");
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
-/// Read and consume (delete) the state file, returning the sessions to
-/// recreate. An absent file yields an empty list. Consume-once so a later normal
-/// start doesn't resurrect stale sessions.
-pub fn take(path: &Path) -> Vec<SessionState> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let _ = std::fs::remove_file(path);
-    parse(&text)
+/// Read and parse the session list, WITHOUT deleting it — the file is the live
+/// source of truth, not consume-once. An absent/unreadable file yields an empty
+/// list.
+pub fn read(path: &Path) -> Vec<SessionState> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse(&text),
+        Err(_) => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +129,28 @@ mod tests {
     #[test]
     fn read_cwd_zero_pid_is_none() {
         assert_eq!(read_cwd(0), None);
+    }
+
+    #[test]
+    fn write_atomic_then_read_round_trips() {
+        let dir = std::env::temp_dir().join(format!("asd-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.tsv");
+        let states = vec![
+            SessionState {
+                name: "web".into(),
+                cwd: Some(PathBuf::from("/home/me/proj")),
+            },
+            SessionState {
+                name: "s0".into(),
+                cwd: None,
+            },
+        ];
+        write_atomic(&path, &states);
+        assert_eq!(read(&path), states);
+        // An absent file reads as an empty list.
+        std::fs::remove_file(&path).unwrap();
+        assert!(read(&path).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
