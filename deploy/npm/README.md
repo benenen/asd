@@ -9,14 +9,17 @@ platform from the project's GitHub Releases.
 
 ```bash
 # one-off, no install:
-npx asd
+npx @shibenenen/asd
 
 # or globally (exposes the `asd` command):
-npm install -g asd
+npm install -g @shibenenen/asd
 asd            # launches the GUI
 asd new work   # create a session
 asd ui         # the terminal session switcher (TUI)
 ```
+
+The package is published scoped as `@shibenenen/asd` (the bare name `asd` is
+taken on the registry), but the exposed command is still just `asd`.
 
 ## Supported platforms
 
@@ -68,16 +71,20 @@ release assets.
 
 The package `version` must equal the GitHub Release tag without the `v`
 (tag `v1.2.3` ⇄ `"version": "1.2.3"`), so it stays in lockstep with the crate
-version. To publish:
+version. To publish (under the `@shibenenen` scope, to the public npm registry):
 
 ```bash
 cd deploy/npm
+npm login                # authenticate as the scope owner (once per machine)
 npm version 1.2.3        # match the release tag
-npm publish              # add --access public if you scope the name
+npm publish              # public access + registry.npmjs.org are set in publishConfig
 ```
 
-If the bare name `asd` is taken on the registry, scope it (e.g. `@benenen/asd`);
-the exposed command stays `asd` regardless of the package name.
+`publishConfig` pins `access: public` (scoped packages default to private) and
+`registry: https://registry.npmjs.org/` so a publish still lands on the real
+registry even when the default registry is a read-only mirror (e.g.
+`registry.npmmirror.com`). The exposed command stays `asd` regardless of the
+scoped package name.
 
 ## Validate without publishing
 

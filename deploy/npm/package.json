@@ -1,5 +1,5 @@
 {
-  "name": "asd",
+  "name": "@shibenenen/asd",
   "version": "0.1.1",
   "description": "asd — GPU terminal client + headless mux daemon (shpool-style: one session = one PTY). Installs the matching prebuilt binary from GitHub Releases.",
   "keywords": ["terminal", "tui", "mux", "pty", "daemon", "cli", "gpu", "shpool"],
@@ -13,6 +13,10 @@
     "directory": "deploy/npm"
   },
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "bin": {
     "asd": "bin/asd.js"
   },

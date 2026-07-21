@@ -2,7 +2,7 @@
 #
 #   make            # build the full asd (CLI + daemon + GUI) for this host
 #   make cli        # build the CLI/daemon-only binary (no GUI)
-#   make install    # install to $(PREFIX)/bin   (PREFIX, DESTDIR honored)
+#   make install    # install (stripped) to $(PREFIX)/bin   (PREFIX, DESTDIR honored)
 #   make package    # stage a tar.gz install archive for THIS platform in dist/
 #   make cross-arm  # cross-build + package the aarch64 CLI archive (needs cross)
 #   make deb        # build a Debian .deb for this host (needs `cargo deb`)
@@ -64,10 +64,19 @@ build: ## Build the full asd binary (CLI + daemon + GUI) for the host
 cli: ## Build the CLI/daemon-only binary (no GUI) for the host
 	$(CARGO) build --release --no-default-features --features local
 
-install: build ## Install the binary to $(PREFIX)/bin (honors PREFIX, DESTDIR)
+install: build ## Install the binary to $(PREFIX)/bin, stripped (honors PREFIX, DESTDIR)
 	install -d "$(BINDIR)"
 	install -m755 target/release/asd "$(BINDIR)/asd"
-	@echo "installed $(BINDIR)/asd"
+	# The release profile keeps debug symbols (lto only); strip the installed
+	# copy to shrink it, leaving the build artifact untouched. Best-effort:
+	# a missing/foreign strip must not fail the install.
+	strip "$(BINDIR)/asd" 2>/dev/null || true
+	@echo "installed asd $(VERSION) -> $(BINDIR)/asd"
+	# PATH hint only for a real (non-staged) install to a dir that isn't on PATH.
+	@if [ -z "$(DESTDIR)" ]; then case ":$$PATH:" in \
+		*":$(PREFIX)/bin:"*) ;; \
+		*) echo "note: $(PREFIX)/bin is not on your PATH — add it to run \`asd\`" ;; \
+	esac; fi
 
 uninstall: ## Remove the installed binary
 	rm -f "$(BINDIR)/asd"

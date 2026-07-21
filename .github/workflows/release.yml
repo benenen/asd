@@ -215,3 +215,45 @@ jobs:
           files: ${{ steps.pkg.outputs.archive }}
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  # Publish the npm installer (@shibenenen/asd) to the public npm registry after
+  # every platform binary is attached to the release. The npm package ships no
+  # binary — its postinstall downloads the matching asset from this release — so
+  # it MUST publish only once the build jobs have uploaded their archives.
+  # Requires an `NPM_TOKEN` repo secret: an npm "Automation" access token for the
+  # shibenenen account (automation tokens bypass publish 2FA, as CI needs).
+  npm:
+    name: npm publish
+    needs: [build, windows, macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node (npmjs registry)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Sync package version to the release tag
+        working-directory: deploy/npm
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="${REF_NAME#v}"
+          echo "publishing @shibenenen/asd@${version}"
+          # Keep the published version in lockstep with the release tag so the
+          # postinstall fetches the v<version> assets this workflow just built.
+          npm version --no-git-tag-version --allow-same-version "$version"
+
+      - name: Validate the package (syntax + offline URL mapping, no network)
+        working-directory: deploy/npm
+        run: npm test
+
+      - name: Publish to npm
+        working-directory: deploy/npm
+        env:
+          # publishConfig in package.json pins access=public + the npmjs registry.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish
