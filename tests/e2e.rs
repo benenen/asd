@@ -103,6 +103,44 @@ impl Daemon {
             libc::kill(self.child.id() as i32, libc::SIGTERM);
         }
     }
+
+    /// Start a fresh daemon on the same socket + data dir (as a detached process,
+    /// not our child) and wait for it to accept connections. Used to test restore
+    /// after the original daemon has stopped. Returns the child so the caller can
+    /// SIGTERM it at the end.
+    fn respawn_successor(&self) -> std::process::Child {
+        let child = Command::new(cli_exe())
+            .arg("daemon")
+            .arg("--socket")
+            .arg(&self.socket)
+            .env("XDG_DATA_HOME", self.dir.join("data"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + WAIT;
+        while !self.socket.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "successor daemon never came up"
+            );
+            std::thread::sleep(TICK);
+        }
+        child
+    }
+
+    /// SIGTERM this daemon and wait for its socket to disappear.
+    fn stop_and_wait(&self) {
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + WAIT;
+        while self.socket.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon didn't shut down after SIGTERM"
+            );
+            std::thread::sleep(TICK);
+        }
+    }
 }
 
 impl Drop for Daemon {
@@ -1074,4 +1112,138 @@ async fn restart_preserves_session_workspace() {
     let _ = d2.kill();
     let _ = d2.wait();
     assert!(in_cwd, "restored shell is not in the saved cwd");
+}
+
+/// A plain daemon stop (SIGTERM, not `asd restart`) still persists the session
+/// list, and a fresh daemon restores every session — cwd included.
+#[tokio::test]
+async fn sessions_persist_across_a_full_stop() {
+    let daemon = Daemon::start("persist");
+    for name in ["web", "logs"] {
+        assert!(daemon.cli().args(["new", name]).status().unwrap().success());
+    }
+    let workdir = daemon.dir.join("web-workspace");
+    std::fs::create_dir_all(&workdir).unwrap();
+    daemon
+        .cli()
+        .args([
+            "send",
+            "web",
+            "--text",
+            &format!("cd '{}' && echo READY", workdir.display()),
+            "--enter",
+        ])
+        .status()
+        .unwrap();
+    assert!(
+        daemon
+            .cli()
+            .args(["wait", "web", "--text", "READY", "--timeout", "10s"])
+            .status()
+            .unwrap()
+            .success(),
+        "web never reached READY"
+    );
+
+    daemon.stop_and_wait();
+    let mut successor = daemon.respawn_successor();
+
+    let list = daemon.cli().args(["list"]).output().unwrap();
+    let list = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        list.contains("web") && list.contains("logs"),
+        "both restored: {list}"
+    );
+
+    daemon
+        .cli()
+        .args(["send", "web", "--text", "pwd", "--enter"])
+        .status()
+        .unwrap();
+    assert!(
+        daemon
+            .cli()
+            .args([
+                "wait",
+                "web",
+                "--text",
+                workdir.to_str().unwrap(),
+                "--timeout",
+                "10s"
+            ])
+            .status()
+            .unwrap()
+            .success(),
+        "web not restored in its saved cwd"
+    );
+
+    unsafe { libc::kill(successor.id() as i32, libc::SIGTERM) };
+    let _ = successor.wait();
+}
+
+/// Killing a session removes it from the persisted list, so a restart does not
+/// bring it back — only the survivors return.
+#[tokio::test]
+async fn killed_session_is_not_restored() {
+    let daemon = Daemon::start("nokill");
+    for name in ["keep", "doomed"] {
+        assert!(daemon.cli().args(["new", name]).status().unwrap().success());
+    }
+    assert!(
+        daemon
+            .cli()
+            .args(["kill", "doomed"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    daemon.stop_and_wait();
+    let mut successor = daemon.respawn_successor();
+
+    let list = daemon.cli().args(["list"]).output().unwrap();
+    let list = String::from_utf8_lossy(&list.stdout);
+    assert!(list.contains("keep"), "survivor missing: {list}");
+    assert!(
+        !list.contains("doomed"),
+        "killed session resurrected: {list}"
+    );
+
+    unsafe { libc::kill(successor.id() as i32, libc::SIGTERM) };
+    let _ = successor.wait();
+}
+
+/// Renaming a session updates the persisted list, so a restart restores it under
+/// the new name (and not the old).
+#[tokio::test]
+async fn rename_persists_across_restart() {
+    let daemon = Daemon::start("rename");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "before"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let mut c = ProtoClient::connect(&daemon.socket).await;
+    c.send(Frame::Rename {
+        name: "before".into(),
+        new_name: "after".into(),
+    })
+    .await;
+    assert!(matches!(c.recv().await, Frame::Ack), "rename not acked");
+    drop(c);
+
+    daemon.stop_and_wait();
+    let mut successor = daemon.respawn_successor();
+
+    let list = daemon.cli().args(["list"]).output().unwrap();
+    let list = String::from_utf8_lossy(&list.stdout);
+    assert!(list.contains("after"), "renamed session missing: {list}");
+    assert!(!list.contains("before"), "old name still present: {list}");
+
+    unsafe { libc::kill(successor.id() as i32, libc::SIGTERM) };
+    let _ = successor.wait();
 }
