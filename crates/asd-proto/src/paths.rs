@@ -54,6 +54,13 @@ pub fn pid_path(socket: &Path) -> PathBuf {
     socket.with_extension("pid")
 }
 
+/// Where the daemon records each session's workspace (cwd) when asked to restart
+/// (SIGUSR1); the successor daemon consumes it to recreate the sessions in their
+/// old directories. Per-socket, a sibling of the pid file.
+pub fn restart_state_path(socket: &Path) -> PathBuf {
+    socket.with_extension("restart")
+}
+
 /// Daemon data directory: `~/.local/share/asd/` (session metadata, logs).
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME")

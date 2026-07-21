@@ -314,11 +314,11 @@ async fn restart_replaces_the_daemon() {
     let mut daemon = Daemon::start("restart");
     let old_pid = daemon.child.id();
 
-    // A session to lose across the restart.
+    // A session that should survive the restart (its workspace is restored).
     assert!(
         daemon
             .cli()
-            .args(["new", "gone"])
+            .args(["new", "kept"])
             .output()
             .unwrap()
             .status
@@ -338,8 +338,8 @@ async fn restart_replaces_the_daemon() {
         std::thread::sleep(TICK);
     }
 
-    // A fresh daemon is up under a new pid, answers `list`, and the old session
-    // did not survive.
+    // A fresh daemon is up under a new pid, answers `list`, and the session was
+    // recreated (its workspace is restored across the restart).
     let new_pid: i32 = std::fs::read_to_string(daemon.socket.with_extension("pid"))
         .unwrap()
         .trim()
@@ -349,8 +349,9 @@ async fn restart_replaces_the_daemon() {
     let list = daemon.cli().arg("list").output().unwrap();
     assert!(list.status.success(), "list after restart failed: {list:?}");
     assert!(
-        !String::from_utf8_lossy(&list.stdout).contains("gone"),
-        "session survived restart"
+        String::from_utf8_lossy(&list.stdout).contains("kept"),
+        "session should survive restart (workspace restored): {}",
+        String::from_utf8_lossy(&list.stdout)
     );
 
     // The fresh daemon is detached (not our child); stop it so it doesn't leak.
@@ -959,4 +960,112 @@ async fn attach_after_attached_session_dies_is_not_wedged() {
         ),
         other => panic!("expected Snapshot, got {other:?}"),
     }
+}
+
+/// `asd restart` (SIGUSR1) records each session's working directory; the
+/// successor daemon recreates the session as a fresh shell in that directory.
+/// Regression for "restart preserves each session's workspace".
+#[tokio::test]
+async fn restart_preserves_session_workspace() {
+    let daemon = Daemon::start("restartws");
+
+    // A session, cd'd into a known directory.
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "work"])
+            .status()
+            .unwrap()
+            .success(),
+        "create failed"
+    );
+    let workdir = daemon.dir.join("the-workspace");
+    std::fs::create_dir_all(&workdir).unwrap();
+    daemon
+        .cli()
+        .args([
+            "send",
+            "work",
+            "--text",
+            &format!("cd '{}' && echo READY", workdir.display()),
+            "--enter",
+        ])
+        .status()
+        .unwrap();
+    // Wait until the cd has actually run (the shell prints READY).
+    assert!(
+        daemon
+            .cli()
+            .args(["wait", "work", "--text", "READY", "--timeout", "10s"])
+            .status()
+            .unwrap()
+            .success(),
+        "session never reached READY"
+    );
+
+    // Restart: SIGUSR1 makes the daemon record workspaces, then shut down.
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR1) };
+    let deadline = std::time::Instant::now() + WAIT;
+    while daemon.socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon didn't shut down after SIGUSR1"
+        );
+        std::thread::sleep(TICK);
+    }
+
+    // The state file records name + cwd.
+    let state = std::fs::read_to_string(asd_proto::paths::restart_state_path(&daemon.socket))
+        .expect("restart state file written");
+    assert!(
+        state.contains(&format!("work\t{}", workdir.display())),
+        "state should record work's cwd, got: {state:?}"
+    );
+
+    // A fresh daemon on the same socket recreates the session in its cwd.
+    let mut d2 = Command::new(cli_exe())
+        .arg("daemon")
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .env("XDG_DATA_HOME", daemon.dir.join("data"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    while !daemon.socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "successor daemon never came up"
+        );
+        std::thread::sleep(TICK);
+    }
+
+    // Session is back...
+    let list = daemon.cli().args(["list"]).output().unwrap();
+    let list = String::from_utf8_lossy(&list.stdout);
+    assert!(list.contains("work"), "session not restored: {list}");
+
+    // ...and its fresh shell is in the saved directory (pwd prints the path).
+    daemon
+        .cli()
+        .args(["send", "work", "--text", "pwd", "--enter"])
+        .status()
+        .unwrap();
+    let in_cwd = daemon
+        .cli()
+        .args([
+            "wait",
+            "work",
+            "--text",
+            "the-workspace",
+            "--timeout",
+            "10s",
+        ])
+        .status()
+        .unwrap()
+        .success();
+    let _ = d2.kill();
+    let _ = d2.wait();
+    assert!(in_cwd, "restored shell is not in the saved cwd");
 }

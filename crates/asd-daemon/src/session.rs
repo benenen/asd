@@ -407,6 +407,7 @@ fn proc_command(_pid: libc::pid_t) -> Option<String> {
 pub fn spawn_session(
     name: String,
     cmd: Option<String>,
+    cwd: Option<std::path::PathBuf>,
     cols: u16,
     rows: u16,
     registry: Arc<Mutex<Registry>>,
@@ -439,8 +440,14 @@ pub fn spawn_session(
     // check it to refuse attaching the session that hosts them — attaching
     // yourself is a render feedback loop that floods the pty.
     builder.env("ASD_SESSION", &name);
-    if let Some(home) = std::env::var_os("HOME") {
-        builder.cwd(home);
+    // Working directory: the requested one (a restart workspace restore) when it
+    // still exists, else the process default ($HOME). A stale/missing dir must
+    // not fail the spawn — fall back rather than error.
+    let start_dir = cwd
+        .filter(|d| d.is_dir())
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
+    if let Some(dir) = start_dir {
+        builder.cwd(dir);
     }
 
     let child = pair.slave.spawn_command(builder)?;

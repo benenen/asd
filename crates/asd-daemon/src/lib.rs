@@ -11,6 +11,7 @@
 
 mod conn;
 mod registry;
+mod restart;
 mod session;
 
 use std::path::PathBuf;
@@ -64,8 +65,23 @@ async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
 
     let registry = Arc::new(Mutex::new(Registry::default()));
 
+    // Restart workspace restore: if a predecessor daemon was asked to restart
+    // (SIGUSR1) it left a state file — recreate each session as a fresh shell in
+    // its saved cwd, then consume the file so a later normal start doesn't
+    // resurrect stale sessions.
+    let state_path = paths::restart_state_path(&socket_path);
+    for st in restart::take(&state_path) {
+        match Registry::create(&registry, Some(st.name.clone()), None, st.cwd) {
+            Ok(_) => info!(session = %st.name, "session workspace restored"),
+            Err((code, msg)) => warn!(session = %st.name, code, %msg, "restore failed"),
+        }
+    }
+
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    // `asd restart` sends SIGUSR1: save each session's workspace, then shut down.
+    let mut sigusr1 =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
 
     let mut conn_id: u64 = 0;
     loop {
@@ -81,6 +97,12 @@ async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
             },
             _ = sigterm.recv() => { info!("SIGTERM received"); break; }
             _ = sigint.recv() => { info!("SIGINT received"); break; }
+            _ = sigusr1.recv() => {
+                info!("SIGUSR1 received — saving session workspaces for restart");
+                let states = registry.lock().unwrap().capture_restart_state();
+                restart::write(&state_path, &states);
+                break;
+            }
         }
     }
 

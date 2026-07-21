@@ -114,7 +114,7 @@ pub async fn handle_conn(stream: UnixStream, registry: Arc<Mutex<Registry>>, con
                     sessions: registry.lock().unwrap().list(),
                 });
             }
-            Frame::Create { name, cmd } => match Registry::create(&registry, name, cmd) {
+            Frame::Create { name, cmd } => match Registry::create(&registry, name, cmd, None) {
                 Ok(name) => reply(Frame::Created { name }),
                 Err((code, msg)) => reply(Frame::Error { code, msg }),
             },

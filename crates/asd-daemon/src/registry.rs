@@ -28,6 +28,7 @@ impl Registry {
         registry: &Arc<Mutex<Self>>,
         name: Option<String>,
         cmd: Option<String>,
+        cwd: Option<std::path::PathBuf>,
     ) -> Result<String, (u32, String)> {
         let mut reg = registry.lock().unwrap();
         let name = match name {
@@ -58,6 +59,7 @@ impl Registry {
         let handle = spawn_session(
             name.clone(),
             cmd,
+            cwd,
             DEFAULT_SIZE.0,
             DEFAULT_SIZE.1,
             Arc::clone(registry),
@@ -66,6 +68,27 @@ impl Registry {
         reg.sessions.insert(name.clone(), handle);
         info!(session = %name, "session created");
         Ok(name)
+    }
+
+    /// Snapshot each session's workspace (name + cwd read from its child) for a
+    /// restart handoff. Reads `/proc/<pid>/cwd` under the lock — a cheap readlink.
+    pub fn capture_restart_state(&self) -> Vec<crate::restart::SessionState> {
+        self.sessions
+            .values()
+            .map(|h| {
+                let name = h
+                    .meta
+                    .name
+                    .lock()
+                    .map(|n| n.clone())
+                    .unwrap_or_else(|_| h.name.clone());
+                let pid = h.meta.child_pid.load(std::sync::atomic::Ordering::Relaxed);
+                crate::restart::SessionState {
+                    name,
+                    cwd: crate::restart::read_cwd(pid),
+                }
+            })
+            .collect()
     }
 
     pub fn get(&self, name: &str) -> Option<SessionHandle> {

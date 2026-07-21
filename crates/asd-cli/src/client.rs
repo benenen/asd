@@ -73,10 +73,12 @@ pub async fn restart(socket: &Path) -> anyhow::Result<Client> {
     }
 }
 
-/// Stop the daemon owning `socket` if one is recorded and alive: SIGTERM it and
-/// wait for it to remove its socket (its clean-shutdown signal), escalating to
-/// SIGKILL after a grace period; then clear any leftover socket/pid file so a
-/// fresh daemon can bind.
+/// Stop the daemon owning `socket` if one is recorded and alive, for a restart:
+/// send **SIGUSR1** (which makes the daemon record each session's workspace/cwd
+/// before shutting down, so the successor can recreate them) and wait for it to
+/// remove its socket, escalating to SIGKILL after a grace period; then clear any
+/// leftover socket/pid file so a fresh daemon can bind. (An old daemon predating
+/// the feature treats SIGUSR1 as terminate — that first restart loses sessions.)
 async fn stop_daemon(socket: &Path) {
     let pid_path = paths::pid_path(socket);
     if let Some(pid) = std::fs::read_to_string(&pid_path)
@@ -85,7 +87,7 @@ async fn stop_daemon(socket: &Path) {
         .filter(|&p| p > 0 && process_alive(p))
     {
         // SAFETY: kill(2) with a real signal; failures are ignored (racing exit).
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        unsafe { libc::kill(pid, libc::SIGUSR1) };
         let deadline = Instant::now() + Duration::from_secs(3);
         while socket.exists() {
             if Instant::now() >= deadline {
