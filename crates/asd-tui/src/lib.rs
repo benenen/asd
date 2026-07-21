@@ -24,6 +24,7 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
 mod conn;
 mod key;
@@ -332,14 +333,23 @@ fn event_loop(
         }
         if app.dirty {
             app.now_ms = now_ms();
-            // Hide the cursor before the frame is flushed: ratatui shows/moves
-            // the cursor only *after* writing the buffer, so on the ~33 fps
-            // redraws driven by the running-session shimmer the still-visible
-            // cursor would dart to each sidebar shimmer cell and back every
-            // frame (a constant flicker). Hidden during the flush, `draw` then
-            // re-shows it at the pane position — steady, no darting.
+            // Bracket the whole flush in a synchronized-output update (DEC 2026)
+            // so the host terminal composites the frame atomically. Reason: the
+            // `hide_cursor()` below emits `?25l` and `draw` re-shows the cursor
+            // (`?25h`) every frame — on the ~33 fps redraws a running session's
+            // sidebar shimmer drives, that hide→show toggle flashes the cursor
+            // even though the pane and its cursor never changed. Inside 2026 the
+            // intermediate states are never shown (it also prevents partial-frame
+            // tearing). Terminals without 2026 ignore the mode.
+            let _ = execute!(std::io::stdout(), BeginSynchronizedUpdate);
+            // Hide the cursor before the buffer is flushed: ratatui shows/moves
+            // the cursor only *after* writing the buffer, so the still-visible
+            // cursor would otherwise dart to each sidebar shimmer cell as the
+            // diff is written. Hidden during the flush, `draw` re-shows it at the
+            // pane position.
             let _ = terminal.hide_cursor();
             terminal.draw(|f| ui::draw(f, &mut app))?;
+            let _ = execute!(std::io::stdout(), EndSynchronizedUpdate);
             // Effects animate frame-by-frame, and a pane hold must expire on
             // time: stay dirty while any is pending (the input poll below caps
             // the frame rate at ~33 fps). The running borders breathe as long
