@@ -141,6 +141,44 @@ impl Daemon {
             std::thread::sleep(TICK);
         }
     }
+
+    /// The real working directory of a session's child process: `asd inspect
+    /// --json` reports the child pid, then `/proc/<pid>/cwd` is its (canonical)
+    /// cwd. `None` if the session/pid/proc entry isn't available. This is a
+    /// deterministic cwd check — unlike scraping `pwd` off the rendered screen,
+    /// which races the shell's readiness and can match a marker echoed in the
+    /// command line before the command runs.
+    fn session_cwd(&self, name: &str) -> Option<PathBuf> {
+        let out = self.cli().args(["inspect", name, "--json"]).output().ok()?;
+        let json = String::from_utf8_lossy(&out.stdout);
+        let pid: u32 = json
+            .split("\"pid\":")
+            .nth(1)?
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?;
+        if pid == 0 {
+            return None;
+        }
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    /// Poll until `name`'s child cwd equals `want`, or panic after `WAIT`.
+    fn wait_session_cwd(&self, name: &str, want: &Path) {
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            let got = self.session_cwd(name);
+            if got.as_deref() == Some(want) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{name} cwd never became {want:?} (got {got:?})"
+            );
+            std::thread::sleep(TICK);
+        }
+    }
 }
 
 impl Drop for Daemon {
@@ -1024,27 +1062,25 @@ async fn restart_preserves_session_workspace() {
     );
     let workdir = daemon.dir.join("the-workspace");
     std::fs::create_dir_all(&workdir).unwrap();
+    // The daemon captures the session cwd via /proc/<pid>/cwd, which resolves
+    // symlinks. On hosts whose temp dir has a symlink component (e.g. CI
+    // runners), the restored cwd is that physical path — so drive and assert
+    // with the canonical path, not the logical (possibly-symlinked) one.
+    let workdir = std::fs::canonicalize(&workdir).unwrap();
     daemon
         .cli()
         .args([
             "send",
             "work",
             "--text",
-            &format!("cd '{}' && echo READY", workdir.display()),
+            &format!("cd '{}'", workdir.display()),
             "--enter",
         ])
         .status()
         .unwrap();
-    // Wait until the cd has actually run (the shell prints READY).
-    assert!(
-        daemon
-            .cli()
-            .args(["wait", "work", "--text", "READY", "--timeout", "10s"])
-            .status()
-            .unwrap()
-            .success(),
-        "session never reached READY"
-    );
+    // Wait until the cd has actually taken effect (the child's real cwd), so it
+    // is captured before the daemon is asked to restart.
+    daemon.wait_session_cwd("work", &workdir);
 
     // Restart: SIGUSR1 shuts the daemon down (the session list is already kept
     // persisted on disk continuously, so no special save-on-signal step needed).
@@ -1090,25 +1126,18 @@ async fn restart_preserves_session_workspace() {
     let list = String::from_utf8_lossy(&list.stdout);
     assert!(list.contains("work"), "session not restored: {list}");
 
-    // ...and its fresh shell is in the saved directory (pwd prints the path).
-    daemon
-        .cli()
-        .args(["send", "work", "--text", "pwd", "--enter"])
-        .status()
-        .unwrap();
-    let in_cwd = daemon
-        .cli()
-        .args([
-            "wait",
-            "work",
-            "--text",
-            "the-workspace",
-            "--timeout",
-            "10s",
-        ])
-        .status()
-        .unwrap()
-        .success();
+    // ...and its fresh shell is in the saved directory (the child's real cwd).
+    // Poll without panicking so the detached successor `d2` is still reaped on
+    // failure.
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut in_cwd = false;
+    while std::time::Instant::now() < deadline {
+        if daemon.session_cwd("work").as_deref() == Some(workdir.as_path()) {
+            in_cwd = true;
+            break;
+        }
+        std::thread::sleep(TICK);
+    }
     let _ = d2.kill();
     let _ = d2.wait();
     assert!(in_cwd, "restored shell is not in the saved cwd");
@@ -1124,26 +1153,26 @@ async fn sessions_persist_across_a_full_stop() {
     }
     let workdir = daemon.dir.join("web-workspace");
     std::fs::create_dir_all(&workdir).unwrap();
+    // The daemon captures the session cwd via /proc/<pid>/cwd, which resolves
+    // symlinks. On hosts whose temp dir has a symlink component (e.g. CI
+    // runners), the restored cwd is that physical path — so drive and assert
+    // with the canonical path, not the logical (possibly-symlinked) one.
+    let workdir = std::fs::canonicalize(&workdir).unwrap();
+    // cd web into workdir, then confirm the cd actually took effect by reading
+    // the child's real cwd before stopping. (A screen marker like "READY" would
+    // also match the echoed command line before `cd` even runs.)
     daemon
         .cli()
         .args([
             "send",
             "web",
             "--text",
-            &format!("cd '{}' && echo READY", workdir.display()),
+            &format!("cd '{}'", workdir.display()),
             "--enter",
         ])
         .status()
         .unwrap();
-    assert!(
-        daemon
-            .cli()
-            .args(["wait", "web", "--text", "READY", "--timeout", "10s"])
-            .status()
-            .unwrap()
-            .success(),
-        "web never reached READY"
-    );
+    daemon.wait_session_cwd("web", &workdir);
 
     daemon.stop_and_wait();
     let mut successor = daemon.respawn_successor();
@@ -1155,27 +1184,8 @@ async fn sessions_persist_across_a_full_stop() {
         "both restored: {list}"
     );
 
-    daemon
-        .cli()
-        .args(["send", "web", "--text", "pwd", "--enter"])
-        .status()
-        .unwrap();
-    assert!(
-        daemon
-            .cli()
-            .args([
-                "wait",
-                "web",
-                "--text",
-                workdir.to_str().unwrap(),
-                "--timeout",
-                "10s"
-            ])
-            .status()
-            .unwrap()
-            .success(),
-        "web not restored in its saved cwd"
-    );
+    // The restored web session must be back in its saved cwd.
+    daemon.wait_session_cwd("web", &workdir);
 
     unsafe { libc::kill(successor.id() as i32, libc::SIGTERM) };
     let _ = successor.wait();
