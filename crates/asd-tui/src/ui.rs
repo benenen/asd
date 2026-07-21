@@ -280,8 +280,10 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
         let text_x = area.left() + ROW_TEXT_X;
         // Line 1: [ordinal][name] … kill mark. Column 0 is left blank (it only
         // ever carries the selected row's accent bar, drawn below).
-        // 1-based ordinal, right-aligned in 2 cols — it matches the Ctrl+A <n>
-        // quick-switch for the first nine rows (dimmer past nine: no shortcut).
+        // 1-based ordinal, LEFT-aligned in 2 cols so a single-digit number hugs
+        // the frame (col 1) instead of floating a column in; the name stays put
+        // at ROW_TEXT_X, so the two are no longer jammed together. Matches the
+        // Ctrl+A <n> quick-switch for the first nine rows (dimmer past nine).
         let n = i + 1;
         let num_style = if selected {
             row_bg.fg(ACCENT)
@@ -290,7 +292,7 @@ fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
         } else {
             row_bg.fg(DIM)
         };
-        buf.set_string(area.left() + 1, y, format!("{n:>2}"), num_style);
+        buf.set_string(area.left() + 1, y, format!("{n:<2}"), num_style);
         // The session hosting this UI is shown but not selectable: dim it. A
         // running session's text is drawn in the saturated accent so the hue
         // shimmer (`App::process_running_fx`) has color to rotate — hue-shifting
