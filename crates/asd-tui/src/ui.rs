@@ -15,9 +15,10 @@ use crate::modal::Modal;
 /// Sidebar width in cells (incl. its 1-cell right border).
 pub const SIDEBAR_W: u16 = 28;
 /// Column (relative to the sidebar's left) where a row's name/title text
-/// starts, after the 1-col marker and the 2-col ordinal. Shared with the
-/// running-shimmer so only the text — not the ordinal — is hue-shifted.
-pub const ROW_TEXT_X: u16 = 4;
+/// starts: col 0 is reserved for the selected row's accent bar, cols 1-2 for
+/// the ordinal, so text begins right after at col 3. Shared with the running
+/// shimmer so only the text — not the ordinal — is hue-shifted.
+pub const ROW_TEXT_X: u16 = 3;
 
 /// The session index that the `Ctrl+A <digit>` quick-switch selects, or `None`
 /// for a digit with no target. Only `1..=9` map (to the 1st..9th session); the
