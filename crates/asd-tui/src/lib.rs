@@ -334,12 +334,13 @@ fn event_loop(
         if app.dirty {
             app.now_ms = now_ms();
             // Composite each frame atomically (DEC 2026 synchronized output) so a
-            // ~33 fps shimmer redraw can't display a partially-written frame.
-            // The pane and modal cursors are painted into the buffer (see
-            // `ui::draw`), not driven via the real terminal cursor — ratatui keeps
-            // the real cursor hidden because the frame's cursor_position stays
-            // None — so no cursor hide/show/dart can flicker on these redraws.
-            // Terminals without 2026 ignore the mode.
+            // ~33 fps shimmer redraw can't display a partially-written frame: the
+            // sidebar-cell rewrites would otherwise drag the real terminal cursor
+            // across them before `ui::draw` repositions it to the pane. We keep
+            // the REAL cursor (ui::draw positions it — the IME/codex/vim anchor to
+            // it) and, critically, never hide it per frame: the old `hide_cursor()`
+            // emitted `?25l`/`?25h` every frame, and that visibility toggle was the
+            // flicker. Terminals without 2026 ignore the mode.
             let _ = execute!(std::io::stdout(), BeginSynchronizedUpdate);
             terminal.draw(|f| ui::draw(f, &mut app))?;
             let _ = execute!(std::io::stdout(), EndSynchronizedUpdate);

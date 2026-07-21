@@ -136,24 +136,22 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     let modal_open = app.modal.is_some();
     if let Some(snap) = app.snapshot() {
         render_pane(f.buffer_mut(), pane, &snap, sel);
-        // Paint the pane cursor as a reverse-video cell rather than driving the
-        // real terminal cursor. A running session's sidebar shimmer redraws the
-        // frame at ~33 fps; the real cursor would be hidden+reshown (or
-        // repositioned) every frame — a visible flicker — whereas a painted cell
-        // is part of the atomic frame buffer and only moves when the shell's
-        // cursor does. Never calling `set_cursor_position` also keeps ratatui
-        // hiding the real cursor. Suppressed under a modal / while scrolled back.
+        // Position the REAL terminal cursor at the pane's cursor. It must be the
+        // real cursor — not a painted cell — so the OS input-method (IME) popup
+        // and TUI programs like codex/vim anchor to it. Suppressed under a modal
+        // / while scrolled back. Crucially we do NOT hide+reshow it per frame:
+        // that `?25l`/`?25h` toggle was the flicker under the running-session
+        // shimmer's ~33 fps redraws. Left shown and repositioned to the same
+        // spot (a no-op), with the whole frame wrapped in synchronized output
+        // (see the event loop) so the sidebar-cell writes can't drag it.
         if !modal_open
             && app.scroll == 0
             && snap.cursor.visible
             && let Some((cx, cy)) = snap.cursor.position
             && cx < pane.width
             && cy < pane.height
-            && let Some(cell) = f
-                .buffer_mut()
-                .cell_mut(Position::new(pane.x + cx, pane.y + cy))
         {
-            cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+            f.set_cursor_position(Position::new(pane.x + cx, pane.y + cy));
         }
         // The scrollback offset is shown in the status bar (next to the session
         // count), not over the pane's top row — see `draw_bar`.
@@ -247,12 +245,10 @@ fn draw_modal(f: &mut Frame<'_>, modal: &Modal) {
             buf.set_string(ix, inner.y + 3, truncate(&line, iw), style);
         }
     }
-    if let Some(pos) = cursor
-        && let Some(cell) = f.buffer_mut().cell_mut(pos)
-    {
-        // Painted caret (reverse-video), matching the pane cursor — the real
-        // terminal cursor is never used, so shimmer redraws can't flicker it.
-        cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+    if let Some(pos) = cursor {
+        // Real terminal cursor for the rename caret, so the IME popup anchors to
+        // it while typing (e.g. a CJK session name).
+        f.set_cursor_position(pos);
     }
 }
 
