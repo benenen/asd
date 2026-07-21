@@ -83,6 +83,11 @@ async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
             Err((code, msg)) => warn!(session = %st.name, code, %msg, "restore failed"),
         }
     }
+    // Compact the file down to what actually came back. Each successful restore
+    // above already re-persists, but a boot where every entry failed to restore
+    // (e.g. a stale hand-edited file) would otherwise leave the bad entries on
+    // disk and retry them forever — this one write drops them.
+    registry.lock().unwrap().persist();
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;

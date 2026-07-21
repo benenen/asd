@@ -115,7 +115,9 @@ impl Registry {
     }
 
     /// Rewrite the persisted session list from the live set (no-op while frozen).
-    fn persist(&self) {
+    /// Also called once after startup restore to compact the file down to the
+    /// sessions that actually came back.
+    pub fn persist(&self) {
         if self.persist_frozen {
             return;
         }

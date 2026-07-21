@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// One session's restorable workspace: its name and cwd (if readable).
+/// One session's entry in the persisted list: its name and cwd (if readable).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionState {
     pub name: String,
