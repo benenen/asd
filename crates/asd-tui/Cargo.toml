@@ -19,3 +19,6 @@ tachyonfx = "0.25"
 unicode-width = "0.2"
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Signal handlers (SIGHUP/SIGTERM/SIGINT) that restore the terminal on an
+# abnormal exit — a Rust panic hook can't catch a kill/hangup.
+libc = { workspace = true }

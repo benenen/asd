@@ -276,6 +276,7 @@ dependencies = [
  "anyhow",
  "asd-proto",
  "asd-vt",
+ "libc",
  "ratatui",
  "tachyonfx",
  "tokio",
