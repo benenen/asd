@@ -54,13 +54,6 @@ pub fn pid_path(socket: &Path) -> PathBuf {
     socket.with_extension("pid")
 }
 
-/// Where the daemon records each session's workspace (cwd) when asked to restart
-/// (SIGUSR1); the successor daemon consumes it to recreate the sessions in their
-/// old directories. Per-socket, a sibling of the pid file.
-pub fn restart_state_path(socket: &Path) -> PathBuf {
-    socket.with_extension("restart")
-}
-
 /// Daemon data directory: `~/.local/share/asd/` (session metadata, logs).
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME")
@@ -69,6 +62,15 @@ pub fn data_dir() -> PathBuf {
         return PathBuf::from(dir).join("asd");
     }
     home_dir().join(".local/share/asd")
+}
+
+/// Path of the persisted session list: `<data_dir>/sessions.tsv`. The daemon
+/// rewrites it on every session create/rename/kill and restores from it on every
+/// startup. Lives in the (persistent) data directory, keyed by it — a single
+/// daemon per data directory. Read-write daemon state, distinct from the
+/// read-only user `config.toml`.
+pub fn session_list_path() -> PathBuf {
+    data_dir().join("sessions.tsv")
 }
 
 /// Config file: `$XDG_CONFIG_HOME/asd/config.toml`, falling back to
@@ -139,6 +141,13 @@ mod tests {
             pid_path(Path::new("/custom/mysock")),
             PathBuf::from("/custom/mysock.pid")
         );
+    }
+
+    #[test]
+    fn session_list_path_is_sessions_tsv_in_data_dir() {
+        let p = session_list_path();
+        assert_eq!(p.file_name().unwrap(), std::ffi::OsStr::new("sessions.tsv"));
+        assert_eq!(p.parent().unwrap(), data_dir());
     }
 
     #[test]
