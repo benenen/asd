@@ -332,6 +332,13 @@ fn event_loop(
         }
         if app.dirty {
             app.now_ms = now_ms();
+            // Hide the cursor before the frame is flushed: ratatui shows/moves
+            // the cursor only *after* writing the buffer, so on the ~33 fps
+            // redraws driven by the running-session shimmer the still-visible
+            // cursor would dart to each sidebar shimmer cell and back every
+            // frame (a constant flicker). Hidden during the flush, `draw` then
+            // re-shows it at the pane position — steady, no darting.
+            let _ = terminal.hide_cursor();
             terminal.draw(|f| ui::draw(f, &mut app))?;
             // Effects animate frame-by-frame, and a pane hold must expire on
             // time: stay dirty while any is pending (the input poll below caps
