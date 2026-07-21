@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "asd"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "asd-cli",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "asd-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "asd-daemon",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "asd-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "asd-proto",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "asd-dioxus"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "asd-proto",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "asd-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "postcard",
  "serde",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "asd-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "asd-proto",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "asd-vt"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libghostty-vt",
 ]
