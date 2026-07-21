@@ -12,7 +12,7 @@ const path = require('path');
 const TARGETS = {
   'linux x64': 'x86_64-unknown-linux-gnu',
   'linux arm64': 'aarch64-unknown-linux-gnu',
-  'darwin x64': 'x86_64-apple-darwin',
+  // macOS is Apple Silicon (arm64) only — the Intel release leg was dropped.
   'darwin arm64': 'aarch64-apple-darwin',
   'win32 x64': 'x86_64-pc-windows-msvc'
 };

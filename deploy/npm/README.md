@@ -26,13 +26,14 @@ taken on the registry), but the exposed command is still just `asd`.
 | OS            | x64 | arm64 |
 |---------------|-----|-------|
 | Linux (gnu)   | ✅  | ✅    |
-| macOS         | ✅  | ✅    |
+| macOS         | —   | ✅    |
 | Windows (msvc)| ✅  | —     |
 
-These mirror the assets built by the release CI. On Windows the binary is the
-GUI client (the daemon/CLI side is Unix-only). Any other platform/arch has no
-prebuilt asset — the installer fails with a clear message and you can build from
-source instead.
+These mirror the assets built by the release CI. macOS ships **Apple Silicon
+(arm64) only** — the Intel leg was dropped because GitHub's Intel runners are
+frequently unavailable. On Windows the binary is the GUI client (the daemon/CLI
+side is Unix-only). Any other platform/arch has no prebuilt asset — the installer
+fails with a clear message and you can build from source instead.
 
 ## How it works
 
@@ -42,7 +43,6 @@ source instead.
    release CI publishes (see [`lib/shared.js`](lib/shared.js)):
    - `linux/x64` → `x86_64-unknown-linux-gnu`
    - `linux/arm64` → `aarch64-unknown-linux-gnu`
-   - `darwin/x64` → `x86_64-apple-darwin`
    - `darwin/arm64` → `aarch64-apple-darwin`
    - `win32/x64` → `x86_64-pc-windows-msvc`
 2. Downloads the matching asset

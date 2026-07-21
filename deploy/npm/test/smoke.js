@@ -24,11 +24,11 @@ function eq(a, b, label) {
 // 1) Every published target maps as release.yml names it.
 eq(shared.rustTarget('linux', 'x64'), 'x86_64-unknown-linux-gnu', 'linux x64');
 eq(shared.rustTarget('linux', 'arm64'), 'aarch64-unknown-linux-gnu', 'linux arm64');
-eq(shared.rustTarget('darwin', 'x64'), 'x86_64-apple-darwin', 'darwin x64');
 eq(shared.rustTarget('darwin', 'arm64'), 'aarch64-apple-darwin', 'darwin arm64');
 eq(shared.rustTarget('win32', 'x64'), 'x86_64-pc-windows-msvc', 'win32 x64');
 
 // 2) Unsupported combos have no asset (must fail loudly, not guess).
+eq(shared.rustTarget('darwin', 'x64'), null, 'darwin x64 unsupported (arm64-only macOS)');
 eq(shared.rustTarget('win32', 'arm64'), null, 'win32 arm64 unsupported');
 eq(shared.rustTarget('linux', 'ia32'), null, 'linux ia32 unsupported');
 eq(shared.rustTarget('sunos', 'x64'), null, 'sunos unsupported');

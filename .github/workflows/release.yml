@@ -148,8 +148,9 @@ jobs:
           generate_release_notes: true
 
   # macOS — full binary (CLI + daemon + GUI); macOS is unix, so the daemon side
-  # compiles. aarch64 is native on the runner; x86_64 is cross-built by the Apple
-  # toolchain. Zig builds the vendored ghostty for each `-Dtarget`.
+  # compiles. Apple Silicon (arm64) only, on a native runner; Zig builds the
+  # vendored ghostty. The Intel (x86_64) leg was dropped: GitHub's macos-13
+  # runners are frequently unavailable and were blocking the whole release.
   macos:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -157,13 +158,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Native per-arch runners so zig never cross-compiles ghostty (the
-          # `<arch>-macos-none` cross target didn't link libSystem): arm64 on
-          # macos-14, Intel on macos-13.
+          # Native runner so zig never cross-compiles ghostty (the
+          # `<arch>-macos-none` cross target didn't link libSystem).
           - target: aarch64-apple-darwin
             os: macos-14
-          - target: x86_64-apple-darwin
-            os: macos-13
     steps:
       - uses: actions/checkout@v4
 
