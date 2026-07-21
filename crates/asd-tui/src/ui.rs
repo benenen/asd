@@ -136,16 +136,24 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     let modal_open = app.modal.is_some();
     if let Some(snap) = app.snapshot() {
         render_pane(f.buffer_mut(), pane, &snap, sel);
-        // A real terminal cursor when following live output — suppressed under a
-        // modal (the modal owns the cursor).
+        // Paint the pane cursor as a reverse-video cell rather than driving the
+        // real terminal cursor. A running session's sidebar shimmer redraws the
+        // frame at ~33 fps; the real cursor would be hidden+reshown (or
+        // repositioned) every frame — a visible flicker — whereas a painted cell
+        // is part of the atomic frame buffer and only moves when the shell's
+        // cursor does. Never calling `set_cursor_position` also keeps ratatui
+        // hiding the real cursor. Suppressed under a modal / while scrolled back.
         if !modal_open
             && app.scroll == 0
             && snap.cursor.visible
             && let Some((cx, cy)) = snap.cursor.position
             && cx < pane.width
             && cy < pane.height
+            && let Some(cell) = f
+                .buffer_mut()
+                .cell_mut(Position::new(pane.x + cx, pane.y + cy))
         {
-            f.set_cursor_position(Position::new(pane.x + cx, pane.y + cy));
+            cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
         }
         // The scrollback offset is shown in the status bar (next to the session
         // count), not over the pane's top row — see `draw_bar`.
@@ -239,8 +247,12 @@ fn draw_modal(f: &mut Frame<'_>, modal: &Modal) {
             buf.set_string(ix, inner.y + 3, truncate(&line, iw), style);
         }
     }
-    if let Some(pos) = cursor {
-        f.set_cursor_position(pos);
+    if let Some(pos) = cursor
+        && let Some(cell) = f.buffer_mut().cell_mut(pos)
+    {
+        // Painted caret (reverse-video), matching the pane cursor — the real
+        // terminal cursor is never used, so shimmer redraws can't flicker it.
+        cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
     }
 }
 
