@@ -26,9 +26,6 @@ use crate::registry::Registry;
 /// unaffected.
 pub const OUTPUT_QUEUE_CAP: usize = 4 * 1024 * 1024;
 
-/// Scrollback line count (fixed in M0; moves to the config file from M1 on).
-const SCROLLBACK_LINES: usize = 10_000;
-
 /// Queue element from connection tasks → the socket write loop.
 #[derive(Debug)]
 pub enum ConnItem {
@@ -404,12 +401,14 @@ fn proc_command(_pid: libc::pid_t) -> Option<String> {
 
 /// Create the pty, start the child process, and launch the session thread
 /// and pty read thread.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_session(
     name: String,
     cmd: Option<String>,
     cwd: Option<std::path::PathBuf>,
     cols: u16,
     rows: u16,
+    scrollback: usize,
     registry: Arc<Mutex<Registry>>,
 ) -> anyhow::Result<SessionHandle> {
     let pty = native_pty_system();
@@ -509,7 +508,7 @@ pub fn spawn_session(
             .name(format!("session-{name}"))
             .spawn(move || {
                 session_thread(
-                    name, rx, master, pty_writer, child, cols, rows, meta, registry,
+                    name, rx, master, pty_writer, child, cols, rows, scrollback, meta, registry,
                 );
             })?;
     }
@@ -532,10 +531,11 @@ fn session_thread(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     cols: u16,
     rows: u16,
+    scrollback: usize,
     meta: Arc<SessionMeta>,
     registry: Arc<Mutex<Registry>>,
 ) {
-    let mut vt = GhosttyVt::new(cols, rows, SCROLLBACK_LINES);
+    let mut vt = GhosttyVt::new(cols, rows, scrollback);
     let mut clients: Vec<ClientSink> = Vec::new();
     info!(session = %name, pid = meta.child_pid.load(Ordering::Relaxed), "session started");
 

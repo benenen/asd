@@ -13,15 +13,27 @@ use crate::session::{SessionHandle, SessionMsg, spawn_session};
 /// overridden by the client's size on attach).
 const DEFAULT_SIZE: (u16, u16) = (80, 24);
 
-#[derive(Default)]
 pub struct Registry {
     sessions: HashMap<String, SessionHandle>,
     /// Auto-naming counter for `s0`, `s1`, ... — monotonically increasing
     /// (avoids reusing a name that just died).
     next_auto: u64,
+    /// Scrollback depth (lines) applied to every session this registry spawns;
+    /// comes from the daemon config, resolved once at startup.
+    scrollback_lines: usize,
 }
 
 impl Registry {
+    /// Create an empty registry whose sessions will each keep `scrollback_lines`
+    /// lines of scrollback history.
+    pub fn new(scrollback_lines: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            next_auto: 0,
+            scrollback_lines,
+        }
+    }
+
     /// Create a session. `name` defaults to auto-assignment; `cmd` defaults
     /// to `$SHELL`.
     pub fn create(
@@ -56,12 +68,14 @@ impl Registry {
             },
         };
 
+        let scrollback = reg.scrollback_lines;
         let handle = spawn_session(
             name.clone(),
             cmd,
             cwd,
             DEFAULT_SIZE.0,
             DEFAULT_SIZE.1,
+            scrollback,
             Arc::clone(registry),
         )
         .map_err(|e| (code::INTERNAL, format!("failed to spawn session: {e}")))?;

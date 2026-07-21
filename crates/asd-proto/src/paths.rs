@@ -71,6 +71,30 @@ pub fn data_dir() -> PathBuf {
     home_dir().join(".local/share/asd")
 }
 
+/// Config file: `$XDG_CONFIG_HOME/asd/config.toml`, falling back to
+/// `~/.config/asd/config.toml`. `ASD_CONFIG` overrides it entirely (tests,
+/// multi-instance). The daemon reads it once at startup; it is never
+/// auto-created — a missing file just means "all defaults".
+pub fn config_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("ASD_CONFIG")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
+    }
+    config_dir().join("config.toml")
+}
+
+/// Directory holding the config file: `$XDG_CONFIG_HOME/asd`, falling back to
+/// `~/.config/asd`.
+fn config_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("asd");
+    }
+    home_dir().join(".config/asd")
+}
+
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())

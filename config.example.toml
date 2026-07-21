@@ -1,0 +1,19 @@
+# asd daemon configuration — example.
+#
+# Copy this to your config path and edit. The daemon looks for it at:
+#   $ASD_CONFIG                      (if set, wins)
+#   $XDG_CONFIG_HOME/asd/config.toml (if XDG_CONFIG_HOME is set)
+#   ~/.config/asd/config.toml        (default)
+#
+#   mkdir -p ~/.config/asd
+#   cp config.example.toml ~/.config/asd/config.toml
+#
+# The daemon reads it once at startup, so run `asd restart` after editing to
+# apply changes. Every key is optional — anything omitted uses the default
+# shown below, and a missing or malformed file just means "all defaults".
+
+[session]
+# Lines of scrollback history each session's terminal keeps (how far you can
+# scroll back / how much `asd peek --scrollback` returns). Default: 10000.
+# 0 disables scrollback. Memory grows only with lines actually produced.
+scrollback_lines = 10000

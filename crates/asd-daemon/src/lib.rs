@@ -9,6 +9,7 @@
 //! the data directory) is the spawner's responsibility (the self-healing
 //! path of `asd attach -A` / `asd new`).
 
+mod config;
 mod conn;
 mod registry;
 mod restart;
@@ -63,7 +64,11 @@ async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
         warn!(error = %e, "failed to write pid file");
     }
 
-    let registry = Arc::new(Mutex::new(Registry::default()));
+    // Load config (scrollback depth, …) once at startup; a missing/broken file
+    // falls back to defaults. It governs every session this daemon spawns —
+    // change it and `asd restart` to apply.
+    let config = config::Config::load(&paths::config_path());
+    let registry = Arc::new(Mutex::new(Registry::new(config.scrollback_lines)));
 
     // Restart workspace restore: if a predecessor daemon was asked to restart
     // (SIGUSR1) it left a state file — recreate each session as a fresh shell in
