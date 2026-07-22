@@ -1,6 +1,6 @@
 {
   "name": "@shibenenen/asd",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "asd — terminal session client + headless mux daemon (shpool-style: one session = one PTY). Installs the matching prebuilt binary from GitHub Releases.",
   "keywords": ["terminal", "tui", "mux", "pty", "daemon", "cli", "shpool"],
   "homepage": "https://github.com/benenen/asd#readme",
