@@ -1,6 +1,6 @@
 # asd-dioxus
 
-GPU terminal client built with [Dioxus Desktop][dioxus] + [ghostty-web][ghostty-web]: a host-grouped session sidebar, saved SSH connections, a settings overlay, and pure-Rust SSH remotes (the M2 feature set).
+Terminal client built with [Dioxus Desktop][dioxus] + [ghostty-web][ghostty-web]: a host-grouped session sidebar, saved SSH connections, a settings overlay, and pure-Rust SSH remotes (the M2 feature set).
 
 This is a **library crate**: the root `asd` binary combines it via the `dioxus` feature. Entry point: `asd_dioxus::run(session: Option<String>)`.
 

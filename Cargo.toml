@@ -1,6 +1,6 @@
 [package]
 name = "asd"
-description = "asd: GPU terminal mux — CLI, embedded daemon, and GUI in one binary"
+description = "asd: terminal session mux — CLI, embedded daemon, and GUI in one binary"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,7 +17,7 @@ copyright = "2026, benshi"
 section = "utils"
 priority = "optional"
 extended-description = """\
-asd is a GPU-rendered terminal multiplexer client with an embedded headless \
+asd is a terminal session multiplexer client with an embedded headless \
 daemon: one session = one PTY (shpool-style), a two-pane GUI, and SSH-remote \
 session lists. This package ships the full binary (CLI + daemon + GUI)."""
 assets = [

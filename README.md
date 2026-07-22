@@ -5,7 +5,7 @@
 [![npm](https://img.shields.io/npm/v/@shibenenen/asd?label=npm)](https://www.npmjs.com/package/@shibenenen/asd)
 
 A terminal **session multiplexer**: a background daemon owns your PTY sessions,
-reachable from a ratatui TUI, a scriptable CLI, and a GPU-accelerated desktop
+reachable from a ratatui TUI, a scriptable CLI, and a desktop
 GUI. Attach and detach at will — sessions and their scrollback survive the
 client disconnecting. Local *and* remote-over-SSH sessions share one interface.
 
@@ -21,7 +21,7 @@ mouse-mode mirroring for full-screen apps like `vim`/`htop`.
 - **Persistent sessions** — a background daemon owns each PTY; clients
   attach/detach freely and nothing is lost on disconnect.
 - **Three clients, one binary** — `asd ui` (ratatui TUI), `asd attach` (a
-  VT-rendering CLI client), and a GPU GUI (bare `asd`).
+  VT-rendering CLI client), and a desktop GUI (bare `asd`).
 - **Local + remote** — reach a local daemon over a Unix socket, or a remote one
   over pure-Rust SSH (`russh`) with no `ssh` subprocess.
 - **Scriptable** — `send` / `peek` / `wait` / `inspect` drive and observe
@@ -46,7 +46,7 @@ library crates with hard dependency boundaries:
 | `asd-daemon` | Session lifecycle + Unix-socket service — one PTY + headless terminal per session, broadcast to attached clients. |
 | `asd-cli` | The `asd` command surface — the `attach` VT client, scripting commands, the embedded daemon, and the SSH `--stdio` proxy. |
 | `asd-tui` | `asd ui` — a ratatui session sidebar next to a live terminal pane; switching, local scrollback, and selection. |
-| `asd-dioxus` | The GPU GUI (Dioxus Desktop + ghostty-web): host-grouped sidebar, saved SSH connections, settings. |
+| `asd-dioxus` | The desktop GUI (Dioxus Desktop + ghostty-web): host-grouped sidebar, saved SSH connections, settings. |
 
 **Daemon–client model:** a background daemon holds every session's PTY and
 terminal state; clients connect over a Unix socket (or an SSH-proxied one) and

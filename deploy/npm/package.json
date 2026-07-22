@@ -1,8 +1,8 @@
 {
   "name": "@shibenenen/asd",
   "version": "0.1.5",
-  "description": "asd — GPU terminal client + headless mux daemon (shpool-style: one session = one PTY). Installs the matching prebuilt binary from GitHub Releases.",
-  "keywords": ["terminal", "tui", "mux", "pty", "daemon", "cli", "gpu", "shpool"],
+  "description": "asd — terminal session client + headless mux daemon (shpool-style: one session = one PTY). Installs the matching prebuilt binary from GitHub Releases.",
+  "keywords": ["terminal", "tui", "mux", "pty", "daemon", "cli", "shpool"],
   "homepage": "https://github.com/benenen/asd#readme",
   "bugs": {
     "url": "https://github.com/benenen/asd/issues"

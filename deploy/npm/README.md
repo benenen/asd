@@ -1,6 +1,6 @@
 # asd (npm installer)
 
-Install [`asd`](https://github.com/benenen/asd) — a GPU terminal client + headless
+Install [`asd`](https://github.com/benenen/asd) — a terminal client + headless
 mux daemon (shpool-style: one session = one PTY) — via npm. This package ships no
 binary itself; on install it downloads the prebuilt executable that matches your
 platform from the project's GitHub Releases.
