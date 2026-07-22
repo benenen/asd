@@ -11,7 +11,9 @@
 //! creates, `r` renames (input modal), `x` kills (confirmation modal), `R`
 //! reconnects, `q` quits, `Ctrl+A` sends a literal Ctrl+A. The mouse
 //! selects/kills in the sidebar and scrolls the pane (local scrollback, like
-//! `asd attach`); Shift+PageUp/PageDown scroll too.
+//! `asd attach`) — but when the focused session tracks the mouse (opencode,
+//! vim, htop) the event is forwarded to it instead (SGR-encoded); Shift keeps
+//! the mouse local, and Shift+PageUp/PageDown scroll too.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -977,6 +979,44 @@ impl App {
             && m.row >= pane.top()
             && m.row < pane.bottom();
         let on_divider = ui::divider_col(self.sidebar_w, self.sidebar_hidden) == Some(m.column);
+        // When the focused session is tracking the mouse (opencode, vim, htop),
+        // forward the event to it instead of using the wheel/click for local
+        // scroll/selection — otherwise the app never receives mouse input (e.g.
+        // opencode can't wheel-scroll). Only in the live view (not scrolled back
+        // into history) and over the pane, not while Shift is held (Shift stays
+        // local: host-native selection / scrollback) and not mid local gesture.
+        // Encodes SGR (1006), which such apps enable; a session without SGR falls
+        // through to local handling.
+        if self.scroll == 0
+            && in_pane
+            && !m.modifiers.contains(KeyModifiers::SHIFT)
+            && !self.dragging_divider
+            && !self.selecting
+        {
+            let modes = self.vt.as_mut().and_then(|vt| {
+                if vt.is_mouse_tracking() {
+                    Some(vt.mouse_modes())
+                } else {
+                    None
+                }
+            });
+            if let Some(modes) = modes
+                && modes.iter().any(|&x| x == 1006 || x == 1015 || x == 1016)
+            {
+                if let Some(report) = encode_sgr_mouse(
+                    m.kind,
+                    m.modifiers,
+                    m.column - pane.left(),
+                    m.row - pane.top(),
+                    &modes,
+                ) {
+                    self.send(Cmd::Input(report));
+                }
+                // The session owns the mouse in the live view: don't also
+                // scroll/select locally, even for an event it didn't want.
+                return;
+            }
+        }
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_by(WHEEL_STEP as isize),
             MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_STEP as isize)),
@@ -1139,4 +1179,149 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Encode a crossterm mouse event as an SGR (mode 1006) mouse report, to forward
+/// to a session that has mouse tracking on. `col`/`row` are 0-based
+/// pane-relative; the report uses 1-based coordinates. `modes` are the session's
+/// enabled DEC mouse modes: motion (drag/move) is only reported when the session
+/// asked for it (1002 button-event / 1003 any-event), so a plain click-tracking
+/// app isn't spammed. Returns `None` for events the session's modes don't want.
+fn encode_sgr_mouse(
+    kind: MouseEventKind,
+    mods: KeyModifiers,
+    col: u16,
+    row: u16,
+    modes: &[u16],
+) -> Option<Vec<u8>> {
+    let button = |b: MouseButton| match b {
+        MouseButton::Left => 0u16,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    // (SGR button code, is-release)
+    let (mut cb, release) = match kind {
+        MouseEventKind::Down(b) => (button(b), false),
+        MouseEventKind::Up(b) => (button(b), true),
+        MouseEventKind::Drag(b) => {
+            if !modes.iter().any(|&m| m == 1002 || m == 1003) {
+                return None;
+            }
+            (button(b) + 32, false) // + motion bit
+        }
+        MouseEventKind::Moved => {
+            if !modes.contains(&1003) {
+                return None;
+            }
+            (3 + 32, false) // no button + motion
+        }
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+    };
+    // Modifier bits (Shift is handled by the caller as a local-override bypass,
+    // so it is not normally set here, but honor it if present).
+    if mods.contains(KeyModifiers::SHIFT) {
+        cb += 4;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        cb += 8;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        cb += 16;
+    }
+    let end = if release { 'm' } else { 'M' };
+    Some(format!("\x1b[<{cb};{};{}{end}", col + 1, row + 1).into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sgr_mouse_encodes_wheel_click_and_modifiers() {
+        let sgr = [1000u16, 1006];
+        // Wheel up/down: buttons 64/65, 1-based pane-relative coords.
+        assert_eq!(
+            encode_sgr_mouse(MouseEventKind::ScrollUp, KeyModifiers::NONE, 0, 0, &sgr),
+            Some(b"\x1b[<64;1;1M".to_vec())
+        );
+        assert_eq!(
+            encode_sgr_mouse(MouseEventKind::ScrollDown, KeyModifiers::NONE, 4, 2, &sgr),
+            Some(b"\x1b[<65;5;3M".to_vec())
+        );
+        // Left press (M) and release (m).
+        assert_eq!(
+            encode_sgr_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                9,
+                4,
+                &sgr
+            ),
+            Some(b"\x1b[<0;10;5M".to_vec())
+        );
+        assert_eq!(
+            encode_sgr_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                KeyModifiers::NONE,
+                9,
+                4,
+                &sgr
+            ),
+            Some(b"\x1b[<0;10;5m".to_vec())
+        );
+        // Ctrl adds 16 to the button code.
+        assert_eq!(
+            encode_sgr_mouse(MouseEventKind::ScrollUp, KeyModifiers::CONTROL, 0, 0, &sgr),
+            Some(b"\x1b[<80;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn sgr_mouse_motion_only_when_the_session_wants_it() {
+        // Drag is dropped unless the session enabled 1002/1003.
+        assert_eq!(
+            encode_sgr_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                KeyModifiers::NONE,
+                0,
+                0,
+                &[1000, 1006]
+            ),
+            None
+        );
+        assert_eq!(
+            encode_sgr_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                KeyModifiers::NONE,
+                0,
+                0,
+                &[1002, 1006]
+            ),
+            Some(b"\x1b[<32;1;1M".to_vec())
+        );
+        // Bare motion needs 1003.
+        assert_eq!(
+            encode_sgr_mouse(
+                MouseEventKind::Moved,
+                KeyModifiers::NONE,
+                0,
+                0,
+                &[1002, 1006]
+            ),
+            None
+        );
+        assert_eq!(
+            encode_sgr_mouse(
+                MouseEventKind::Moved,
+                KeyModifiers::NONE,
+                1,
+                1,
+                &[1003, 1006]
+            ),
+            Some(b"\x1b[<35;2;2M".to_vec())
+        );
+    }
 }
