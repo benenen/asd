@@ -8,8 +8,10 @@
 //!
 //! Keys: everything is forwarded to the attached session except the `Ctrl+A`
 //! prefix (screen-style): `j/k` or arrows switch sessions, `1-9` jump, `c`
-//! creates, `r` renames (input modal), `x` kills (confirmation modal), `R`
-//! reconnects, `q` quits, `Ctrl+A` sends a literal Ctrl+A. The mouse
+//! creates, `r` renames (input modal), `x` kills (confirmation modal), `b`/`s`
+//! hide the sidebar / bottom status bar (the latter frees the pane's bottom row
+//! so an input line can reach the window edge, keeping the IME box from covering
+//! it), `R` reconnects, `q` quits, `Ctrl+A` sends a literal Ctrl+A. The mouse
 //! selects/kills in the sidebar and scrolls the pane (local scrollback, like
 //! `asd attach`) — but when the focused session tracks the mouse (opencode,
 //! vim, htop) the event is forwarded to it instead (SGR-encoded); Shift keeps
@@ -123,6 +125,11 @@ pub(crate) struct App {
     sidebar_w: u16,
     /// Sidebar hidden (Ctrl+A b) — the pane takes the full width.
     sidebar_hidden: bool,
+    /// Bottom status bar hidden (Ctrl+A s) — the pane takes the full height, so
+    /// a session's input line can reach the window's true bottom. This lets the
+    /// OS input-method candidate box float off the bottom edge instead of
+    /// covering the bottom row (the asd status bar otherwise costs a row).
+    status_hidden: bool,
     /// True while dragging the sidebar↔pane divider with the mouse.
     dragging_divider: bool,
     /// Drag selection over the pane, if any.
@@ -295,6 +302,7 @@ fn event_loop(
         ratatui::layout::Rect::new(0, 0, size.width, size.height),
         sidebar_w,
         false,
+        false,
     );
 
     let mut app = App {
@@ -310,6 +318,7 @@ fn event_loop(
         term_size: (size.width, size.height),
         sidebar_w,
         sidebar_hidden: false,
+        status_hidden: false,
         dragging_divider: false,
         sel: None,
         selecting: false,
@@ -795,6 +804,13 @@ impl App {
                     self.sidebar_hidden = !self.sidebar_hidden;
                     self.apply_layout();
                 }
+                KeyCode::Char('s') => {
+                    // Toggle the bottom status bar: hidden gives the pane the
+                    // full window height so an input line can reach the true
+                    // bottom (keeps the OS IME candidate box from covering it).
+                    self.status_hidden = !self.status_hidden;
+                    self.apply_layout();
+                }
                 // Kill asks first (confirmation modal); rename opens an input.
                 KeyCode::Char('x') => {
                     if let Some(name) = self.active.clone() {
@@ -978,7 +994,12 @@ impl App {
             return;
         }
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        let (_, pane, _) = ui::areas(area, self.sidebar_w, self.sidebar_hidden);
+        let (_, pane, _) = ui::areas(
+            area,
+            self.sidebar_w,
+            self.sidebar_hidden,
+            self.status_hidden,
+        );
         let in_pane = m.column >= pane.left()
             && m.column < pane.right()
             && m.row >= pane.top()
@@ -1150,7 +1171,12 @@ impl App {
     /// tear-free pane path (`pane_needs_render`) so no half-frame shows.
     fn apply_layout(&mut self) {
         let total = ratatui::layout::Rect::new(0, 0, self.term_size.0, self.term_size.1);
-        let grid = ui::pane_grid(total, self.sidebar_w, self.sidebar_hidden);
+        let grid = ui::pane_grid(
+            total,
+            self.sidebar_w,
+            self.sidebar_hidden,
+            self.status_hidden,
+        );
         if grid != self.grid {
             self.grid = grid;
             if let Some(vt) = &mut self.vt {

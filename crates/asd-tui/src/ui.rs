@@ -47,9 +47,16 @@ pub const MAX_SIDEBAR: u16 = 50;
 const MIN_PANE: u16 = 20;
 
 /// Split the frame: sidebar | terminal pane, with a full-width keybind/status
-/// bar along the bottom. A hidden sidebar gives the pane the full width.
-pub fn areas(total: Rect, sidebar_w: u16, hidden: bool) -> (Rect, Rect, Rect) {
-    let body_h = total.height.saturating_sub(1);
+/// bar along the bottom. A hidden sidebar gives the pane the full width; a hidden
+/// status bar (`status_hidden`) gives the *pane* the full height (the sidebar
+/// keeps its height, leaving a blank last row) so a session's input can reach the
+/// window's true bottom.
+pub fn areas(total: Rect, sidebar_w: u16, hidden: bool, status_hidden: bool) -> (Rect, Rect, Rect) {
+    // Rows reserved for the sidebar/pane. The sidebar is always height-1 (its
+    // last row is the status bar's neighbor); the pane reclaims that last row
+    // only when the status bar is hidden.
+    let side_h = total.height.saturating_sub(1);
+    let pane_h = if status_hidden { total.height } else { side_h };
     // Keep the pane usable on a narrow terminal: never let the sidebar squeeze
     // it below MIN_PANE, and drop the sidebar entirely when even the sidebar's
     // own minimum plus MIN_PANE won't fit (rather than swallow the pane whole).
@@ -58,25 +65,26 @@ pub fn areas(total: Rect, sidebar_w: u16, hidden: bool) -> (Rect, Rect, Rect) {
     } else {
         sidebar_w.min(total.width - MIN_PANE)
     };
-    let side = Rect::new(total.x, total.y, side_w, body_h);
+    let side = Rect::new(total.x, total.y, side_w, side_h);
     let pane = Rect::new(
         total.x + side_w,
         total.y,
         total.width.saturating_sub(side_w),
-        body_h,
+        pane_h,
     );
+    // Zero-height (and thus not drawn) when the status bar is hidden.
     let bar = Rect::new(
         total.x,
-        total.y + body_h,
+        total.y + pane_h,
         total.width,
-        total.height - body_h,
+        total.height - pane_h,
     );
     (side, pane, bar)
 }
 
 /// The terminal grid the pane offers (what `Attach`/`Resize` request).
-pub fn pane_grid(total: Rect, sidebar_w: u16, hidden: bool) -> (u16, u16) {
-    let (_, pane, _) = areas(total, sidebar_w, hidden);
+pub fn pane_grid(total: Rect, sidebar_w: u16, hidden: bool, status_hidden: bool) -> (u16, u16) {
+    let (_, pane, _) = areas(total, sidebar_w, hidden, status_hidden);
     (pane.width.max(1), pane.height.max(1))
 }
 
@@ -127,7 +135,12 @@ pub struct Selection {
 }
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
-    let (side, pane, bar) = areas(f.area(), app.sidebar_w, app.sidebar_hidden);
+    let (side, pane, bar) = areas(
+        f.area(),
+        app.sidebar_w,
+        app.sidebar_hidden,
+        app.status_hidden,
+    );
     draw_sidebar(f.buffer_mut(), side, app);
     draw_bar(f.buffer_mut(), bar, app);
     app.process_fx(f.buffer_mut(), side);
@@ -418,7 +431,7 @@ pub fn sidebar_hit(
     col: u16,
     row: u16,
 ) -> Option<(usize, bool)> {
-    let (side, _, _) = areas(area, sidebar_w, hidden);
+    let (side, _, _) = areas(area, sidebar_w, hidden, false);
     if side.width == 0 || col >= side.right().saturating_sub(1) || row >= side.bottom() {
         return None;
     }
@@ -651,17 +664,17 @@ mod tests {
     #[test]
     fn narrow_terminal_keeps_a_usable_pane() {
         // Wide: sidebar honored, the pane gets the rest.
-        let (side, pane, _) = areas(Rect::new(0, 0, 100, 40), SIDEBAR_W, false);
+        let (side, pane, _) = areas(Rect::new(0, 0, 100, 40), SIDEBAR_W, false, false);
         assert_eq!(side.width, SIDEBAR_W);
         assert_eq!(pane.width, 100 - SIDEBAR_W);
         // Medium-narrow: the sidebar shrinks so the pane never drops below
         // MIN_PANE (28-wide sidebar can't fit alongside a 20-wide pane in 40).
-        let (side, pane, _) = areas(Rect::new(0, 0, 40, 40), SIDEBAR_W, false);
+        let (side, pane, _) = areas(Rect::new(0, 0, 40, 40), SIDEBAR_W, false, false);
         assert!(pane.width >= MIN_PANE, "pane {} >= {MIN_PANE}", pane.width);
         assert!(side.width > 0);
         // Too narrow for both: the sidebar drops out; the pane takes it all.
         let w = MIN_SIDEBAR + MIN_PANE - 1;
-        let (side, pane, _) = areas(Rect::new(0, 0, w, 40), SIDEBAR_W, false);
+        let (side, pane, _) = areas(Rect::new(0, 0, w, 40), SIDEBAR_W, false, false);
         assert_eq!(side.width, 0);
         assert_eq!(pane.width, w);
     }
@@ -719,17 +732,17 @@ mod tests {
 
     #[test]
     fn pane_grid_reserves_the_sidebar_and_bottom_bar() {
-        let (cols, rows) = pane_grid(Rect::new(0, 0, 120, 40), SIDEBAR_W, false);
+        let (cols, rows) = pane_grid(Rect::new(0, 0, 120, 40), SIDEBAR_W, false, false);
         assert_eq!(cols, 120 - SIDEBAR_W);
         assert_eq!(rows, 39); // one row goes to the full-width keybind bar
         // Hidden: the pane takes the whole width.
-        let (cols, _) = pane_grid(Rect::new(0, 0, 120, 40), SIDEBAR_W, true);
+        let (cols, _) = pane_grid(Rect::new(0, 0, 120, 40), SIDEBAR_W, true, false);
         assert_eq!(cols, 120);
     }
 
     #[test]
     fn bar_spans_the_full_width() {
-        let (_, _, bar) = areas(Rect::new(0, 0, 120, 40), SIDEBAR_W, false);
+        let (_, _, bar) = areas(Rect::new(0, 0, 120, 40), SIDEBAR_W, false, false);
         assert_eq!(bar, Rect::new(0, 39, 120, 1));
     }
 
