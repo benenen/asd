@@ -9,9 +9,13 @@
 //! Keys: everything is forwarded to the attached session except the `Ctrl+A`
 //! prefix (screen-style): `j/k` or arrows switch sessions, `1-9` jump, `c`
 //! creates, `r` renames (input modal), `x` kills (confirmation modal), `b`/`s`
-//! hide the sidebar / bottom status bar (the latter frees the pane's bottom row
-//! so an input line can reach the window edge, keeping the IME box from covering
-//! it), `R` reconnects, `q` quits, `Ctrl+A` sends a literal Ctrl+A. The mouse
+//! hide the sidebar / bottom status bar, `R` reconnects, `q` quits, `Ctrl+A`
+//! sends a literal Ctrl+A. The bottom status bar also auto-hides on its own
+//! whenever the focused session is a full-screen (alternate-screen) app like
+//! pi/opencode/vim: that frees the pane's bottom row so the app's input reaches
+//! the window edge and the OS IME candidate box floats off it instead of
+//! covering it. `Ctrl+A s` is the manual override (e.g. to hide it in a plain
+//! shell too). The mouse
 //! selects/kills in the sidebar and scrolls the pane (local scrollback, like
 //! `asd attach`) — but when the focused session tracks the mouse (opencode,
 //! vim, htop) the event is forwarded to it instead (SGR-encoded); Shift keeps
@@ -749,6 +753,12 @@ impl App {
                 }
                 // The terminal changed: the pane must regenerate next draw.
                 self.pane_needs_render = true;
+                // Entering/leaving the alternate screen (a full-screen app like
+                // pi/opencode) auto-hides/shows the bottom status bar, which
+                // changes the pane height — re-layout so the session is resized.
+                // The grid-diff guard makes this a no-op unless it actually
+                // flipped, so it resizes once on app enter/exit, not per batch.
+                self.apply_layout();
                 if snapshot {
                     // The dump is an exact replay of the daemon's terminal
                     // (asd-vt's two-pass snapshot), generated at this pane's
@@ -994,12 +1004,8 @@ impl App {
             return;
         }
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        let (_, pane, _) = ui::areas(
-            area,
-            self.sidebar_w,
-            self.sidebar_hidden,
-            self.status_hidden,
-        );
+        let status_hidden = self.effective_status_hidden();
+        let (_, pane, _) = ui::areas(area, self.sidebar_w, self.sidebar_hidden, status_hidden);
         let in_pane = m.column >= pane.left()
             && m.column < pane.right()
             && m.row >= pane.top()
@@ -1169,14 +1175,22 @@ impl App {
     /// if it changed, resize the local VT and tell the daemon. Called after a
     /// sidebar drag, an `Ctrl+A b` toggle, or a terminal resize. Reuses the
     /// tear-free pane path (`pane_needs_render`) so no half-frame shows.
+    /// Whether the bottom status bar is hidden right now — the manual toggle
+    /// (Ctrl+A s), OR the focused session being in the alternate screen. A
+    /// full-screen app (pi/opencode/vim, all alt-screen) draws its input at
+    /// its own bottom, so handing it the pane's full height lets that input
+    /// reach the window's last row — then the OS IME candidate box floats off
+    /// the bottom edge instead of covering it. Plain shells (normal screen)
+    /// keep the status bar. Alt-screen flips only on app enter/exit, so this
+    /// resizes the session at most once per app, not per output batch.
+    fn effective_status_hidden(&mut self) -> bool {
+        self.status_hidden || self.vt.as_mut().is_some_and(|vt| vt.is_alt_screen())
+    }
+
     fn apply_layout(&mut self) {
         let total = ratatui::layout::Rect::new(0, 0, self.term_size.0, self.term_size.1);
-        let grid = ui::pane_grid(
-            total,
-            self.sidebar_w,
-            self.sidebar_hidden,
-            self.status_hidden,
-        );
+        let status_hidden = self.effective_status_hidden();
+        let grid = ui::pane_grid(total, self.sidebar_w, self.sidebar_hidden, status_hidden);
         if grid != self.grid {
             self.grid = grid;
             if let Some(vt) = &mut self.vt {
