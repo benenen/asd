@@ -135,6 +135,8 @@ pub struct Selection {
 }
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
+    // Recomputed every frame by the cursor block below; default off.
+    app.ime_anchor = None;
     let (side, pane, bar) = areas(
         f.area(),
         app.sidebar_w,
@@ -149,22 +151,31 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     let modal_open = app.modal.is_some();
     if let Some(snap) = app.snapshot() {
         render_pane(f.buffer_mut(), pane, &snap, sel);
-        // Position the REAL terminal cursor at the pane's cursor. It must be the
-        // real cursor — not a painted cell — so the OS input-method (IME) popup
-        // and TUI programs like codex/vim anchor to it. Suppressed under a modal
-        // / while scrolled back. Crucially we do NOT hide+reshow it per frame:
-        // that `?25l`/`?25h` toggle was the flicker under the running-session
-        // shimmer's ~33 fps redraws. Left shown and repositioned to the same
-        // spot (a no-op), with the whole frame wrapped in synchronized output
-        // (see the event loop) so the sidebar-cell writes can't drag it.
+        // Anchor the OS input-method (IME) popup and TUI programs like codex/vim
+        // at the pane's cursor. Suppressed under a modal / while scrolled back.
+        // Two cases by the session's own cursor visibility:
+        //  - visible: park the REAL (shown) terminal cursor there — not a painted
+        //    cell — so the IME/codex/vim anchor to it. We do NOT hide+reshow it
+        //    per frame: that `?25l`/`?25h` toggle was the flicker under the
+        //    running-session shimmer's ~33 fps redraws. Left shown and moved to
+        //    the same spot (a no-op), inside the event loop's synchronized-output
+        //    frame so the sidebar-cell writes can't drag it.
+        //  - hidden: pi / Claude Code hide the cursor and draw their own caret.
+        //    ratatui then leaves the host cursor un-positioned, so the IME box
+        //    floats at a stale screen-top spot. Record the logical position for
+        //    the event loop to move the *still-hidden* host cursor there — the
+        //    box then anchors at the app's input, matching a native run.
         if !modal_open
             && app.scroll == 0
-            && snap.cursor.visible
             && let Some((cx, cy)) = snap.cursor.position
             && cx < pane.width
             && cy < pane.height
         {
-            f.set_cursor_position(Position::new(pane.x + cx, pane.y + cy));
+            if snap.cursor.visible {
+                f.set_cursor_position(Position::new(pane.x + cx, pane.y + cy));
+            } else {
+                app.ime_anchor = Some((pane.x + cx, pane.y + cy));
+            }
         }
         // The scrollback offset is shown in the status bar (next to the session
         // count), not over the pane's top row — see `draw_bar`.

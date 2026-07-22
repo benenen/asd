@@ -140,6 +140,14 @@ pub(crate) struct App {
     /// grabs the mouse, so the host terminal's own right-click paste never
     /// reaches us. This is what was selected *here*, not the system clipboard.
     clipboard: Option<String>,
+    /// Where to park the *hidden* host cursor this frame, in host cells. Set by
+    /// `ui::draw` only when the focused session hides its own cursor (pi /
+    /// Claude Code draw their own caret) but still has a logical position: the
+    /// event loop moves the (still-hidden) host cursor there so the OS IME
+    /// candidate box anchors at the app's input instead of floating at the
+    /// stale screen-top spot ratatui leaves it. `None` = leave it to ratatui
+    /// (visible cursor, no session, scrolled back, or a modal is up).
+    ime_anchor: Option<(u16, u16)>,
 
     pub daemon_up: bool,
     pub notice: Option<String>,
@@ -323,6 +331,7 @@ fn event_loop(
         sel: None,
         selecting: false,
         clipboard: None,
+        ime_anchor: None,
         daemon_up: false,
         notice: None,
         modal: None,
@@ -359,6 +368,15 @@ fn event_loop(
             // flicker. Terminals without 2026 ignore the mode.
             let _ = execute!(std::io::stdout(), BeginSynchronizedUpdate);
             terminal.draw(|f| ui::draw(f, &mut app))?;
+            // When the focused session hides its own cursor (pi / Claude Code),
+            // ratatui hides the host cursor but leaves it un-positioned, so the
+            // OS IME box anchors at a stale spot (screen top). Move the still-
+            // hidden host cursor to the session's logical input position so the
+            // box floats there instead — matching a native run. Inside the 2026
+            // bracket so it composites atomically with the frame.
+            if let Some((x, y)) = app.ime_anchor {
+                let _ = execute!(std::io::stdout(), ratatui::crossterm::cursor::MoveTo(x, y));
+            }
             let _ = execute!(std::io::stdout(), EndSynchronizedUpdate);
             // Effects animate frame-by-frame, and a pane hold must expire on
             // time: stay dirty while any is pending (the input poll below caps
