@@ -135,8 +135,12 @@ pub struct Selection {
 }
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
-    let status_hidden = app.effective_status_hidden();
-    let (side, pane, bar) = areas(f.area(), app.sidebar_w, app.sidebar_hidden, status_hidden);
+    let (side, pane, bar) = areas(
+        f.area(),
+        app.sidebar_w,
+        app.sidebar_hidden,
+        app.status_hidden,
+    );
     draw_sidebar(f.buffer_mut(), side, app);
     draw_bar(f.buffer_mut(), bar, app);
     app.process_fx(f.buffer_mut(), side);
