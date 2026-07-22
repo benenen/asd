@@ -1,6 +1,8 @@
 # asd
 
 [![CI](https://github.com/benenen/asd/actions/workflows/ci.yml/badge.svg)](https://github.com/benenen/asd/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/benenen/asd?label=release)](https://github.com/benenen/asd/releases/latest)
+[![npm](https://img.shields.io/npm/v/@shibenenen/asd?label=npm)](https://www.npmjs.com/package/@shibenenen/asd)
 
 A terminal **session multiplexer**: a background daemon owns your PTY sessions,
 reachable from a ratatui TUI, a scriptable CLI, and a GPU-accelerated desktop
