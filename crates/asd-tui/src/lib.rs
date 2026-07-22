@@ -129,6 +129,10 @@ pub(crate) struct App {
     sel: Option<Sel>,
     /// True between mouse press and release while dragging a selection.
     selecting: bool,
+    /// The last text copied from a pane selection, for right-click paste — asd
+    /// grabs the mouse, so the host terminal's own right-click paste never
+    /// reaches us. This is what was selected *here*, not the system clipboard.
+    clipboard: Option<String>,
 
     pub daemon_up: bool,
     pub notice: Option<String>,
@@ -309,6 +313,7 @@ fn event_loop(
         dragging_divider: false,
         sel: None,
         selecting: false,
+        clipboard: None,
         daemon_up: false,
         notice: None,
         modal: None,
@@ -1101,24 +1106,39 @@ impl App {
                 self.selecting = false;
                 // Releasing copies the selection (OSC 52 through the host
                 // terminal) and clears the highlight; a plain click leaves
-                // nothing behind. Screen-space coords are scroll-independent,
-                // so the copy captures the whole range even off-view.
-                if let Some(sel) = self.sel.take()
-                    && sel.anchor != sel.head
-                    && let Some(vt) = &mut self.vt
-                {
-                    let text = vt.selection_text_screen(
-                        (sel.anchor.0, sel.anchor.1 as u32),
-                        (sel.head.0, sel.head.1 as u32),
-                    );
-                    if !text.is_empty() {
-                        use std::io::Write;
-                        let mut out = std::io::stdout();
-                        let _ = out.write_all(&asd_vt::clip::osc52_copy(&text));
-                        let _ = out.flush();
-                    }
+                // nothing behind. Screen-space coords are scroll-independent, so
+                // the copy captures the whole range even off-view. Keep the text
+                // for right-click paste too.
+                let text = self
+                    .sel
+                    .take()
+                    .filter(|s| s.anchor != s.head)
+                    .and_then(|sel| {
+                        let vt = self.vt.as_mut()?;
+                        let text = vt.selection_text_screen(
+                            (sel.anchor.0, sel.anchor.1 as u32),
+                            (sel.head.0, sel.head.1 as u32),
+                        );
+                        (!text.is_empty()).then_some(text)
+                    });
+                if let Some(text) = text {
+                    use std::io::Write;
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&asd_vt::clip::osc52_copy(&text));
+                    let _ = out.flush();
+                    self.clipboard = Some(text);
                 }
                 self.dirty = true;
+            }
+            // Right-click pastes what was last copied here into the session — asd
+            // grabs the mouse, so the host terminal's own right-click paste can't
+            // reach us. Sent as plain input, like a host bracketed paste. (A
+            // mouse-tracking session gets the right-click forwarded above; this
+            // arm is reached for a plain shell prompt.)
+            MouseEventKind::Down(MouseButton::Right) if in_pane => {
+                if let Some(text) = self.clipboard.clone() {
+                    self.send(Cmd::Input(text.into_bytes()));
+                }
             }
             _ => {}
         }
