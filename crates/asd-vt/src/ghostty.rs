@@ -36,6 +36,8 @@ pub struct GhosttyVt {
     encoder: gkey::Encoder<'static>,
     /// Query replies the terminal produces during `vt_write` (DA/DSR/DECRQM...).
     pty_responses: Rc<RefCell<Vec<u8>>>,
+    /// Cell rows from the previous `render_snapshot()`, to skip FFI for unchanged scrollback.
+    prev_cells: Vec<Vec<CellSnapshot>>,
 }
 
 impl std::fmt::Debug for GhosttyVt {
@@ -69,6 +71,7 @@ impl VtBackend for GhosttyVt {
             cell_iter: CellIterator::new().expect("cell iterator allocation failed"),
             encoder: gkey::Encoder::new().expect("key encoder allocation failed"),
             pty_responses,
+            prev_cells: Vec::new(),
         }
     }
 
@@ -222,7 +225,22 @@ impl VtBackend for GhosttyVt {
             .update(&snapshot)
             .expect("row iterator update failed");
         while let Some(row) = row_iter.next() {
-            row_dirty.push(row.dirty().expect("row dirty flag"));
+            let dirty = row.dirty().expect("row dirty flag");
+            row_dirty.push(dirty);
+            let idx = row_dirty.len() - 1;
+
+            // Reuse previous cells when this row hasn't changed — during
+            // streaming output 99%+ of scrollback rows are static, so
+            // skipping the FFI-per-cell iteration is a huge win.
+            if !dirty
+                && idx < self.prev_cells.len()
+                && self.prev_cells[idx].len() == cols as usize
+            {
+                cells.push(self.prev_cells[idx].clone());
+                row.set_dirty(false).expect("resetting row dirty failed");
+                continue;
+            }
+
             let mut row_cells = Vec::with_capacity(cols as usize);
 
             let mut cell_iter = self
@@ -262,6 +280,7 @@ impl VtBackend for GhosttyVt {
         snapshot
             .set_dirty(Dirty::Clean)
             .expect("resetting global dirty failed");
+        self.prev_cells = cells.clone();
 
         RenderSnapshot {
             cols,
