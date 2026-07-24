@@ -135,8 +135,8 @@ pub struct Selection {
 }
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
-    // Recomputed every frame by the cursor block below; default off.
-    app.ime_anchor = None;
+    // Recomputed every frame by the cursor blocks below; default hidden.
+    app.cursor_tail = None;
     let (side, pane, bar) = areas(
         f.area(),
         app.sidebar_w,
@@ -152,30 +152,21 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     if let Some(snap) = app.snapshot() {
         render_pane(f.buffer_mut(), pane, &snap, sel);
         // Anchor the OS input-method (IME) popup and TUI programs like codex/vim
-        // at the pane's cursor. Suppressed under a modal / while scrolled back.
-        // Two cases by the session's own cursor visibility:
-        //  - visible: park the REAL (shown) terminal cursor there — not a painted
-        //    cell — so the IME/codex/vim anchor to it. We do NOT hide+reshow it
-        //    per frame: that `?25l`/`?25h` toggle was the flicker under the
-        //    running-session shimmer's ~33 fps redraws. Left shown and moved to
-        //    the same spot (a no-op), inside the event loop's synchronized-output
-        //    frame so the sidebar-cell writes can't drag it.
-        //  - hidden: pi / Claude Code hide the cursor and draw their own caret.
-        //    ratatui then leaves the host cursor un-positioned, so the IME box
-        //    floats at a stale screen-top spot. Record the logical position for
-        //    the event loop to move the *still-hidden* host cursor there — the
-        //    box then anchors at the app's input, matching a native run.
+        // at the pane's cursor — the REAL terminal cursor, not a painted cell
+        // (IME and child-TUI focus both anchor to the hardware cursor). The
+        // session's own visibility carries over: pi / Claude Code hide theirs
+        // and draw their own caret, so the host cursor is moved there but kept
+        // hidden — the IME box still floats at the app's input. Emitted as the
+        // frame's closing bytes by `FrameBuf::finish`, after the body painted
+        // with the cursor hidden. Suppressed under a modal / while scrolled
+        // back.
         if !modal_open
             && app.scroll == 0
             && let Some((cx, cy)) = snap.cursor.position
             && cx < pane.width
             && cy < pane.height
         {
-            if snap.cursor.visible {
-                f.set_cursor_position(Position::new(pane.x + cx, pane.y + cy));
-            } else {
-                app.ime_anchor = Some((pane.x + cx, pane.y + cy));
-            }
+            app.cursor_tail = Some((pane.x + cx, pane.y + cy, snap.cursor.visible));
         }
         // The scrollback offset is shown in the status bar (next to the session
         // count), not over the pane's top row — see `draw_bar`.
@@ -192,13 +183,20 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
         f.buffer_mut().set_string(x, y, hint, Style::new().fg(DIM));
     }
 
-    if let Some(modal) = &app.modal {
-        draw_modal(f, modal);
+    let caret = match &app.modal {
+        Some(modal) => draw_modal(f, modal),
+        None => None,
+    };
+    if let Some(pos) = caret {
+        // Rename caret: the REAL cursor, shown, so the IME popup anchors to it
+        // while typing (e.g. a CJK session name).
+        app.cursor_tail = Some((pos.x, pos.y, true));
     }
 }
 
-/// A centered overlay: the rename input box or the kill confirmation.
-fn draw_modal(f: &mut Frame<'_>, modal: &Modal) {
+/// A centered overlay: the rename input box or the kill confirmation. Returns
+/// the caret position for the rename input, if one should be shown.
+fn draw_modal(f: &mut Frame<'_>, modal: &Modal) -> Option<Position> {
     let area = f.area();
     let w = 54u16.clamp(24, area.width.saturating_sub(4).max(24));
     let h = 6u16.min(area.height);
@@ -269,11 +267,7 @@ fn draw_modal(f: &mut Frame<'_>, modal: &Modal) {
             buf.set_string(ix, inner.y + 3, truncate(&line, iw), style);
         }
     }
-    if let Some(pos) = cursor {
-        // Real terminal cursor for the rename caret, so the IME popup anchors to
-        // it while typing (e.g. a CJK session name).
-        f.set_cursor_position(pos);
-    }
+    cursor
 }
 
 fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {

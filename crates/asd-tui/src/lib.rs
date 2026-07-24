@@ -28,7 +28,6 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
 mod conn;
 mod key;
@@ -140,14 +139,15 @@ pub(crate) struct App {
     /// grabs the mouse, so the host terminal's own right-click paste never
     /// reaches us. This is what was selected *here*, not the system clipboard.
     clipboard: Option<String>,
-    /// Where to park the *hidden* host cursor this frame, in host cells. Set by
-    /// `ui::draw` only when the focused session hides its own cursor (pi /
-    /// Claude Code draw their own caret) but still has a logical position: the
-    /// event loop moves the (still-hidden) host cursor there so the OS IME
-    /// candidate box anchors at the app's input instead of floating at the
-    /// stale screen-top spot ratatui leaves it. `None` = leave it to ratatui
-    /// (visible cursor, no session, scrolled back, or a modal is up).
-    ime_anchor: Option<(u16, u16)>,
+    /// The host cursor's end-of-frame state `(x, y, visible)` in host cells,
+    /// recomputed by `ui::draw` every frame and emitted by `FrameBuf::finish`
+    /// as the frame's closing bytes. Visible for the pane's shell cursor and
+    /// the rename caret — the IME popup and codex/vim anchor to the REAL
+    /// cursor (a painted cell broke both). Positioned-but-hidden when the
+    /// focused session hides its own cursor (pi / Claude Code draw their own
+    /// caret), so the OS IME box still floats at the app's input. `None` (no
+    /// session, scrolled back, kill-confirm modal) keeps the cursor hidden.
+    cursor_tail: Option<(u16, u16, bool)>,
 
     pub daemon_up: bool,
     pub notice: Option<String>,
@@ -258,6 +258,73 @@ fn install_terminating_signal_restore() {
     }
 }
 
+/// Shared per-frame byte buffer backing the ratatui terminal, so one frame
+/// reaches the terminal as ONE `write`.
+///
+/// A stock stdout backend flushes mid-frame: crossterm's `execute!` flushes on
+/// every cursor command and `Stdout`'s LineWriter splits the cell diff into
+/// ~1 KiB chunks, so each frame left the process as 4–7 separate writes with
+/// the visible cursor parked on whatever cell was painted last. Any terminal
+/// that renders at such a boundary — guaranteed possible over SSH, certain
+/// without DEC-2026 support — briefly showed the cursor inside the sidebar
+/// shimmer or on the echoed keystroke: the historical flicker. Composing the
+/// whole frame here — `?2026h ?25l <cells> <CUP><?25h|?25l> ?2026l`, boo's
+/// frame shape — and writing it once is atomic on 2026 terminals; on anything
+/// else the cursor is hidden during the body, so a torn frame can at worst
+/// blank it for one refresh, never misplace it.
+#[derive(Clone, Default)]
+struct FrameBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl FrameBuf {
+    /// Open a frame: synchronized-update begin, cursor hidden for the body.
+    fn begin(&self) {
+        let mut b = self.0.borrow_mut();
+        b.clear();
+        b.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+    }
+
+    /// Close a frame with the cursor tail and hand it to the terminal as a
+    /// single write.
+    fn finish(&self, tail: Option<(u16, u16, bool)>) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut b = self.0.borrow_mut();
+        b.extend_from_slice(&cursor_tail(tail));
+        b.extend_from_slice(b"\x1b[?2026l");
+        let mut out = std::io::stdout();
+        out.write_all(&b)?;
+        out.flush()
+    }
+}
+
+impl std::io::Write for FrameBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    // ratatui/crossterm flush after every cursor command; the frame goes out
+    // only in `FrameBuf::finish`.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// End-of-frame cursor bytes: place, then set visibility — CUP before
+/// `?25h`/`?25l` (boo's order) so even a frame torn right here never shows the
+/// cursor mid-body. `None` keeps it hidden.
+fn cursor_tail(tail: Option<(u16, u16, bool)>) -> Vec<u8> {
+    match tail {
+        Some((x, y, visible)) => format!(
+            "\x1b[{};{}H\x1b[?25{}",
+            u32::from(y) + 1,
+            u32::from(x) + 1,
+            if visible { 'h' } else { 'l' }
+        )
+        .into_bytes(),
+        None => b"\x1b[?25l".to_vec(),
+    }
+}
+
 /// Open the TUI against `socket`; `session` preselects one by name. The
 /// daemon must already be running (the `asd ui` wrapper ensures it).
 pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
@@ -265,12 +332,20 @@ pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
     // dropped SSH) — a panic hook only fires for Rust panics, not signals. Must
     // run before raw mode so it captures the cooked termios.
     install_terminating_signal_restore();
-    let mut terminal = ratatui::init();
-    // `ratatui::init` installs a panic hook that restores the screen (leaves the
-    // alt screen, disables raw mode) — but it doesn't know about the mouse
-    // capture + bracketed paste we enable below. Chain a hook that turns those
-    // back off first, so a panic can't leave the terminal in mouse-tracking mode
-    // spewing `ESC[<..M` reports on every mouse move (garbage at the shell).
+    // Manual `ratatui::init`, with the backend writing into a `FrameBuf`
+    // instead of stdout so each frame is flushed as a single write.
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    let _ = execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::EnterAlternateScreen
+    );
+    let frame = FrameBuf::default();
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(frame.clone()))?;
+    // Manual construction skips `ratatui::init`'s panic hook, so chain our own:
+    // mouse capture + bracketed paste off first (a panic must not leave the
+    // terminal spewing `ESC[<..M` reports on every mouse move), then ratatui's
+    // screen restore (leave the alt screen, disable raw mode).
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(
@@ -278,6 +353,7 @@ pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
             event::DisableBracketedPaste,
             event::DisableMouseCapture
         );
+        ratatui::restore();
         prev_hook(info);
     }));
     let _ = execute!(
@@ -286,7 +362,7 @@ pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
         event::EnableBracketedPaste
     );
 
-    let result = event_loop(&mut terminal, socket, session);
+    let result = event_loop(&mut terminal, &frame, socket, session);
 
     let _ = execute!(
         std::io::stdout(),
@@ -294,11 +370,16 @@ pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
         event::DisableMouseCapture
     );
     ratatui::restore();
+    // The last frame may have left the cursor hidden (viewing a pi/Claude-style
+    // session that hides its own): `?25` is global terminal state that survives
+    // leaving the alt screen, so re-show it for the shell.
+    let _ = execute!(std::io::stdout(), ratatui::crossterm::cursor::Show);
     result
 }
 
 fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<FrameBuf>>,
+    frame: &FrameBuf,
     socket: PathBuf,
     preferred: Option<String>,
 ) -> anyhow::Result<()> {
@@ -331,7 +412,7 @@ fn event_loop(
         sel: None,
         selecting: false,
         clipboard: None,
-        ime_anchor: None,
+        cursor_tail: None,
         daemon_up: false,
         notice: None,
         modal: None,
@@ -358,26 +439,17 @@ fn event_loop(
         }
         if app.dirty {
             app.now_ms = now_ms();
-            // Composite each frame atomically (DEC 2026 synchronized output) so a
-            // ~33 fps shimmer redraw can't display a partially-written frame: the
-            // sidebar-cell rewrites would otherwise drag the real terminal cursor
-            // across them before `ui::draw` repositions it to the pane. We keep
-            // the REAL cursor (ui::draw positions it — the IME/codex/vim anchor to
-            // it) and, critically, never hide it per frame: the old `hide_cursor()`
-            // emitted `?25l`/`?25h` every frame, and that visibility toggle was the
-            // flicker. Terminals without 2026 ignore the mode.
-            let _ = execute!(std::io::stdout(), BeginSynchronizedUpdate);
+            // One frame = one write: `FrameBuf` wraps the cell diff in
+            // `?2026h ?25l` … `<CUP><?25h|?25l> ?2026l` and flushes it in a
+            // single `write_all`, so the ~33 fps shimmer redraw can neither
+            // drag the cursor across the sidebar cells nor toggle its
+            // visibility at a flush boundary — both historical flicker sources
+            // (separate `execute!` flushes made every frame 4–7 writes, and
+            // terminals without DEC-2026 render freely between writes). The
+            // tail is `app.cursor_tail`, recomputed by `ui::draw`.
+            frame.begin();
             terminal.draw(|f| ui::draw(f, &mut app))?;
-            // When the focused session hides its own cursor (pi / Claude Code),
-            // ratatui hides the host cursor but leaves it un-positioned, so the
-            // OS IME box anchors at a stale spot (screen top). Move the still-
-            // hidden host cursor to the session's logical input position so the
-            // box floats there instead — matching a native run. Inside the 2026
-            // bracket so it composites atomically with the frame.
-            if let Some((x, y)) = app.ime_anchor {
-                let _ = execute!(std::io::stdout(), ratatui::crossterm::cursor::MoveTo(x, y));
-            }
-            let _ = execute!(std::io::stdout(), EndSynchronizedUpdate);
+            frame.finish(app.cursor_tail)?;
             // Effects animate frame-by-frame, and a pane hold must expire on
             // time: stay dirty while any is pending (the input poll below caps
             // the frame rate at ~33 fps). The running borders breathe as long
@@ -1302,6 +1374,37 @@ fn encode_sgr_mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_tail_places_before_visibility() {
+        // Visible pane cursor: CUP (1-based) then show — boo's order, so a
+        // frame torn at the tail still never paints the cursor mid-body.
+        assert_eq!(cursor_tail(Some((49, 0, true))), b"\x1b[1;50H\x1b[?25h");
+        // Hidden-cursor session (pi / Claude Code): positioned for the IME
+        // box, but left hidden.
+        assert_eq!(cursor_tail(Some((3, 9, false))), b"\x1b[10;4H\x1b[?25l");
+        // No cursor this frame (scrolled back / kill modal / no session).
+        assert_eq!(cursor_tail(None), b"\x1b[?25l");
+    }
+
+    #[test]
+    fn frame_buf_is_one_atomic_unit() {
+        use std::io::Write;
+        let frame = FrameBuf::default();
+        frame.begin();
+        // The ratatui backend writes the cell diff (and its own cursor-hide)
+        // through the shared handle; none of it may flush early.
+        let mut backend_handle = frame.clone();
+        backend_handle.write_all(b"<cells>\x1b[?25l").unwrap();
+        backend_handle.flush().unwrap();
+        assert_eq!(
+            frame.0.borrow().as_slice(),
+            b"\x1b[?2026h\x1b[?25l<cells>\x1b[?25l"
+        );
+        // begin() starts the next frame from scratch.
+        frame.begin();
+        assert_eq!(frame.0.borrow().as_slice(), b"\x1b[?2026h\x1b[?25l");
+    }
 
     #[test]
     fn sgr_mouse_encodes_wheel_click_and_modifiers() {
