@@ -131,6 +131,18 @@ impl Attach {
         }
     }
 
+    /// The client renamed a session. If it is the one being shown, re-tag the
+    /// view: the TUI optimistically renames its `active` at the same moment,
+    /// and frames still tagged with the old name would fail its "is this the
+    /// active session?" check — every Output after a rename-while-viewing was
+    /// silently dropped, freezing the pane (typed input still executed; only
+    /// the display stalled) until a switch away and back re-attached.
+    fn on_rename(&mut self, old: &str, new: &str) {
+        if self.showing.as_deref() == Some(old) {
+            self.showing = Some(new.to_string());
+        }
+    }
+
     /// A pending Attach failed (`NO_SUCH_SESSION`: the session died before we
     /// attached). Drains one pending count; returns the ended name only if that
     /// was the newest attach, so the client stops holding the pane for a
@@ -323,6 +335,9 @@ async fn drive(
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(Cmd::Rename { name, new_name }) => {
+                    // Keep the frame tag in step with the TUI's optimistic
+                    // rename of its active session (see `Attach::on_rename`).
+                    at.on_rename(&name, &new_name);
                     if writer.write_frame(&Frame::Rename { name, new_name }).await.is_err() {
                         return Err("rename write failed".to_string());
                     }
@@ -422,6 +437,29 @@ mod tests {
         at.begin("b".into());
         assert_eq!(at.on_attach_failed(), None); // a failed, b still pending
         assert_eq!(at.on_snapshot(), s("b"));
+    }
+
+    /// Bug regression: renaming the session being viewed re-tags the view, so
+    /// its Output keeps matching the TUI's optimistically-renamed `active`.
+    /// Before the fix every frame after a rename-while-viewing was dropped —
+    /// the pane froze (input still executed) until a switch away and back.
+    /// The common trigger: create a session, rename it, start typing.
+    #[test]
+    fn rename_of_the_shown_session_retags_the_view() {
+        let mut at = Attach::default();
+        at.begin("s0".into());
+        assert_eq!(at.on_snapshot(), s("s0"));
+        at.on_rename("s0", "zzz");
+        // Frames now tag as the new name — the TUI's active after its
+        // optimistic rename — instead of being dropped as a name mismatch.
+        assert_eq!(at.on_output(), s("zzz"));
+
+        // Renaming a session that is NOT being shown leaves the view alone.
+        let mut at = Attach::default();
+        at.begin("a".into());
+        at.on_snapshot();
+        at.on_rename("other", "new");
+        assert_eq!(at.on_output(), s("a"));
     }
 
     /// Bug regression (client side): after the attached session is killed and
