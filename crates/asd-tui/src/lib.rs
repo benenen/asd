@@ -325,6 +325,38 @@ fn cursor_tail(tail: Option<(u16, u16, bool)>) -> Vec<u8> {
     }
 }
 
+/// Exit when the hosting terminal disappears out from under us. When the pty
+/// backing stdin is destroyed without a SIGHUP reaching this process (orphaned:
+/// the terminal emulator died, or the parent shell was SIGKILLed), reads on the
+/// dead fd return EOF forever — and crossterm 0.29's event source spins on
+/// them without ever returning (its read loop treats `Ok(0)` as neither data
+/// nor an error), so the event loop never regains control and the TUI turns
+/// into an invisible 100%-CPU process. A `poll` with no requested events still
+/// reports `POLLHUP`/`POLLERR`, so this thread sleeps at zero cost (it never
+/// wakes for keyboard input) until the terminal is gone, then exits: the
+/// daemon treats the dropped connection as a detach, and there is no terminal
+/// left to restore.
+fn spawn_tty_watchdog() {
+    std::thread::Builder::new()
+        .name("asd-tui-ttywatch".into())
+        .spawn(|| {
+            loop {
+                let mut pfd = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: 0,
+                    revents: 0,
+                };
+                let n = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if n > 0 && pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                    std::process::exit(0);
+                }
+                // EINTR or a spurious wake: back off briefly and re-arm.
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+        .expect("tty watchdog thread");
+}
+
 /// Open the TUI against `socket`; `session` preselects one by name. The
 /// daemon must already be running (the `asd ui` wrapper ensures it).
 pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
@@ -332,6 +364,7 @@ pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
     // dropped SSH) — a panic hook only fires for Rust panics, not signals. Must
     // run before raw mode so it captures the cooked termios.
     install_terminating_signal_restore();
+    spawn_tty_watchdog();
     // Manual `ratatui::init`, with the backend writing into a `FrameBuf`
     // instead of stdout so each frame is flushed as a single write.
     ratatui::crossterm::terminal::enable_raw_mode()?;
