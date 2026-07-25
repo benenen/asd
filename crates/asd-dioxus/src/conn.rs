@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use asd_proto::attach::Attach;
+use asd_client::attach::Attach;
 use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, code};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -154,7 +154,7 @@ async fn drive(
     let mut writer = FrameWriter::new(writer);
 
     // Handshake.
-    asd_proto::handshake(&mut writer, &mut reader, ClientKind::Gui)
+    asd_client::handshake(&mut writer, &mut reader, ClientKind::Gui)
         .await
         .map_err(|msg| format!("handshake: {msg}"))?;
     let _ = ev_tx.send(UiEvent::State {
@@ -162,7 +162,7 @@ async fn drive(
         state: HostState::Up,
     });
 
-    // Attach state machine (shared with asd-tui; see asd_proto::attach::Attach).
+    // Attach state machine (shared with asd-tui; see asd_client::attach::Attach).
     let mut at = Attach::default();
 
     let mut ticker = tokio::time::interval(LIST_INTERVAL);

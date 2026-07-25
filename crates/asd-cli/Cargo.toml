@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = { workspace = true }
 asd-daemon = { workspace = true }
+asd-client = { workspace = true }
 asd-proto = { workspace = true }
 asd-tui = { workspace = true }
 asd-vt = { workspace = true }

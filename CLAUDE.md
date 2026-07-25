@@ -16,7 +16,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | crate | 职责 | 禁止依赖 |
 |---|---|---|
-| asd-proto | 帧枚举、postcard 编解码、framed reader/writer、路径契约 | tokio 之外的运行时、任何业务 crate |
+| asd-proto | 帧枚举、postcard 编解码、framed reader/writer、路径契约（**daemon 与客户端共用的线格式层**，只放两端都跑的东西） | tokio 之外的运行时、任何业务 crate |
+| asd-client（**lib**） | **只有客户端才跑的那一半协议**：`handshake()`（发 Hello / 等 HelloAck）+ `attach::Attach`（Attach 收敛状态机——判定到达的帧属不属于当前视图；规则三端必须完全一致，故收敛于此）。被 asd-cli / asd-tui / asd-dioxus 共用 | GUI 框架、**portable-pty 及一切 PTY/进程管理**（asd-dioxus 链它，必须保持 PTY-free）、asd-vt |
 | asd-vt | `VtBackend` trait + libghostty-vt 实现（逃生门边界） | GUI 框架、portable-pty、asd-proto |
 | asd-daemon（lib） | session 管理、UDS 服务 | GUI 框架（含传递依赖） |
 | asd-cli（**lib**，`pub fn run`） | 调试客户端、`attach --stdio` 代理、内嵌 daemon（`asd daemon`）；被根 bin 的 `local` feature 组合 | GUI 框架（GUI 启动器由 bin 注入） |

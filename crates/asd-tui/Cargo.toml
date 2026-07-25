@@ -10,6 +10,7 @@ license.workspace = true
 # daemon connection speaks asd-proto over the Unix socket.
 [dependencies]
 anyhow = { workspace = true }
+asd-client = { workspace = true }
 asd-proto = { workspace = true }
 asd-vt = { workspace = true }
 ratatui = { workspace = true }

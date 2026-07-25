@@ -71,7 +71,7 @@ pub enum Ev {
     Renamed(Result<(), String>),
 }
 
-use asd_proto::attach::Attach;
+use asd_client::attach::Attach;
 
 /// Handle to the running actor thread.
 pub struct Conn {
@@ -121,7 +121,7 @@ async fn drive(
     let mut reader = FrameReader::new(r);
     let mut writer = FrameWriter::new(w);
 
-    asd_proto::handshake(&mut writer, &mut reader, ClientKind::Cli)
+    asd_client::handshake(&mut writer, &mut reader, ClientKind::Cli)
         .await
         .map_err(|msg| format!("handshake: {msg}"))?;
     let _ = ev_tx.send(Ev::Up);

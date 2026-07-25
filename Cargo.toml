@@ -58,6 +58,7 @@ repository = ""
 
 [workspace.dependencies]
 asd-cli = { path = "crates/asd-cli" }
+asd-client = { path = "crates/asd-client" }
 asd-dioxus = { path = "crates/asd-dioxus" }
 asd-daemon = { path = "crates/asd-daemon" }
 asd-proto = { path = "crates/asd-proto" }

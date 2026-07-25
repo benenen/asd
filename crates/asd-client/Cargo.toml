@@ -1,0 +1,14 @@
+[package]
+name = "asd-client"
+description = "asd shared client logic: handshake and the Attach convergence state machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Contract (spec §3): the client half of the protocol, shared by asd-cli,
+# asd-tui and asd-dioxus. Depends on asd-proto and the tokio runtime only —
+# no GUI framework, and above all no portable-pty or process management, since
+# asd-dioxus links this and must stay PTY-free (the Windows client's basis).
+[dependencies]
+asd-proto = { workspace = true }
+tokio = { workspace = true }

@@ -16,40 +16,10 @@
 //! `Inspect`/`InspectReply` frames (detailed single-session dump); v7 added
 //! `Rename` (rename a session; replies `Ack`).
 
-pub mod attach;
 mod codec;
 pub mod paths;
 
 pub use codec::{FrameReader, FrameWriter, decode_frame, encode_frame};
-
-use tokio::io::{AsyncRead, AsyncWrite};
-
-/// Run the client side of the asd handshake: send Hello, expect HelloAck.
-/// Returns the daemon's version string on success.
-///
-/// This is the one handshake shared by every asd client (CLI, TUI, GUI); a
-/// version mismatch or bad reply is returned as an error.
-pub async fn handshake(
-    writer: &mut FrameWriter<impl AsyncWrite + Unpin>,
-    reader: &mut FrameReader<impl AsyncRead + Unpin>,
-    kind: ClientKind,
-) -> Result<String, String> {
-    writer
-        .write_frame(&Frame::Hello {
-            proto_version: PROTO_VERSION,
-            kind,
-        })
-        .await
-        .map_err(|_| "handshake write failed".to_string())?;
-    match reader.read_frame().await {
-        Ok(Some(Frame::HelloAck { daemon_version, .. })) => Ok(daemon_version),
-        Ok(Some(Frame::Error { code, msg })) => {
-            Err(format!("daemon rejected handshake ({code}): {msg}"))
-        }
-        Ok(_) => Err("unexpected handshake reply".to_string()),
-        Err(e) => Err(format!("handshake read failed: {e}")),
-    }
-}
 
 use serde::{Deserialize, Serialize};
 

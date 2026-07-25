@@ -68,7 +68,7 @@ pub async fn connect(socket: &Path, kind: ClientKind) -> anyhow::Result<Client> 
 }
 
 async fn handshake(client: &mut Client, kind: ClientKind) -> anyhow::Result<()> {
-    client.daemon_version = asd_proto::handshake(&mut client.writer, &mut client.reader, kind)
+    client.daemon_version = asd_client::handshake(&mut client.writer, &mut client.reader, kind)
         .await
         .map_err(|msg| anyhow::anyhow!("{msg}"))?;
     Ok(())
