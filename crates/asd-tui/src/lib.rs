@@ -205,6 +205,7 @@ pub(crate) struct App {
 /// The cooked termios captured before raw mode, so the signal handler can put
 /// the line discipline back. A leaked box, loaded via an async-signal-safe
 /// atomic read inside the handler.
+#[cfg(unix)]
 static ORIG_TERMIOS: std::sync::atomic::AtomicPtr<libc::termios> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
@@ -220,6 +221,7 @@ const TERM_RESTORE: &[u8] =
 /// spewing `ESC[<..M` on every mouse move. Restore the terminal, then re-raise
 /// the signal with the default disposition so the exit status is unchanged. Only
 /// async-signal-safe calls here (write / tcsetattr / signal / raise).
+#[cfg(unix)]
 extern "C" fn on_terminating_signal(sig: libc::c_int) {
     unsafe {
         libc::write(
@@ -239,6 +241,7 @@ extern "C" fn on_terminating_signal(sig: libc::c_int) {
 /// Capture the cooked termios and install the terminal-restore handlers for the
 /// signals that would otherwise kill the process without cleanup. Call before
 /// entering raw mode.
+#[cfg(unix)]
 fn install_terminating_signal_restore() {
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
@@ -363,6 +366,7 @@ pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
     // Restore the terminal even on a kill / hangup (external `kill`, closed tab,
     // dropped SSH) — a panic hook only fires for Rust panics, not signals. Must
     // run before raw mode so it captures the cooked termios.
+    #[cfg(unix)]
     install_terminating_signal_restore();
     spawn_tty_watchdog();
     // Manual `ratatui::init`, with the backend writing into a `FrameBuf`

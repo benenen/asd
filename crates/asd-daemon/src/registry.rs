@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use asd_proto::{SessionInfo, code, paths};
-use nix::sys::signal::Signal;
+use crate::session::kill_child;
 use tracing::info;
 
 use crate::session::{SessionHandle, SessionMsg, spawn_session};
@@ -209,7 +209,7 @@ impl Registry {
         }
         info!(count = handles.len(), "shutting down sessions (SIGHUP)");
         for h in &handles {
-            crate::session::signal_child(&h.meta, Signal::SIGHUP);
+            kill_child(&h.meta, false);
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
@@ -220,7 +220,7 @@ impl Registry {
         }
         info!("grace period over, SIGKILL remaining children");
         for h in &handles {
-            crate::session::signal_child(&h.meta, Signal::SIGKILL);
+            kill_child(&h.meta, true);
         }
         // Give the EOF→reap path a moment, to avoid leaving zombies for init
         // to adopt

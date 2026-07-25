@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asd_proto::{Frame, FrameReader, FrameWriter, PROTO_VERSION, code};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -23,8 +23,12 @@ struct Attached {
     client_id: u64,
 }
 
-pub async fn handle_conn(stream: UnixStream, registry: Arc<Mutex<Registry>>, conn_id: u64) {
-    let (r, w) = stream.into_split();
+pub async fn handle_conn(
+    r: impl AsyncRead + Unpin + Send + 'static,
+    w: impl AsyncWrite + Unpin + Send + 'static,
+    registry: Arc<Mutex<Registry>>,
+    conn_id: u64,
+) {
     let mut reader = FrameReader::new(r);
     let mut writer = FrameWriter::new(w);
 
