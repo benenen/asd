@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, PROTO_VERSION, code};
+use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, code};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -71,91 +71,7 @@ pub enum Ev {
     Renamed(Result<(), String>),
 }
 
-/// The connection actor's attach bookkeeping, as a small pure state machine so
-/// the frame-routing rules — which Snapshot/Output belongs to the current view,
-/// and when a switch is still converging — are unit-testable (the
-/// "active-session / frame-filter" logic).
-///
-/// `pending` counts Attach frames whose Snapshot has not arrived yet: while
-/// `> 0` a live Output is stale (belongs to a session we just left), and while
-/// `> 1` an arriving Snapshot belongs to a superseded attach (a quick switch).
-/// `showing` names the session the forwarded frames are tagged with — the
-/// current view; the TUI drops frames tagged with anything else.
-#[derive(Default, Debug, PartialEq, Eq)]
-struct Attach {
-    pending: usize,
-    showing: Option<String>,
-}
-
-impl Attach {
-    /// Begin an Attach to `name`. Returns whether the connection was already
-    /// attached (so the caller writes a `Detach` first — switching sessions on
-    /// one connection is detach-then-attach).
-    fn begin(&mut self, name: String) -> bool {
-        let was_attached = self.showing.is_some();
-        self.pending += 1;
-        self.showing = Some(name);
-        was_attached
-    }
-
-    /// A Snapshot arrived: the session name to tag it with, or `None` when it
-    /// belongs to a superseded attach and must be dropped.
-    fn on_snapshot(&mut self) -> Option<String> {
-        if self.pending > 1 {
-            self.pending -= 1; // superseded attach — not our view
-            return None;
-        }
-        self.pending = 0;
-        self.showing.clone()
-    }
-
-    /// An Output arrived: the session name to tag it with, or `None` while a
-    /// switch is still converging (the bytes belong to a session we just left).
-    fn on_output(&self) -> Option<String> {
-        if self.pending > 0 {
-            return None;
-        }
-        self.showing.clone()
-    }
-
-    /// The attached session exited (`SESSION_EXITED` carries no name). Returns
-    /// the ended session's name only when it can be pinned on the current view —
-    /// with no switch in flight; with one pending, the exit belongs to the
-    /// session we just left and taking `showing` would drop the incoming
-    /// Snapshot of the new one.
-    fn on_session_exited(&mut self) -> Option<String> {
-        if self.pending == 0 {
-            self.showing.take()
-        } else {
-            None
-        }
-    }
-
-    /// The client renamed a session. If it is the one being shown, re-tag the
-    /// view: the TUI optimistically renames its `active` at the same moment,
-    /// and frames still tagged with the old name would fail its "is this the
-    /// active session?" check — every Output after a rename-while-viewing was
-    /// silently dropped, freezing the pane (typed input still executed; only
-    /// the display stalled) until a switch away and back re-attached.
-    fn on_rename(&mut self, old: &str, new: &str) {
-        if self.showing.as_deref() == Some(old) {
-            self.showing = Some(new.to_string());
-        }
-    }
-
-    /// A pending Attach failed (`NO_SUCH_SESSION`: the session died before we
-    /// attached). Drains one pending count; returns the ended name only if that
-    /// was the newest attach, so the client stops holding the pane for a
-    /// Snapshot that will never come. Caller guards `pending > 0`.
-    fn on_attach_failed(&mut self) -> Option<String> {
-        self.pending -= 1;
-        if self.pending == 0 {
-            self.showing.take()
-        } else {
-            None
-        }
-    }
-}
+use asd_proto::attach::Attach;
 
 /// Handle to the running actor thread.
 pub struct Conn {
@@ -205,20 +121,9 @@ async fn drive(
     let mut reader = FrameReader::new(r);
     let mut writer = FrameWriter::new(w);
 
-    writer
-        .write_frame(&Frame::Hello {
-            proto_version: PROTO_VERSION,
-            kind: ClientKind::Cli,
-        })
+    asd_proto::handshake(&mut writer, &mut reader, ClientKind::Cli)
         .await
-        .map_err(|_| "handshake write failed".to_string())?;
-    match reader.read_frame().await {
-        Ok(Some(Frame::HelloAck { .. })) => {}
-        Ok(Some(Frame::Error { code, msg })) => {
-            return Err(format!("handshake rejected ({code}): {msg}"));
-        }
-        _ => return Err("no handshake ack".to_string()),
-    }
+        .map_err(|msg| format!("handshake: {msg}"))?;
     let _ = ev_tx.send(Ev::Up);
 
     // Attach bookkeeping (see `Attach`): which session's frames to forward and
@@ -283,7 +188,7 @@ async fn drive(
                     // the newest attach that failed, tell the TUI so it
                     // stops holding the pane for a Snapshot that will never
                     // come.
-                    else if code == code::NO_SUCH_SESSION && at.pending > 0 {
+                    else if code == code::NO_SUCH_SESSION && at.pending() > 0 {
                         if let Some(name) = at.on_attach_failed() {
                             let _ = ev_tx.send(Ev::SessionEnded { name, msg });
                         }
@@ -310,14 +215,14 @@ async fn drive(
                     }
                 }
                 Some(Cmd::Input(bytes)) => {
-                    if at.showing.is_some()
+                    if at.is_attached()
                         && writer.write_frame(&Frame::Input { bytes }).await.is_err()
                     {
                         return Err("input write failed".to_string());
                     }
                 }
                 Some(Cmd::Resize { cols, rows }) => {
-                    if at.showing.is_some()
+                    if at.is_attached()
                         && writer.write_frame(&Frame::Resize { cols, rows }).await.is_err()
                     {
                         return Err("resize write failed".to_string());
@@ -345,139 +250,12 @@ async fn drive(
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(Cmd::Shutdown) | None => {
-                    if at.showing.is_some() {
+                    if at.is_attached() {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
                     return Ok(());
                 }
             },
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Attach;
-
-    fn s(name: &str) -> Option<String> {
-        Some(name.to_string())
-    }
-
-    #[test]
-    fn first_attach_needs_no_detach_switch_does() {
-        let mut at = Attach::default();
-        // Nothing attached yet → no Detach precedes the first Attach.
-        assert!(!at.begin("a".into()));
-        at.on_snapshot(); // converges
-        // Now attached → switching sends a Detach first.
-        assert!(at.begin("b".into()));
-    }
-
-    #[test]
-    fn snapshot_then_output_tag_the_current_view() {
-        let mut at = Attach::default();
-        at.begin("a".into());
-        assert_eq!(at.on_snapshot(), s("a")); // reveal a
-        assert_eq!(at.on_output(), s("a")); // live output belongs to a
-    }
-
-    #[test]
-    fn output_is_dropped_until_the_snapshot_converges() {
-        let mut at = Attach::default();
-        at.begin("a".into());
-        // A switch is in flight: Output before the Snapshot is stale, dropped.
-        assert_eq!(at.on_output(), None);
-        assert_eq!(at.on_snapshot(), s("a"));
-        assert_eq!(at.on_output(), s("a"));
-    }
-
-    #[test]
-    fn quick_switch_drops_the_superseded_snapshot() {
-        let mut at = Attach::default();
-        at.begin("a".into());
-        at.begin("b".into()); // switched before a's snapshot arrived
-        // a's snapshot arrives first — superseded, dropped (not shown as b).
-        assert_eq!(at.on_snapshot(), None);
-        // b's snapshot arrives — this is the view.
-        assert_eq!(at.on_snapshot(), s("b"));
-        assert_eq!(at.on_output(), s("b"));
-    }
-
-    #[test]
-    fn session_exit_pins_the_name_only_when_settled() {
-        // No switch in flight: the exit is the current view's.
-        let mut at = Attach::default();
-        at.begin("a".into());
-        at.on_snapshot();
-        assert_eq!(at.on_session_exited(), s("a"));
-        // After the exit nothing is shown.
-        assert_eq!(at.on_output(), None);
-
-        // Switch in flight: a stray exit belongs to the session we left, so it
-        // must NOT take the pending view (that would drop the new Snapshot).
-        let mut at = Attach::default();
-        at.begin("a".into());
-        at.on_snapshot();
-        at.begin("b".into()); // switching to b, snapshot pending
-        assert_eq!(at.on_session_exited(), None);
-        assert_eq!(at.on_snapshot(), s("b")); // b still reveals
-    }
-
-    #[test]
-    fn failed_attach_drains_and_reports_only_the_newest() {
-        // Single failed attach → report so the pane stops holding.
-        let mut at = Attach::default();
-        at.begin("gone".into());
-        assert_eq!(at.on_attach_failed(), s("gone"));
-
-        // Two in flight, the older attach fails: drain the count but keep the
-        // newer view; its Snapshot still reveals.
-        let mut at = Attach::default();
-        at.begin("a".into());
-        at.begin("b".into());
-        assert_eq!(at.on_attach_failed(), None); // a failed, b still pending
-        assert_eq!(at.on_snapshot(), s("b"));
-    }
-
-    /// Bug regression: renaming the session being viewed re-tags the view, so
-    /// its Output keeps matching the TUI's optimistically-renamed `active`.
-    /// Before the fix every frame after a rename-while-viewing was dropped —
-    /// the pane froze (input still executed) until a switch away and back.
-    /// The common trigger: create a session, rename it, start typing.
-    #[test]
-    fn rename_of_the_shown_session_retags_the_view() {
-        let mut at = Attach::default();
-        at.begin("s0".into());
-        assert_eq!(at.on_snapshot(), s("s0"));
-        at.on_rename("s0", "zzz");
-        // Frames now tag as the new name — the TUI's active after its
-        // optimistic rename — instead of being dropped as a name mismatch.
-        assert_eq!(at.on_output(), s("zzz"));
-
-        // Renaming a session that is NOT being shown leaves the view alone.
-        let mut at = Attach::default();
-        at.begin("a".into());
-        at.on_snapshot();
-        at.on_rename("other", "new");
-        assert_eq!(at.on_output(), s("a"));
-    }
-
-    /// Bug regression (client side): after the attached session is killed and
-    /// exits, attaching a brand-new session routes that session's Snapshot to
-    /// the pane — the frame is NOT filtered out. (The daemon-side fix is what
-    /// makes the Snapshot actually arrive; this pins the client's routing.)
-    #[test]
-    fn reattach_after_kill_routes_the_new_sessions_snapshot() {
-        let mut at = Attach::default();
-        at.begin("a".into());
-        assert_eq!(at.on_snapshot(), s("a"));
-        // a is killed and exits under us.
-        assert_eq!(at.on_session_exited(), s("a"));
-        assert_eq!(at.showing, None);
-        // Create + attach a new session b.
-        assert!(!at.begin("b".into())); // not attached (a exited) → no Detach
-        // b's Snapshot must reveal as b — not dropped, not tagged a.
-        assert_eq!(at.on_snapshot(), s("b"));
-        assert_eq!(at.on_output(), s("b"));
     }
 }
