@@ -477,6 +477,92 @@ fn snapshot_fidelity_alt_screen_after_history() {
     assert_eq!(a.cursor.position, b.cursor.position, "cursor position");
 }
 
+// render_snapshot memoizes cell rows by viewport row index and rebuilds only
+// the rows libghostty flags dirty. That is sound exactly while libghostty
+// marks a row dirty whenever the content at its viewport index changes — which
+// includes the index shifts from scrolling, alt-screen switches and resizes,
+// none of which the memo's column-count guard can catch. These pin that
+// upstream invariant: if a libghostty-vt bump ever makes dirty tracking
+// finer-grained, the pane would silently render stale rows instead.
+
+#[test]
+fn cached_rows_keep_content_and_style_on_partial_repaint() {
+    let mut vt = term(20, 4);
+    vt.feed(b"\x1b[1;31maaa\x1b[0m\r\nbbb\r\nccc");
+    let first = vt.render_snapshot();
+
+    // Repaint row 2 only; the others stay clean and must come back intact.
+    vt.feed(b"\x1b[2;1HXYZ");
+    let second = vt.render_snapshot();
+    assert!(!second.row_dirty[0], "untouched row stays clean (memo hit)");
+    assert_eq!(row_text(&second, 0).trim_end(), "aaa");
+    assert_eq!(row_text(&second, 1).trim_end(), "XYZ");
+    assert_eq!(row_text(&second, 2).trim_end(), "ccc");
+    assert_eq!(second.cells[0][0].fg, first.cells[0][0].fg, "cached fg");
+    assert!(second.cells[0][0].flags.bold, "cached bold");
+}
+
+#[test]
+fn row_cache_invalidated_when_output_scrolls_the_screen() {
+    let mut vt = term(20, 4);
+    vt.feed(b"line0\r\nline1\r\nline2\r\n");
+    vt.render_snapshot();
+
+    // Every further line shifts the whole viewport up by one: row N now holds
+    // what row N+1 held, so the memo must not answer for any of them.
+    vt.feed(b"line3\r\n");
+    let scrolled = vt.render_snapshot();
+    assert_eq!(row_text(&scrolled, 0).trim_end(), "line1");
+    assert_eq!(row_text(&scrolled, 2).trim_end(), "line3");
+
+    vt.feed(b"line4\r\n");
+    let again = vt.render_snapshot();
+    assert_eq!(row_text(&again, 0).trim_end(), "line2");
+    assert_eq!(row_text(&again, 2).trim_end(), "line4");
+}
+
+#[test]
+fn row_cache_invalidated_on_alt_screen_switch() {
+    let mut vt = term(20, 4);
+    vt.feed(b"primary0\r\nprimary1\r\nprimary2");
+    vt.render_snapshot();
+
+    vt.feed(b"\x1b[?1049h\x1b[2J\x1b[HALT-A\r\nALT-B");
+    let alt = vt.render_snapshot();
+    assert_eq!(row_text(&alt, 0).trim_end(), "ALT-A");
+
+    // Leaving the alt screen restores rows written before the memo was filled
+    // with alt content.
+    vt.feed(b"\x1b[?1049l");
+    let back = vt.render_snapshot();
+    assert_eq!(row_text(&back, 0).trim_end(), "primary0");
+    assert_eq!(row_text(&back, 1).trim_end(), "primary1");
+}
+
+#[test]
+fn row_cache_invalidated_on_rows_only_resize() {
+    let mut vt = term(20, 6);
+    for i in 0..6 {
+        vt.feed(format!("line{i}\r\n").as_bytes());
+    }
+    let before = vt.render_snapshot();
+    assert_eq!(row_text(&before, 0).trim_end(), "line1");
+
+    // Columns are unchanged, so the memo's column-count guard cannot fire —
+    // only correct dirty flagging keeps the shifted rows from going stale.
+    vt.resize(20, 3);
+    let shrunk = vt.render_snapshot();
+    assert_eq!(shrunk.rows, 3);
+    assert_eq!(row_text(&shrunk, 0).trim_end(), "line4");
+    assert_eq!(row_text(&shrunk, 1).trim_end(), "line5");
+
+    vt.resize(20, 6);
+    let grown = vt.render_snapshot();
+    assert_eq!(grown.rows, 6);
+    assert_eq!(row_text(&grown, 0).trim_end(), "line1");
+    assert_eq!(row_text(&grown, 4).trim_end(), "line5");
+}
+
 #[test]
 fn synchronized_output_tracks_mode_2026() {
     let mut vt = term(80, 24);

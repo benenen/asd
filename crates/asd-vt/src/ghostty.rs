@@ -36,7 +36,10 @@ pub struct GhosttyVt {
     encoder: gkey::Encoder<'static>,
     /// Query replies the terminal produces during `vt_write` (DA/DSR/DECRQM...).
     pty_responses: Rc<RefCell<Vec<u8>>>,
-    /// Cell rows from the previous `render_snapshot()`, to skip FFI for unchanged scrollback.
+    /// Cell rows from the previous `render_snapshot()`, keyed by viewport row
+    /// index, reused for rows libghostty reports clean. Valid only because a
+    /// row is flagged dirty whenever the content at its index changes — see
+    /// the memo comment in `render_snapshot`.
     prev_cells: Vec<Vec<CellSnapshot>>,
 }
 
@@ -218,6 +221,7 @@ impl VtBackend for GhosttyVt {
 
         let mut cells = Vec::with_capacity(rows as usize);
         let mut row_dirty = Vec::with_capacity(rows as usize);
+        let mut rebuilt = Vec::with_capacity(rows as usize);
         let mut grapheme_buf = String::new();
 
         let mut row_iter = self
@@ -229,15 +233,17 @@ impl VtBackend for GhosttyVt {
             row_dirty.push(dirty);
             let idx = row_dirty.len() - 1;
 
-            // Reuse previous cells when this row hasn't changed — during
-            // streaming output 99%+ of scrollback rows are static, so
-            // skipping the FFI-per-cell iteration is a huge win.
-            if !dirty
-                && idx < self.prev_cells.len()
-                && self.prev_cells[idx].len() == cols as usize
+            // Reuse the previous pass's cells for rows libghostty left clean:
+            // reading one cell costs several FFI calls, and a partially
+            // repainted screen (a TUI redrawing its status line) leaves most
+            // rows untouched. Sound only because libghostty flags a row dirty
+            // whenever the content at its viewport index changes — including
+            // the index shifts from scrolling, alt-screen switches and
+            // resizes, which the column guard here would not catch on its own.
+            // tests/vt.rs pins those cases.
+            if !dirty && idx < self.prev_cells.len() && self.prev_cells[idx].len() == cols as usize
             {
                 cells.push(self.prev_cells[idx].clone());
-                row.set_dirty(false).expect("resetting row dirty failed");
                 continue;
             }
 
@@ -276,11 +282,22 @@ impl VtBackend for GhosttyVt {
             // Dirty semantics: this snapshot consumes the row-level dirty flag
             row.set_dirty(false).expect("resetting row dirty failed");
             cells.push(row_cells);
+            rebuilt.push(idx);
         }
         snapshot
             .set_dirty(Dirty::Clean)
             .expect("resetting global dirty failed");
-        self.prev_cells = cells.clone();
+
+        // Refresh the memo for rebuilt rows only. Reused rows already hold the
+        // identical data, so copying the whole grid back every pass would cost
+        // the O(rows x cols) walk (one string allocation per cell) that the
+        // reuse above exists to avoid — and would do so even when nothing hit.
+        if self.prev_cells.len() != cells.len() {
+            self.prev_cells.resize_with(cells.len(), Vec::new);
+        }
+        for idx in rebuilt {
+            self.prev_cells[idx] = cells[idx].clone();
+        }
 
         RenderSnapshot {
             cols,
