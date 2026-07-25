@@ -774,12 +774,18 @@ mod win32 {
         }
     }
 
-    /// Graceful kill: GenerateConsoleCtrlEvent(CTRL_BREAK) — the closest
-    /// Windows analogue to SIGHUP for a console/ConPTY child.
-    pub fn graceful_kill(pid: u32) {
-        unsafe {
-            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
-        }
+    /// Best-effort graceful stop, the nearest Windows analogue to SIGHUP.
+    /// Returns whether the event was actually delivered.
+    ///
+    /// Two caveats make this fail far more often than it succeeds, so the
+    /// caller must not assume the child is going away:
+    /// `GenerateConsoleCtrlEvent`'s second argument is a process *group* id,
+    /// not a pid, so it only reaches a child created with
+    /// `CREATE_NEW_PROCESS_GROUP`; and it only reaches processes sharing the
+    /// *caller's* console, which a ConPTY child of a daemon does not. The
+    /// caller falls back to `force_kill` when this returns false.
+    pub fn graceful_kill(pid: u32) -> bool {
+        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0 }
     }
 }
 
@@ -801,10 +807,13 @@ pub fn kill_child(meta: &SessionMeta, force: bool) {
     }
     #[cfg(windows)]
     {
-        if force {
+        // A graceful stop that could not be delivered would otherwise leave the
+        // child running until the 2s grace period expires and something else
+        // force-kills it — so every `asd kill` would stall for two seconds and
+        // the child would still die abruptly. Falling straight through to
+        // TerminateProcess costs the child nothing it was going to get anyway.
+        if force || !win32::graceful_kill(pid) {
             win32::force_kill(pid);
-        } else {
-            win32::graceful_kill(pid);
         }
     }
 }

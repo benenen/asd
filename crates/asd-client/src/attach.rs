@@ -195,6 +195,11 @@ mod tests {
         assert_eq!(at.on_snapshot(), s("b"));
     }
 
+    /// Bug regression: renaming the session being viewed re-tags the view, so
+    /// its Output keeps matching the client's optimistically-renamed active
+    /// session. Before the fix every frame after a rename-while-viewing was
+    /// dropped — the pane froze (input still executed) until a switch away and
+    /// back. The common trigger: create a session, rename it, start typing.
     #[test]
     fn rename_of_the_shown_session_retags_the_view() {
         let mut at = Attach::default();
@@ -211,6 +216,10 @@ mod tests {
         assert_eq!(at.on_output(), s("a"));
     }
 
+    /// Bug regression (client side): after the attached session is killed and
+    /// exits, attaching a brand-new session routes that session's Snapshot to
+    /// the pane — the frame is NOT filtered out. (The daemon-side fix is what
+    /// makes the Snapshot actually arrive; this pins the client's routing.)
     #[test]
     fn reattach_after_kill_routes_the_new_sessions_snapshot() {
         let mut at = Attach::default();

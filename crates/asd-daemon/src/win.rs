@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use tracing::{error, info};
+use asd_proto::paths;
+use tracing::{error, info, warn};
 
 use crate::conn;
 use crate::registry::Registry;
@@ -22,35 +23,38 @@ pub(super) async fn serve_connections(
         .to_str()
         .context("pipe path is not valid UTF-8")?
         .to_string();
+
+    // The FIRST instance claims the name exclusively. Without this flag any
+    // other process — including a second asd daemon started while this one is
+    // still alive — can add its own instances to the same name, after which
+    // clients are routed to whichever instance happens to accept them and the
+    // session list silently splits across two daemons. Failing here instead is
+    // exactly what makes "a daemon is already running" detectable.
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)
+        .with_context(|| {
+            format!("creating named pipe {pipe_name} (is another asd daemon already running?)")
+        })?;
     info!(pipe = %pipe_name, version = env!("CARGO_PKG_VERSION"), "asd daemon listening");
+
+    // Record our pid so `asd restart` can stop us. Named pipes carry no path in
+    // the filesystem, so this goes in the data dir (see `paths::pid_path`).
+    let pid_path = paths::pid_path(&pipe_path);
+    if let Some(dir) = pid_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&pid_path, std::process::id().to_string()) {
+        warn!(error = %e, "failed to write pid file");
+    }
 
     let mut conn_id: u64 = 0;
     loop {
-        // Create a new server instance for each connection.
-        // NamedPipeServer on Windows: each instance serves one client; the
-        // next client waits until we create another instance.
-        let server = match ServerOptions::new()
-            .first_pipe_instance(false)
-            .create(&pipe_name)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                error!(error = %e, "failed to create named pipe server");
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                continue;
-            }
-        };
-
         tokio::select! {
             result = server.connect() => {
-                match result {
-                    Ok(()) => {
-                        conn_id += 1;
-                        spawn_conn(server, Arc::clone(&registry), conn_id);
-                    }
-                    Err(e) => {
-                        error!(error = %e, "named pipe connect failed");
-                    }
+                if let Err(e) = result {
+                    error!(error = %e, "named pipe connect failed");
+                    continue;
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -58,9 +62,27 @@ pub(super) async fn serve_connections(
                 break;
             }
         }
+
+        // Create the successor instance *before* handing the connected one to
+        // its task: between a client connecting and the next instance existing
+        // there is no instance listening, and a client arriving in that window
+        // gets ERROR_PIPE_BUSY.
+        conn_id += 1;
+        match ServerOptions::new().create(&pipe_name) {
+            Ok(next) => {
+                let connected = std::mem::replace(&mut server, next);
+                spawn_conn(connected, Arc::clone(&registry), conn_id);
+            }
+            Err(e) => {
+                // No further clients can be accepted; serve this one, then stop.
+                error!(error = %e, "failed to create the next named pipe instance");
+                spawn_conn(server, Arc::clone(&registry), conn_id);
+                break;
+            }
+        }
     }
 
-    shutdown(&registry).await;
+    shutdown(&registry, &pid_path).await;
     Ok(())
 }
 
@@ -79,14 +101,16 @@ fn spawn_conn(
 
 // ---- Shutdown ---------------------------------------------------------------
 
-async fn shutdown(registry: &Arc<Mutex<Registry>>) {
+async fn shutdown(registry: &Arc<Mutex<Registry>>, pid_path: &Path) {
     // Capture final cwds and freeze the session list before killing children.
     registry.lock().unwrap().freeze_and_persist();
 
     // Shutdown: terminate each child → wait 2s → force-kill stragglers.
     let reg = Arc::clone(registry);
     let _ = tokio::task::spawn_blocking(move || Registry::shutdown_all(&reg)).await;
-    // Named pipes auto-cleanup when the process exits; nothing to remove.
+    // The pipe itself is a kernel object and disappears with the process; only
+    // the pid file needs removing so `asd restart` does not chase a dead pid.
+    let _ = std::fs::remove_file(pid_path);
     info!("asd daemon stopped");
 }
 

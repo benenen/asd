@@ -70,7 +70,10 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 libghostty-vt = "0.2"
 nix = { version = "0.30", features = ["signal", "process", "term", "fs"] }
-crossterm = "0.28"
+# Must match the crossterm ratatui 0.30 pulls in: asd-cli and asd-tui drive the
+# same terminal in one binary, and crossterm keeps process-global mode state, so
+# two versions would each restore what only they knew about.
+crossterm = "0.29"
 portable-pty = "0.9"
 postcard = { version = "1", features = ["use-std"] }
 ratatui = "0.30.2"

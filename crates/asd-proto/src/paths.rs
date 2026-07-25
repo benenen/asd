@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 /// Maximum session name length.
 pub const SESSION_NAME_MAX: usize = 64;
 
-/// UDS file name (unix) / named-pipe base name (Windows).
+/// UDS file name. Unix only — the Windows listener is a named pipe whose name
+/// is built in [`socket_path`], not a file in a directory.
 pub const SOCKET_FILE: &str = "asd.sock";
 
 /// Named-pipe path prefix on Windows.
@@ -66,13 +67,31 @@ pub fn socket_path() -> PathBuf {
 /// on startup and removes it on clean shutdown; `asd restart` reads it to stop
 /// the running daemon by signal — no protocol handshake, so it works even when
 /// the running daemon's `PROTO_VERSION` differs from the client's.
+#[cfg(unix)]
 pub fn pid_path(socket: &Path) -> PathBuf {
     socket.with_extension("pid")
 }
 
+/// PID file for the daemon owning `socket` (Windows). `socket` here is a named
+/// pipe (`\\.\pipe\asd-<user>`), which lives in the kernel's pipe namespace and
+/// cannot hold a file — appending `.pid` to it would just name a second pipe.
+/// The pid file therefore goes in [`data_dir`], named after the pipe so a
+/// custom `ASD_SOCKET` still gets its own file: `<data_dir>/asd-<user>.pid`.
+#[cfg(windows)]
+pub fn pid_path(socket: &Path) -> PathBuf {
+    let base = socket
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "asd".to_string());
+    data_dir().join(format!("{base}.pid"))
+}
+
 /// Daemon data directory (session metadata, logs).
 /// Unix: `$XDG_DATA_HOME/asd` or `~/.local/share/asd`.
-/// Windows: `%LOCALAPPDATA%\asd`.
+/// Windows: `%LOCALAPPDATA%\asd`, falling back to `%USERPROFILE%\AppData\Local\asd`.
+/// Machine-local read-write daemon state — deliberately a different directory
+/// from [`config_dir`] on every platform, so a hand-edited `config.toml` never
+/// shares a folder with files the daemon rewrites.
 pub fn data_dir() -> PathBuf {
     #[cfg(unix)]
     {
@@ -90,7 +109,7 @@ pub fn data_dir() -> PathBuf {
         {
             return PathBuf::from(dir).join("asd");
         }
-        home_dir().join("asd")
+        home_dir().join("AppData").join("Local").join("asd")
     }
 }
 
@@ -104,9 +123,10 @@ pub fn session_list_path() -> PathBuf {
 }
 
 /// Config file: `$XDG_CONFIG_HOME/asd/config.toml`, falling back to
-/// `~/.config/asd/config.toml`. `ASD_CONFIG` overrides it entirely (tests,
-/// multi-instance). The daemon reads it once at startup; it is never
-/// auto-created — a missing file just means "all defaults".
+/// `~/.config/asd/config.toml` (Windows: `%APPDATA%\asd\config.toml`).
+/// `ASD_CONFIG` overrides it entirely (tests, multi-instance). The daemon reads
+/// it once at startup; it is never auto-created — a missing file just means
+/// "all defaults".
 pub fn config_path() -> PathBuf {
     if let Some(p) = std::env::var_os("ASD_CONFIG")
         && !p.is_empty()
@@ -116,7 +136,9 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-/// Directory holding the config file.
+/// Directory holding the (read-only, user-authored) config file. Roaming
+/// application data on Windows — `%APPDATA%\asd`, i.e. deliberately not the
+/// same directory as [`data_dir`]'s `%LOCALAPPDATA%\asd`.
 fn config_dir() -> PathBuf {
     #[cfg(unix)]
     {
@@ -129,7 +151,12 @@ fn config_dir() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        home_dir().join("asd")
+        if let Some(dir) = std::env::var_os("APPDATA")
+            && !dir.is_empty()
+        {
+            return PathBuf::from(dir).join("asd");
+        }
+        home_dir().join("AppData").join("Roaming").join("asd")
     }
 }
 
@@ -172,6 +199,9 @@ fn uid() -> u32 {
 mod tests {
     use super::*;
 
+    // Unix only: on Windows the listener is a named pipe and the pid file is
+    // derived into `data_dir` instead (see the windows `pid_path`).
+    #[cfg(unix)]
     #[test]
     fn pid_path_swaps_the_socket_extension() {
         assert_eq!(

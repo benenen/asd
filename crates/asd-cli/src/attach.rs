@@ -571,31 +571,36 @@ impl Drop for ScreenGuard {
 }
 
 /// Raw mode guard: restores the original terminal mode on drop.
-struct RawGuard;
+///
+/// The guard owns the mode it has to put back, rather than parking it in a
+/// process-wide slot: a second guard would overwrite such a slot with the
+/// *raw* termios it just installed, and dropping either one would then restore
+/// raw mode as if it were the original. Owning it makes that unrepresentable.
+struct RawGuard {
+    /// The termios to restore. Windows keeps no state — crossterm restores the
+    /// console mode it saved itself.
+    #[cfg(unix)]
+    original: nix::sys::termios::Termios,
+}
 
 impl RawGuard {
     fn enable() -> anyhow::Result<Self> {
         #[cfg(unix)]
         {
-            // Store the original termios inside a thread-local so drop can restore it.
             use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
-            #[cfg(unix)]
             use std::os::fd::AsFd;
             let stdin = std::io::stdin();
             let original = tcgetattr(stdin.as_fd())?;
             let mut raw = original.clone();
             cfmakeraw(&mut raw);
             tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw)?;
-            // Stash for drop
-            RAW_ORIGINAL.with(|cell| {
-                cell.replace(Some(original));
-            });
+            Ok(Self { original })
         }
         #[cfg(windows)]
         {
             crossterm::terminal::enable_raw_mode().context("enabling raw terminal mode")?;
+            Ok(Self {})
         }
-        Ok(Self)
     }
 }
 
@@ -604,26 +609,15 @@ impl Drop for RawGuard {
         #[cfg(unix)]
         {
             use nix::sys::termios::{SetArg, tcsetattr};
-            #[cfg(unix)]
             use std::os::fd::AsFd;
-            RAW_ORIGINAL.with(|cell| {
-                if let Some(original) = cell.take() {
-                    let stdin = std::io::stdin();
-                    let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &original);
-                }
-            });
+            let stdin = std::io::stdin();
+            let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &self.original);
         }
         #[cfg(windows)]
         {
             let _ = crossterm::terminal::disable_raw_mode();
         }
     }
-}
-
-#[cfg(unix)]
-std::thread_local! {
-    static RAW_ORIGINAL: std::cell::RefCell<Option<nix::sys::termios::Termios>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

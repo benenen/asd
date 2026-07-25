@@ -206,9 +206,9 @@ async fn drive(
                 }
                 Ok(Some(Frame::Error { code, msg })) => {
                     // SESSION_EXITED carries no session name: only pin it on
-                    // the current attach when no switch is in flight. With
-                    // pending_attach > 0 it belongs to the session we just
-                    // left — taking `attached` then would drop the incoming
+                    // the current attach when no switch is in flight. With a
+                    // pending attach it belongs to the session we just left —
+                    // taking the shown name then would drop the incoming
                     // Snapshot of the new session.
                     if code == code::SESSION_EXITED {
                         if let Some(name) = at.on_session_exited() {
@@ -216,10 +216,15 @@ async fn drive(
                         }
                     }
                     // A failed Attach (the session died before the daemon saw
-                    // it) sends this instead of a Snapshot — drain the count
-                    // or every later Snapshot would be taken for a stale one.
+                    // it) sends this instead of a Snapshot — drain the count or
+                    // every later Snapshot would be taken for a stale one. When
+                    // that was the newest attach the view is now showing
+                    // nothing, so tell the UI rather than leaving the pane
+                    // waiting on a Snapshot that will never arrive.
                     else if code == code::NO_SUCH_SESSION && at.pending() > 0 {
-                        at.on_attach_failed();
+                        if let Some(name) = at.on_attach_failed() {
+                            let _ = ev_tx.send(UiEvent::SessionEnded { host: id, name, msg });
+                        }
                     }
                     // Other errors are logged and ignored; the next list poll
                     // reconciles.

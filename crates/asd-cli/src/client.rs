@@ -49,14 +49,19 @@ pub async fn connect(socket: &Path, kind: ClientKind) -> anyhow::Result<Client> 
     use tokio::net::windows::named_pipe::ClientOptions;
 
     let pipe_name = socket.to_str().context("pipe path is not valid UTF-8")?;
-    let stream = ClientOptions::new()
-        .open(pipe_name)
-        .map_err(|e| {
+    let stream = ClientOptions::new().open(pipe_name).map_err(|e| {
+        // Only "no such pipe" means no daemon. Everything else — the pipe is
+        // busy because every instance is taken, access denied, … — must keep
+        // its real error, or the user chases a daemon that is in fact running.
+        if e.kind() == std::io::ErrorKind::NotFound {
             anyhow::anyhow!(
-                "asd-daemon is not running at {}                  (start one with `asd new` or `asd attach -A <name>`)",
-                pipe_name
+                "asd-daemon is not running at {pipe_name} \
+                 (start one with `asd new` or `asd attach -A <name>`)"
             )
-        })?;
+        } else {
+            anyhow::Error::new(e).context(format!("connecting {pipe_name}"))
+        }
+    })?;
     let (r, w) = tokio::io::split(stream);
     let mut client = Client {
         reader: FrameReader::new(Box::new(r)),
@@ -94,8 +99,11 @@ pub async fn restart(socket: &Path) -> anyhow::Result<Client> {
 
 #[cfg(windows)]
 pub async fn restart(socket: &Path) -> anyhow::Result<Client> {
-    // On Windows, named pipes auto-cleanup when the process exits.
-    // Just spawn a new daemon — the old one's pipe will be invalid.
+    // The old daemon must actually be stopped first. A named pipe lives as long
+    // as its owning process, so "just spawn a new one" leaves the old daemon
+    // holding the name — and since the successor claims it with
+    // `first_pipe_instance(true)`, the new daemon would fail to start at all.
+    stop_daemon(socket).await;
     spawn_daemon(socket)?;
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -137,6 +145,71 @@ async fn stop_daemon(socket: &Path) {
 #[cfg(unix)]
 fn process_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Stop the daemon owning `socket` if one is recorded, for a restart.
+///
+/// Windows has no signals, so the recorded pid is ended with TerminateProcess.
+/// That is abrupt — the daemon does not get to refresh each session's live cwd
+/// on the way out — but the session list on disk is rewritten on every
+/// create/rename/kill, so a restart still restores every session at its last
+/// recorded cwd. That is the same guarantee a SIGKILLed unix daemon gives.
+#[cfg(windows)]
+async fn stop_daemon(socket: &Path) {
+    let pid_path = paths::pid_path(socket);
+    if let Some(pid) = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&p| p > 0)
+    {
+        win32::terminate(pid);
+        // The successor claims the pipe name with `first_pipe_instance(true)`
+        // and would fail outright if the old one still held it, so wait for the
+        // name to be released before spawning.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pipe_in_use(socket) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let _ = std::fs::remove_file(&pid_path);
+}
+
+/// Whether any process still serves the named pipe. Anything other than "no
+/// such pipe" — all instances busy, access denied — still means it exists.
+#[cfg(windows)]
+fn pipe_in_use(socket: &Path) -> bool {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    let Some(name) = socket.to_str() else {
+        return false;
+    };
+    match ClientOptions::new().open(name) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Minimal kernel32 process control (no extra crate, mirrors asd-daemon's).
+#[cfg(windows)]
+mod win32 {
+    unsafe extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
+        fn CloseHandle(hObject: isize) -> i32;
+    }
+
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    /// End `pid`. Failure means it is already gone (or not ours to kill), which
+    /// for a restart is indistinguishable from success.
+    pub fn terminate(pid: u32) {
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if handle != 0 {
+            unsafe {
+                TerminateProcess(handle, 0);
+                CloseHandle(handle);
+            }
+        }
+    }
 }
 
 /// Self-healing startup: connection refused/absent → spawn daemon → retry.
