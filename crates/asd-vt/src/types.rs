@@ -4,6 +4,8 @@
 //! `!Send` Terminal owned exclusively by its holding thread, then handed over
 //! a channel to the GUI/other threads.
 
+use std::sync::Arc;
+
 /// RGB color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rgb {
@@ -101,8 +103,10 @@ pub struct CursorSnapshot {
 pub struct RenderSnapshot {
     pub cols: u16,
     pub rows: u16,
-    /// `rows` rows × `cols` cells.
-    pub cells: Vec<Vec<CellSnapshot>>,
+    /// `rows` rows × `cols` cells. Rows are shared rather than owned so a
+    /// backend can hand back a row that did not change without copying its
+    /// cells; treat them as immutable once the snapshot is built.
+    pub cells: Vec<Arc<Vec<CellSnapshot>>>,
     /// Per-row dirty flags, length = `rows`.
     pub row_dirty: Vec<bool>,
     pub cursor: CursorSnapshot,

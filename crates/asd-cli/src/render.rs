@@ -43,7 +43,7 @@ pub fn render_frame(snap: &RenderSnapshot, sel: Option<Selection>) -> Vec<u8> {
         let mut last_sgr: Option<String> = None; // each row starts clean
         out.extend_from_slice(b"\x1b[0m");
         let mut x = 0u16;
-        for cell in row {
+        for cell in row.iter() {
             if cell.width == CellWidth::SpacerTail {
                 // Emitted as part of the preceding wide char.
                 continue;
@@ -263,7 +263,9 @@ mod tests {
         let mk = |pos| RenderSnapshot {
             cols: 10,
             rows: 3,
-            cells: vec![vec![CellSnapshot::default(); 10]; 3],
+            cells: (0..3)
+                .map(|_| std::sync::Arc::new(vec![CellSnapshot::default(); 10]))
+                .collect(),
             row_dirty: vec![true; 3],
             cursor: CursorSnapshot {
                 visible: true,
@@ -297,7 +299,7 @@ mod tests {
         let mk = |row: Vec<CellSnapshot>| RenderSnapshot {
             cols: row.len() as u16,
             rows: 1,
-            cells: vec![row],
+            cells: vec![std::sync::Arc::new(row)],
             row_dirty: vec![true],
             cursor: CursorSnapshot::default(),
             palette: [Rgb::default(); 256],

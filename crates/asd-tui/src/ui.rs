@@ -813,7 +813,12 @@ mod tests {
         let snap = RenderSnapshot {
             cols: 4,
             rows: 1,
-            cells: vec![vec![cell("a"), cell(" "), cell(""), cell("")]],
+            cells: vec![std::sync::Arc::new(vec![
+                cell("a"),
+                cell(" "),
+                cell(""),
+                cell(""),
+            ])],
             row_dirty: vec![true],
             cursor: CursorSnapshot::default(),
             palette: [Rgb::default(); 256],

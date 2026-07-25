@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use libghostty_vt::{
     RenderState, Terminal, TerminalOptions,
@@ -39,8 +40,9 @@ pub struct GhosttyVt {
     /// Cell rows from the previous `render_snapshot()`, keyed by viewport row
     /// index, reused for rows libghostty reports clean. Valid only because a
     /// row is flagged dirty whenever the content at its index changes — see
-    /// the memo comment in `render_snapshot`.
-    prev_cells: Vec<Vec<CellSnapshot>>,
+    /// the memo comment in `render_snapshot`. Shared with the snapshot that
+    /// was handed out, so rows must never be mutated in place.
+    prev_cells: Vec<Arc<Vec<CellSnapshot>>>,
 }
 
 impl std::fmt::Debug for GhosttyVt {
@@ -221,7 +223,6 @@ impl VtBackend for GhosttyVt {
 
         let mut cells = Vec::with_capacity(rows as usize);
         let mut row_dirty = Vec::with_capacity(rows as usize);
-        let mut rebuilt = Vec::with_capacity(rows as usize);
         let mut grapheme_buf = String::new();
 
         let mut row_iter = self
@@ -243,7 +244,7 @@ impl VtBackend for GhosttyVt {
             // tests/vt.rs pins those cases.
             if !dirty && idx < self.prev_cells.len() && self.prev_cells[idx].len() == cols as usize
             {
-                cells.push(self.prev_cells[idx].clone());
+                cells.push(Arc::clone(&self.prev_cells[idx]));
                 continue;
             }
 
@@ -281,23 +282,14 @@ impl VtBackend for GhosttyVt {
             }
             // Dirty semantics: this snapshot consumes the row-level dirty flag
             row.set_dirty(false).expect("resetting row dirty failed");
-            cells.push(row_cells);
-            rebuilt.push(idx);
+            cells.push(Arc::new(row_cells));
         }
         snapshot
             .set_dirty(Dirty::Clean)
             .expect("resetting global dirty failed");
-
-        // Refresh the memo for rebuilt rows only. Reused rows already hold the
-        // identical data, so copying the whole grid back every pass would cost
-        // the O(rows x cols) walk (one string allocation per cell) that the
-        // reuse above exists to avoid — and would do so even when nothing hit.
-        if self.prev_cells.len() != cells.len() {
-            self.prev_cells.resize_with(cells.len(), Vec::new);
-        }
-        for idx in rebuilt {
-            self.prev_cells[idx] = cells[idx].clone();
-        }
+        // Rows are shared, so refreshing the memo is one refcount bump each —
+        // no per-cell copy, whether the row was reused or just rebuilt.
+        self.prev_cells = cells.clone();
 
         RenderSnapshot {
             cols,
