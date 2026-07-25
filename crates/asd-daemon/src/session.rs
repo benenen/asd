@@ -403,8 +403,10 @@ fn proc_pidpath_basename(pid: libc::pid_t) -> Option<String> {
     (!base.is_empty()).then(|| base.to_string())
 }
 
-/// No cheap foreground-command source on other targets.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// No cheap foreground-command source on other unix targets. Windows never
+/// reaches here — `libc` is a unix-only dependency and the Windows
+/// `foreground_command` above is a self-contained stub.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn proc_command(_pid: libc::pid_t) -> Option<String> {
     None
 }
@@ -466,7 +468,12 @@ pub fn spawn_session(
     let master = pair.master;
     // Raw fd for foreground-process lookups; the master owns it and stays open
     // for the session's lifetime (this is a borrow, not a dup).
+    #[cfg(unix)]
     let master_fd = master.as_raw_fd().unwrap_or(-1);
+    // ConPTY exposes no equivalent handle for foreground-process lookups, and
+    // the Windows `foreground_command` ignores this value anyway.
+    #[cfg(windows)]
+    let master_fd = -1;
     let pty_writer = master.take_writer()?;
     let pty_reader = master.try_clone_reader()?;
 
@@ -752,7 +759,7 @@ fn broadcast(clients: &mut Vec<ClientSink>, meta: &SessionMeta, frame: Frame) {
 mod win32 {
     #![allow(unsafe_code)]
 
-    extern "system" {
+    unsafe extern "system" {
         fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
         fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
         fn CloseHandle(hObject: isize) -> i32;

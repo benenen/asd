@@ -212,7 +212,8 @@ static ORIG_TERMIOS: std::sync::atomic::AtomicPtr<libc::termios> =
 /// Escape sequences that undo the modes the TUI turns on: disable mouse tracking
 /// (SGR 1006/1015 + 1000/1002/1003), bracketed paste (2004), leave the alternate
 /// screen (1049), show the cursor (25h), reset SGR (0m). Written verbatim from
-/// the signal handler.
+/// the signal handler (which only exists on unix).
+#[cfg(unix)]
 const TERM_RESTORE: &[u8] =
     b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m";
 
@@ -339,6 +340,7 @@ fn cursor_tail(tail: Option<(u16, u16, bool)>) -> Vec<u8> {
 /// wakes for keyboard input) until the terminal is gone, then exits: the
 /// daemon treats the dropped connection as a detach, and there is no terminal
 /// left to restore.
+#[cfg(unix)]
 fn spawn_tty_watchdog() {
     std::thread::Builder::new()
         .name("asd-tui-ttywatch".into())
@@ -359,6 +361,11 @@ fn spawn_tty_watchdog() {
         })
         .expect("tty watchdog thread");
 }
+
+/// No equivalent on Windows: a console has no pty master to be destroyed
+/// behind us, and closing the window terminates the process outright.
+#[cfg(windows)]
+fn spawn_tty_watchdog() {}
 
 /// Open the TUI against `socket`; `session` preselects one by name. The
 /// daemon must already be running (the `asd ui` wrapper ensures it).

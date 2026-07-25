@@ -8,13 +8,16 @@
 //! so a quick session switch can't paint stale content (same race as the GUI
 //! clients).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, code};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
+type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
 /// How often the session list is re-polled.
 const LIST_INTERVAL: Duration = Duration::from_millis(1500);
@@ -107,17 +110,38 @@ impl Conn {
     }
 }
 
+/// Open the local daemon endpoint and box the halves: a Unix socket on unix,
+/// a named pipe on Windows — the two transports the daemon's server layer
+/// listens on.
+#[cfg(unix)]
+async fn connect_local(socket: &Path) -> Result<(BoxRead, BoxWrite), String> {
+    let stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    let (r, w) = tokio::io::split(stream);
+    Ok((Box::new(r), Box::new(w)))
+}
+
+#[cfg(windows)]
+async fn connect_local(socket: &Path) -> Result<(BoxRead, BoxWrite), String> {
+    let pipe_name = socket
+        .to_str()
+        .ok_or_else(|| format!("pipe path is not valid UTF-8: {}", socket.display()))?;
+    let stream = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(pipe_name)
+        .map_err(|e| format!("connect {pipe_name}: {e}"))?;
+    let (r, w) = tokio::io::split(stream);
+    Ok((Box::new(r), Box::new(w)))
+}
+
 /// The connection event loop. Returns `Err(reason)` if the connection ends
 /// abnormally; a clean `Shutdown` returns `Ok(())`.
 async fn drive(
-    socket: &PathBuf,
+    socket: &Path,
     mut cmd_rx: UnboundedReceiver<Cmd>,
     ev_tx: &Sender<Ev>,
 ) -> Result<(), String> {
-    let stream = UnixStream::connect(socket)
-        .await
-        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
-    let (r, w) = stream.into_split();
+    let (r, w) = connect_local(socket).await?;
     let mut reader = FrameReader::new(r);
     let mut writer = FrameWriter::new(w);
 

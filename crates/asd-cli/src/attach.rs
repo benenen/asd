@@ -17,11 +17,12 @@
 
 use std::io::Write as _;
 
-
 use anyhow::Context;
 use asd_proto::Frame;
 use asd_vt::{GhosttyVt, VtBackend};
 use tokio::io::AsyncReadExt;
+// Only the unix-only `--stdio` proxy needs the async write/shutdown extensions.
+#[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -144,7 +145,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     let mut sigwinch = signal(SignalKind::window_change())?;
     #[cfg(windows)]
-    let mut sigwinch = std::future::pending::<()>();
+    let mut sigwinch = NeverSignal;
     let mut writer = client.writer;
 
     let exit = loop {
@@ -556,6 +557,22 @@ impl Drop for ScreenGuard {
     }
 }
 
+/// Stands in for the SIGWINCH stream on Windows, which has no such signal:
+/// `recv()` never resolves, so the resize arm of the select is simply never
+/// taken.
+///
+/// TODO: drive resizes from crossterm's `Event::Resize` instead, so the pty
+/// follows the console window on Windows too.
+#[cfg(windows)]
+struct NeverSignal;
+
+#[cfg(windows)]
+impl NeverSignal {
+    async fn recv(&mut self) -> Option<()> {
+        std::future::pending().await
+    }
+}
+
 /// Raw mode guard: restores the original terminal mode on drop.
 struct RawGuard;
 
@@ -565,8 +582,7 @@ impl RawGuard {
         {
             // Store the original termios inside a thread-local so drop can restore it.
             use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
-            #[cfg(unix)]
-use std::os::fd::AsFd;
+            use std::os::fd::AsFd;
             let stdin = std::io::stdin();
             let original = tcgetattr(stdin.as_fd())?;
             let mut raw = original.clone();
@@ -579,8 +595,7 @@ use std::os::fd::AsFd;
         }
         #[cfg(windows)]
         {
-            crossterm::terminal::enable_raw_mode()
-                .context("enabling raw terminal mode")?;
+            crossterm::terminal::enable_raw_mode().context("enabling raw terminal mode")?;
         }
         Ok(Self)
     }
@@ -591,8 +606,7 @@ impl Drop for RawGuard {
         #[cfg(unix)]
         {
             use nix::sys::termios::{SetArg, tcsetattr};
-            #[cfg(unix)]
-use std::os::fd::AsFd;
+            use std::os::fd::AsFd;
             RAW_ORIGINAL.with(|cell| {
                 if let Some(original) = cell.take() {
                     let stdin = std::io::stdin();
@@ -610,7 +624,7 @@ use std::os::fd::AsFd;
 #[cfg(unix)]
 std::thread_local! {
     static RAW_ORIGINAL: std::cell::RefCell<Option<nix::sys::termios::Termios>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
