@@ -56,11 +56,7 @@ pub(super) async fn serve_connections(
 
 // ---- Connection spawn -------------------------------------------------------
 
-fn spawn_conn(
-    stream: tokio::net::UnixStream,
-    registry: Arc<Mutex<Registry>>,
-    conn_id: u64,
-) {
+fn spawn_conn(stream: tokio::net::UnixStream, registry: Arc<Mutex<Registry>>, conn_id: u64) {
     let (r, w) = stream.into_split();
     tokio::spawn(async move {
         conn::handle_conn(r, w, registry, conn_id).await;
@@ -69,11 +65,7 @@ fn spawn_conn(
 
 // ---- Shutdown ---------------------------------------------------------------
 
-async fn shutdown(
-    registry: &Arc<Mutex<Registry>>,
-    socket_path: &Path,
-    pid_path: &Path,
-) {
+async fn shutdown(registry: &Arc<Mutex<Registry>>, socket_path: &Path, pid_path: &Path) {
     // Capture final cwds and freeze the session list before killing children.
     registry.lock().unwrap().freeze_and_persist();
 

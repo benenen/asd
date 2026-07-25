@@ -17,7 +17,6 @@
 
 use std::io::Write as _;
 
-
 use anyhow::Context;
 use asd_proto::Frame;
 use asd_vt::{GhosttyVt, VtBackend};
@@ -49,6 +48,21 @@ enum Exit {
     Detached,
     SessionEnded(String),
     DaemonGone,
+}
+
+/// SIGWINCH stand-in for platforms without the signal. Windows delivers resize
+/// as a console event rather than a signal, so this never resolves and the
+/// select arm is simply never taken; the size is still picked up on the next
+/// explicit resize. Mirrors `tokio::signal::unix::Signal::recv`'s shape so the
+/// call site stays platform-independent.
+#[cfg(windows)]
+struct NoWinch;
+
+#[cfg(windows)]
+impl NoWinch {
+    async fn recv(&mut self) -> Option<()> {
+        std::future::pending().await
+    }
 }
 
 pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
@@ -144,7 +158,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     let mut sigwinch = signal(SignalKind::window_change())?;
     #[cfg(windows)]
-    let mut sigwinch = std::future::pending::<()>();
+    let mut sigwinch = NoWinch;
     let mut writer = client.writer;
 
     let exit = loop {
@@ -566,7 +580,7 @@ impl RawGuard {
             // Store the original termios inside a thread-local so drop can restore it.
             use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
             #[cfg(unix)]
-use std::os::fd::AsFd;
+            use std::os::fd::AsFd;
             let stdin = std::io::stdin();
             let original = tcgetattr(stdin.as_fd())?;
             let mut raw = original.clone();
@@ -579,8 +593,7 @@ use std::os::fd::AsFd;
         }
         #[cfg(windows)]
         {
-            crossterm::terminal::enable_raw_mode()
-                .context("enabling raw terminal mode")?;
+            crossterm::terminal::enable_raw_mode().context("enabling raw terminal mode")?;
         }
         Ok(Self)
     }
@@ -592,7 +605,7 @@ impl Drop for RawGuard {
         {
             use nix::sys::termios::{SetArg, tcsetattr};
             #[cfg(unix)]
-use std::os::fd::AsFd;
+            use std::os::fd::AsFd;
             RAW_ORIGINAL.with(|cell| {
                 if let Some(original) = cell.take() {
                     let stdin = std::io::stdin();
@@ -610,7 +623,7 @@ use std::os::fd::AsFd;
 #[cfg(unix)]
 std::thread_local! {
     static RAW_ORIGINAL: std::cell::RefCell<Option<nix::sys::termios::Termios>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

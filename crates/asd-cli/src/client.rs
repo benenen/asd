@@ -48,9 +48,7 @@ pub async fn connect(socket: &Path, kind: ClientKind) -> anyhow::Result<Client> 
 pub async fn connect(socket: &Path, kind: ClientKind) -> anyhow::Result<Client> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    let pipe_name = socket
-        .to_str()
-        .context("pipe path is not valid UTF-8")?;
+    let pipe_name = socket.to_str().context("pipe path is not valid UTF-8")?;
     let stream = ClientOptions::new()
         .open(pipe_name)
         .map_err(|e| {

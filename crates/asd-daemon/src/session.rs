@@ -752,7 +752,7 @@ fn broadcast(clients: &mut Vec<ClientSink>, meta: &SessionMeta, frame: Frame) {
 mod win32 {
     #![allow(unsafe_code)]
 
-    extern "system" {
+    unsafe extern "system" {
         fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
         fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
         fn CloseHandle(hObject: isize) -> i32;

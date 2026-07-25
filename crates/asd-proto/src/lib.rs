@@ -16,8 +16,8 @@
 //! `Inspect`/`InspectReply` frames (detailed single-session dump); v7 added
 //! `Rename` (rename a session; replies `Ack`).
 
-mod codec;
 pub mod attach;
+mod codec;
 pub mod paths;
 
 pub use codec::{FrameReader, FrameWriter, decode_frame, encode_frame};
@@ -50,7 +50,6 @@ pub async fn handshake(
         Err(e) => Err(format!("handshake read failed: {e}")),
     }
 }
-
 
 use serde::{Deserialize, Serialize};
 
