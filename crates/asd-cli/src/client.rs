@@ -4,8 +4,8 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
-use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, PROTO_VERSION, paths};
+use anyhow::Context;
+use asd_proto::{ClientKind, FrameReader, FrameWriter, paths};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub struct Client {
@@ -70,21 +70,10 @@ pub async fn connect(socket: &Path, kind: ClientKind) -> anyhow::Result<Client> 
 }
 
 async fn handshake(client: &mut Client, kind: ClientKind) -> anyhow::Result<()> {
-    client
-        .writer
-        .write_frame(&Frame::Hello {
-            proto_version: PROTO_VERSION,
-            kind,
-        })
-        .await?;
-    match client.reader.read_frame().await? {
-        Some(Frame::HelloAck { daemon_version, .. }) => {
-            client.daemon_version = daemon_version;
-            Ok(())
-        }
-        Some(Frame::Error { code, msg }) => bail!("daemon rejected handshake ({code}): {msg}"),
-        other => bail!("unexpected handshake reply: {other:?}"),
-    }
+    client.daemon_version = asd_proto::handshake(&mut client.writer, &mut client.reader, kind)
+        .await
+        .map_err(|msg| anyhow::anyhow!("{msg}"))?;
+    Ok(())
 }
 
 /// Restart the daemon for `socket`: stop the running one, then start a fresh

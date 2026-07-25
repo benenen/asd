@@ -13,7 +13,8 @@
 
 use std::time::Duration;
 
-use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, PROTO_VERSION, code};
+use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, code};
+use asd_proto::attach::Attach;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -153,33 +154,16 @@ async fn drive(
     let mut writer = FrameWriter::new(writer);
 
     // Handshake.
-    writer
-        .write_frame(&Frame::Hello {
-            proto_version: PROTO_VERSION,
-            kind: ClientKind::Gui,
-        })
+    asd_proto::handshake(&mut writer, &mut reader, ClientKind::Gui)
         .await
-        .map_err(|_| "handshake write failed".to_string())?;
-    match reader.read_frame().await {
-        Ok(Some(Frame::HelloAck { .. })) => {}
-        Ok(Some(Frame::Error { code, msg })) => {
-            return Err(format!("handshake rejected ({code}): {msg}"));
-        }
-        _ => return Err("no handshake ack".to_string()),
-    }
+        .map_err(|msg| format!("handshake: {msg}"))?;
     let _ = ev_tx.send(UiEvent::State {
         host: id,
         state: HostState::Up,
     });
 
-    // Attach frames sent whose Snapshot has not arrived yet. While > 0, Output
-    // belongs to a session we already left and is dropped. While > 1, arriving
-    // Snapshots belong to superseded attaches (the user switched again before
-    // the reply landed) and are dropped too — feeding them would paint the old
-    // session over the new one (the A→B→A switch scramble; all asd clients
-    // guard it the same way).
-    let mut pending_attach: usize = 0;
-    let mut attached: Option<String> = None;
+    // Attach state machine (shared with asd-tui; see asd_proto::attach::Attach).
+    let mut at = Attach::default();
 
     let mut ticker = tokio::time::interval(LIST_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -196,26 +180,20 @@ async fn drive(
                     let _ = ev_tx.send(UiEvent::Sessions { host: id, sessions });
                 }
                 Ok(Some(Frame::Snapshot { vt: dump })) => {
-                    if pending_attach > 1 {
-                        pending_attach -= 1; // superseded attach — not our view
-                        continue;
-                    }
-                    pending_attach = 0;
-                    if let Some(name) = &attached {
+                    if let Some(name) = at.on_snapshot() {
                         let _ = ev_tx.send(UiEvent::Bytes {
                             host: id,
-                            name: name.clone(),
+                            name,
                             data: dump,
                             snapshot: true,
                         });
                     }
                 }
                 Ok(Some(Frame::Output { bytes })) => {
-                    if pending_attach > 0 { continue; } // belongs to a session we just left
-                    if let Some(name) = &attached {
+                    if let Some(name) = at.on_output() {
                         let _ = ev_tx.send(UiEvent::Bytes {
                             host: id,
-                            name: name.clone(),
+                            name,
                             data: bytes,
                             snapshot: false,
                         });
@@ -233,17 +211,15 @@ async fn drive(
                     // left — taking `attached` then would drop the incoming
                     // Snapshot of the new session.
                     if code == code::SESSION_EXITED {
-                        if pending_attach == 0
-                            && let Some(name) = attached.take()
-                        {
+                        if let Some(name) = at.on_session_exited() {
                             let _ = ev_tx.send(UiEvent::SessionEnded { host: id, name, msg });
                         }
                     }
                     // A failed Attach (the session died before the daemon saw
                     // it) sends this instead of a Snapshot — drain the count
                     // or every later Snapshot would be taken for a stale one.
-                    else if code == code::NO_SUCH_SESSION && pending_attach > 0 {
-                        pending_attach -= 1;
+                    else if code == code::NO_SUCH_SESSION && at.pending() > 0 {
+                        at.on_attach_failed();
                     }
                     // Other errors are logged and ignored; the next list poll
                     // reconciles.
@@ -256,33 +232,27 @@ async fn drive(
             },
             cmd = cmd_rx.recv() => match cmd {
                 Some(HostCmd::Attach { name, cols, rows }) => {
-                    // Switching sessions on one connection means detach first.
-                    if attached.is_some() {
+                    if at.begin(name.clone()) {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
-                    pending_attach += 1;
-                    attached = Some(name.clone());
                     if writer.write_frame(&Frame::Attach { name, cols, rows }).await.is_err() {
                         return Err("attach write failed".to_string());
                     }
                 }
                 Some(HostCmd::Detach) => {
-                    if attached.take().is_some() {
+                    if at.detach().is_some() {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
-                    // pending_attach stays: any Snapshot still in flight must
-                    // drain through the Snapshot branch (attached is None,
-                    // nothing is forwarded) so the count stays aligned.
                 }
                 Some(HostCmd::Input(bytes)) => {
-                    if attached.is_some()
+                    if at.is_attached()
                         && writer.write_frame(&Frame::Input { bytes }).await.is_err()
                     {
                         return Err("input write failed".to_string());
                     }
                 }
                 Some(HostCmd::Resize { cols, rows }) => {
-                    if attached.is_some()
+                    if at.is_attached()
                         && writer.write_frame(&Frame::Resize { cols, rows }).await.is_err()
                     {
                         return Err("resize write failed".to_string());
@@ -308,7 +278,7 @@ async fn drive(
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(HostCmd::Shutdown) | None => {
-                    if attached.is_some() {
+                    if at.is_attached() {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
                     return Ok(());
