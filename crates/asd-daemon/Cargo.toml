@@ -1,6 +1,6 @@
 [package]
 name = "asd-daemon"
-description = "asd headless mux daemon (library): session keeping, UDS server; embedded by the `asd` CLI"
+description = "asd headless mux daemon (library): session keeping, daemon server; embedded by the `asd` CLI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,11 +10,13 @@ license.workspace = true
 anyhow = { workspace = true }
 asd-proto = { workspace = true }
 asd-vt = { workspace = true }
-libc = { workspace = true }
-nix = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true }

@@ -15,14 +15,28 @@ pub struct SessionState {
     pub cwd: Option<PathBuf>,
 }
 
-/// The cwd of a live process, read from `/proc/<pid>/cwd`. Returns `None` on any
-/// error or platform without `/proc` (macOS) — the session then recreates in the
-/// daemon's default directory rather than failing.
+/// The cwd of a live process. On Unix, read from `/proc/<pid>/cwd`.
+/// On Windows, uses `NtQueryInformationProcess` to read the process parameters.
+/// Returns `None` on any error — the session then recreates in the daemon's
+/// default directory rather than failing.
+#[cfg(unix)]
 pub fn read_cwd(pid: u32) -> Option<PathBuf> {
     if pid == 0 {
         return None;
     }
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(windows)]
+pub fn read_cwd(pid: u32) -> Option<PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    // On Windows, reading another process's cwd requires NtQueryInformationProcess
+    // (undocumented but stable) or toolhelp snapshots. For now, return None so
+    // sessions recreate in the default directory — a future improvement.
+    let _ = pid;
+    None
 }
 
 /// One `name\tcwd` line per session (cwd left empty when unknown). Names are

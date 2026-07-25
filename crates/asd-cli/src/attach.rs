@@ -16,13 +16,14 @@
 //! exact modes to the host and forward the events to it (`sync_host_mouse`).
 
 use std::io::Write as _;
-use std::os::fd::AsFd;
+
 
 use anyhow::Context;
 use asd_proto::Frame;
 use asd_vt::{GhosttyVt, VtBackend};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
@@ -140,7 +141,10 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
         }
     });
 
+    #[cfg(unix)]
     let mut sigwinch = signal(SignalKind::window_change())?;
+    #[cfg(windows)]
+    let mut sigwinch = std::future::pending::<()>();
     let mut writer = client.writer;
 
     let exit = loop {
@@ -476,6 +480,7 @@ fn is_mouse_report(chunk: &[u8]) -> bool {
 /// the protocol is spoken by the pipe's far end (a future remote GUI/CLI) —
 /// this process is a pure passthrough.
 /// SSH dumb-pipe scenario: `ssh host "asd attach --stdio"`.
+#[cfg(unix)]
 pub async fn run_stdio_proxy(socket: &std::path::Path) -> anyhow::Result<()> {
     let stream = tokio::net::UnixStream::connect(socket)
         .await
@@ -504,13 +509,21 @@ fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
 
 /// Terminal size; 80×24 when unavailable (not a tty).
 pub fn term_size() -> (u16, u16) {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
-    if ret == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-        (ws.ws_col, ws.ws_row)
-    } else {
-        (80, 24)
+    #[cfg(unix)]
+    {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+        if ret == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+            return (ws.ws_col, ws.ws_row);
+        }
     }
+    #[cfg(windows)]
+    {
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            return (cols, rows);
+        }
+    }
+    (80, 24)
 }
 
 /// Alternate-screen guard. Enters the alternate screen (DEC 1049) so detach
@@ -543,29 +556,61 @@ impl Drop for ScreenGuard {
     }
 }
 
-/// Raw mode guard: restores the original termios on drop.
-struct RawGuard {
-    original: nix::sys::termios::Termios,
-}
+/// Raw mode guard: restores the original terminal mode on drop.
+struct RawGuard;
 
 impl RawGuard {
     fn enable() -> anyhow::Result<Self> {
-        use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
-        let stdin = std::io::stdin();
-        let original = tcgetattr(stdin.as_fd())?;
-        let mut raw = original.clone();
-        cfmakeraw(&mut raw);
-        tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw)?;
-        Ok(Self { original })
+        #[cfg(unix)]
+        {
+            // Store the original termios inside a thread-local so drop can restore it.
+            use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
+            #[cfg(unix)]
+use std::os::fd::AsFd;
+            let stdin = std::io::stdin();
+            let original = tcgetattr(stdin.as_fd())?;
+            let mut raw = original.clone();
+            cfmakeraw(&mut raw);
+            tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw)?;
+            // Stash for drop
+            RAW_ORIGINAL.with(|cell| {
+                cell.replace(Some(original));
+            });
+        }
+        #[cfg(windows)]
+        {
+            crossterm::terminal::enable_raw_mode()
+                .context("enabling raw terminal mode")?;
+        }
+        Ok(Self)
     }
 }
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
-        use nix::sys::termios::{SetArg, tcsetattr};
-        let stdin = std::io::stdin();
-        let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &self.original);
+        #[cfg(unix)]
+        {
+            use nix::sys::termios::{SetArg, tcsetattr};
+            #[cfg(unix)]
+use std::os::fd::AsFd;
+            RAW_ORIGINAL.with(|cell| {
+                if let Some(original) = cell.take() {
+                    let stdin = std::io::stdin();
+                    let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &original);
+                }
+            });
+        }
+        #[cfg(windows)]
+        {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
     }
+}
+
+#[cfg(unix)]
+std::thread_local! {
+    static RAW_ORIGINAL: std::cell::RefCell<Option<nix::sys::termios::Termios>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]

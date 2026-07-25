@@ -17,6 +17,9 @@ asd-proto = { workspace = true }
 asd-tui = { workspace = true }
 asd-vt = { workspace = true }
 clap = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 nix = { workspace = true }
-tokio = { workspace = true }

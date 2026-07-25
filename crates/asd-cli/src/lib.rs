@@ -247,14 +247,21 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
         }
         Cmd::Attach { name, auto, stdio } => {
             if stdio {
-                // The pure byte proxy does no handshake: the pipe's far end
-                // speaks the protocol
-                if auto {
-                    // First make sure the daemon is alive (one handshake
-                    // connection to probe/start it)
-                    let _ = client::connect_or_spawn(&socket, ClientKind::Proxy).await?;
+                #[cfg(unix)]
+                {
+                    // The pure byte proxy does no handshake: the pipe's far end
+                    // speaks the protocol
+                    if auto {
+                        // First make sure the daemon is alive (one handshake
+                        // connection to probe/start it)
+                        let _ = client::connect_or_spawn(&socket, ClientKind::Proxy).await?;
+                    }
+                    return attach::run_stdio_proxy(&socket).await;
                 }
-                return attach::run_stdio_proxy(&socket).await;
+                #[cfg(windows)]
+                {
+                    anyhow::bail!("--stdio proxy is not supported on Windows");
+                }
             }
             // clap enforces NAME unless --stdio, so this cannot fail here.
             let name = name.expect("NAME is required without --stdio");

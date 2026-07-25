@@ -6,6 +6,7 @@
 //! via a channel. The network side (tokio) holds only a [`SessionHandle`].
 
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
@@ -14,7 +15,9 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use asd_proto::{Frame, code};
 use asd_vt::{GhosttyVt, VtBackend};
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tracing::{debug, info, warn};
@@ -227,6 +230,7 @@ fn now_ms() -> u64 {
 /// the pty (`tcgetpgrp` on the master), resolved to a command via `/proc`
 /// (Linux) or libproc's `proc_pidpath` (macOS). `None` when there is no
 /// foreground group or the platform has no cheap way to resolve it.
+#[cfg(unix)]
 fn foreground_command(master_fd: RawFd) -> Option<String> {
     if master_fd < 0 {
         return None;
@@ -238,6 +242,12 @@ fn foreground_command(master_fd: RawFd) -> Option<String> {
         return None;
     }
     proc_command(pgrp)
+}
+
+#[cfg(windows)]
+fn foreground_command(_master_fd: i32) -> Option<String> {
+    // TODO: read foreground process from ConPTY process list
+    None
 }
 
 /// Strip the leading `-` of a login shell's argv[0] (`-bash` → `bash`).
@@ -632,14 +642,14 @@ fn session_thread(
             }
             SessionMsg::Kill => {
                 info!(session = %name, "kill requested");
-                signal_child(&meta, Signal::SIGHUP);
+                kill_child(&meta, false); // graceful
                 // Follow up with SIGKILL after a 2s grace period (skipped if
                 // the child already exited and the liveness check fails)
                 let meta2 = Arc::clone(&meta);
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     if meta2.alive.load(Ordering::Relaxed) {
-                        signal_child(&meta2, Signal::SIGKILL);
+                        kill_child(&meta2, true); // force
                     }
                 });
             }
@@ -737,12 +747,65 @@ fn broadcast(clients: &mut Vec<ClientSink>, meta: &SessionMeta, frame: Frame) {
         .store(clients.len() as u32, Ordering::Relaxed);
 }
 
-/// Signal the session's child process (ignored when the pid is already
-/// zeroed).
-pub fn signal_child(meta: &SessionMeta, sig: Signal) {
+/// Windows process-management helpers via raw kernel32 FFI (no extra crate).
+#[cfg(windows)]
+mod win32 {
+    #![allow(unsafe_code)]
+
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
+        fn CloseHandle(hObject: isize) -> i32;
+        fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) -> i32;
+    }
+
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    /// Force-kill the process via TerminateProcess.
+    pub fn force_kill(pid: u32) {
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if handle != 0 && handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+
+    /// Graceful kill: GenerateConsoleCtrlEvent(CTRL_BREAK) — the closest
+    /// Windows analogue to SIGHUP for a console/ConPTY child.
+    pub fn graceful_kill(pid: u32) {
+        unsafe {
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
+        }
+    }
+}
+
+/// Kill the session's child process.
+/// `force`: false = graceful (SIGHUP / CTRL_BREAK), true = force (SIGKILL / TerminateProcess).
+pub fn kill_child(meta: &SessionMeta, force: bool) {
     let pid = meta.child_pid.load(Ordering::Relaxed);
-    if pid != 0 {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let sig = if force {
+            Signal::SIGKILL
+        } else {
+            Signal::SIGHUP
+        };
         let _ = kill(Pid::from_raw(pid as i32), sig);
+    }
+    #[cfg(windows)]
+    {
+        if force {
+            win32::force_kill(pid);
+        } else {
+            win32::graceful_kill(pid);
+        }
     }
 }
 

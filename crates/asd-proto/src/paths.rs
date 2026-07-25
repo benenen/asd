@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 /// Maximum session name length.
 pub const SESSION_NAME_MAX: usize = 64;
 
-/// UDS file name.
+/// UDS file name (unix) / named-pipe base name (Windows).
 pub const SOCKET_FILE: &str = "asd.sock";
+
+/// Named-pipe path prefix on Windows.
+#[cfg(windows)]
+pub const PIPE_PREFIX: &str = "\\\\.\\pipe\\";
 
 /// Session name contract: `[A-Za-z0-9_-]{1,64}`.
 pub fn is_valid_session_name(name: &str) -> bool {
@@ -30,12 +34,12 @@ pub fn runtime_dir() -> PathBuf {
     }
 }
 
-/// Full UDS path: `$XDG_RUNTIME_DIR/asd.sock` (or the same name under the
-/// fallback directory).
+/// Full path for the daemon listener: UDS on unix, named pipe on Windows.
 ///
 /// The `ASD_SOCKET` environment variable overrides it entirely (tests and
 /// multi-instance scenarios); the daemon and all clients honor the same
 /// precedence.
+#[cfg(unix)]
 pub fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("ASD_SOCKET")
         && !p.is_empty()
@@ -43,6 +47,18 @@ pub fn socket_path() -> PathBuf {
         return PathBuf::from(p);
     }
     runtime_dir().join(SOCKET_FILE)
+}
+
+#[cfg(windows)]
+pub fn socket_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("ASD_SOCKET")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
+    }
+    // \\.\pipe\asd-<username>
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
+    PathBuf::from(format!("{PIPE_PREFIX}asd-{user}"))
 }
 
 /// PID file for the daemon owning `socket`: the socket path with a `.pid`
@@ -54,14 +70,28 @@ pub fn pid_path(socket: &Path) -> PathBuf {
     socket.with_extension("pid")
 }
 
-/// Daemon data directory: `~/.local/share/asd/` (session metadata, logs).
+/// Daemon data directory (session metadata, logs).
+/// Unix: `$XDG_DATA_HOME/asd` or `~/.local/share/asd`.
+/// Windows: `%LOCALAPPDATA%\asd`.
 pub fn data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME")
-        && !dir.is_empty()
+    #[cfg(unix)]
     {
-        return PathBuf::from(dir).join("asd");
+        if let Some(dir) = std::env::var_os("XDG_DATA_HOME")
+            && !dir.is_empty()
+        {
+            return PathBuf::from(dir).join("asd");
+        }
+        home_dir().join(".local/share/asd")
     }
-    home_dir().join(".local/share/asd")
+    #[cfg(windows)]
+    {
+        if let Some(dir) = std::env::var_os("LOCALAPPDATA")
+            && !dir.is_empty()
+        {
+            return PathBuf::from(dir).join("asd");
+        }
+        home_dir().join("asd")
+    }
 }
 
 /// Path of the persisted session list: `<data_dir>/sessions.tsv`. The daemon
@@ -86,22 +116,38 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-/// Directory holding the config file: `$XDG_CONFIG_HOME/asd`, falling back to
-/// `~/.config/asd`.
+/// Directory holding the config file.
 fn config_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
-        && !dir.is_empty()
+    #[cfg(unix)]
     {
-        return PathBuf::from(dir).join("asd");
+        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
+            && !dir.is_empty()
+        {
+            return PathBuf::from(dir).join("asd");
+        }
+        home_dir().join(".config/asd")
     }
-    home_dir().join(".config/asd")
+    #[cfg(windows)]
+    {
+        home_dir().join("asd")
+    }
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\"))
+    }
 }
 
 /// Real uid of the current process (std has no API for this; on unix obtained
