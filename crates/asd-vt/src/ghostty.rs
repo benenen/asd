@@ -232,9 +232,7 @@ impl VtBackend for GhosttyVt {
             // Reuse previous cells when this row hasn't changed — during
             // streaming output 99%+ of scrollback rows are static, so
             // skipping the FFI-per-cell iteration is a huge win.
-            if !dirty
-                && idx < self.prev_cells.len()
-                && self.prev_cells[idx].len() == cols as usize
+            if !dirty && idx < self.prev_cells.len() && self.prev_cells[idx].len() == cols as usize
             {
                 cells.push(self.prev_cells[idx].clone());
                 row.set_dirty(false).expect("resetting row dirty failed");

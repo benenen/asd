@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use asd_proto::{SessionInfo, code, paths};
 use crate::session::kill_child;
+use asd_proto::{SessionInfo, code, paths};
 use tracing::info;
 
 use crate::session::{SessionHandle, SessionMsg, spawn_session};

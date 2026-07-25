@@ -69,7 +69,9 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 libghostty-vt = "0.2"
 nix = { version = "0.30", features = ["signal", "process", "term", "fs"] }
-crossterm = "0.28"
+# Keep in lockstep with the crossterm ratatui 0.30 pulls in: two versions in one
+# binary means two process-global raw-mode statics that cannot see each other.
+crossterm = "0.29"
 portable-pty = "0.9"
 postcard = { version = "1", features = ["use-std"] }
 ratatui = "0.30.2"
