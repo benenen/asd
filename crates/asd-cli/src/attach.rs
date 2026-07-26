@@ -22,11 +22,10 @@ use asd_proto::Frame;
 use asd_vt::{GhosttyVt, VtBackend};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-#[cfg(unix)]
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use crate::client::Client;
+use crate::platform::{self, RawGuard, term_size};
 use crate::render;
 
 /// Detach key: Ctrl-\ (byte 0x1C in raw mode).
@@ -48,21 +47,6 @@ enum Exit {
     Detached,
     SessionEnded(String),
     DaemonGone,
-}
-
-/// SIGWINCH stand-in for platforms without the signal. Windows delivers resize
-/// as a console event rather than a signal, so this never resolves and the
-/// select arm is simply never taken; the size is still picked up on the next
-/// explicit resize. Mirrors `tokio::signal::unix::Signal::recv`'s shape so the
-/// call site stays platform-independent.
-#[cfg(windows)]
-struct NoWinch;
-
-#[cfg(windows)]
-impl NoWinch {
-    async fn recv(&mut self) -> Option<()> {
-        std::future::pending().await
-    }
 }
 
 pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
@@ -155,10 +139,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
         }
     });
 
-    #[cfg(unix)]
-    let mut sigwinch = signal(SignalKind::window_change())?;
-    #[cfg(windows)]
-    let mut sigwinch = NoWinch;
+    let mut sigwinch: platform::Winch = platform::winch()?;
     let mut writer = client.writer;
 
     let exit = loop {
@@ -491,15 +472,15 @@ fn is_mouse_report(chunk: &[u8]) -> bool {
 }
 
 /// `--stdio` proxy: bidirectional raw byte copy between stdio and the UDS;
-/// the protocol is spoken by the pipe's far end (a future remote GUI/CLI) —
-/// this process is a pure passthrough.
+/// Body of the `--stdio` byte proxy, over whatever transport the platform
+/// opened: no handshake, no local VT — the protocol is spoken by the pipe's far
+/// end (a future remote GUI/CLI) and this process is a pure passthrough.
 /// SSH dumb-pipe scenario: `ssh host "asd attach --stdio"`.
-#[cfg(unix)]
-pub async fn run_stdio_proxy(socket: &std::path::Path) -> anyhow::Result<()> {
-    let stream = tokio::net::UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connecting {}", socket.display()))?;
-    let (mut sock_r, mut sock_w) = stream.into_split();
+pub(crate) async fn stdio_proxy_over<S>(stream: S) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    let (mut sock_r, mut sock_w) = tokio::io::split(stream);
 
     let to_sock = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
@@ -519,25 +500,6 @@ fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(bytes)?;
     stdout.flush()
-}
-
-/// Terminal size; 80×24 when unavailable (not a tty).
-pub fn term_size() -> (u16, u16) {
-    #[cfg(unix)]
-    {
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
-        if ret == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-            return (ws.ws_col, ws.ws_row);
-        }
-    }
-    #[cfg(windows)]
-    {
-        if let Ok((cols, rows)) = crossterm::terminal::size() {
-            return (cols, rows);
-        }
-    }
-    (80, 24)
 }
 
 /// Alternate-screen guard. Enters the alternate screen (DEC 1049) so detach
@@ -567,56 +529,6 @@ impl Drop for ScreenGuard {
         // reset SGR, and reset the cursor shape.
         seq.extend_from_slice(b"\x1b[?1049l\x1b[?25h\x1b[0m\x1b[0 q");
         let _ = write_stdout(&seq);
-    }
-}
-
-/// Raw mode guard: restores the original terminal mode on drop.
-///
-/// The guard owns the mode it has to put back, rather than parking it in a
-/// process-wide slot: a second guard would overwrite such a slot with the
-/// *raw* termios it just installed, and dropping either one would then restore
-/// raw mode as if it were the original. Owning it makes that unrepresentable.
-struct RawGuard {
-    /// The termios to restore. Windows keeps no state — crossterm restores the
-    /// console mode it saved itself.
-    #[cfg(unix)]
-    original: nix::sys::termios::Termios,
-}
-
-impl RawGuard {
-    fn enable() -> anyhow::Result<Self> {
-        #[cfg(unix)]
-        {
-            use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
-            use std::os::fd::AsFd;
-            let stdin = std::io::stdin();
-            let original = tcgetattr(stdin.as_fd())?;
-            let mut raw = original.clone();
-            cfmakeraw(&mut raw);
-            tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw)?;
-            Ok(Self { original })
-        }
-        #[cfg(windows)]
-        {
-            crossterm::terminal::enable_raw_mode().context("enabling raw terminal mode")?;
-            Ok(Self {})
-        }
-    }
-}
-
-impl Drop for RawGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use nix::sys::termios::{SetArg, tcsetattr};
-            use std::os::fd::AsFd;
-            let stdin = std::io::stdin();
-            let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &self.original);
-        }
-        #[cfg(windows)]
-        {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
     }
 }
 

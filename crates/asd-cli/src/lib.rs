@@ -7,6 +7,7 @@
 mod attach;
 mod client;
 mod control;
+mod platform;
 mod render;
 
 use std::path::PathBuf;
@@ -247,21 +248,14 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
         }
         Cmd::Attach { name, auto, stdio } => {
             if stdio {
-                #[cfg(unix)]
-                {
-                    // The pure byte proxy does no handshake: the pipe's far end
-                    // speaks the protocol
-                    if auto {
-                        // First make sure the daemon is alive (one handshake
-                        // connection to probe/start it)
-                        let _ = client::connect_or_spawn(&socket, ClientKind::Proxy).await?;
-                    }
-                    return attach::run_stdio_proxy(&socket).await;
+                // The pure byte proxy does no handshake: the pipe's far end
+                // speaks the protocol.
+                if auto {
+                    // First make sure the daemon is alive (one handshake
+                    // connection to probe/start it)
+                    let _ = client::connect_or_spawn(&socket, ClientKind::Proxy).await?;
                 }
-                #[cfg(windows)]
-                {
-                    anyhow::bail!("--stdio proxy is not supported on Windows");
-                }
+                return platform::run_stdio_proxy(&socket).await;
             }
             // clap enforces NAME unless --stdio, so this cannot fail here.
             let name = name.expect("NAME is required without --stdio");
