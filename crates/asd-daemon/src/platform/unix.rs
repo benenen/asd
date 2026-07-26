@@ -1,5 +1,6 @@
-//! Unix-specific daemon operations: UDS listener, signal handling, and
-//! socket-directory management.
+//! Unix-specific daemon operations: UDS listener, signal handling,
+//! socket-directory management, process control. Selected by [`super`]; see
+//! there for the shared surface.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,7 +14,7 @@ use crate::registry::Registry;
 
 // ---- Listener ---------------------------------------------------------------
 
-pub(super) async fn serve_connections(
+pub(crate) async fn serve_connections(
     socket_path: PathBuf,
     registry: Arc<Mutex<Registry>>,
 ) -> anyhow::Result<()> {
@@ -83,7 +84,7 @@ async fn shutdown(registry: &Arc<Mutex<Registry>>, socket_path: &Path, pid_path:
 
 /// Ensure the socket directory exists; the fallback directory
 /// (/tmp/asd-$UID) must be 0700.
-pub(super) fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
+pub(crate) fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
     let Some(dir) = socket_path.parent() else {
         return Ok(());
     };
@@ -99,7 +100,7 @@ pub(super) fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
 /// Stale socket handling: if it accepts a connection, a daemon is already
 /// running (error out); if it refuses (ECONNREFUSED), it is a corpse from a
 /// previous crash — remove it and rebind.
-pub(super) fn remove_stale_socket(socket_path: &Path) -> anyhow::Result<()> {
+pub(crate) fn remove_stale_socket(socket_path: &Path) -> anyhow::Result<()> {
     if !socket_path.exists() {
         return Ok(());
     }
@@ -114,4 +115,30 @@ pub(super) fn remove_stale_socket(socket_path: &Path) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+// ---- Process control --------------------------------------------------------
+
+/// End the process `pid`: `force` picks SIGKILL over SIGHUP. A failure means it
+/// is already gone, which is indistinguishable from success here.
+pub(crate) fn kill_child(pid: u32, force: bool) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let sig = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGHUP
+    };
+    let _ = kill(Pid::from_raw(pid as i32), sig);
+}
+
+/// The cwd of a live process, read from `/proc/<pid>/cwd`. `None` on any error —
+/// the session then recreates in the daemon's default directory rather than
+/// failing.
+pub(crate) fn read_cwd(pid: u32) -> Option<PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }

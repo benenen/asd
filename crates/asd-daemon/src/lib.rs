@@ -11,14 +11,11 @@
 
 mod config;
 mod conn;
+mod platform;
 mod registry;
 mod server;
 mod session;
 mod store;
-#[cfg(unix)]
-mod unix;
-#[cfg(windows)]
-mod win;
 
 use std::path::PathBuf;
 
@@ -44,15 +41,8 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     // it from M1 on)
     std::fs::create_dir_all(paths::data_dir()).context("creating data dir")?;
 
-    #[cfg(unix)]
-    unix::prepare_socket_dir(&socket_path)?;
-    #[cfg(unix)]
-    unix::remove_stale_socket(&socket_path)?;
-
-    #[cfg(windows)]
-    win::prepare_socket_dir(&socket_path)?;
-    #[cfg(windows)]
-    win::remove_stale_socket(&socket_path)?;
+    platform::prepare_socket_dir(&socket_path)?;
+    platform::remove_stale_socket(&socket_path)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

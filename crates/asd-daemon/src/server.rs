@@ -40,10 +40,7 @@ pub(super) async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
     registry.lock().unwrap().persist();
 
     // Platform-specific listener + accept loop.
-    #[cfg(unix)]
-    crate::unix::serve_connections(socket_path, registry).await?;
-    #[cfg(windows)]
-    crate::win::serve_connections(socket_path, registry).await?;
+    crate::platform::serve_connections(socket_path, registry).await?;
 
     Ok(())
 }

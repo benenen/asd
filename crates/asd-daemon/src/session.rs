@@ -15,10 +15,6 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use asd_proto::{Frame, code};
 use asd_vt::{GhosttyVt, VtBackend};
-#[cfg(unix)]
-use nix::sys::signal::{Signal, kill};
-#[cfg(unix)]
-use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tracing::{debug, info, warn};
 
@@ -747,75 +743,16 @@ fn broadcast(clients: &mut Vec<ClientSink>, meta: &SessionMeta, frame: Frame) {
         .store(clients.len() as u32, Ordering::Relaxed);
 }
 
-/// Windows process-management helpers via raw kernel32 FFI (no extra crate).
-#[cfg(windows)]
-mod win32 {
-    #![allow(unsafe_code)]
-
-    unsafe extern "system" {
-        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
-        fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
-        fn CloseHandle(hObject: isize) -> i32;
-        fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) -> i32;
-    }
-
-    const PROCESS_TERMINATE: u32 = 0x0001;
-    const CTRL_BREAK_EVENT: u32 = 1;
-    const INVALID_HANDLE_VALUE: isize = -1;
-
-    /// Force-kill the process via TerminateProcess.
-    pub fn force_kill(pid: u32) {
-        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if handle != 0 && handle != INVALID_HANDLE_VALUE {
-            unsafe {
-                TerminateProcess(handle, 1);
-                CloseHandle(handle);
-            }
-        }
-    }
-
-    /// Best-effort graceful stop, the nearest Windows analogue to SIGHUP.
-    /// Returns whether the event was actually delivered.
-    ///
-    /// Two caveats make this fail far more often than it succeeds, so the
-    /// caller must not assume the child is going away:
-    /// `GenerateConsoleCtrlEvent`'s second argument is a process *group* id,
-    /// not a pid, so it only reaches a child created with
-    /// `CREATE_NEW_PROCESS_GROUP`; and it only reaches processes sharing the
-    /// *caller's* console, which a ConPTY child of a daemon does not. The
-    /// caller falls back to `force_kill` when this returns false.
-    pub fn graceful_kill(pid: u32) -> bool {
-        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0 }
-    }
-}
-
-/// Kill the session's child process.
-/// `force`: false = graceful (SIGHUP / CTRL_BREAK), true = force (SIGKILL / TerminateProcess).
+/// Kill the session's child process (ignored when the pid is already zeroed).
+/// `force`: false = graceful (SIGHUP / best-effort CTRL_BREAK), true = force
+/// (SIGKILL / TerminateProcess). The platform difference lives in
+/// `platform::kill_child`.
 pub fn kill_child(meta: &SessionMeta, force: bool) {
     let pid = meta.child_pid.load(Ordering::Relaxed);
     if pid == 0 {
         return;
     }
-    #[cfg(unix)]
-    {
-        let sig = if force {
-            Signal::SIGKILL
-        } else {
-            Signal::SIGHUP
-        };
-        let _ = kill(Pid::from_raw(pid as i32), sig);
-    }
-    #[cfg(windows)]
-    {
-        // A graceful stop that could not be delivered would otherwise leave the
-        // child running until the 2s grace period expires and something else
-        // force-kills it — so every `asd kill` would stall for two seconds and
-        // the child would still die abruptly. Falling straight through to
-        // TerminateProcess costs the child nothing it was going to get anyway.
-        if force || !win32::graceful_kill(pid) {
-            win32::force_kill(pid);
-        }
-    }
+    crate::platform::kill_child(pid, force);
 }
 
 #[cfg(test)]
