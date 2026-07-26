@@ -101,7 +101,7 @@ pub async fn run_host(
     ev_tx: UnboundedSender<UiEvent>,
 ) {
     let opened = match &kind {
-        HostKind::Local => connect_local().await,
+        HostKind::Local => crate::platform::connect_local().await,
         HostKind::Ssh(spec) => crate::ssh::open(spec).await,
     };
     let (reader, writer) = match opened {
@@ -120,25 +120,6 @@ pub async fn run_host(
             state: HostState::Down(reason),
         });
     }
-}
-
-/// Open the local daemon socket and box the halves. Unix only: the local
-/// daemon speaks over a Unix socket (tokio has no `UnixStream` on Windows),
-/// and the Windows client is GUI-only with no bundled daemon — it reaches
-/// sessions through SSH remotes instead.
-#[cfg(unix)]
-async fn connect_local() -> anyhow::Result<(BoxRead, BoxWrite)> {
-    let socket = asd_proto::paths::socket_path();
-    let stream = tokio::net::UnixStream::connect(&socket)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect {}: {e}", socket.display()))?;
-    let (r, w) = tokio::io::split(stream);
-    Ok((Box::new(r), Box::new(w)))
-}
-
-#[cfg(not(unix))]
-async fn connect_local() -> anyhow::Result<(BoxRead, BoxWrite)> {
-    anyhow::bail!("no local daemon on this platform — connect an SSH remote instead")
 }
 
 /// The per-host event loop. Returns `Err(reason)` if the connection ends

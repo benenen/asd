@@ -11,6 +11,7 @@ mod app;
 mod bridge;
 mod conn;
 mod model;
+mod platform;
 mod settings;
 mod ssh;
 
