@@ -21,7 +21,6 @@ use anyhow::Context;
 use asd_proto::Frame;
 use asd_vt::{GhosttyVt, VtBackend};
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::client::Client;
@@ -472,28 +471,6 @@ fn is_mouse_report(chunk: &[u8]) -> bool {
 }
 
 /// `--stdio` proxy: bidirectional raw byte copy between stdio and the UDS;
-/// Body of the `--stdio` byte proxy, over whatever transport the platform
-/// opened: no handshake, no local VT — the protocol is spoken by the pipe's far
-/// end (a future remote GUI/CLI) and this process is a pure passthrough.
-/// SSH dumb-pipe scenario: `ssh host "asd attach --stdio"`.
-pub(crate) async fn stdio_proxy_over<S>(stream: S) -> anyhow::Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
-{
-    let (mut sock_r, mut sock_w) = tokio::io::split(stream);
-
-    let to_sock = tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let _ = tokio::io::copy(&mut stdin, &mut sock_w).await;
-        let _ = sock_w.shutdown().await;
-    });
-    let mut stdout = tokio::io::stdout();
-    let _ = tokio::io::copy(&mut sock_r, &mut stdout).await;
-    let _ = stdout.flush().await;
-    to_sock.abort();
-    Ok(())
-}
-
 /// Synchronous stdout write (the lock's lifetime stays inside the function —
 /// never across an await point).
 fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {

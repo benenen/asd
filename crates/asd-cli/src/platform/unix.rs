@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use asd_proto::paths;
 
 use super::{BoxRead, BoxWrite, not_running};
@@ -25,10 +26,27 @@ pub(crate) async fn connect_stream(socket: &Path) -> anyhow::Result<(BoxRead, Bo
     Ok((Box::new(r), Box::new(w)))
 }
 
-/// The `--stdio` byte proxy: no handshake, the pipe's far end speaks the
-/// protocol and this process is a pure passthrough.
+/// The `--stdio` byte proxy: no handshake and no local VT — the protocol is
+/// spoken by the pipe's far end (a remote GUI/CLI) and this process is a pure
+/// passthrough. The SSH dumb-pipe scenario: `ssh host "asd attach --stdio"`.
 pub(crate) async fn run_stdio_proxy(socket: &Path) -> anyhow::Result<()> {
-    crate::attach::stdio_proxy_over(tokio::net::UnixStream::connect(socket).await?).await
+    use tokio::io::AsyncWriteExt as _;
+
+    let stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connecting {}", socket.display()))?;
+    let (mut sock_r, mut sock_w) = stream.into_split();
+
+    let to_sock = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let _ = tokio::io::copy(&mut stdin, &mut sock_w).await;
+        let _ = sock_w.shutdown().await;
+    });
+    let mut stdout = tokio::io::stdout();
+    let _ = tokio::io::copy(&mut sock_r, &mut stdout).await;
+    let _ = stdout.flush().await;
+    to_sock.abort();
+    Ok(())
 }
 
 // ---- Daemon process control -------------------------------------------------
