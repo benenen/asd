@@ -35,7 +35,14 @@ cargo test -p asd-vt                 # 单 crate
 cargo test --test e2e sigterm        # 单个 e2e（e2e 在根 package tests/，非 asd-cli）
 cargo clippy --workspace --all-targets
 cargo fmt --all
+
+# Windows 代码的本地预检（约 3 分钟，整条 daemon 路径都过一遍）：
+env -i PATH="$PATH" HOME="$HOME" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" \
+  LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast \
+  cargo check --target x86_64-pc-windows-gnu --no-default-features --features local
 ```
+
+**在 Linux 上预检 Windows 代码：用 `x86_64-pc-windows-gnu`，不是 `-msvc`。** msvc 目标会死在 libghostty-vt-sys 的 Zig 构建里（zig 不带 MSVC SDK 头文件，highway/simdutf 卡在 `<mm_malloc.h>`）——这条死路曾让人误以为「Windows 代码没法本地检查」，转而去抠隔离 crate 验证片段，白白多花了好几轮 CI。而 **zig 自带 mingw**，所以 gnu 目标能把 vendored C++ 编出来，asd-proto/client/vt/daemon/tui/cli 连同根 bin 一次全查。必须用 `env -i` 起干净环境：被污染的 shell env/stdin 会让 cargo 的 target 探测把垃圾喂给 `rustc -`，报出莫名其妙的 `unknown start of token: \u{0}`。**边界**：加 `--all-targets` 会失败（cc-rs 找不到 `x86_64-w64-mingw32-gcc`，是某个 dev-dep 的 build script 要 mingw C 编译器），所以这招只覆盖 **build 层**；`cfg(test)` 专属的错误和 clippy 的死代码告警仍然只有 `windows-check.yml` 能发现——三层各有各的价值，别拿一层当全部。
 
 手工冒烟：`cargo run -- attach -A demo`（根 bin `asd`；自动拉起 daemon + 创建 session；detach 键 Ctrl-\）；TUI 客户端 `cargo run -- ui [session]`（ratatui 版侧栏+实时终端，Ctrl+A 前缀键切换/新建/杀 session，自动拉起 daemon）。`cargo run` 裸跑 = 开 GUI。`cargo build --workspace` 编所有 crate；`cargo test --workspace` 跑所有测试（`cargo test` 不带 `--workspace` 只测根 package）。脚本化（对标 boo，v4，attach-free）：`asd send <name> --text 'make test' --enter`（也支持 `--key Enter,C-c,Up` 具名键 / stdin 管道）、`asd peek <name> [--scrollback|--json]`（打印渲染后的屏幕）、`asd wait <name> (--text <s>|--idle) [--timeout 30s]`（阻塞到匹配/静默，超时退出码 4）。
 
