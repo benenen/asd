@@ -118,6 +118,9 @@ pub(crate) struct App {
     pub scroll: usize,
     /// Terminal grid offered by the pane.
     grid: (u16, u16),
+    /// The size the local terminal is currently at. Usually [`grid`], but the
+    /// pty belongs to whichever client resized it last, so it can be smaller.
+    vt_grid: (u16, u16),
     /// Whole-terminal size (cols, rows), for recomputing the layout on a
     /// sidebar resize/toggle without a `Resize` event.
     term_size: (u16, u16),
@@ -350,6 +353,7 @@ fn event_loop(
         vt: None,
         scroll: 0,
         grid,
+        vt_grid: grid,
         term_size: (size.width, size.height),
         sidebar_w,
         sidebar_hidden: false,
@@ -498,6 +502,35 @@ impl App {
             fx.process(delta, buf, rect);
             !fx.done()
         });
+    }
+
+    /// Keep the local terminal the same size as the session's pty.
+    ///
+    /// The pty belongs to whichever client resized it last, so another client
+    /// with a smaller window shrinks it under us. Our terminal would stay at
+    /// our own pane size, and the columns and rows the session no longer writes
+    /// would keep whatever was last drawn there — nothing revisits them, so the
+    /// leftovers sit on screen until something forces a full repaint. Following
+    /// the real size makes the snapshot honest about how much of the pane the
+    /// session actually covers; `ui::render_pane` blanks the rest.
+    fn follow_session_size(&mut self) {
+        let Some(active) = self.active.clone() else {
+            return;
+        };
+        let Some(info) = self.sessions.iter().find(|s| s.name == active) else {
+            return;
+        };
+        let want = (info.cols.max(1), info.rows.max(1));
+        if want == self.vt_grid {
+            return;
+        }
+        if let Some(vt) = &mut self.vt {
+            vt.resize(want.0, want.1);
+            self.vt_grid = want;
+            // The cached frame describes the old geometry.
+            self.pane_cache = None;
+            self.dirty = true;
+        }
     }
 
     /// Keep one color-shimmer effect per running (non-self) session, then
@@ -653,6 +686,7 @@ impl App {
         // event well before this.
         self.pane_hold = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
         self.vt = Some(GhosttyVt::new(self.grid.0, self.grid.1, SCROLLBACK));
+        self.vt_grid = self.grid;
         self.scroll = 0;
         self.sel = None;
         self.selecting = false;
@@ -730,6 +764,7 @@ impl App {
                     }
                 }
                 self.sessions = list;
+                self.follow_session_size();
                 // The attached session vanished (killed elsewhere): fall back
                 // to the first remaining one.
                 if let Some(a) = &self.active
@@ -768,6 +803,7 @@ impl App {
                 if snapshot {
                     // A snapshot is a full redraw into a clean terminal.
                     self.vt = Some(GhosttyVt::new(self.grid.0, self.grid.1, SCROLLBACK));
+                    self.vt_grid = self.grid;
                     self.scroll = 0;
                     self.sel = None;
                     // The old cache belongs to a different terminal — drop it.
@@ -1217,6 +1253,7 @@ impl App {
             self.grid = grid;
             if let Some(vt) = &mut self.vt {
                 vt.resize(grid.0, grid.1);
+                self.vt_grid = grid;
             }
             self.send(Cmd::Resize {
                 cols: grid.0,
