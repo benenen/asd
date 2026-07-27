@@ -1,0 +1,150 @@
+name: Windows check
+
+# The Windows half of CI. ci.yml only ever runs on Linux, which is how three
+# Windows-only build breaks reached the branch unnoticed: a bare `extern` block
+# (Rust 2024 requires `unsafe extern`), a `recv()` call on `std::future::Pending`,
+# and an ungated `libc::poll` watchdog in asd-tui. None of them are visible from
+# a Linux build, and neither is `cargo check --target x86_64-pc-windows-msvc`
+# usable as a substitute here, because libghostty-vt-sys's Zig build does not
+# cross-compile from Linux. A native Windows runner is the only thing that
+# actually answers the question.
+#
+# Runs on a push to ANY branch on purpose: `workflow_dispatch` is only offered
+# for workflows already on the default branch, so a work branch could not be
+# checked before merging — exactly when you need it, and the whole point when
+# there is no Windows machine to hand.
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "images/**"
+      - "deploy/npm/**"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "images/**"
+      - "deploy/npm/**"
+  workflow_dispatch:
+
+# A newer push to the same branch makes the in-flight run pointless; Windows
+# runners bill at a premium, so cancel it.
+concurrency:
+  group: windows-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Each flavor is built rather than `cargo check`ed: check would not link, and
+  # the kernel32 imports the daemon and CLI declare by hand (OpenProcess,
+  # TerminateProcess, GenerateConsoleCtrlEvent) only resolve at link time.
+  build:
+    name: build (${{ matrix.flavor }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Toolchain per flavor, from the actual dependency tree rather than
+          # from assumption — installing what is not needed only makes the job
+          # slower and more fragile.
+          - flavor: full # CLI + daemon + TUI + GUI (default features)
+            features: ""
+            zig: true # asd-vt
+            node: true # asd-dioxus build.rs runs npm (esbuild bundle)
+            nasm: true # aws-lc-sys, pulled by russh
+          - flavor: local # CLI + daemon + TUI, no GUI
+            features: "--no-default-features --features local"
+            zig: true
+            node: false
+            nasm: false
+          - flavor: gui # GUI only; ghostty-web renders in the WebView, so no asd-vt
+            features: "--no-default-features --features dioxus"
+            zig: false
+            node: true
+            nasm: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.flavor }}
+
+      - name: Install Zig (vendored libghostty-vt)
+        if: matrix.zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install Node (asd-dioxus build.rs runs npm)
+        if: matrix.node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install NASM (aws-lc-sys, pulled by russh)
+        if: matrix.nasm
+        uses: ilammy/setup-nasm@v1
+
+      # Deliberately not --workspace: that builds every member regardless of the
+      # root package's features, so `local` would still compile asd-dioxus and
+      # need the npm and NASM this job skips. Building the root package pulls in
+      # exactly the crates the chosen feature set selects.
+      - name: Build
+        run: cargo build --locked ${{ matrix.features }}
+
+  # Unit tests plus the portable integration tests. tests/e2e.rs is excluded by
+  # excluding the root package: it drives the daemon over UnixStream and signals
+  # children with libc::kill, with no cfg gating, so it does not even compile
+  # here. That leaves the Windows daemon without end-to-end coverage — worth
+  # knowing when reading a green tick on this workflow.
+  test:
+    name: test + clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: Install Zig (vendored libghostty-vt)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install Node (asd-dioxus build.rs runs npm)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install NASM (aws-lc-sys, pulled by russh)
+        uses: ilammy/setup-nasm@v1
+
+      - name: Test
+        run: cargo test --workspace --exclude asd --locked
+
+      # Lints the Windows-only code paths, which the Linux clippy in ci.yml
+      # never compiles. Split in two so the root package is linted without its
+      # unix-only e2e test target.
+      - name: Clippy (libraries)
+        run: cargo clippy --workspace --exclude asd --all-targets --locked -- -D warnings
+
+      - name: Clippy (asd binary)
+        run: cargo clippy -p asd --bins --locked -- -D warnings
