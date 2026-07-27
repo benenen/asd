@@ -461,15 +461,25 @@ fn in_selection(sel: Option<Selection>, x: u16, y: u16) -> bool {
 fn render_pane(buf: &mut Buffer, area: Rect, snap: &RenderSnapshot, sel: Option<Selection>) {
     let rows = snap.rows.min(area.height);
     let cols = snap.cols.min(area.width);
-    for y in 0..rows {
-        for x in 0..cols {
-            let cell = &snap.cells[y as usize][x as usize];
-            if matches!(cell.width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
-                continue;
-            }
+    for y in 0..area.height {
+        for x in 0..area.width {
             let Some(target) = buf.cell_mut(Position::new(area.x + x, area.y + y)) else {
                 continue;
             };
+            // The pane and the session's grid are not always the same size —
+            // hiding the sidebar widens the pane a frame or two before the
+            // resize round-trips through the daemon. Blank what the grid does
+            // not cover: this function is the only thing that writes the pane,
+            // and ratatui emits only changed cells, so anything left here would
+            // stay on screen indefinitely.
+            let Some(cell) = (y < rows && x < cols).then(|| &snap.cells[y as usize][x as usize])
+            else {
+                target.reset();
+                continue;
+            };
+            if matches!(cell.width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
+                continue;
+            }
             if cell.grapheme.is_empty() {
                 target.set_symbol(" ");
             } else {
@@ -844,5 +854,64 @@ mod tests {
         // ...never-written blanks do not (clicking empty areas shows nothing).
         assert!(!reversed(2));
         assert!(!reversed(3));
+    }
+
+    /// A snapshot smaller than the pane must not leave the rest of the pane
+    /// showing whatever happened to be there before.
+    ///
+    /// The pane and the session's grid are not always the same size — hiding
+    /// the sidebar widens the pane a frame or two before the resize round-trips
+    /// through the daemon. Anything painted outside the snapshot's extent
+    /// during that window persists indefinitely otherwise: this function never
+    /// writes there again, and ratatui only emits cells that changed, so
+    /// nothing downstream clears it either.
+    #[test]
+    fn pane_clears_beyond_a_smaller_snapshot() {
+        use asd_vt::{CellSnapshot, CursorSnapshot, RenderSnapshot};
+        let cell = |g: &str| CellSnapshot {
+            grapheme: g.to_string(),
+            ..CellSnapshot::default()
+        };
+        // Session grid is 2x1; the pane is 6x2.
+        let snap = RenderSnapshot {
+            cols: 2,
+            rows: 1,
+            cells: vec![std::sync::Arc::new(vec![cell("a"), cell("b")])],
+            row_dirty: vec![true],
+            cursor: CursorSnapshot::default(),
+            palette: [Rgb::default(); 256],
+            foreground: Rgb::default(),
+            background: Rgb::default(),
+        };
+        let area = Rect::new(0, 0, 6, 2);
+        // What an untouched cell looks like, to compare the cleared ones with.
+        let pristine = Buffer::empty(area)
+            .cell(Position::new(0, 0))
+            .unwrap()
+            .clone();
+
+        let mut buf = Buffer::empty(area);
+        // Leftovers from an earlier, larger frame — a coloured block is exactly
+        // what a stale cell looks like on screen.
+        let stale = [(4u16, 0u16), (1, 1), (5, 1)];
+        for (x, y) in stale {
+            buf.cell_mut(Position::new(x, y))
+                .unwrap()
+                .set_symbol("X")
+                .set_style(Style::new().bg(Color::Rgb(0, 95, 0)));
+        }
+
+        render_pane(&mut buf, area, &snap, None);
+
+        assert_eq!(buf.cell(Position::new(0, 0)).unwrap().symbol(), "a");
+        assert_eq!(buf.cell(Position::new(1, 0)).unwrap().symbol(), "b");
+        for (x, y) in stale {
+            let c = buf.cell(Position::new(x, y)).unwrap();
+            assert_eq!(
+                (c.symbol(), c.style()),
+                (pristine.symbol(), pristine.style()),
+                "({x},{y}) outside the snapshot kept its stale content"
+            );
+        }
     }
 }
