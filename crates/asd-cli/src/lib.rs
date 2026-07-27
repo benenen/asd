@@ -124,8 +124,10 @@ enum Cmd {
     /// `asd new` / `asd attach -A`)
     Daemon,
     /// Restart the daemon: stop the running one and start a fresh copy of this
-    /// binary. Handy after a rebuild bumps the protocol version (all sessions
-    /// are lost — the daemon does not persist them).
+    /// binary. Handy after a rebuild bumps the protocol version. Sessions are
+    /// recreated from the persisted list — each as a fresh shell in its saved
+    /// directory — so the names and workspaces survive, but the running
+    /// programs and screen contents do not.
     Restart,
     /// Open the GUI (same as running `asd` with no subcommand).
     Gui {

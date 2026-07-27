@@ -1356,3 +1356,67 @@ async fn wait_reports_a_missing_session_the_same_way_in_both_modes() {
     assert_ne!(by_idle.status.code(), Some(4), "idle took the timeout path");
     assert_ne!(by_text.status.code(), Some(4), "text took the timeout path");
 }
+
+/// The recorded cwd converges on where the session actually is.
+///
+/// A shell told to `cd` has not moved yet when the daemon samples its cwd at
+/// create time, so the entry starts out recording the daemon's own directory.
+/// It used to stay wrong until some unrelated session was added or removed, or
+/// until a clean shutdown — a crash in between persisted the wrong directory,
+/// and a restart put the session back in the wrong place.
+#[tokio::test]
+async fn persisted_cwd_follows_the_session() {
+    let daemon = Daemon::start("cwdrefresh");
+    let target = daemon.dir.join("workdir");
+    std::fs::create_dir_all(&target).unwrap();
+
+    assert!(
+        daemon
+            .cli()
+            .args([
+                "new",
+                "wanderer",
+                "--cmd",
+                &format!("cd {} && exec bash", target.display()),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let list = daemon.dir.join("data/asd/sessions.tsv");
+    let recorded = |()| std::fs::read_to_string(&list).unwrap_or_default();
+
+    // Converges on the shell's real directory without anything else happening.
+    let want = target.canonicalize().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !recorded(()).contains(want.to_str().unwrap()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cwd never converged; file: {}",
+            recorded(())
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // And keeps following when the session moves again.
+    assert!(
+        daemon
+            .cli()
+            .args(["send", "wanderer", "--text", "cd /tmp", "--enter"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !recorded(()).contains("\t/tmp") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cwd did not follow the second move; file: {}",
+            recorded(())
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}

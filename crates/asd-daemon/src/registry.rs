@@ -27,6 +27,9 @@ pub struct Registry {
     /// Once set (at shutdown), `persist` is a no-op — so the SIGHUP-driven
     /// session removals during shutdown don't wipe the file before restart.
     persist_frozen: bool,
+    /// What was last written to `persist_path`, so the periodic cwd refresh can
+    /// skip the write when nothing moved.
+    last_persisted: Vec<crate::store::SessionState>,
 }
 
 impl Registry {
@@ -39,6 +42,7 @@ impl Registry {
             scrollback_lines,
             persist_path,
             persist_frozen: false,
+            last_persisted: Vec::new(),
         }
     }
 
@@ -117,17 +121,27 @@ impl Registry {
     /// Rewrite the persisted session list from the live set (no-op while frozen).
     /// Also called once after startup restore to compact the file down to the
     /// sessions that actually came back.
-    pub fn persist(&self) {
+    pub fn persist(&mut self) {
         if self.persist_frozen {
             return;
         }
-        crate::store::write_atomic(&self.persist_path, &self.snapshot());
+        let snap = self.snapshot();
+        // A session's cwd is read live, so most refreshes find nothing changed;
+        // comparing first keeps the periodic sweep from rewriting the file every
+        // few seconds for no reason.
+        if snap == self.last_persisted {
+            return;
+        }
+        crate::store::write_atomic(&self.persist_path, &snap);
+        self.last_persisted = snap;
     }
 
     /// Final persist (capturing live cwds), then freeze so the shutdown SIGHUPs'
     /// session removals don't clobber the file. Called once on the way out.
     pub fn freeze_and_persist(&mut self) {
-        crate::store::write_atomic(&self.persist_path, &self.snapshot());
+        let snap = self.snapshot();
+        crate::store::write_atomic(&self.persist_path, &snap);
+        self.last_persisted = snap;
         self.persist_frozen = true;
     }
 
