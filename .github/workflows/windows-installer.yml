@@ -1,0 +1,168 @@
+name: Windows installer (manual)
+
+# Ad-hoc Windows packaging: build the binary on a native Windows runner and wrap
+# it in an Inno Setup installer, without cutting a tag or touching a release.
+# Pick the branch in the "Run workflow" dialog; artifacts hang off the run.
+#
+# Separate from release.yml on purpose — that workflow publishes, this one only
+# produces something to try out.
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "What goes in the binary"
+        type: choice
+        default: full
+        options:
+          - full # CLI + embedded daemon + TUI + GUI (default features)
+          - local # CLI + embedded daemon + TUI, no GUI (no WebView2 needed)
+          - gui # GUI only — no PTY/process management at all
+      profile:
+        description: "Cargo profile"
+        type: choice
+        default: release
+        options:
+          - release
+          - debug
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    name: ${{ inputs.flavor }} (${{ inputs.profile }})
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve build inputs
+        id: cfg
+        shell: pwsh
+        run: |
+          # Feature flags per flavor. "full" takes the crate's default features.
+          $features = switch ("${{ inputs.flavor }}") {
+            "full"  { "" }
+            "local" { "--no-default-features --features local" }
+            "gui"   { "--no-default-features --features dioxus" }
+          }
+          $profileFlag = if ("${{ inputs.profile }}" -eq "release") { "--release" } else { "" }
+          # debug builds land in target/<triple>/debug, release in .../release.
+          $outDir = "${{ inputs.profile }}"
+          # Version from the workspace manifest + short SHA: these builds are not
+          # releases, so the SHA is what actually identifies them.
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' |
+                      Select-Object -First 1).Matches[0].Groups[1].Value
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $name = "asd-$version-g$sha-$env:TARGET-${{ inputs.flavor }}"
+
+          "features=$features"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "profile_flag=$profileFlag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "out_dir=$outDir"          | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$version"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "name=$name"               | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "building $name  features='$features' $profileFlag"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ inputs.flavor }}-${{ inputs.profile }}
+
+      # Zig builds the vendored libghostty-vt (asd-vt). The GUI-only flavor
+      # renders in ghostty-web inside the WebView and never links asd-vt.
+      - name: Install Zig (vendored libghostty-vt)
+        if: inputs.flavor != 'gui'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      # asd-dioxus's build.rs shells out to npm (esbuild vendor bundle), and its
+      # russh dependency pulls aws-lc-sys, which assembles its crypto with NASM.
+      # Both are GUI-only, so the `local` flavor skips them.
+      - name: Install Node (asd-dioxus build.rs runs npm)
+        if: inputs.flavor != 'local'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install NASM (aws-lc-sys, pulled by russh)
+        if: inputs.flavor != 'local'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cargo build --locked --target $env:TARGET `
+            ${{ steps.cfg.outputs.profile_flag }} ${{ steps.cfg.outputs.features }}
+
+      - name: Stage payload
+        id: stage
+        shell: pwsh
+        run: |
+          # Named after the package so the portable zip unpacks into a folder
+          # that says what it is, rather than a generic "payload".
+          $stage = Join-Path $env:RUNNER_TEMP "${{ steps.cfg.outputs.name }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/$env:TARGET/${{ steps.cfg.outputs.out_dir }}/asd.exe" $stage
+          Copy-Item LICENSE, README.md $stage
+          # Fail loudly rather than shipping an installer with no program in it.
+          if (-not (Test-Path (Join-Path $stage "asd.exe"))) { throw "asd.exe missing from payload" }
+          "dir=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Get-ChildItem $stage | ForEach-Object { Write-Host "staged $($_.Name) ($($_.Length) bytes)" }
+
+      # Portable archive alongside the installer: useful when you just want the
+      # exe, and it is the fallback if someone cannot run an installer.
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "${{ steps.stage.outputs.dir }}" `
+            -DestinationPath "${{ steps.cfg.outputs.name }}.zip" -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc `
+            "/DAppVersion=${{ steps.cfg.outputs.version }}" `
+            "/DPayloadDir=${{ steps.stage.outputs.dir }}" `
+            "/DOutputBase=${{ steps.cfg.outputs.name }}-setup" `
+            "/DBuildFlavor=${{ inputs.flavor }}" `
+            "deploy\windows\asd.iss"
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed with $LASTEXITCODE" }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.cfg.outputs.name }}-setup
+          path: ${{ steps.cfg.outputs.name }}-setup.exe
+          if-no-files-found: error
+
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.cfg.outputs.name }}-portable
+          path: ${{ steps.cfg.outputs.name }}.zip
+          if-no-files-found: error
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          $rows = @(
+            "| | |",
+            "|---|---|",
+            "| flavor | ``${{ inputs.flavor }}`` |",
+            "| profile | ``${{ inputs.profile }}`` |",
+            "| commit | ``${{ github.sha }}`` |",
+            "| installer | ``${{ steps.cfg.outputs.name }}-setup.exe`` |",
+            "| portable | ``${{ steps.cfg.outputs.name }}.zip`` |"
+          )
+          $rows -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
