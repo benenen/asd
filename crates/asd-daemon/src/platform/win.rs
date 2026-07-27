@@ -186,3 +186,11 @@ pub(crate) fn kill_child(pid: u32, force: bool) {
 pub(crate) fn read_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
+
+/// No fd to borrow: portable-pty exposes a HANDLE here, not a file descriptor,
+/// and the caller only wants one to run `tcgetpgrp` against. `-1` is the same
+/// "no answer" the unix side reports when the fd is unavailable, and the
+/// Windows `foreground_command` ignores the value anyway.
+pub(crate) fn pty_master_fd(_master: &(dyn portable_pty::MasterPty + Send)) -> i32 {
+    -1
+}

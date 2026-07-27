@@ -8,12 +8,11 @@
 //! so a quick session switch can't paint stale content (same race as the GUI
 //! clients).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, code};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// How often the session list is re-polled.
@@ -110,14 +109,11 @@ impl Conn {
 /// The connection event loop. Returns `Err(reason)` if the connection ends
 /// abnormally; a clean `Shutdown` returns `Ok(())`.
 async fn drive(
-    socket: &PathBuf,
+    socket: &Path,
     mut cmd_rx: UnboundedReceiver<Cmd>,
     ev_tx: &Sender<Ev>,
 ) -> Result<(), String> {
-    let stream = UnixStream::connect(socket)
-        .await
-        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
-    let (r, w) = stream.into_split();
+    let (r, w) = crate::platform::connect_stream(socket).await?;
     let mut reader = FrameReader::new(r);
     let mut writer = FrameWriter::new(w);
 

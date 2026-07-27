@@ -1,8 +1,8 @@
-//! Windows terminal hygiene. Selected by [`super`]; see there for the shared
-//! surface.
+//! Windows half: the named-pipe transport plus terminal hygiene. Selected by
+//! [`super`]; see there for the shared surface.
 //!
-//! Both entries are no-ops for now, and deliberately so rather than by
-//! oversight:
+//! The two hygiene entries are no-ops for now, and deliberately so rather than
+//! by oversight:
 //!
 //! - Windows has no signal whose default action kills the process before
 //!   cleanup runs. Console close and Ctrl+Break arrive as a `HandlerRoutine`
@@ -11,6 +11,24 @@
 //! - There is no ConPTY equivalent of the orphaned-pty EOF spin the unix
 //!   watchdog exists to catch: a closed console signals the process rather than
 //!   leaving a readable-forever handle.
+
+use std::path::Path;
+
+use super::{BoxRead, BoxWrite};
+
+/// Connect to the daemon's named pipe and split it for the framed codec.
+pub(crate) async fn connect_stream(socket: &Path) -> Result<(BoxRead, BoxWrite), String> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let name = socket
+        .to_str()
+        .ok_or_else(|| "pipe path is not valid UTF-8".to_string())?;
+    let stream = ClientOptions::new()
+        .open(name)
+        .map_err(|e| format!("connect {name}: {e}"))?;
+    let (r, w) = tokio::io::split(stream);
+    Ok((Box::new(r), Box::new(w)))
+}
 
 /// No-op: see the module docs.
 pub(crate) fn install_terminating_signal_restore() {}

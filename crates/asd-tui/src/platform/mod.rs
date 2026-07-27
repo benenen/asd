@@ -6,12 +6,16 @@
 //!
 //! The surface:
 //!
+//! - [`connect_stream`] — open the transport to the daemon's listener and split
+//!   it into the two boxed halves the framed codec wants.
 //! - [`install_terminating_signal_restore`] — put the terminal back when the
 //!   process is killed outright, which normal cleanup never sees.
 //! - [`spawn_tty_watchdog`] — exit when the hosting terminal disappears.
 //!
-//! Both are best-effort terminal hygiene: a platform without the mechanism
-//! provides a no-op rather than making callers ask whether it exists.
+//! The latter two are best-effort terminal hygiene: a platform without the
+//! mechanism provides a no-op rather than making callers ask whether it exists.
+
+use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(unix)]
 #[path = "unix.rs"]
@@ -20,7 +24,11 @@ mod imp;
 #[path = "win.rs"]
 mod imp;
 
-pub(crate) use imp::{install_terminating_signal_restore, spawn_tty_watchdog};
+pub(crate) use imp::{connect_stream, install_terminating_signal_restore, spawn_tty_watchdog};
+
+/// The daemon side of a connection, type-erased for the framed codec.
+pub(crate) type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
+pub(crate) type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
 /// Escape sequences that undo the modes the TUI turns on: disable mouse tracking
 /// (SGR 1006/1015 + 1000/1002/1003), bracketed paste (2004), leave the alternate

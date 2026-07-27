@@ -142,3 +142,10 @@ pub(crate) fn read_cwd(pid: u32) -> Option<PathBuf> {
     }
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
+
+/// The pty master's raw fd, borrowed (not duplicated) — the master owns it and
+/// keeps it open for the session's lifetime. `-1` when it cannot be obtained,
+/// which `foreground_command` treats as "no answer".
+pub(crate) fn pty_master_fd(master: &(dyn portable_pty::MasterPty + Send)) -> i32 {
+    master.as_raw_fd().unwrap_or(-1)
+}

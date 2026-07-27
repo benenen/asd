@@ -15,6 +15,8 @@
 //! - [`kill_child`] — end a session's child process, gracefully or forcibly.
 //! - [`read_cwd`] — the current working directory of a live process, for the
 //!   persisted session list.
+//! - [`pty_master_fd`] — the pty master's raw fd, for foreground-process
+//!   lookups; `-1` where the platform has no fd to borrow.
 
 #[cfg(unix)]
 #[path = "unix.rs"]
@@ -24,5 +26,5 @@ mod imp;
 mod imp;
 
 pub(crate) use imp::{
-    kill_child, prepare_socket_dir, read_cwd, remove_stale_socket, serve_connections,
+    kill_child, prepare_socket_dir, pty_master_fd, read_cwd, remove_stale_socket, serve_connections,
 };

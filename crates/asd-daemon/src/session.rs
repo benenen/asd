@@ -399,8 +399,10 @@ fn proc_pidpath_basename(pid: libc::pid_t) -> Option<String> {
     (!base.is_empty()).then(|| base.to_string())
 }
 
-/// No cheap foreground-command source on other targets.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// No cheap foreground-command source on other unix targets. Not defined for
+/// Windows at all: `libc::pid_t` does not exist there, and nothing calls this —
+/// the Windows `foreground_command` answers `None` without ever resolving a pid.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn proc_command(_pid: libc::pid_t) -> Option<String> {
     None
 }
@@ -461,8 +463,9 @@ pub fn spawn_session(
 
     let master = pair.master;
     // Raw fd for foreground-process lookups; the master owns it and stays open
-    // for the session's lifetime (this is a borrow, not a dup).
-    let master_fd = master.as_raw_fd().unwrap_or(-1);
+    // for the session's lifetime (this is a borrow, not a dup). `-1` where the
+    // platform has no fd to borrow — see `platform::pty_master_fd`.
+    let master_fd = crate::platform::pty_master_fd(master.as_ref());
     let pty_writer = master.take_writer()?;
     let pty_reader = master.try_clone_reader()?;
 

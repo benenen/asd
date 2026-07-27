@@ -1,9 +1,20 @@
-//! Unix terminal hygiene: signal-driven restore and a hangup watchdog.
-//! Selected by [`super`]; see there for the shared surface.
+//! Unix half: the UDS transport plus terminal hygiene (signal-driven restore
+//! and a hangup watchdog). Selected by [`super`]; see there for the shared
+//! surface.
 
+use std::path::Path;
 use std::time::Duration;
 
-use super::TERM_RESTORE;
+use super::{BoxRead, BoxWrite, TERM_RESTORE};
+
+/// Connect to the daemon's UDS and split it for the framed codec.
+pub(crate) async fn connect_stream(socket: &Path) -> Result<(BoxRead, BoxWrite), String> {
+    let stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    let (r, w) = stream.into_split();
+    Ok((Box::new(r), Box::new(w)))
+}
 
 /// The cooked termios captured before raw mode, so the signal handler can put
 /// the line discipline back. A leaked box, loaded via an async-signal-safe
