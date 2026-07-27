@@ -232,10 +232,15 @@ impl ProtoClient {
 
     /// Attach and return the Snapshot contents.
     async fn attach(&mut self, name: &str) -> Vec<u8> {
+        self.attach_sized(name, 80, 24).await
+    }
+
+    /// Attach as a client of a given window size.
+    async fn attach_sized(&mut self, name: &str, cols: u16, rows: u16) -> Vec<u8> {
         self.send(Frame::Attach {
             name: name.into(),
-            cols: 80,
-            rows: 24,
+            cols,
+            rows,
         })
         .await;
         match self.recv().await {
@@ -1600,4 +1605,87 @@ async fn kill_all_clears_every_session() {
             .status
             .success()
     );
+}
+
+/// One pty, many viewers: it is sized to the smallest of them.
+///
+/// "Last resize wins" let whichever client moved most recently decide, so a
+/// small window silently cropped everyone else's view and never gave it back.
+/// Taking the minimum is the only rule that does not depend on ordering — and
+/// the pty grows again the moment the small window leaves.
+#[tokio::test]
+async fn pty_follows_the_smallest_attached_client() {
+    let daemon = Daemon::start("sizeneg");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "shared"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let size = |d: &Daemon| {
+        let out = d.cli().args(["list", "--json"]).output().unwrap();
+        let json = String::from_utf8_lossy(&out.stdout).to_string();
+        let pick = |key: &str| -> u16 {
+            json.split(&format!("\"{key}\":"))
+                .nth(1)
+                .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|d| d.parse().ok())
+                .unwrap_or_else(|| panic!("no {key} in {json}"))
+        };
+        (pick("cols"), pick("rows"))
+    };
+
+    // A wide viewer sets the size on its own.
+    let mut wide = ProtoClient::connect(&daemon.socket).await;
+    wide.attach_sized("shared", 180, 50).await;
+    wait_for(
+        || size(&daemon) == (180, 50),
+        "pty to follow the only client",
+    )
+    .await;
+
+    // A narrower one joins: everyone drops to the smaller box, per axis.
+    let mut narrow = ProtoClient::connect(&daemon.socket).await;
+    narrow.attach_sized("shared", 100, 60).await;
+    wait_for(
+        || size(&daemon) == (100, 50),
+        "pty to take the minimum of both",
+    )
+    .await;
+
+    // A later resize by the wide client cannot force the narrow one out of view.
+    wide.send(Frame::Resize {
+        cols: 200,
+        rows: 70,
+    })
+    .await;
+    wait_for(
+        || size(&daemon) == (100, 60),
+        "pty to stay within the narrow client",
+    )
+    .await;
+
+    // The narrow client leaves: the pty grows back to what is left.
+    narrow.send(Frame::Detach).await;
+    wait_for(
+        || size(&daemon) == (200, 70),
+        "pty to grow back after the small window closes",
+    )
+    .await;
+}
+
+/// Poll `cond` until it holds, or fail with `what`.
+async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

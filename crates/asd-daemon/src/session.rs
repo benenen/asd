@@ -94,6 +94,8 @@ pub enum SessionMsg {
     Input(Vec<u8>),
     /// Resize policy v1: "last Attach/Resize wins" (spec §5).
     Resize {
+        /// Which viewer changed size; the pty is sized from all of them.
+        client_id: u64,
         cols: u16,
         rows: u16,
     },
@@ -553,6 +555,8 @@ fn session_thread(
 ) {
     let mut vt = GhosttyVt::new(cols, rows, scrollback);
     let mut clients: Vec<ClientSink> = Vec::new();
+    // Each attached client's window size; the pty follows the smallest.
+    let mut client_sizes: std::collections::HashMap<u64, (u16, u16)> = Default::default();
     info!(session = %name, pid = meta.child_pid.load(Ordering::Relaxed), "session started");
 
     while let Ok(msg) = rx.recv() {
@@ -589,12 +593,22 @@ fn session_thread(
                     debug!(session = %name, "pty write failed (child likely exited)");
                 }
             }
-            SessionMsg::Resize { cols, rows } => {
-                apply_resize(&*master, &mut vt, &meta, cols, rows);
+            SessionMsg::Resize {
+                client_id,
+                cols,
+                rows,
+            } => {
+                client_sizes.insert(client_id, (cols, rows));
+                resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
             }
             SessionMsg::Attach { sink, cols, rows } => {
-                // Last attacher wins
-                apply_resize(&*master, &mut vt, &meta, cols, rows);
+                // The newcomer joins the size negotiation before its snapshot
+                // is taken, so the dump it gets already describes the size
+                // everyone ends up at.
+                client_sizes.insert(sink.id, (cols, rows));
+                let mut with_new: Vec<ClientSink> = clients.clone();
+                with_new.push(sink.clone());
+                resize_to_clients(&*master, &mut vt, &meta, &with_new, &mut client_sizes);
                 let snapshot = vt.snapshot_vt();
                 // The Snapshot is enqueued before any subsequent Output (the
                 // single channel preserves order)
@@ -609,6 +623,7 @@ fn session_thread(
                 clients.retain(|c| c.id != client_id);
                 meta.attached_clients
                     .store(clients.len() as u32, Ordering::Relaxed);
+                resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
                 debug!(session = %name, client = client_id, "client detached");
             }
             SessionMsg::FetchHistory { sink, start, count } => {
@@ -689,6 +704,37 @@ fn session_thread(
     }
     meta.attached_clients.store(0, Ordering::Relaxed);
     info!(session = %name, "session ended");
+}
+
+/// The pty size every attached client has to live with.
+///
+/// One pty, many viewers: it can only be as large as the smallest window
+/// looking at it, or a client would be sent content it has no room to show and
+/// would have to letterbox — which is what left stale cells stranded on screen
+/// before. Taking the minimum per axis is also the only rule that does not
+/// depend on who moved last, and it grows back the moment the small window
+/// closes.
+fn negotiated_size(sizes: &std::collections::HashMap<u64, (u16, u16)>) -> Option<(u16, u16)> {
+    sizes
+        .values()
+        .copied()
+        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
+}
+
+/// Drop sizes of clients that are gone, then resize the pty to what the
+/// remaining ones agree on. With no viewers left the last size stands — a
+/// session nobody is watching keeps running at the size it had.
+fn resize_to_clients(
+    master: &(dyn portable_pty::MasterPty + Send),
+    vt: &mut GhosttyVt,
+    meta: &SessionMeta,
+    clients: &[ClientSink],
+    sizes: &mut std::collections::HashMap<u64, (u16, u16)>,
+) {
+    sizes.retain(|id, _| clients.iter().any(|c| c.id == *id));
+    if let Some((cols, rows)) = negotiated_size(sizes) {
+        apply_resize(master, vt, meta, cols, rows);
+    }
 }
 
 fn apply_resize(

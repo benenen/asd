@@ -183,7 +183,11 @@ pub async fn handle_conn(
             }
             Frame::Resize { cols, rows } => {
                 if let Some(a) = &attached {
-                    let _ = a.session_tx.send(SessionMsg::Resize { cols, rows });
+                    let _ = a.session_tx.send(SessionMsg::Resize {
+                        client_id: a.client_id,
+                        cols,
+                        rows,
+                    });
                 }
             }
             Frame::Detach => {
