@@ -353,6 +353,42 @@ fn parse_duration(s: &str) -> Option<u64> {
     value.checked_mul(mult)
 }
 
+/// The session list as a JSON array, one object per session — always an array,
+/// so `[]` is the empty case rather than a special form.
+///
+/// Field names match what `inspect --json` emits for the same data (`session`
+/// for the name, `status` alongside the `running` bool), so a caller can read
+/// either without special-casing. The fields `inspect` adds beyond this are the
+/// ones only a session thread can answer (pid, alt-screen, cursor, …); they are
+/// absent here rather than null, because `list` never asks for them.
+pub fn sessions_json(sessions: &[asd_proto::SessionInfo]) -> String {
+    let mut s = String::from("[");
+    for (i, info) in sessions.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(r#"{"session":"#);
+        json_string(&info.name, &mut s);
+        s.push_str(r#","status":"#);
+        json_string(if info.running { "running" } else { "idle" }, &mut s);
+        s.push_str(r#","command":"#);
+        json_string(&info.command, &mut s);
+        s.push_str(r#","title":"#);
+        json_string(&info.title, &mut s);
+        s.push_str(&format!(
+            r#","cols":{cols},"rows":{rows},"created_ms":{created},"idle_ms":{idle},"running":{running},"attached_clients":{clients}}}"#,
+            cols = info.cols,
+            rows = info.rows,
+            created = info.created_ms,
+            idle = info.idle_ms,
+            running = info.running,
+            clients = info.attached_clients,
+        ));
+    }
+    s.push(']');
+    s
+}
+
 /// Append `value` as a JSON-escaped string literal (with surrounding quotes)
 /// to `out`. Avoids a serde_json dependency for one small object.
 fn json_string(value: &str, out: &mut String) {
@@ -374,6 +410,54 @@ fn json_string(value: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(name: &str, running: bool) -> asd_proto::SessionInfo {
+        asd_proto::SessionInfo {
+            name: name.to_string(),
+            command: "bash".to_string(),
+            title: String::new(),
+            created_ms: 1_700_000_000_000,
+            idle_ms: 42,
+            running,
+            attached_clients: 1,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    #[test]
+    fn sessions_json_is_always_an_array() {
+        assert_eq!(sessions_json(&[]), "[]");
+        let one = sessions_json(&[info("s0", true)]);
+        assert!(one.starts_with('[') && one.ends_with(']'), "{one}");
+        assert_eq!(one.matches("\"session\"").count(), 1);
+    }
+
+    #[test]
+    fn sessions_json_reports_status_and_running_together() {
+        let out = sessions_json(&[info("a", true), info("b", false)]);
+        // Two objects, comma-separated at the top level.
+        assert_eq!(out.matches("{\"session\":").count(), 2);
+        assert!(
+            out.contains(r#"{"session":"a","status":"running""#),
+            "{out}"
+        );
+        assert!(out.contains(r#"{"session":"b","status":"idle""#), "{out}");
+        // `status` is the string form of the same flag `running` carries.
+        assert!(out.contains(r#""running":true"#), "{out}");
+        assert!(out.contains(r#""running":false"#), "{out}");
+    }
+
+    #[test]
+    fn sessions_json_escapes_names_and_titles() {
+        let mut s = info("weird", true);
+        s.title = "say \"hi\"\n\tdone\\".to_string();
+        let out = sessions_json(&[s]);
+        assert!(
+            out.contains(r#""title":"say \"hi\"\n\tdone\\""#),
+            "title not escaped: {out}"
+        );
+    }
 
     #[test]
     fn named_key_covers_documented_names() {

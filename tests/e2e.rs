@@ -1274,3 +1274,50 @@ async fn rename_persists_across_restart() {
     unsafe { libc::kill(successor.id() as i32, libc::SIGTERM) };
     let _ = successor.wait();
 }
+
+/// `asd list --json`: a machine-readable form of the session table. Always an
+/// array — the empty case is `[]`, not the human "no sessions" line — and each
+/// object names the session with the same `session` key `inspect --json` uses,
+/// so a caller can read either without special-casing.
+#[tokio::test]
+async fn list_json_is_an_array_of_sessions() {
+    let daemon = Daemon::start("listjson");
+
+    // No sessions yet: still valid JSON, not prose.
+    let out = daemon.cli().args(["list", "--json"]).output().unwrap();
+    assert!(out.status.success(), "list --json failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
+
+    for name in ["lj0", "lj1"] {
+        assert!(
+            daemon
+                .cli()
+                .args(["new", name])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    let out = daemon.cli().args(["list", "--json"]).output().unwrap();
+    assert!(out.status.success(), "list --json failed: {out:?}");
+    let json = String::from_utf8_lossy(&out.stdout);
+    let json = json.trim();
+    assert!(json.starts_with('[') && json.ends_with(']'), "json: {json}");
+    assert!(json.contains(r#""session":"lj0""#), "json: {json}");
+    assert!(json.contains(r#""session":"lj1""#), "json: {json}");
+    // Both objects are present, comma-separated at the top level.
+    assert_eq!(json.matches(r#"{"session":"#).count(), 2, "json: {json}");
+    // Default create size, and the fields the table shows.
+    assert!(json.contains(r#""cols":80"#), "json: {json}");
+    assert!(json.contains(r#""rows":24"#), "json: {json}");
+    assert!(json.contains(r#""attached_clients":0"#), "json: {json}");
+    assert!(json.contains(r#""status":"#), "json: {json}");
+
+    // Without --json the human table is unchanged.
+    let out = daemon.cli().args(["list"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("NAME"), "table: {text}");
+    assert!(!text.contains(r#""session":"#), "table leaked json: {text}");
+}

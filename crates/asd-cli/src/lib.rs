@@ -35,7 +35,11 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// List all sessions
-    List,
+    List {
+        /// Emit a JSON array instead of the table (`[]` when there are none)
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a session (auto-assigns s0, s1, ... when unnamed);
     /// starts the daemon if it is not running
     New {
@@ -192,12 +196,14 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
         unreachable!("no-subcommand is dispatched before the runtime starts")
     };
     match cmd {
-        Cmd::List => {
+        Cmd::List { json } => {
             let mut c = client::connect(&socket, ClientKind::Cli).await?;
             c.writer.write_frame(&Frame::ListSessions).await?;
             match c.reader.read_frame().await? {
                 Some(Frame::SessionList { sessions }) => {
-                    if sessions.is_empty() {
+                    if json {
+                        println!("{}", control::sessions_json(&sessions));
+                    } else if sessions.is_empty() {
                         println!("no sessions");
                     } else {
                         println!(
