@@ -63,7 +63,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     // switching the terminal's mode so the message stays visible.
     let first = match client.reader.read_frame().await? {
         Some(Frame::Snapshot { vt }) => vt,
-        Some(Frame::Error { code, msg }) => anyhow::bail!("attach failed ({code}): {msg}"),
+        Some(Frame::Error { code, msg }) => return Err(crate::exit::daemon("attach", code, &msg)),
         other => anyhow::bail!("expected Snapshot after Attach, got {other:?}"),
     };
 

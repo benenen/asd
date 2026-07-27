@@ -8,8 +8,26 @@
 //! daemon) — only this binary combines them. Build with
 //! `--no-default-features --features dioxus` for a PTY-free, GUI-only client.
 
-fn main() -> anyhow::Result<()> {
-    run()
+fn main() {
+    if let Err(e) = run() {
+        // Same rendering anyhow's own `Termination` gives (message + causes);
+        // only the status differs, so a caller can tell "no such session" from
+        // "the daemon is down" without matching on wording.
+        eprintln!("Error: {e:?}");
+        std::process::exit(failure_status(&e));
+    }
+}
+
+/// Exit status for a failed run. The CLI knows which failures a caller can act
+/// on; a GUI-only build has no such distinctions to draw.
+#[cfg(feature = "local")]
+fn failure_status(err: &anyhow::Error) -> i32 {
+    asd_cli::exit_status(err)
+}
+
+#[cfg(not(feature = "local"))]
+fn failure_status(_err: &anyhow::Error) -> i32 {
+    1
 }
 
 /// Full build: the CLI owns the command surface and calls back into the GUI

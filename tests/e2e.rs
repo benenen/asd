@@ -1420,3 +1420,55 @@ async fn persisted_cwd_follows_the_session() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
+
+/// Exit statuses a caller can branch on without matching stderr wording.
+///
+/// Every failure used to be exit 1, with the protocol code surviving only as
+/// text in the message — so a script asking "did that session exist?" had to
+/// grep. `3` now means it did not, from whichever command asked.
+#[tokio::test]
+async fn exit_status_distinguishes_a_missing_session() {
+    let daemon = Daemon::start("exitcodes");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "live"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // Every command that names a session agrees on 3.
+    for args in [
+        vec!["peek", "ghost"],
+        vec!["send", "ghost", "--text", "x"],
+        vec!["inspect", "ghost"],
+        vec!["kill", "ghost"],
+        vec!["wait", "ghost", "--idle", "--timeout", "1s"],
+        vec!["wait", "ghost", "--text", "x", "--timeout", "1s"],
+    ] {
+        let out = daemon.cli().args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{args:?} → {out:?}");
+    }
+
+    // A timeout is its own status, and is not confused with a missing session.
+    let out = daemon
+        .cli()
+        .args(["wait", "live", "--text", "never-appears", "--timeout", "1s"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4), "timeout: {out:?}");
+
+    // Success stays 0.
+    assert_eq!(
+        daemon
+            .cli()
+            .args(["peek", "live"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+}

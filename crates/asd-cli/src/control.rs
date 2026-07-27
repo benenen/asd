@@ -10,11 +10,10 @@ use asd_proto::{ClientKind, Frame, IDLE_SETTLE_MS, MAX_FRAME_LEN, code};
 use tokio::io::AsyncReadExt;
 
 use crate::client;
+use crate::exit;
 
 /// Poll interval for `wait` (matches boo).
 const POLL_MS: u64 = 50;
-/// Process exit code on `wait` timeout (matches boo's documented code).
-const EXIT_TIMEOUT: i32 = 4;
 
 /// `asd send`: type bytes into a session's pty. The payload is `--text`
 /// (literal), `--key` (named keys), or stdin; `--enter` appends a carriage
@@ -67,7 +66,7 @@ pub async fn send(
         .await?;
     match c.reader.read_frame().await? {
         Some(Frame::Ack) => Ok(()),
-        Some(Frame::Error { code, msg }) => bail!("send failed ({code}): {msg}"),
+        Some(Frame::Error { code, msg }) => Err(exit::daemon("send", code, &msg)),
         other => bail!("unexpected reply: {other:?}"),
     }
 }
@@ -84,7 +83,7 @@ pub async fn peek(socket: &Path, name: String, scrollback: bool, json: bool) -> 
         .await?;
     let reply = match c.reader.read_frame().await? {
         Some(f @ Frame::PeekReply { .. }) => f,
-        Some(Frame::Error { code, msg }) => bail!("peek failed ({code}): {msg}"),
+        Some(Frame::Error { code, msg }) => return Err(exit::daemon("peek", code, &msg)),
         other => bail!("unexpected reply: {other:?}"),
     };
     let Frame::PeekReply {
@@ -131,7 +130,7 @@ pub async fn inspect(socket: &Path, name: String, json: bool) -> anyhow::Result<
     c.writer.write_frame(&Frame::Inspect { name }).await?;
     let reply = match c.reader.read_frame().await? {
         Some(f @ Frame::InspectReply { .. }) => f,
-        Some(Frame::Error { code, msg }) => bail!("inspect failed ({code}): {msg}"),
+        Some(Frame::Error { code, msg }) => return Err(exit::daemon("inspect", code, &msg)),
         other => bail!("unexpected reply: {other:?}"),
     };
     let Frame::InspectReply {
@@ -238,7 +237,7 @@ fn fmt_idle(ms: u64) -> String {
 
 /// `asd wait`: block until the session's screen contains `text`, or output has
 /// been idle for [`IDLE_SETTLE_MS`], then exit 0. On timeout, exit
-/// [`EXIT_TIMEOUT`]. One persistent connection is polled every [`POLL_MS`].
+/// [`exit::TIMEOUT`]. One persistent connection is polled every [`POLL_MS`].
 pub async fn wait(
     socket: &Path,
     name: String,
@@ -267,7 +266,7 @@ pub async fn wait(
                         return Ok(());
                     }
                 }
-                Some(Frame::Error { code, msg }) => bail!("wait failed ({code}): {msg}"),
+                Some(Frame::Error { code, msg }) => return Err(exit::daemon("wait", code, &msg)),
                 other => bail!("unexpected reply: {other:?}"),
             }
         } else {
@@ -284,19 +283,22 @@ pub async fn wait(
                         // condition through `Peek`, which *does* answer with
                         // `Error{NO_SUCH_SESSION}`, and one command must not
                         // describe one situation two ways.
-                        None => bail!(
-                            "wait failed ({}): no such session '{name}'",
-                            code::NO_SUCH_SESSION
-                        ),
+                        None => {
+                            return Err(exit::daemon(
+                                "wait",
+                                code::NO_SUCH_SESSION,
+                                &format!("no such session '{name}'"),
+                            ));
+                        }
                     }
                 }
-                Some(Frame::Error { code, msg }) => bail!("wait failed ({code}): {msg}"),
+                Some(Frame::Error { code, msg }) => return Err(exit::daemon("wait", code, &msg)),
                 other => bail!("unexpected reply: {other:?}"),
             }
         }
         if Instant::now() >= deadline {
             eprintln!("wait: timed out after {timeout}");
-            std::process::exit(EXIT_TIMEOUT);
+            std::process::exit(exit::TIMEOUT);
         }
         tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
     }

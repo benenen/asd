@@ -7,6 +7,7 @@
 mod attach;
 mod client;
 mod control;
+mod exit;
 mod platform;
 mod render;
 
@@ -15,6 +16,8 @@ use std::path::PathBuf;
 use anyhow::bail;
 use asd_proto::{ClientKind, Frame, paths};
 use clap::{Parser, Subcommand};
+
+pub use exit::status as exit_status;
 
 /// Launches the GUI for an optional session name. Injected by the binary (the
 /// GUI crate is only linked under the `gui` feature), so this crate never
@@ -93,7 +96,8 @@ enum Cmd {
         json: bool,
     },
     /// Block until the session's screen matches or its output settles, then
-    /// exit 0 (exit 4 on timeout). Replaces sleep-and-poll loops in scripts.
+    /// exit 0 (4 on timeout, 3 if there is no such session). Replaces
+    /// sleep-and-poll loops in scripts.
     #[command(group(clap::ArgGroup::new("wait_cond").required(true).args(["text", "idle"])))]
     Wait {
         /// Session name
@@ -225,7 +229,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                         }
                     }
                 }
-                Some(Frame::Error { code, msg }) => bail!("daemon error ({code}): {msg}"),
+                Some(Frame::Error { code, msg }) => return Err(exit::daemon("daemon", code, &msg)),
                 other => bail!("unexpected reply: {other:?}"),
             }
         }
@@ -235,7 +239,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             c.writer.write_frame(&Frame::Create { name, cmd }).await?;
             match c.reader.read_frame().await? {
                 Some(Frame::Created { name }) => println!("{name}"),
-                Some(Frame::Error { code, msg }) => bail!("create failed ({code}): {msg}"),
+                Some(Frame::Error { code, msg }) => return Err(exit::daemon("create", code, &msg)),
                 other => bail!("unexpected reply: {other:?}"),
             }
         }
@@ -250,7 +254,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             c.writer.write_frame(&Frame::ListSessions).await?;
             match c.reader.read_frame().await? {
                 Some(Frame::SessionList { .. }) => println!("kill signalled: {name}"),
-                Some(Frame::Error { code, msg }) => bail!("kill failed ({code}): {msg}"),
+                Some(Frame::Error { code, msg }) => return Err(exit::daemon("kill", code, &msg)),
                 other => bail!("unexpected reply: {other:?}"),
             }
         }
@@ -299,7 +303,9 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                         // as we can attach
                         let _ = msg;
                     }
-                    Some(Frame::Error { code, msg }) => bail!("create failed ({code}): {msg}"),
+                    Some(Frame::Error { code, msg }) => {
+                        return Err(exit::daemon("create", code, &msg));
+                    }
                     other => bail!("unexpected reply: {other:?}"),
                 }
             }
@@ -344,7 +350,7 @@ async fn session_exists(c: &mut client::Client, name: &str) -> anyhow::Result<bo
     c.writer.write_frame(&Frame::ListSessions).await?;
     match c.reader.read_frame().await? {
         Some(Frame::SessionList { sessions }) => Ok(sessions.iter().any(|s| s.name == name)),
-        Some(Frame::Error { code, msg }) => bail!("daemon error ({code}): {msg}"),
+        Some(Frame::Error { code, msg }) => Err(exit::daemon("daemon", code, &msg)),
         other => bail!("unexpected reply: {other:?}"),
     }
 }
