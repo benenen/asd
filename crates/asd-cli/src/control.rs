@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
-use asd_proto::{ClientKind, Frame, IDLE_SETTLE_MS, MAX_FRAME_LEN};
+use asd_proto::{ClientKind, Frame, IDLE_SETTLE_MS, MAX_FRAME_LEN, code};
 use tokio::io::AsyncReadExt;
 
 use crate::client;
@@ -277,7 +277,17 @@ pub async fn wait(
                     match sessions.iter().find(|s| s.name == name) {
                         Some(s) if s.idle_ms >= IDLE_SETTLE_MS => return Ok(()),
                         Some(_) => {}
-                        None => bail!("wait: no session named '{name}'"),
+                        // `ListSessions` cannot fail on a missing name — it just
+                        // returns a list without it — so the absence is detected
+                        // here. Report it exactly as the daemon would have, code
+                        // and wording included: `--text` reaches the same
+                        // condition through `Peek`, which *does* answer with
+                        // `Error{NO_SUCH_SESSION}`, and one command must not
+                        // describe one situation two ways.
+                        None => bail!(
+                            "wait failed ({}): no such session '{name}'",
+                            code::NO_SUCH_SESSION
+                        ),
                     }
                 }
                 Some(Frame::Error { code, msg }) => bail!("wait failed ({code}): {msg}"),

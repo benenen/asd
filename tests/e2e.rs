@@ -1321,3 +1321,38 @@ async fn list_json_is_an_array_of_sessions() {
     assert!(text.contains("NAME"), "table: {text}");
     assert!(!text.contains(r#""session":"#), "table leaked json: {text}");
 }
+
+/// A missing session must read the same whichever way `wait` was asked to
+/// watch it. `--text` reaches the daemon through `Peek`, which answers
+/// `Error{NO_SUCH_SESSION}`; `--idle` polls `ListSessions`, which cannot fail on
+/// a name it simply does not contain, so the CLI detects the absence itself —
+/// and used to word it differently and drop the protocol code, leaving scripts
+/// no single pattern to match.
+#[tokio::test]
+async fn wait_reports_a_missing_session_the_same_way_in_both_modes() {
+    let daemon = Daemon::start("waitmissing");
+
+    let by_text = daemon
+        .cli()
+        .args(["wait", "ghost", "--text", "x", "--timeout", "1s"])
+        .output()
+        .unwrap();
+    let by_idle = daemon
+        .cli()
+        .args(["wait", "ghost", "--idle", "--timeout", "1s"])
+        .output()
+        .unwrap();
+
+    for (label, out) in [("--text", &by_text), ("--idle", &by_idle)] {
+        assert!(!out.status.success(), "{label} should fail: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("wait failed (2)") && err.contains("no such session 'ghost'"),
+            "{label} wording: {err}"
+        );
+    }
+
+    // Not the timeout path: that exits 4 and says so.
+    assert_ne!(by_idle.status.code(), Some(4), "idle took the timeout path");
+    assert_ne!(by_text.status.code(), Some(4), "text took the timeout path");
+}
