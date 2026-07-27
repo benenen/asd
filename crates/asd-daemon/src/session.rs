@@ -343,8 +343,14 @@ fn procargs2(pid: libc::pid_t) -> Option<String> {
 }
 
 /// Parse a `KERN_PROCARGS2` blob: `[argc:i32][exec_path\0][\0…][argv0\0]…`.
-/// Pure byte parsing (no syscalls), so it's built in `test` too for coverage.
-#[cfg(any(target_os = "macos", test))]
+/// Pure byte parsing (no syscalls), so it is built under `test` on Linux too,
+/// which is how the macOS argv parser keeps unit tests on a Linux dev box.
+///
+/// The test arm is pinned to Linux rather than left open: the body needs
+/// `libc::c_int` and the `strip_login_dash`/`unwrap_shell_c` helpers, none of
+/// which exist on Windows, so a bare `test` compiled this into the Windows test
+/// build and broke it.
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 fn parse_procargs2(buf: &[u8]) -> Option<String> {
     let int_sz = std::mem::size_of::<libc::c_int>();
     let argc = i32::from_ne_bytes(buf.get(..int_sz)?.try_into().ok()?);
@@ -758,7 +764,9 @@ pub fn kill_child(meta: &SessionMeta, force: bool) {
     crate::platform::kill_child(pid, force);
 }
 
-#[cfg(test)]
+// The only tests here exercise the macOS argv parser, which is compiled on
+// Linux for exactly that purpose; on any other target there is nothing to test.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
