@@ -13,7 +13,7 @@ mod render;
 
 use std::path::PathBuf;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use asd_proto::{ClientKind, Frame, paths};
 use clap::{Parser, Subcommand};
 
@@ -51,9 +51,21 @@ enum Cmd {
         /// Command to run (parsed via sh -c); defaults to $SHELL
         #[arg(long)]
         cmd: Option<String>,
+        /// Directory to start in; defaults to the daemon's. Prefer this over
+        /// folding a `cd` into --cmd: the session starts there, so its recorded
+        /// workspace is right from the first moment.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
     },
     /// Kill a session (SIGHUP, with SIGKILL fallback after 2s)
-    Kill { name: String },
+    #[command(group(clap::ArgGroup::new("kill_target").required(true).args(["name", "all"])))]
+    Kill {
+        /// Session name
+        name: Option<String>,
+        /// Kill every session instead of one
+        #[arg(long)]
+        all: bool,
+    },
     /// Type into a session, exactly as if typed at the keyboard. --text is sent
     /// literally (no escaping, no implicit newline); with neither --text nor
     /// --key, bytes are read from stdin (binary-safe, NUL excluded).
@@ -233,29 +245,78 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                 other => bail!("unexpected reply: {other:?}"),
             }
         }
-        Cmd::New { name, cmd } => {
+        Cmd::New { name, cmd, cwd } => {
             // Creating a session implies wanting a daemon (tmux-like semantics)
             let mut c = client::connect_or_spawn(&socket, ClientKind::Cli).await?;
-            c.writer.write_frame(&Frame::Create { name, cmd }).await?;
+            // Resolve here so a relative --cwd means "relative to where the user
+            // ran asd", not to wherever the daemon happens to be.
+            let cwd = match cwd {
+                Some(p) => Some(
+                    std::fs::canonicalize(&p)
+                        .with_context(|| format!("resolving --cwd {}", p.display()))?
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                None => None,
+            };
+            c.writer
+                .write_frame(&Frame::Create { name, cmd, cwd })
+                .await?;
             match c.reader.read_frame().await? {
                 Some(Frame::Created { name }) => println!("{name}"),
                 Some(Frame::Error { code, msg }) => return Err(exit::daemon("create", code, &msg)),
                 other => bail!("unexpected reply: {other:?}"),
             }
         }
-        Cmd::Kill { name } => {
+        Cmd::Kill { name, all } => {
             let mut c = client::connect(&socket, ClientKind::Cli).await?;
-            c.writer
-                .write_frame(&Frame::Kill { name: name.clone() })
-                .await?;
+            // clap's group guarantees exactly one of name / --all.
+            let names = match name {
+                Some(n) => vec![n],
+                None => {
+                    debug_assert!(all);
+                    c.writer.write_frame(&Frame::ListSessions).await?;
+                    match c.reader.read_frame().await? {
+                        Some(Frame::SessionList { sessions }) => {
+                            sessions.into_iter().map(|s| s.name).collect()
+                        }
+                        Some(Frame::Error { code, msg }) => {
+                            return Err(exit::daemon("kill", code, &msg));
+                        }
+                        other => bail!("unexpected reply: {other:?}"),
+                    }
+                }
+            };
+            if names.is_empty() {
+                println!("no sessions");
+                return Ok(());
+            }
+            for n in &names {
+                c.writer
+                    .write_frame(&Frame::Kill { name: n.clone() })
+                    .await?;
+            }
             // Kill has no ack frame (spec §4): use a ListSessions to anchor
             // the confirmation ordering — the daemon processes in order, so
-            // if Kill failed, the Error arrives before the SessionList.
+            // any Kill error arrives before the SessionList.
             c.writer.write_frame(&Frame::ListSessions).await?;
-            match c.reader.read_frame().await? {
-                Some(Frame::SessionList { .. }) => println!("kill signalled: {name}"),
-                Some(Frame::Error { code, msg }) => return Err(exit::daemon("kill", code, &msg)),
-                other => bail!("unexpected reply: {other:?}"),
+            loop {
+                match c.reader.read_frame().await? {
+                    Some(Frame::SessionList { .. }) => break,
+                    // Killing several at once races their own exits; one that
+                    // died on its own in the meantime is the outcome we wanted,
+                    // not a failure.
+                    Some(Frame::Error { code, msg }) => {
+                        if code == asd_proto::code::NO_SUCH_SESSION && names.len() > 1 {
+                            continue;
+                        }
+                        return Err(exit::daemon("kill", code, &msg));
+                    }
+                    other => bail!("unexpected reply: {other:?}"),
+                }
+            }
+            for n in &names {
+                println!("kill signalled: {n}");
             }
         }
         Cmd::Attach { name, auto, stdio } => {
@@ -294,6 +355,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                     .write_frame(&Frame::Create {
                         name: Some(name.clone()),
                         cmd: None,
+                        cwd: None,
                     })
                     .await?;
                 match c.reader.read_frame().await? {

@@ -201,6 +201,7 @@ impl SessionHandle {
             name,
             command,
             title,
+            pid: self.meta.child_pid.load(Ordering::Relaxed),
             created_ms: self.created_ms,
             idle_ms,
             // "Running" = recently producing output; for an agent this tracks

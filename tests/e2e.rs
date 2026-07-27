@@ -1472,3 +1472,132 @@ async fn exit_status_distinguishes_a_missing_session() {
         Some(0)
     );
 }
+
+/// v8: `new --cwd` starts the session in the given directory, so the recorded
+/// workspace is right from the first moment instead of converging later.
+#[tokio::test]
+async fn new_cwd_starts_the_session_there() {
+    let daemon = Daemon::start("newcwd");
+    let target = daemon.dir.join("startdir");
+    std::fs::create_dir_all(&target).unwrap();
+    let want = target.canonicalize().unwrap();
+
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "placed", "--cwd", want.to_str().unwrap()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // Recorded immediately — no waiting for the refresh sweep to correct it.
+    let list = daemon.dir.join("data/asd/sessions.tsv");
+    let recorded = std::fs::read_to_string(&list).unwrap_or_default();
+    assert!(
+        recorded.contains(want.to_str().unwrap()),
+        "cwd not recorded at create: {recorded}"
+    );
+
+    // A directory that cannot be entered fails the create rather than silently
+    // starting somewhere else.
+    let out = daemon
+        .cli()
+        .args(["new", "nowhere", "--cwd", "/definitely/not/here"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "bad --cwd should fail: {out:?}");
+}
+
+/// v8: `list --json` carries the pid, so a caller reaches the process without
+/// an `inspect` round trip per session.
+#[tokio::test]
+async fn list_json_carries_the_pid() {
+    let daemon = Daemon::start("listpid");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "p0"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let out = daemon.cli().args(["list", "--json"]).output().unwrap();
+    let json = String::from_utf8_lossy(&out.stdout);
+    let pid: u32 = json
+        .split(r#""pid":"#)
+        .nth(1)
+        .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|d| d.parse().ok())
+        .unwrap_or_else(|| panic!("no pid in {json}"));
+    assert!(pid > 0, "pid should be live: {json}");
+
+    // The same pid `inspect` reports — one source of truth, two ways to reach it.
+    let ins = daemon
+        .cli()
+        .args(["inspect", "p0", "--json"])
+        .output()
+        .unwrap();
+    let ins = String::from_utf8_lossy(&ins.stdout);
+    assert!(ins.contains(&format!(r#""pid":{pid}"#)), "inspect: {ins}");
+}
+
+/// v8: `kill --all` clears every session in one call.
+#[tokio::test]
+async fn kill_all_clears_every_session() {
+    let daemon = Daemon::start("killall");
+    for n in ["k0", "k1", "k2"] {
+        assert!(
+            daemon
+                .cli()
+                .args(["new", n])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    let out = daemon.cli().args(["kill", "--all"]).output().unwrap();
+    assert!(out.status.success(), "kill --all: {out:?}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let list = daemon.cli().args(["list", "--json"]).output().unwrap();
+        if String::from_utf8_lossy(&list.stdout).trim() == "[]" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sessions outlived kill --all"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // With nothing left it says so rather than failing.
+    let out = daemon.cli().args(["kill", "--all"]).output().unwrap();
+    assert!(out.status.success(), "kill --all on empty: {out:?}");
+
+    // A name and --all are mutually exclusive; neither is also rejected.
+    assert!(
+        !daemon
+            .cli()
+            .args(["kill"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        !daemon
+            .cli()
+            .args(["kill", "x", "--all"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}

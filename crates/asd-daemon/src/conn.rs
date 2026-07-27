@@ -118,10 +118,13 @@ pub async fn handle_conn(
                     sessions: registry.lock().unwrap().list(),
                 });
             }
-            Frame::Create { name, cmd } => match Registry::create(&registry, name, cmd, None) {
-                Ok(name) => reply(Frame::Created { name }),
-                Err((code, msg)) => reply(Frame::Error { code, msg }),
-            },
+            Frame::Create { name, cmd, cwd } => {
+                let cwd = cwd.map(std::path::PathBuf::from);
+                match Registry::create(&registry, name, cmd, cwd) {
+                    Ok(name) => reply(Frame::Created { name }),
+                    Err((code, msg)) => reply(Frame::Error { code, msg }),
+                }
+            }
             Frame::Kill { name } => {
                 if let Err((code, msg)) = registry.lock().unwrap().kill(&name) {
                     reply(Frame::Error { code, msg });

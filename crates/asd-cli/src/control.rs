@@ -388,7 +388,8 @@ pub fn sessions_json(sessions: &[asd_proto::SessionInfo]) -> String {
         s.push_str(r#","title":"#);
         json_string(&info.title, &mut s);
         s.push_str(&format!(
-            r#","cols":{cols},"rows":{rows},"created_ms":{created},"idle_ms":{idle},"running":{running},"attached_clients":{clients}}}"#,
+            r#","pid":{pid},"cols":{cols},"rows":{rows},"created_ms":{created},"idle_ms":{idle},"running":{running},"attached_clients":{clients}}}"#,
+            pid = info.pid,
             cols = info.cols,
             rows = info.rows,
             created = info.created_ms,
@@ -432,9 +433,17 @@ mod tests {
             idle_ms: 42,
             running,
             attached_clients: 1,
+            pid: 4242,
             cols: 80,
             rows: 24,
         }
+    }
+
+    #[test]
+    fn sessions_json_carries_the_pid() {
+        // The whole point: a caller can reach /proc/<pid> straight from `list`,
+        // without an `inspect` round trip per session.
+        assert!(sessions_json(&[info("s0", true)]).contains(r#""pid":4242"#));
     }
 
     #[test]

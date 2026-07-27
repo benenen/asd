@@ -14,7 +14,11 @@
 //! (`SendInput`/`Ack`, `Peek`/`PeekReply`) and `SessionInfo.idle_ms`; v5 added
 //! `SessionInfo.running` (idle-derived activity flag); v6 added the
 //! `Inspect`/`InspectReply` frames (detailed single-session dump); v7 added
-//! `Rename` (rename a session; replies `Ack`).
+//! `Rename` (rename a session; replies `Ack`); v8 added `Create.cwd` (start the
+//! session in a given directory, instead of the caller folding a `cd` into
+//! `cmd` — which also made the persisted cwd wrong at create time) and
+//! `SessionInfo.pid` (so `list` answers what previously took an `inspect` per
+//! session).
 
 mod codec;
 pub mod paths;
@@ -25,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 7;
+pub const PROTO_VERSION: u32 = 8;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -89,6 +93,10 @@ pub struct SessionInfo {
     /// it is, it does not flip with activity. Daemon-derived.
     pub running: bool,
     pub attached_clients: u32,
+    /// The session child's process id, or 0 before it is known. Lets a caller
+    /// reach the process (its `/proc` entry, say) straight from `list`, instead
+    /// of an `inspect` round trip per session.
+    pub pid: u32,
     pub cols: u16,
     pub rows: u16,
 }
@@ -121,6 +129,10 @@ pub enum Frame {
     Create {
         name: Option<String>,
         cmd: Option<String>,
+        /// Directory to start the session in; `None` inherits the daemon's.
+        /// A path the daemon cannot enter fails the create rather than falling
+        /// back, so a caller is never silently given the wrong directory.
+        cwd: Option<String>,
     },
     Created {
         name: String,

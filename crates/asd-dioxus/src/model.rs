@@ -328,6 +328,7 @@ mod tests {
             idle_ms: 0,
             running: false,
             attached_clients: clients,
+            pid: 0,
             cols: 80,
             rows: 24,
         }

@@ -245,7 +245,7 @@ async fn drive(
                     }
                 }
                 Some(HostCmd::Create) => {
-                    if writer.write_frame(&Frame::Create { name: None, cmd: None }).await.is_err() {
+                    if writer.write_frame(&Frame::Create { name: None, cmd: None, cwd: None }).await.is_err() {
                         return Err("create write failed".to_string());
                     }
                 }
