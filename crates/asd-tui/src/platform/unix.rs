@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::{BoxRead, BoxWrite, TERM_RESTORE};
+use super::{BoxRead, BoxWrite};
 
 /// Connect to the daemon's UDS and split it for the framed codec.
 pub(crate) async fn connect_stream(socket: &Path) -> Result<(BoxRead, BoxWrite), String> {
@@ -15,6 +15,14 @@ pub(crate) async fn connect_stream(socket: &Path) -> Result<(BoxRead, BoxWrite),
     let (r, w) = stream.into_split();
     Ok((Box::new(r), Box::new(w)))
 }
+
+/// Escape sequences that undo the modes the TUI turns on: disable mouse tracking
+/// (SGR 1006/1015 + 1000/1002/1003), bracketed paste (2004), leave the alternate
+/// screen (1049), show the cursor (25h), reset SGR (0m). Written verbatim from
+/// the signal handler, which is the only thing that needs them — hence here and
+/// not in the shared module.
+const TERM_RESTORE: &[u8] =
+    b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m";
 
 /// The cooked termios captured before raw mode, so the signal handler can put
 /// the line discipline back. A leaked box, loaded via an async-signal-safe
