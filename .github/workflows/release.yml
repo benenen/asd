@@ -80,10 +80,12 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
 
-  # Native Windows build — the GPU GUI client (`gui` feature only). The `local`
-  # side pulls the Unix-only `nix` crate (daemon/PTY), which can't compile for
-  # Windows; the Windows deliverable is the GUI. russh → aws-lc-sys needs NASM to
-  # assemble its crypto.
+  # Native Windows build — the full binary (CLI + daemon + TUI + GUI), same
+  # deliverable as Linux and macOS. This used to ship GUI-only, back when the
+  # terminal side was Unix-only; the Named Pipe transport and the platform/
+  # modules changed that, and windows-check.yml builds all three flavors on
+  # every push to prove it. russh → aws-lc-sys needs NASM to assemble its
+  # crypto; asd-vt needs Zig for the vendored ghostty.
   windows:
     name: x86_64-pc-windows-msvc
     runs-on: windows-latest
@@ -110,8 +112,8 @@ jobs:
       - name: Install NASM (aws-lc-sys, pulled by russh)
         uses: ilammy/setup-nasm@v1
 
-      - name: Build (GUI only)
-        run: cargo build --release --locked --no-default-features --features gui --target x86_64-pc-windows-msvc
+      - name: Build (full)
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
       - name: Package
         id: pkg

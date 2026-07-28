@@ -41,8 +41,10 @@ fn run() -> anyhow::Result<()> {
     asd_cli::run(gui)
 }
 
-/// GUI-only build (e.g. Windows): no CLI/daemon. Bare `asd`, or
-/// `asd [gui] <session>`, opens the window.
+/// GUI-only build: no CLI/daemon, so there is no command surface to parse —
+/// bare `asd`, or `asd [gui] <session>`, opens the window, and anything else
+/// on the command line is read as a session name. Every shipped binary is a
+/// full build; this is for a hand-built PTY-free client.
 #[cfg(all(not(feature = "local"), feature = "dioxus"))]
 fn run() -> anyhow::Result<()> {
     let session = std::env::args()

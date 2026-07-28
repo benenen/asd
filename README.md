@@ -68,15 +68,15 @@ cargo build --release
 # Server / headless: CLI + daemon + TUI, no GUI (won't link WebKitGTK)
 cargo build --release --no-default-features --features local
 
-# Client-only (e.g. Windows): GUI, no PTY/daemon
+# Client-only: GUI, no PTY/daemon
 cargo build --release --no-default-features --features dioxus
 ```
 
 Prebuilt binaries are produced by CI (currently green) for:
 
 - Linux `x86_64` / `aarch64` — full
-- Windows `x86_64-msvc` — GUI only
-- macOS `x86_64` / `aarch64` — full
+- Windows `x86_64-msvc` — full
+- macOS `aarch64` — full
 
 ## Usage
 
