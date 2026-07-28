@@ -109,6 +109,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/$env:TARGET/${{ steps.cfg.outputs.out_dir }}/asd.exe" $stage
           Copy-Item LICENSE, README.md $stage
+          # Any flavor that links asd-vt imports ghostty-vt.dll (the vendored
+          # ghostty builds as a DLL, and the crate's "static" link resolves to
+          # its import library), so the DLL is part of the payload. The gui
+          # flavor renders in ghostty-web and never links asd-vt, hence no DLL.
+          if ("${{ inputs.flavor }}" -ne "gui") {
+            $dll = Get-ChildItem -Path "target/$env:TARGET/${{ steps.cfg.outputs.out_dir }}/build" `
+              -Recurse -Filter ghostty-vt.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $dll) { throw "ghostty-vt.dll missing — asd.exe would not start" }
+            Copy-Item $dll.FullName $stage
+          }
           # Fail loudly rather than shipping an installer with no program in it.
           if (-not (Test-Path (Join-Path $stage "asd.exe"))) { throw "asd.exe missing from payload" }
           "dir=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append

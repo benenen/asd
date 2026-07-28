@@ -78,7 +78,10 @@ jobs:
         with:
           files: ${{ steps.pkg.outputs.archive }}
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          # No generate_release_notes here: it APPENDS, and four build jobs
+          # attaching to one release appended four copies of the notes (eight
+          # once the tag was re-released). The `notes` job below writes them
+          # once instead.
 
   # Native Windows build — the full binary (CLI + daemon + TUI + GUI), same
   # deliverable as Linux and macOS. This used to ship GUI-only, back when the
@@ -128,8 +131,22 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP $name
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/$target/release/asd.exe" $stage
+          # asd.exe imports ghostty-vt.dll, so the DLL is part of the payload —
+          # without it the exe dies at startup with "ghostty-vt.dll not found".
+          # It is not statically linked despite libghostty-vt-sys asking for a
+          # static link: the Zig build installs ghostty-vt.lib (the DLL's import
+          # library) next to the real ghostty-vt-static.lib, and the crate emits
+          # `rustc-link-lib=static=ghostty-vt`, which on MSVC resolves to
+          # ghostty-vt.lib — the import library. Cargo never copies the DLL out
+          # of OUT_DIR, so find it in the build directory and fail loudly if the
+          # upstream layout moves.
+          $dll = Get-ChildItem -Path "target/$target/release/build" -Recurse `
+            -Filter ghostty-vt.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) { throw "ghostty-vt.dll not found under target/$target/release/build" }
+          Copy-Item $dll.FullName $stage
           if (Test-Path LICENSE) { Copy-Item LICENSE $stage }
           if (Test-Path README.md) { Copy-Item README.md $stage }
+          Get-ChildItem $stage | ForEach-Object { Write-Host "staged $($_.Name) ($($_.Length) bytes)" }
           $archive = "$name.zip"
           Compress-Archive -Path $stage -DestinationPath $archive -Force
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -147,7 +164,10 @@ jobs:
         with:
           files: ${{ steps.pkg.outputs.archive }}
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          # No generate_release_notes here: it APPENDS, and four build jobs
+          # attaching to one release appended four copies of the notes (eight
+          # once the tag was re-released). The `notes` job below writes them
+          # once instead.
 
   # macOS — full binary (CLI + daemon + GUI); macOS is unix, so the daemon side
   # compiles. Apple Silicon (arm64) only, on a native runner; Zig builds the
@@ -214,7 +234,33 @@ jobs:
         with:
           files: ${{ steps.pkg.outputs.archive }}
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          # No generate_release_notes here: it APPENDS, and four build jobs
+          # attaching to one release appended four copies of the notes (eight
+          # once the tag was re-released). The `notes` job below writes them
+          # once instead.
+
+  # Write the release notes exactly once, after every asset is attached. The
+  # build jobs used to each pass generate_release_notes to action-gh-release,
+  # which appends — so the body collected one "Full Changelog" line per job, and
+  # re-releasing a tag doubled the collection again. Generating here and *setting*
+  # the body makes the result identical no matter how many times a tag is built.
+  notes:
+    name: release notes
+    needs: [build, windows, macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Set the release body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          gh api "repos/${REPO}/releases/generate-notes" \
+            -f tag_name="$REF_NAME" --jq .body > notes.md
+          gh release edit "$REF_NAME" --repo "$REPO" --notes-file notes.md
 
   # Publish the npm installer (@shibenenen/asd) to the public npm registry after
   # every platform binary is attached to the release. The npm package ships no

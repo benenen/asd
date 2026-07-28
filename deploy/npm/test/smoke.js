@@ -61,4 +61,27 @@ const skip = spawnSync(process.execPath, ['install.js'], {
 eq(skip.status, 0, 'skip-download install exits 0');
 ok(/skipping|leaving/i.test(skip.stderr), 'skip-download logs a skip notice');
 
+// 6) Sidecars: asd.exe imports ghostty-vt.dll, so the DLL has to be installed
+// beside the binary. Getting this wrong is invisible until the exe is run on
+// Windows, which nothing in CI does — hence a test rather than a code reading.
+eq(install.sidecarNames('win32').join(','), 'ghostty-vt.dll', 'windows needs the ghostty DLL');
+eq(install.sidecarNames('linux').length, 0, 'linux has no sidecars');
+eq(install.sidecarNames('darwin').length, 0, 'macos has no sidecars');
+
+const fs = require('fs');
+const os = require('os');
+const from = fs.mkdtempSync(path.join(os.tmpdir(), 'asd-sidecar-src-'));
+const to = fs.mkdtempSync(path.join(os.tmpdir(), 'asd-sidecar-dst-'));
+fs.writeFileSync(path.join(from, 'ghostty-vt.dll'), 'not really a dll');
+install.placeSidecars(path.join(from, 'asd.exe'), path.join(to, 'asd.exe'), 'win32');
+ok(fs.existsSync(path.join(to, 'ghostty-vt.dll')), 'the DLL lands beside the binary');
+
+// An archive without the DLL (every release before this fix) must not throw —
+// installing an old version should still reach a clear runtime error instead of
+// failing the install with a confusing one.
+const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'asd-sidecar-bare-'));
+install.placeSidecars(path.join(bare, 'asd.exe'), path.join(to, 'asd.exe'), 'win32');
+ok(!fs.existsSync(path.join(bare, 'ghostty-vt.dll')), 'a missing sidecar is tolerated');
+for (const d of [from, to, bare]) fs.rmSync(d, { recursive: true, force: true });
+
 console.log(`ok — ${checks} checks passed`);

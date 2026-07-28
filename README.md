@@ -78,6 +78,12 @@ Prebuilt binaries are produced by CI (currently green) for:
 - Windows `x86_64-msvc` — full
 - macOS `aarch64` — full
 
+The Windows zip holds **two** files that belong together: `asd.exe` and
+`ghostty-vt.dll`. Keep them in the same directory — the exe imports the DLL and
+Windows will refuse to start it otherwise. (The vendored ghostty builds as a
+DLL, and libghostty-vt-sys's "static" link resolves to that DLL's import
+library, so the dependency exists even though nothing asked for a dynamic link.)
+
 ## Usage
 
 The daemon starts automatically the first time you create or attach a session.

@@ -7,7 +7,8 @@
 //
 // The asset contract is fixed by .github/workflows/release.yml:
 //   name:   asd-<version>-<target>.<ext>   (ext = tar.gz on unix, zip on win)
-//   layout: a top-level dir asd-<version>-<target>/ containing asd[.exe]
+//   layout: a top-level dir asd-<version>-<target>/ containing asd[.exe],
+//           plus ghostty-vt.dll beside it on Windows (see SIDECARS)
 //
 // Env overrides:
 //   ASD_SKIP_DOWNLOAD=1     do nothing (offline, or CI of this package itself)
@@ -113,6 +114,33 @@ function place(src, dest) {
   if (process.platform !== 'win32') fs.chmodSync(dest, 0o755);
 }
 
+// Files that must sit beside the binary for it to start at all. asd.exe imports
+// ghostty-vt.dll: the vendored ghostty builds as a DLL, and libghostty-vt-sys's
+// "static" link resolves to that DLL's import library, so the dependency is
+// real even though nothing here asked for a dynamic link.
+const SIDECARS = { win32: ['ghostty-vt.dll'] };
+
+/** Names that must be copied alongside the binary on this platform. */
+function sidecarNames(platform = process.platform) {
+  return SIDECARS[platform] || [];
+}
+
+/** Copy the platform's sidecars from the binary's source directory to its destination. */
+function placeSidecars(src, dest, platform = process.platform) {
+  for (const name of sidecarNames(platform)) {
+    const from = path.join(path.dirname(src), name);
+    if (fs.existsSync(from)) {
+      place(from, path.join(path.dirname(dest), name));
+      log(`installed ${name} beside the binary`);
+    } else {
+      // Releases before 0.1.9 shipped the exe alone, so treat this as a warning:
+      // installing an older version should still get as far as a clear runtime
+      // error rather than failing the install with a confusing one.
+      log(`WARNING: ${name} is not in this archive — asd may fail to start`);
+    }
+  }
+}
+
 function cleanup(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
 }
@@ -141,6 +169,7 @@ function main() {
     if (!fs.existsSync(local)) fail(`ASD_BINARY_PATH does not exist: ${local}`);
     log(`ASD_BINARY_PATH set — installing ${local}`);
     place(local, dest);
+    placeSidecars(local, dest);
     log(`installed → ${dest}`);
     return;
   }
@@ -168,6 +197,7 @@ function main() {
       const src = fs.existsSync(inner) ? inner : findBinary(tmp, exe);
       if (!src) throw new Error(`'${exe}' not found inside the archive`);
       place(src, dest);
+      placeSidecars(src, dest);
       cleanup(tmp);
       log(`installed asd ${version} (${target}) → ${dest}`);
     } catch (e) {
@@ -177,6 +207,6 @@ function main() {
   });
 }
 
-module.exports = { assetName, downloadUrl, main };
+module.exports = { assetName, downloadUrl, sidecarNames, placeSidecars, main };
 
 if (require.main === module) main();
