@@ -13,7 +13,7 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Mutex, mpsc};
 
-use asd_proto::{Frame, code};
+use asd_proto::{Frame, IDLE_SETTLE_MS, code};
 use asd_vt::{GhosttyVt, VtBackend};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tracing::{debug, info, warn};
@@ -126,6 +126,19 @@ pub enum SessionMsg {
     Peek {
         sink: ClientSink,
         scrollback: bool,
+    },
+    /// Join the output stream without attaching (v9, `asd follow`): replies
+    /// with the current `FollowStatus`, then gets every pty batch. Followers
+    /// are kept apart from `clients` on purpose — they take no part in size
+    /// negotiation and are not counted as attached, so watching a session
+    /// cannot change what the people attached to it see.
+    Follow {
+        sink: ClientSink,
+    },
+    /// Leave the output stream (v9). Dropping the connection has the same
+    /// effect; this is for a client that carries on afterwards.
+    Unfollow {
+        client_id: u64,
     },
     /// Detailed single-session dump (v6, `asd inspect`); replies with an
     /// `InspectReply` on `sink`. `info` is the metadata gathered on the network
@@ -557,9 +570,36 @@ fn session_thread(
     let mut clients: Vec<ClientSink> = Vec::new();
     // Each attached client's window size; the pty follows the smallest.
     let mut client_sizes: std::collections::HashMap<u64, (u16, u16)> = Default::default();
+    // `asd follow` subscribers. Deliberately not `clients`: they get Output but
+    // no Snapshot, and they neither resize the pty nor count as attached.
+    let mut followers: Vec<ClientSink> = Vec::new();
+    // Whether the followers have already been told this quiet spell began.
+    let mut idle_announced = false;
     info!(session = %name, pid = meta.child_pid.load(Ordering::Relaxed), "session started");
 
-    while let Ok(msg) = rx.recv() {
+    loop {
+        // Going quiet is the one thing a follower needs to hear about that
+        // arrives as *no message at all*, so the wait needs a deadline of its
+        // own — but only while somebody is waiting for that news. With no
+        // followers, or once the quiet spell has been announced, block exactly
+        // as before: nothing can change until the next message.
+        let msg = if followers.is_empty() || idle_announced {
+            match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => break,
+            }
+        } else {
+            let idle_ms = now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed));
+            let until_idle = IDLE_SETTLE_MS.saturating_sub(idle_ms).max(1);
+            match rx.recv_timeout(std::time::Duration::from_millis(until_idle)) {
+                Ok(msg) => msg,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    idle_announced = notify_followers(&mut followers, &meta);
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        };
         match msg {
             SessionMsg::PtyOutput(bytes) => {
                 vt.feed(&bytes);
@@ -582,7 +622,18 @@ fn session_thread(
                     let _ = pty_writer.write_all(&resp);
                     let _ = pty_writer.flush();
                 }
-                broadcast(&mut clients, &meta, Frame::Output { bytes });
+                let output = Frame::Output { bytes };
+                broadcast(&mut clients, &meta, output.clone());
+                // Followers see the same bytes, then where that leaves the
+                // session. Sending the pair from here — inside the one thread
+                // that serializes everything about this session — is what lets
+                // a follower trust that the status describes the output it just
+                // read, rather than whatever a separate poll happened to catch.
+                if !followers.is_empty() {
+                    followers.retain(|f| f.send(output.clone()));
+                    notify_followers(&mut followers, &meta);
+                }
+                idle_announced = false;
             }
             SessionMsg::Input(bytes) => {
                 if pty_writer
@@ -625,6 +676,22 @@ fn session_thread(
                     .store(clients.len() as u32, Ordering::Relaxed);
                 resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
                 debug!(session = %name, client = client_id, "client detached");
+            }
+            SessionMsg::Follow { sink } => {
+                // Answer with the state as it stands before streaming anything:
+                // a follower that arrives after the session has already gone
+                // quiet has to learn that now, not wait for output that is
+                // never coming.
+                let (status, running) = follow_status(&meta);
+                if sink.send(status) {
+                    debug!(session = %name, client = sink.id, "follower joined");
+                    followers.push(sink);
+                }
+                idle_announced = !running;
+            }
+            SessionMsg::Unfollow { client_id } => {
+                followers.retain(|f| f.id != client_id);
+                debug!(session = %name, client = client_id, "follower left");
             }
             SessionMsg::FetchHistory { sink, start, count } => {
                 let count = count.min(MAX_HISTORY_ROWS_PER_FETCH);
@@ -701,6 +768,15 @@ fn session_thread(
         });
         // The sink is dropped by the drain; the connection side sees the
         // channel close after writing out the tail of its queue
+    }
+    // A follower ends on `running == false`, so it has to be given one even
+    // when the session dies mid-stream rather than falling quiet — otherwise
+    // `follow` would sit there until its timeout for a session that is gone.
+    for f in followers.drain(..) {
+        f.send(Frame::FollowStatus {
+            running: false,
+            idle_ms: now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed)),
+        });
     }
     meta.attached_clients.store(0, Ordering::Relaxed);
     info!(session = %name, "session ended");
@@ -791,6 +867,31 @@ fn render_peek(vt: &mut GhosttyVt, scrollback: bool) -> Frame {
         title: vt.title(),
         screen,
     }
+}
+
+/// Where the session stands, as a `FollowStatus` plus the `running` flag it
+/// carries.
+///
+/// `running` is `idle_ms < IDLE_SETTLE_MS`, read off the same
+/// `last_output_ms` stamp that feeds `SessionInfo.running` and, through it,
+/// `asd wait --idle`. One stamp and one rule, so the three ways of asking "is
+/// it still working?" cannot come apart.
+fn follow_status(meta: &SessionMeta) -> (Frame, bool) {
+    let idle_ms = now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed));
+    let running = idle_ms < IDLE_SETTLE_MS;
+    (Frame::FollowStatus { running, idle_ms }, running)
+}
+
+/// Send the current status to every follower, dropping the ones that are gone.
+/// Returns whether that status said the session had gone quiet — the caller
+/// uses it to avoid saying so again until there is more output.
+///
+/// Followers are not attached clients, so this deliberately does not touch
+/// `attached_clients`.
+fn notify_followers(followers: &mut Vec<ClientSink>, meta: &SessionMeta) -> bool {
+    let (status, running) = follow_status(meta);
+    followers.retain(|f| f.send(status.clone()));
+    !running
 }
 
 fn broadcast(clients: &mut Vec<ClientSink>, meta: &SessionMeta, frame: Frame) {

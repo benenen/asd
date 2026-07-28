@@ -304,6 +304,85 @@ pub async fn wait(
     }
 }
 
+/// `asd follow`: stream a session's output as the pty produces it, and return
+/// when the session settles.
+///
+/// The stop condition is the daemon's own quiescence signal — the same
+/// `idle_ms < IDLE_SETTLE_MS` rule behind `SessionInfo.running` and `asd wait
+/// --idle` — rather than a text match. For a Claude Code or Codex session there
+/// is no reliable string to match on: the screen is redrawn continuously, so
+/// spinners, cursor moves and colour resets all look like progress.
+///
+/// The status rides the same connection as the output and is produced by the
+/// session's own thread, so "these bytes, and now it is quiet" arrives in that
+/// order. Nothing polls.
+pub async fn follow(
+    socket: &Path,
+    name: String,
+    until_idle: bool,
+    timeout: Option<String>,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let deadline = match &timeout {
+        Some(t) => Some(
+            Instant::now()
+                + Duration::from_millis(parse_duration(t).ok_or_else(|| {
+                    anyhow::anyhow!("follow: bad duration '{t}' (use 500ms, 2s, 1m, 4h, 1d)")
+                })?),
+        ),
+        None => None,
+    };
+
+    let mut c = client::connect(socket, ClientKind::Cli).await?;
+    c.writer
+        .write_frame(&Frame::Follow { name: name.clone() })
+        .await?;
+
+    let mut out = std::io::stdout();
+    loop {
+        let frame = match deadline {
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(left, c.reader.read_frame()).await {
+                    Ok(frame) => frame?,
+                    // Abandoning a half-read frame is safe here and only here:
+                    // the process ends on the next line, so the reader is never
+                    // used again. (`read_frame` is not cancel-safe, which is
+                    // why it is never put in a `select!`.)
+                    Err(_) => {
+                        let t = timeout.as_deref().unwrap_or_default();
+                        eprintln!("follow: timed out after {t}");
+                        let _ = out.flush();
+                        std::process::exit(exit::TIMEOUT);
+                    }
+                }
+            }
+            None => c.reader.read_frame().await?,
+        };
+        match frame {
+            // Flushed per batch: a follower that buffered would defeat the
+            // point of streaming.
+            Some(Frame::Output { bytes }) => {
+                out.write_all(&bytes)?;
+                out.flush()?;
+            }
+            Some(Frame::FollowStatus { running, .. }) => {
+                if until_idle && !running {
+                    return Ok(());
+                }
+            }
+            // The session ended under us. That is the end of the stream, not a
+            // failure of the command: whatever was being waited for is over.
+            Some(Frame::Error { code, .. }) if code == code::SESSION_EXITED => return Ok(()),
+            Some(Frame::Error { code, msg }) => return Err(exit::daemon("follow", code, &msg)),
+            // The daemon hung up.
+            None => return Ok(()),
+            other => bail!("unexpected reply: {other:?}"),
+        }
+    }
+}
+
 /// The byte sequence for a named key (`--key`), or `None` if unrecognized.
 /// Arrow/Home/End use the legacy `ESC [ …` forms (same bytes as boo).
 fn named_key(name: &str) -> Option<Vec<u8>> {

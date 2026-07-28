@@ -107,6 +107,22 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Stream a session's output as it is produced, returning once the session
+    /// settles (4 on timeout, 3 if there is no such session). `wait --idle`
+    /// with the output kept instead of discarded.
+    Follow {
+        /// Session name
+        name: String,
+        /// Stop once the session has produced no output for 2 seconds. This is
+        /// the default and currently the only mode; the flag is accepted so a
+        /// script can say what it relies on.
+        #[arg(long)]
+        until_idle: bool,
+        /// Give up and exit 4 after this long (500ms, 2s, 1m, 4h, 1d).
+        /// Omitted, `follow` streams until the session settles or ends.
+        #[arg(long)]
+        timeout: Option<String>,
+    },
     /// Block until the session's screen matches or its output settles, then
     /// exit 0 (4 on timeout, 3 if there is no such session). Replaces
     /// sleep-and-poll loops in scripts.
@@ -387,6 +403,17 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             json,
         } => control::peek(&socket, name, scrollback, json).await?,
         Cmd::Inspect { name, json } => control::inspect(&socket, name, json).await?,
+        Cmd::Follow {
+            name,
+            until_idle,
+            timeout,
+        } => {
+            // Stopping at idle is the behaviour, not an option: there is no
+            // stream-past-idle mode yet, so the flag's presence changes
+            // nothing. Kept in the signature so adding one later is local.
+            let _ = until_idle;
+            control::follow(&socket, name, true, timeout).await?
+        }
         Cmd::Wait {
             name,
             text,

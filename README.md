@@ -105,8 +105,15 @@ asd send build --key C-c                     # named keys: Enter/Tab/Esc/arrows/
 asd peek build                               # print the rendered screen (--scrollback, --json)
 asd wait build --text PASS --timeout 2m      # block until the screen contains "PASS" …
 asd wait build --idle && asd peek build      # … or until output settles (2s), then read it
+asd follow build                             # stream output live, return when it settles
 asd inspect build --json                     # full detail: pid, alt-screen, scrollback, mouse, cursor
 ```
+
+`follow` is `wait --idle` that keeps the output instead of discarding it — for
+watching an agent (Claude Code, Codex) work through a task, where there is no
+string worth matching on because the screen is redrawn continuously. It ends on
+the daemon's own quiescence signal, delivered inline with the bytes rather than
+polled, so "here is the output, and now it is done" arrives in that order.
 
 Bare `asd` (or `asd gui [session]`) opens the desktop GUI.
 

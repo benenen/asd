@@ -131,6 +131,16 @@ fn all_frames() -> Vec<Frame> {
             cursor_row: 3,
             cursor_visible: true,
         },
+        Frame::Follow { name: "s0".into() },
+        Frame::Unfollow { name: "s0".into() },
+        Frame::FollowStatus {
+            running: true,
+            idle_ms: 12,
+        },
+        Frame::FollowStatus {
+            running: false,
+            idle_ms: 2500,
+        },
         Frame::Error {
             code: asd_proto::code::VERSION_MISMATCH,
             msg: "proto version mismatch".into(),

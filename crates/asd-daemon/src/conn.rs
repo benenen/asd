@@ -97,6 +97,10 @@ pub async fn handle_conn(
 
     // ---- Inbound loop ----
     let mut attached: Option<Attached> = None;
+    // The session this connection follows, if any (v9). Separate from
+    // `attached`: a connection may do either, and they mean different things to
+    // the session thread.
+    let mut following: Option<Attached> = None;
     loop {
         let frame = match reader.read_frame().await {
             Ok(Some(f)) => f,
@@ -235,6 +239,33 @@ pub async fn handle_conn(
                     msg: format!("no such session '{name}'"),
                 }),
             },
+            // Following is a subscription, not an attachment: it shares the
+            // connection sink with the one-shot scripting frames, but the
+            // session keeps it out of its client list. Tracked here only so
+            // losing the connection unsubscribes it, the way it detaches.
+            Frame::Follow { name } => match registry.lock().unwrap().get(&name) {
+                Some(handle) => {
+                    let sink = ClientSink::new(conn_id, out_tx.clone(), Arc::clone(&queued));
+                    if handle.tx.send(SessionMsg::Follow { sink }).is_ok() {
+                        following = Some(Attached {
+                            session_tx: handle.tx.clone(),
+                            client_id: conn_id,
+                        });
+                    }
+                }
+                None => reply(Frame::Error {
+                    code: code::NO_SUCH_SESSION,
+                    msg: format!("no such session '{name}'"),
+                }),
+            },
+            Frame::Unfollow { name } => {
+                let _ = &name;
+                if let Some(f) = following.take() {
+                    let _ = f.session_tx.send(SessionMsg::Unfollow {
+                        client_id: f.client_id,
+                    });
+                }
+            }
             Frame::Peek { name, scrollback } => match registry.lock().unwrap().get(&name) {
                 Some(handle) => {
                     let sink = ClientSink::new(conn_id, out_tx.clone(), Arc::clone(&queued));
@@ -271,6 +302,13 @@ pub async fn handle_conn(
     if let Some(a) = attached.take() {
         let _ = a.session_tx.send(SessionMsg::Detach {
             client_id: a.client_id,
+        });
+    }
+    // ...and unfollow, for the same reason: the session would otherwise keep a
+    // dead sink until its next output batch swept it up.
+    if let Some(f) = following.take() {
+        let _ = f.session_tx.send(SessionMsg::Unfollow {
+            client_id: f.client_id,
         });
     }
     let _ = out_tx.send(ConnItem::Close);

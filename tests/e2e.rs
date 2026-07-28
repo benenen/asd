@@ -709,6 +709,60 @@ async fn send_wait_peek_round_trip() {
     assert!(screen.contains("sendmark-42"), "peek screen: {screen}");
 }
 
+/// `asd follow` streams a session's output as it is produced and returns on its
+/// own once the session settles — the daemon's idle signal, the same one
+/// `wait --idle` uses, delivered inline with the stream instead of polled.
+#[tokio::test]
+async fn follow_until_idle() {
+    let daemon = Daemon::start("follow");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "fol"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // The pty echoes the command line, so the markers must not appear in the
+    // command *text* — `LINE%s` is typed, `LINE1` only exists once printf has
+    // run. Otherwise the echo alone would satisfy the assertions and the test
+    // would pass without anything having been streamed.
+    //
+    // The leading sleep is the handshake window: `send` returns as soon as the
+    // daemon acks it, so `follow` has to get subscribed before the first line
+    // is printed.
+    let out = daemon
+        .cli()
+        .args([
+            "send",
+            "fol",
+            "--text",
+            "sleep 1; for i in 1 2 3; do printf 'LINE%s\\n' \"$i\"; sleep 0.2; done",
+            "--enter",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "send failed: {out:?}");
+
+    // Blocks until the session goes idle, then exits 0 on its own.
+    let out = daemon
+        .cli()
+        .args(["follow", "fol", "--timeout", "20s"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "follow failed: {out:?}");
+
+    let streamed = String::from_utf8_lossy(&out.stdout);
+    for marker in ["LINE1", "LINE2", "LINE3"] {
+        assert!(
+            streamed.contains(marker),
+            "{marker} missing from: {streamed}"
+        );
+    }
+}
+
 /// `wait --idle` returns once output settles; a condition that never holds
 /// times out with the documented exit code 4.
 #[tokio::test]

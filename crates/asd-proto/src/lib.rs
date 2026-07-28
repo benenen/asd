@@ -18,7 +18,9 @@
 //! session in a given directory, instead of the caller folding a `cd` into
 //! `cmd` — which also made the persisted cwd wrong at create time) and
 //! `SessionInfo.pid` (so `list` answers what previously took an `inspect` per
-//! session).
+//! session); v9 added the following frames (`Follow`/`Unfollow`/`FollowStatus`)
+//! behind `asd follow` — an output subscription that reports quiescence inline
+//! rather than making the client poll for it.
 
 mod codec;
 pub mod paths;
@@ -29,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 8;
+pub const PROTO_VERSION: u32 = 9;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -239,6 +241,29 @@ pub enum Frame {
         cursor_col: u16,
         cursor_row: u16,
         cursor_visible: bool,
+    },
+    // Following (v9). Like `send`/`peek`, name-addressed and attach-free — but
+    // a subscription rather than a one-shot: the follower joins the Output
+    // broadcast without taking part in size negotiation and without asking for
+    // a Snapshot, so watching a session never changes what anyone else sees.
+    /// client → daemon: stream session `name`'s output on this connection.
+    /// Answered immediately with one `FollowStatus` describing the session as
+    /// it stands, then an `Output` + `FollowStatus` pair per pty batch.
+    Follow {
+        name: String,
+    },
+    /// client → daemon: stop streaming. Dropping the connection does the same
+    /// thing; this is for a client that wants to keep talking afterwards.
+    Unfollow {
+        name: String,
+    },
+    /// daemon → client: whether the session is still producing output, and how
+    /// long it has been quiet. `running` is `idle_ms < IDLE_SETTLE_MS` — the
+    /// definition `SessionInfo.running` and `asd wait --idle` already use, so
+    /// three ways of asking "is it done?" cannot drift apart.
+    FollowStatus {
+        running: bool,
+        idle_ms: u64,
     },
     // Errors
     Error {
