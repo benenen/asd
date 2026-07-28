@@ -256,4 +256,18 @@ jobs:
         env:
           # publishConfig in package.json pins access=public + the npmjs registry.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          # npm refuses to overwrite a published version, so re-releasing a tag
+          # (moving it to rebuild a broken asset) would fail here. It doesn't
+          # need to publish: the package ships no binary, its postinstall
+          # downloads the release asset at install time, so replacing the
+          # asset on an existing tag already reaches everyone who installs
+          # that version. `npm view <pkg>@<ver>` prints nothing (exit 0) when
+          # the version is absent, so test the output, not the status.
+          if [ -n "$(npm view "@shibenenen/asd@${version}" version 2>/dev/null)" ]; then
+            echo "@shibenenen/asd@${version} is already on npm; the rebuilt assets"
+            echo "reach its users via the postinstall download. Nothing to publish."
+            exit 0
+          fi
+          npm publish
