@@ -477,7 +477,14 @@ fn render_pane(buf: &mut Buffer, area: Rect, snap: &RenderSnapshot, sel: Option<
                 target.reset();
                 continue;
             };
+            // The cells a wide character reserves render as nothing, but they
+            // still have to be *written*: skipping them leaves the previous
+            // frame's cell in place for as long as the spacer lasts, and
+            // ratatui only emits cells that changed. Blanking also keeps the
+            // buffer well-formed for `Buffer::diff`, which assumes no
+            // double-width cell is ever followed by a non-blank one.
             if matches!(cell.width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
+                target.reset();
                 continue;
             }
             if cell.grapheme.is_empty() {
@@ -911,6 +918,70 @@ mod tests {
                 (c.symbol(), c.style()),
                 (pristine.symbol(), pristine.style()),
                 "({x},{y}) outside the snapshot kept its stale content"
+            );
+        }
+    }
+
+    /// The cells a wide character reserves must be written too, not skipped.
+    ///
+    /// Same trap as `pane_clears_beyond_a_smaller_snapshot`, one layer in: this
+    /// function is the pane's only writer and ratatui emits only cells that
+    /// changed, so a cell skipped here keeps what was there before for as long
+    /// as it stays a spacer. `SpacerHead` — the placeholder a soft wrap leaves
+    /// at the end of a line when the next character is wide — is the worse of
+    /// the two, since nothing precedes it to cover the stale cell up. Skipping
+    /// `SpacerTail` also broke ratatui's documented requirement that a
+    /// double-width cell be followed by a blank one (`Buffer::diff`).
+    #[test]
+    fn pane_clears_wide_char_spacers() {
+        use asd_vt::{CellSnapshot, CursorSnapshot, RenderSnapshot};
+        let cell = |g: &str, width: CellWidth| CellSnapshot {
+            grapheme: g.to_string(),
+            width,
+            ..CellSnapshot::default()
+        };
+        // "中" covers cells 0-1; cell 3 is a soft-wrap placeholder.
+        let snap = RenderSnapshot {
+            cols: 4,
+            rows: 1,
+            cells: vec![std::sync::Arc::new(vec![
+                cell("中", CellWidth::Wide),
+                cell("", CellWidth::SpacerTail),
+                cell("a", CellWidth::Narrow),
+                cell("", CellWidth::SpacerHead),
+            ])],
+            row_dirty: vec![true],
+            cursor: CursorSnapshot::default(),
+            palette: [Rgb::default(); 256],
+            foreground: Rgb::default(),
+            background: Rgb::default(),
+        };
+        let area = Rect::new(0, 0, 4, 1);
+        let pristine = Buffer::empty(area)
+            .cell(Position::new(0, 0))
+            .unwrap()
+            .clone();
+
+        let mut buf = Buffer::empty(area);
+        // A green block from an earlier frame, sitting on both spacers.
+        let stale = [1u16, 3];
+        for x in stale {
+            buf.cell_mut(Position::new(x, 0))
+                .unwrap()
+                .set_symbol("X")
+                .set_style(Style::new().bg(Color::Rgb(0, 95, 0)));
+        }
+
+        render_pane(&mut buf, area, &snap, None);
+
+        assert_eq!(buf.cell(Position::new(0, 0)).unwrap().symbol(), "中");
+        assert_eq!(buf.cell(Position::new(2, 0)).unwrap().symbol(), "a");
+        for x in stale {
+            let c = buf.cell(Position::new(x, 0)).unwrap();
+            assert_eq!(
+                (c.symbol(), c.style()),
+                (pristine.symbol(), pristine.style()),
+                "the spacer at ({x},0) kept its stale content"
             );
         }
     }
