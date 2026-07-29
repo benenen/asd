@@ -41,6 +41,14 @@ pub async fn send(
         out
     } else {
         let _ = stdin; // presence only forces this branch; reading is the default
+        // Reading a terminal blocks until Ctrl-D, and this happens before the
+        // daemon is even contacted — so without a word `asd send --stdin` at a
+        // prompt looks hung rather than waiting.
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            eprintln!(
+                "send: reading the payload from stdin — type it, then Ctrl-D (or pipe it in)"
+            );
+        }
         let mut buf = Vec::new();
         tokio::io::stdin().read_to_end(&mut buf).await?;
         if buf.len() > MAX_FRAME_LEN - 1024 {
@@ -49,7 +57,7 @@ pub async fn send(
         buf
     };
     if enter {
-        payload.push(b'\r');
+        payload = with_enter(payload);
     }
     if payload.is_empty() {
         bail!("send: nothing to send");
@@ -728,6 +736,32 @@ pub async fn follow(
     }
 }
 
+/// Append the Enter keypress `--enter` asks for, absorbing a line ending the
+/// payload already carried.
+///
+/// `echo x | asd send s --stdin --enter` would otherwise put `x\n\r` on the
+/// pty: `echo` supplies the newline, `--enter` the carriage return. A shell
+/// does not care (its line discipline maps both), but a program reading raw
+/// input — Claude Code, an editor, anything with its own key handling — reads
+/// LF as "insert a line break" and CR as "submit", so the text arrives with a
+/// stray newline in it and may not be submitted at all.
+///
+/// The newline in that payload came from the shell, not from the person typing
+/// the command; `--enter` is them saying "and then press Enter". So one
+/// trailing line ending (LF or CRLF) folds into the Enter. Without `--enter`
+/// nothing is touched — `send` stays a byte-exact pipe.
+pub(crate) fn with_enter(mut payload: Vec<u8>) -> Vec<u8> {
+    if payload.last() == Some(&b'\n') {
+        payload.pop();
+        // CRLF is one line ending, not two.
+        if payload.last() == Some(&b'\r') {
+            payload.pop();
+        }
+    }
+    payload.push(b'\r');
+    payload
+}
+
 /// What `--scrollback` meant on the command line. clap gives three states for
 /// an optionally-valued flag, and they map straight onto the wire type: absent
 /// is the screen alone, bare is the whole history, and a value caps it.
@@ -1075,6 +1109,21 @@ mod tests {
         let mut m = ScreenModel::new(20, 6);
         assert_eq!(m.push(b"a\r\nb\r\n"), "");
         assert_eq!(m.screen(), "a\nb");
+    }
+
+    #[test]
+    fn enter_absorbs_a_line_ending_the_payload_already_had() {
+        // What `echo x | send --stdin --enter` produces: the shell's newline
+        // must not reach the pty as "insert a line break" before the Enter.
+        assert_eq!(with_enter(b"make test\n".to_vec()), b"make test\r");
+        assert_eq!(with_enter(b"make test\r\n".to_vec()), b"make test\r");
+        // Nothing to absorb: just the Enter.
+        assert_eq!(with_enter(b"make test".to_vec()), b"make test\r");
+        assert_eq!(with_enter(Vec::new()), b"\r");
+        // Only one line ending is folded in — a deliberate blank line stays.
+        assert_eq!(with_enter(b"a\n\n".to_vec()), b"a\n\r");
+        // An interior newline is content (a multi-line paste), not the ending.
+        assert_eq!(with_enter(b"line1\nline2".to_vec()), b"line1\nline2\r");
     }
 
     #[test]

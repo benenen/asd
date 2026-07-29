@@ -79,7 +79,9 @@ enum Cmd {
         /// Up, Down, Left, Right, Home, End, C-a..C-z
         #[arg(long, conflicts_with = "stdin")]
         key: Option<String>,
-        /// Append Enter (carriage return) after everything else
+        /// Append Enter (carriage return) after everything else. A line ending
+        /// the payload already had (`echo` adds one) folds into it, so the
+        /// session sees one keypress rather than a line break and then Enter
         #[arg(long)]
         enter: bool,
         /// Force reading the payload from stdin
