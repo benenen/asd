@@ -91,9 +91,10 @@ enum Cmd {
     Peek {
         /// Session name
         name: String,
-        /// Include the full scrollback history above the screen
-        #[arg(long)]
-        scrollback: bool,
+        /// Include history above the screen: every retained line, or at most
+        /// LINES of it (`--scrollback` / `--scrollback 200`)
+        #[arg(long, value_name = "LINES")]
+        scrollback: Option<Option<u32>>,
         /// Emit a JSON object instead of raw text
         #[arg(long)]
         json: bool,
@@ -122,6 +123,18 @@ enum Cmd {
         /// Omitted, `follow` streams until the session settles or ends.
         #[arg(long)]
         timeout: Option<String>,
+        /// Emit JSONL instead of raw bytes: one event object per line
+        /// ({"event":"output"|"screen"|"status"|"exit"|"timeout", ...}).
+        /// `output` is text that scrolled off the screen and can no longer
+        /// change; `screen` is the live screen at each pause — so a repainting
+        /// TUI is reported once, not once per frame.
+        #[arg(long)]
+        json: bool,
+        /// Report the verbatim pty stream in --json instead of modelling the
+        /// screen: every byte, escape sequences and repaints included. Without
+        /// --json the stream is always verbatim.
+        #[arg(long, requires = "json")]
+        raw: bool,
     },
     /// Block until the session's screen matches or its output settles, then
     /// exit 0 (4 on timeout, 3 if there is no such session). Replaces
@@ -240,18 +253,32 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                     } else if sessions.is_empty() {
                         println!("no sessions");
                     } else {
+                        // TITLE holds the session's own terminal title (OSC
+                        // 0/2) — what a TUI says it *is*, where COMMAND only
+                        // names the foreground binary. The column is sized to
+                        // the widest title on screen so short titles don't
+                        // push COMMAND off the terminal.
+                        let titles: Vec<String> =
+                            sessions.iter().map(|s| clean_title(&s.title)).collect();
+                        let tw = title_col_width(&titles);
                         println!(
-                            "{:<16} {:>8} {:>8} {:>8} {:>12}  COMMAND",
-                            "NAME", "SIZE", "STATUS", "CLIENTS", "CREATED"
+                            "{:<16} {:>8} {:>8} {:>8} {:>12}  {}  COMMAND",
+                            "NAME",
+                            "SIZE",
+                            "STATUS",
+                            "CLIENTS",
+                            "CREATED",
+                            pad_cell("TITLE", tw),
                         );
-                        for s in sessions {
+                        for (s, title) in sessions.iter().zip(&titles) {
                             println!(
-                                "{:<16} {:>8} {:>8} {:>8} {:>12}  {}",
+                                "{:<16} {:>8} {:>8} {:>8} {:>12}  {}  {}",
                                 s.name,
                                 format!("{}x{}", s.cols, s.rows),
                                 if s.running { "running" } else { "idle" },
                                 s.attached_clients,
                                 format_age(s.created_ms),
+                                pad_cell(title, tw),
                                 s.command,
                             );
                         }
@@ -401,13 +428,15 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             name,
             scrollback,
             json,
-        } => control::peek(&socket, name, scrollback, json).await?,
+        } => control::peek(&socket, name, control::scrollback_arg(scrollback), json).await?,
         Cmd::Inspect { name, json } => control::inspect(&socket, name, json).await?,
         Cmd::Follow {
             name,
             forever,
             timeout,
-        } => control::follow(&socket, name, !forever, timeout).await?,
+            json,
+            raw,
+        } => control::follow(&socket, name, !forever, timeout, json, raw).await?,
         Cmd::Wait {
             name,
             text,
@@ -438,6 +467,66 @@ async fn session_exists(c: &mut client::Client, name: &str) -> anyhow::Result<bo
     }
 }
 
+/// Widest the TITLE column may grow, in display columns. NAME..CREATED
+/// already take 58, so this keeps a titled table inside ~100 columns.
+const TITLE_COL_MAX: usize = 32;
+
+/// A session's terminal title as table text: control characters dropped (a
+/// rogue OSC title must not break the table or move the caller's cursor) and
+/// surrounding whitespace trimmed.
+pub(crate) fn clean_title(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Width of the TITLE column: the widest title present, never below the
+/// header's own width and never past [`TITLE_COL_MAX`].
+pub(crate) fn title_col_width(titles: &[String]) -> usize {
+    titles
+        .iter()
+        .map(|t| str_width(t))
+        .max()
+        .unwrap_or(0)
+        .clamp("TITLE".len(), TITLE_COL_MAX)
+}
+
+/// Fit `s` into exactly `width` display columns: truncated with an ellipsis
+/// when too wide, space-padded when too narrow. Padding is by display width,
+/// not char count, so a CJK title doesn't shove COMMAND out of line.
+pub(crate) fn pad_cell(s: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    if str_width(s) > width {
+        // Reserve one column for the ellipsis; add whole chars while they fit.
+        for c in s.chars() {
+            let cw = str_width(c.encode_utf8(&mut [0u8; 4]));
+            if w + cw > width.saturating_sub(1) {
+                break;
+            }
+            out.push(c);
+            w += cw;
+        }
+        if width > 0 {
+            out.push('…');
+            w += 1;
+        }
+    } else {
+        out.push_str(s);
+        w = str_width(s);
+    }
+    out.extend(std::iter::repeat_n(' ', width - w));
+    out
+}
+
+/// Display width of a string in terminal cells (CJK glyphs are 2 wide).
+fn str_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
 pub(crate) fn format_age(created_ms: u64) -> String {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -449,5 +538,49 @@ pub(crate) fn format_age(created_ms: u64) -> String {
         60..=3599 => format!("{}m ago", secs / 60),
         3600..=86_399 => format!("{}h ago", secs / 3600),
         _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TITLE_COL_MAX, clean_title, pad_cell, str_width, title_col_width};
+
+    #[test]
+    fn clean_title_trims_and_strips_control_characters() {
+        assert_eq!(clean_title("  Claude Code  "), "Claude Code");
+        assert_eq!(clean_title(""), "");
+        // An OSC title carrying escapes must not repaint the caller's screen.
+        assert_eq!(
+            clean_title("vim\x1b[2Jsrc/main.rs\nx"),
+            "vim[2Jsrc/main.rsx"
+        );
+    }
+
+    #[test]
+    fn title_col_width_fits_the_titles_within_bounds() {
+        // Never narrower than the header, even with no titles at all.
+        assert_eq!(title_col_width(&[]), 5);
+        assert_eq!(title_col_width(&["ab".to_string()]), 5);
+        // Sized to the widest title present...
+        assert_eq!(
+            title_col_width(&["short".to_string(), "a longer title".to_string()]),
+            14
+        );
+        // ...but capped, so COMMAND stays on screen.
+        assert_eq!(title_col_width(&["x".repeat(200)]), TITLE_COL_MAX);
+    }
+
+    #[test]
+    fn pad_cell_produces_exactly_the_column_width() {
+        assert_eq!(pad_cell("ab", 5), "ab   ");
+        assert_eq!(pad_cell("abcde", 5), "abcde");
+        assert_eq!(pad_cell("abcdefg", 5), "abcd…");
+        // CJK glyphs are 2 columns each; a wide glyph is never split, and the
+        // cell still measures exactly `width` so COMMAND stays aligned.
+        assert_eq!(str_width(&pad_cell("中文标题", 5)), 5);
+        assert_eq!(pad_cell("中文标题", 5), "中文…");
+        for w in 1..=10 {
+            assert_eq!(str_width(&pad_cell("中文标题abc", w)), w, "width {w}");
+        }
     }
 }

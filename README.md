@@ -102,11 +102,14 @@ Scripting — drive and observe a session without attaching:
 ```bash
 asd send build --text 'make test' --enter   # type into a session
 asd send build --key C-c                     # named keys: Enter/Tab/Esc/arrows/C-a…C-z
-asd peek build                               # print the rendered screen (--scrollback, --json)
+asd peek build                               # print the rendered screen (--json)
+asd peek build --scrollback                  # … with all its history above it
+asd peek build --scrollback 200              # … or just the last 200 lines of it
 asd wait build --text PASS --timeout 2m      # block until the screen contains "PASS" …
 asd wait build --idle && asd peek build      # … or until output settles (2s), then read it
 asd follow build                             # stream output live, return when it settles
 asd follow build --forever                   # … or keep streaming until the session ends
+asd follow build --json                      # … as JSONL: one event object per line
 asd inspect build --json                     # full detail: pid, alt-screen, scrollback, mouse, cursor
 ```
 
@@ -115,6 +118,43 @@ watching an agent (Claude Code, Codex) work through a task, where there is no
 string worth matching on because the screen is redrawn continuously. It ends on
 the daemon's own quiescence signal, delivered inline with the bytes rather than
 polled, so "here is the output, and now it is done" arrives in that order.
+
+`--json` makes it JSONL, so a program can consume the same stream:
+
+```jsonl
+{"event":"status","time_ms":1785290443950,"running":true,"idle_ms":1}
+{"event":"output","time_ms":1785290445242,"text":"LINE-2"}
+{"event":"output","time_ms":1785290445293,"text":"LINE-3"}
+{"event":"screen","time_ms":1785290450682,"text":"LINE-88\nLINE-89\nLINE-90\n$ "}
+{"event":"status","time_ms":1785290450682,"running":false,"idle_ms":2000}
+```
+
+This is modelled, not echoed. The bytes go through a terminal (the same one
+`attach` renders with), which splits them in two:
+
+- **`output`** — lines that have scrolled off the live screen. A row that has
+  left the screen can never be rewritten, so its content is final: logged in
+  order, exactly once, as plain text.
+- **`screen`** — the live screen at each pause (settle, session end, timeout).
+  This is the part a program repaints, so it is reported once per pause however
+  many times it was drawn.
+
+That distinction is the whole point. A TUI rewrites its status line several
+times a second — `✻ building…`, `✽ building… 2`, `· building…` — and in the
+byte stream those are indistinguishable from new output; stripping escape
+sequences does not help, because the escapes *are* the distinction. A terminal
+knows, because it has row identity.
+
+Two consequences: output that never scrolls (a short command on a screen with
+room to spare) is not final until the session settles, so it arrives in
+`screen` rather than streaming line by line; and a full-screen program on the
+alternate screen (vim, htop, less) commits nothing by design — its screen *is*
+the content. `--raw` skips the model entirely and reports the verbatim stream,
+escapes and repaints included.
+
+`status` is logged only when the session's activity flips, since the daemon
+reports it after every batch. The stream ends with `exit` when the session
+does, or `timeout` when `--timeout` expires (exit code 4).
 
 Bare `asd` (or `asd gui [session]`) opens the desktop GUI.
 

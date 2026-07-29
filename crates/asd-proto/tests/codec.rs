@@ -2,8 +2,8 @@
 //! truncated/oversized frame error paths.
 
 use asd_proto::{
-    ClientKind, Frame, FrameReader, FrameWriter, MAX_FRAME_LEN, ProtoError, SessionInfo,
-    decode_frame, encode_frame,
+    ClientKind, Frame, FrameReader, FrameWriter, MAX_FRAME_LEN, ProtoError, Scrollback,
+    SessionInfo, decode_frame, encode_frame,
 };
 
 /// Covers all frame kinds of protocol v1. New frames must be added here in
@@ -96,7 +96,15 @@ fn all_frames() -> Vec<Frame> {
         Frame::Ack,
         Frame::Peek {
             name: "build".into(),
-            scrollback: true,
+            scrollback: Scrollback::All,
+        },
+        Frame::Peek {
+            name: "build".into(),
+            scrollback: Scrollback::None,
+        },
+        Frame::Peek {
+            name: "build".into(),
+            scrollback: Scrollback::Lines(500),
         },
         Frame::PeekReply {
             cols: 80,

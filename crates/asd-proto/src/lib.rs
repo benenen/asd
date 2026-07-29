@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 9;
+pub const PROTO_VERSION: u32 = 10;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -101,6 +101,23 @@ pub struct SessionInfo {
     pub pid: u32,
     pub cols: u16,
     pub rows: u16,
+}
+
+/// How much of a session's history a [`Frame::Peek`] should include above the
+/// live screen.
+///
+/// The limit is applied by the daemon, not the caller: a session can retain
+/// tens of thousands of lines, and the whole dump has to fit in one frame
+/// ([`MAX_FRAME_LEN`]), so "the last N lines" has to mean "send N", not "send
+/// everything and let the client cut".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Scrollback {
+    /// The live screen only.
+    None,
+    /// Every line the session still retains.
+    All,
+    /// At most this many lines above the screen (0 is the same as `None`).
+    Lines(u32),
 }
 
 /// All frames of protocol v1 (spec §4).
@@ -201,10 +218,11 @@ pub enum Frame {
     /// daemon → client: generic success reply (answers `SendInput`).
     Ack,
     /// client → daemon: request a rendered plain-text dump of session `name`
-    /// (`asd peek`). `scrollback` includes the full history above the screen.
+    /// (`asd peek`). `scrollback` says how much history to put above the
+    /// screen.
     Peek {
         name: String,
-        scrollback: bool,
+        scrollback: Scrollback,
     },
     /// daemon → client: the rendered screen plus geometry. `screen` is plain
     /// UTF-8 (one screen row per line, trailing blank lines trimmed); cursor

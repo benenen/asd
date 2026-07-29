@@ -122,10 +122,10 @@ pub enum SessionMsg {
         sink: ClientSink,
     },
     /// Render a plain-text dump of the screen (v4, `asd peek`); replies with a
-    /// `PeekReply` on `sink`. `scrollback` prepends the full history.
+    /// `PeekReply` on `sink`. `scrollback` says how much history to prepend.
     Peek {
         sink: ClientSink,
-        scrollback: bool,
+        scrollback: asd_proto::Scrollback,
     },
     /// Join the output stream without attaching (v9, `asd follow`): replies
     /// with the current `FollowStatus`, then gets every pty batch. Followers
@@ -848,16 +848,24 @@ fn apply_resize(
 
 /// Render the session's screen as a plain-text `PeekReply` (`asd peek`). The
 /// visible screen is the bottom `rows` of screen space; `scrollback` prepends
-/// the whole history. Rows come from the same screen-space plain-text path as
-/// the scrollback fetch; trailing blank lines are trimmed (boo's peek behavior).
-fn render_peek(vt: &mut GhosttyVt, scrollback: bool) -> Frame {
+/// history above it — all of it, or the last N lines. Rows come from the same
+/// screen-space plain-text path as the scrollback fetch; trailing blank lines
+/// are trimmed (boo's peek behavior).
+fn render_peek(vt: &mut GhosttyVt, scrollback: asd_proto::Scrollback) -> Frame {
     let snap = vt.render_snapshot();
     let (cursor_col, cursor_row) = snap.cursor.position.unwrap_or((0, 0));
     let (cols, rows) = (snap.cols, snap.rows);
-    let (start, count) = if scrollback {
-        (0u32, vt.history_len() as u32)
-    } else {
-        (vt.scrollback_rows() as u32, u32::from(rows))
+    let history = vt.scrollback_rows() as u32;
+    let total = vt.history_len() as u32;
+    let (start, count) = match scrollback {
+        asd_proto::Scrollback::None => (history, u32::from(rows)),
+        asd_proto::Scrollback::All => (0, total),
+        // Counted back from where the screen begins, so the screen itself is
+        // always included; more lines than exist just means all of them.
+        asd_proto::Scrollback::Lines(n) => {
+            let start = history.saturating_sub(n);
+            (start, total - start)
+        }
     };
     let lines = vt.fetch_history(start, count);
     // Trim trailing blank lines (empty or all-spaces), then join with '\n'.

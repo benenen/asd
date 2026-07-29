@@ -6,7 +6,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
-use asd_proto::{ClientKind, Frame, IDLE_SETTLE_MS, MAX_FRAME_LEN, code};
+use asd_proto::{ClientKind, Frame, IDLE_SETTLE_MS, MAX_FRAME_LEN, Scrollback, code};
+use asd_vt::{GhosttyVt, VtBackend};
 use tokio::io::AsyncReadExt;
 
 use crate::client;
@@ -71,9 +72,14 @@ pub async fn send(
     }
 }
 
-/// `asd peek`: print a session's rendered screen (or the full scrollback), as
-/// plain text or as a JSON object.
-pub async fn peek(socket: &Path, name: String, scrollback: bool, json: bool) -> anyhow::Result<()> {
+/// `asd peek`: print a session's rendered screen, optionally with history above
+/// it, as plain text or as a JSON object.
+pub async fn peek(
+    socket: &Path,
+    name: String,
+    scrollback: Scrollback,
+    json: bool,
+) -> anyhow::Result<()> {
     let mut c = client::connect(socket, ClientKind::Cli).await?;
     c.writer
         .write_frame(&Frame::Peek {
@@ -257,7 +263,7 @@ pub async fn wait(
             c.writer
                 .write_frame(&Frame::Peek {
                     name: name.clone(),
-                    scrollback: false,
+                    scrollback: Scrollback::None,
                 })
                 .await?;
             match c.reader.read_frame().await? {
@@ -304,6 +310,246 @@ pub async fn wait(
     }
 }
 
+/// One `asd follow --json` event. The stream is a log, so every line says what
+/// happened; a consumer that only wants the text filters on `"event":"output"`.
+pub(crate) enum FollowEvent<'a> {
+    /// A batch of pty output, decoded to text.
+    Output(&'a str),
+    /// The session's activity flipped (or the opening status on subscribe).
+    Status { running: bool, idle_ms: u64 },
+    /// The live screen, as it stands where the stream pauses (settle, end,
+    /// timeout). This is the part a repaint keeps rewriting, so it is reported
+    /// once per pause instead of once per frame.
+    Screen(&'a str),
+    /// The session ended, or the daemon hung up: end of stream.
+    Exit,
+    /// `--timeout` expired with the stream still open.
+    Timeout,
+}
+
+/// Render one event as a JSONL line (no trailing newline). `time_ms` is the
+/// client's wall clock at receipt — the daemon does not stamp frames, and a
+/// log without time is hard to correlate with anything else.
+pub(crate) fn follow_event_json(ev: &FollowEvent<'_>, time_ms: u64) -> String {
+    let mut s = String::from(r#"{"event":""#);
+    match ev {
+        FollowEvent::Output(_) => s.push_str("output"),
+        FollowEvent::Status { .. } => s.push_str("status"),
+        FollowEvent::Screen(_) => s.push_str("screen"),
+        FollowEvent::Exit => s.push_str("exit"),
+        FollowEvent::Timeout => s.push_str("timeout"),
+    }
+    s.push_str(&format!(r#"","time_ms":{time_ms}"#));
+    match ev {
+        FollowEvent::Output(text) | FollowEvent::Screen(text) => {
+            s.push_str(r#","text":"#);
+            json_string(text, &mut s);
+        }
+        FollowEvent::Status { running, idle_ms } => {
+            s.push_str(&format!(r#","running":{running},"idle_ms":{idle_ms}"#));
+        }
+        FollowEvent::Exit | FollowEvent::Timeout => {}
+    }
+    s.push('}');
+    s
+}
+
+/// Decodes a byte stream to text across chunk boundaries. Pty batches are cut
+/// at arbitrary byte offsets, so a multi-byte character can straddle two
+/// `Output` frames; the incomplete tail is held back and prepended to the next
+/// chunk instead of being mangled into a replacement char. Bytes that are
+/// genuinely not UTF-8 (a session dumping binary) do become U+FFFD.
+#[derive(Default)]
+pub(crate) struct Utf8Stream {
+    tail: Vec<u8>,
+}
+
+impl Utf8Stream {
+    /// Decode what is complete; keep any partial character for the next call.
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> String {
+        let mut buf = std::mem::take(&mut self.tail);
+        buf.extend_from_slice(bytes);
+        let mut out = String::new();
+        let mut rest = &buf[..];
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    out.push_str(s);
+                    rest = &[];
+                    break;
+                }
+                Err(e) => {
+                    let good = e.valid_up_to();
+                    out.push_str(std::str::from_utf8(&rest[..good]).unwrap_or_default());
+                    match e.error_len() {
+                        // Invalid byte(s) mid-buffer: replace and keep going.
+                        Some(n) => {
+                            out.push('\u{fffd}');
+                            rest = &rest[good + n..];
+                        }
+                        // Truncated character at the end: hold it back.
+                        None => {
+                            rest = &rest[good..];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.tail = rest.to_vec();
+        out
+    }
+
+    /// End of stream: nothing more is coming, so a held-back tail can only be
+    /// broken. Emit it lossily rather than swallowing it.
+    pub(crate) fn flush(&mut self) -> String {
+        let tail = std::mem::take(&mut self.tail);
+        String::from_utf8_lossy(&tail).into_owned()
+    }
+}
+
+/// A local terminal that tells apart what a program *printed* from what it is
+/// *repainting*.
+///
+/// This is the question the byte stream cannot answer. A TUI rewrites its
+/// status line several times a second — `✻ building…`, `✽ building… 2`, `·
+/// building…` — and to the stream those look exactly like new output. Stripping
+/// escape sequences does not help: the sequences *are* the distinction.
+///
+/// A terminal knows, because it has row identity. Feed the same bytes into a
+/// `GhosttyVt` (the one `attach` already renders with) and screen space splits
+/// in two: rows below `scrollback_rows()` have scrolled off the live screen and
+/// can never be touched again, and the rows above it are the live screen, which
+/// a repaint rewrites in place. So a row leaving the screen *is* the signal
+/// that its content is final — that is what gets logged as `output`, in order,
+/// exactly once. The live screen is reported separately as `screen`, once per
+/// pause, no matter how many times it was painted.
+///
+/// Two consequences worth knowing. Output that never scrolls (a short command
+/// on a screen with room to spare) is not final until the session settles, so
+/// it arrives in the `screen` event rather than streaming line by line. And a
+/// full-screen program on the alternate screen (vim, htop, less) commits
+/// nothing at all by design — its screen *is* the content, so `screen` is the
+/// only thing to report for it.
+pub(crate) struct ScreenModel {
+    vt: GhosttyVt,
+    /// Screen-space rows already reported as final.
+    emitted: usize,
+}
+
+impl ScreenModel {
+    /// `cols`/`rows` should match the session's pty, or wrapping — and so the
+    /// line boundaries this whole thing is built on — will not match either.
+    pub(crate) fn new(cols: u16, rows: u16) -> Self {
+        Self {
+            // Same depth `attach` gives its client-side terminal: the rows are
+            // drained after every batch, so this is headroom, not a buffer.
+            vt: GhosttyVt::new(cols.max(1), rows.max(1), 100_000),
+            emitted: 0,
+        }
+    }
+
+    /// Feed one pty batch; return the lines that just became final (empty when
+    /// the batch only repainted the live screen).
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> String {
+        self.vt.feed(bytes);
+        // A follower has no pty to write to, so the terminal's query replies
+        // (DA, DSR) have nowhere to go; drop them rather than accumulate.
+        let _ = self.vt.take_pty_responses();
+        let committed = self.vt.scrollback_rows();
+        if committed <= self.emitted {
+            return String::new();
+        }
+        let lines = self
+            .vt
+            .fetch_history(self.emitted as u32, (committed - self.emitted) as u32);
+        self.emitted = committed;
+        join_lines(&lines)
+    }
+
+    /// The live screen, trailing blank rows removed (they are padding to the
+    /// terminal's height, not content).
+    pub(crate) fn screen(&mut self) -> String {
+        let start = self.vt.scrollback_rows();
+        let total = self.vt.history_len();
+        let lines = self
+            .vt
+            .fetch_history(start as u32, total.saturating_sub(start) as u32);
+        let end = lines
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .map_or(0, |i| i + 1);
+        join_lines(&lines[..end])
+    }
+}
+
+/// Rows as one block of text. `fetch_history` already trims each row's trailing
+/// blanks, and its bytes come from the terminal's own cells, so they are UTF-8
+/// unless a cell held something unrepresentable.
+fn join_lines(lines: &[Vec<u8>]) -> String {
+    lines
+        .iter()
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How `follow` turns pty bytes into event text: verbatim (`--raw`, and always
+/// in text mode), or through a terminal model that separates final output from
+/// repaints.
+pub(crate) enum Decode {
+    Raw(Utf8Stream),
+    Screen(Box<ScreenModel>),
+}
+
+impl Decode {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        match self {
+            Self::Raw(d) => d.push(bytes),
+            Self::Screen(m) => m.push(bytes),
+        }
+    }
+
+    /// End of stream: whatever the decoder was still holding. The screen model
+    /// holds nothing — its pending content is the live screen, reported as its
+    /// own event.
+    fn flush(&mut self) -> String {
+        match self {
+            Self::Raw(d) => d.flush(),
+            Self::Screen(_) => String::new(),
+        }
+    }
+
+    /// The live screen, when there is a terminal model to ask.
+    fn screen(&mut self) -> Option<String> {
+        match self {
+            Self::Raw(_) => None,
+            Self::Screen(m) => Some(m.screen()),
+        }
+    }
+}
+
+/// The session's pty size from the daemon's list, or `None` if it has no such
+/// session (which `Follow` will then report properly).
+async fn session_size(c: &mut client::Client, name: &str) -> anyhow::Result<Option<(u16, u16)>> {
+    c.writer.write_frame(&Frame::ListSessions).await?;
+    match c.reader.read_frame().await? {
+        Some(Frame::SessionList { sessions }) => Ok(sessions
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| (s.cols, s.rows))),
+        Some(Frame::Error { code, msg }) => Err(exit::daemon("follow", code, &msg)),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// `asd follow`: stream a session's output as the pty produces it, and return
 /// when the session settles.
 ///
@@ -319,11 +565,25 @@ pub async fn wait(
 ///
 /// `until_idle` is the default; `follow --forever` clears it to stream across
 /// quiet spells, and then only the session ending (or `--timeout`) stops it.
+///
+/// `json` turns the stream into JSONL — one event object per line. The daemon
+/// sends a `FollowStatus` after *every* batch, so only the transitions are
+/// logged; a line-per-batch would bury the output.
+///
+/// By default the JSONL is modelled rather than stripped ([`ScreenModel`]):
+/// bytes go through a local terminal, `output` reports the lines that scrolled
+/// off the live screen (final, in order, once), and `screen` reports the live
+/// screen at each pause — so a repainting status line is one event per pause
+/// instead of ten per second. `raw` skips the model and reports the verbatim
+/// stream, escapes and all. Text mode is always verbatim: it is meant for a
+/// terminal, which needs them.
 pub async fn follow(
     socket: &Path,
     name: String,
     until_idle: bool,
     timeout: Option<String>,
+    json: bool,
+    raw: bool,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
 
@@ -338,11 +598,39 @@ pub async fn follow(
     };
 
     let mut c = client::connect(socket, ClientKind::Cli).await?;
+
+    // The terminal model has to be the session's size or its lines wrap
+    // somewhere else than the session's do. Ask before subscribing; a name the
+    // daemon does not know is left to `Follow` to reject, so the missing-session
+    // exit code stays where it is.
+    let mut decoder = if json && !raw {
+        let (cols, rows) = session_size(&mut c, &name).await?.unwrap_or((80, 24));
+        Decode::Screen(Box::new(ScreenModel::new(cols, rows)))
+    } else {
+        Decode::Raw(Utf8Stream::default())
+    };
+
     c.writer
         .write_frame(&Frame::Follow { name: name.clone() })
         .await?;
 
     let mut out = std::io::stdout();
+    let mut last_running: Option<bool> = None;
+    // The live screen is reported at every pause, but only when it has changed
+    // since the last report — settle-then-exit would otherwise print it twice.
+    let mut last_screen = String::new();
+    // Every write is flushed: a follower that buffered would defeat the point
+    // of streaming, in either format.
+    let emit = |ev: &FollowEvent<'_>, out: &mut std::io::Stdout| -> std::io::Result<()> {
+        match ev {
+            _ if json => writeln!(out, "{}", follow_event_json(ev, now_ms()))?,
+            FollowEvent::Output(text) => out.write_all(text.as_bytes())?,
+            // Text mode is the raw stream; status/screen/exit are its control
+            // plane and stay invisible.
+            _ => {}
+        }
+        out.flush()
+    };
     loop {
         let frame = match deadline {
             Some(d) => {
@@ -355,6 +643,17 @@ pub async fn follow(
                     // why it is never put in a `select!`.)
                     Err(_) => {
                         let t = timeout.as_deref().unwrap_or_default();
+                        let tail = decoder.flush();
+                        if !tail.is_empty() {
+                            let _ = emit(&FollowEvent::Output(&tail), &mut out);
+                        }
+                        if let Some(screen) = decoder.screen()
+                            && screen != last_screen
+                            && !screen.is_empty()
+                        {
+                            let _ = emit(&FollowEvent::Screen(&screen), &mut out);
+                        }
+                        let _ = emit(&FollowEvent::Timeout, &mut out);
                         eprintln!("follow: timed out after {t}");
                         let _ = out.flush();
                         std::process::exit(exit::TIMEOUT);
@@ -364,25 +663,79 @@ pub async fn follow(
             None => c.reader.read_frame().await?,
         };
         match frame {
-            // Flushed per batch: a follower that buffered would defeat the
-            // point of streaming.
             Some(Frame::Output { bytes }) => {
-                out.write_all(&bytes)?;
-                out.flush()?;
+                let text = decoder.push(&bytes);
+                // A batch can be nothing but the front half of a character, or
+                // nothing but a cursor move once cleaned; there is no event to
+                // report until something printable arrives.
+                if !text.is_empty() {
+                    emit(&FollowEvent::Output(&text), &mut out)?;
+                }
             }
-            Some(Frame::FollowStatus { running, .. }) => {
+            Some(Frame::FollowStatus { running, idle_ms }) => {
+                // Going quiet is the moment the live screen is worth reporting:
+                // whatever was being repainted has stopped moving.
+                if !running
+                    && let Some(screen) = decoder.screen()
+                    && screen != last_screen
+                    && !screen.is_empty()
+                {
+                    emit(&FollowEvent::Screen(&screen), &mut out)?;
+                    last_screen = screen;
+                }
+                if last_running != Some(running) {
+                    last_running = Some(running);
+                    emit(&FollowEvent::Status { running, idle_ms }, &mut out)?;
+                }
                 if until_idle && !running {
                     return Ok(());
                 }
             }
             // The session ended under us. That is the end of the stream, not a
             // failure of the command: whatever was being waited for is over.
-            Some(Frame::Error { code, .. }) if code == code::SESSION_EXITED => return Ok(()),
+            Some(Frame::Error { code, .. }) if code == code::SESSION_EXITED => {
+                let tail = decoder.flush();
+                if !tail.is_empty() {
+                    emit(&FollowEvent::Output(&tail), &mut out)?;
+                }
+                if let Some(screen) = decoder.screen()
+                    && screen != last_screen
+                    && !screen.is_empty()
+                {
+                    emit(&FollowEvent::Screen(&screen), &mut out)?;
+                }
+                emit(&FollowEvent::Exit, &mut out)?;
+                return Ok(());
+            }
             Some(Frame::Error { code, msg }) => return Err(exit::daemon("follow", code, &msg)),
             // The daemon hung up.
-            None => return Ok(()),
+            None => {
+                let tail = decoder.flush();
+                if !tail.is_empty() {
+                    emit(&FollowEvent::Output(&tail), &mut out)?;
+                }
+                if let Some(screen) = decoder.screen()
+                    && screen != last_screen
+                    && !screen.is_empty()
+                {
+                    emit(&FollowEvent::Screen(&screen), &mut out)?;
+                }
+                emit(&FollowEvent::Exit, &mut out)?;
+                return Ok(());
+            }
             other => bail!("unexpected reply: {other:?}"),
         }
+    }
+}
+
+/// What `--scrollback` meant on the command line. clap gives three states for
+/// an optionally-valued flag, and they map straight onto the wire type: absent
+/// is the screen alone, bare is the whole history, and a value caps it.
+pub(crate) fn scrollback_arg(flag: Option<Option<u32>>) -> Scrollback {
+    match flag {
+        None => Scrollback::None,
+        Some(None) => Scrollback::All,
+        Some(Some(n)) => Scrollback::Lines(n),
     }
 }
 
@@ -622,6 +975,116 @@ mod tests {
         assert_eq!(parse_duration("10"), None); // no unit
         assert_eq!(parse_duration("10x"), None); // bad unit
         assert_eq!(parse_duration("abc"), None);
+    }
+
+    #[test]
+    fn follow_events_are_one_json_object_per_line() {
+        // Escapes survive: the payload is the raw pty stream, so ESC and CR
+        // are normal content here, not formatting.
+        assert_eq!(
+            follow_event_json(&FollowEvent::Output("hi\x1b[0m\r\n"), 1_700_000_000_000),
+            r#"{"event":"output","time_ms":1700000000000,"text":"hi\u001b[0m\r\n"}"#
+        );
+        assert_eq!(
+            follow_event_json(
+                &FollowEvent::Status {
+                    running: false,
+                    idle_ms: 2001
+                },
+                7
+            ),
+            r#"{"event":"status","time_ms":7,"running":false,"idle_ms":2001}"#
+        );
+        assert_eq!(
+            follow_event_json(&FollowEvent::Exit, 7),
+            r#"{"event":"exit","time_ms":7}"#
+        );
+        assert_eq!(
+            follow_event_json(&FollowEvent::Timeout, 7),
+            r#"{"event":"timeout","time_ms":7}"#
+        );
+    }
+
+    #[test]
+    fn utf8_stream_rejoins_characters_split_across_batches() {
+        let mut s = Utf8Stream::default();
+        // "中" is e4 b8 ad; the pty batch boundary falls inside it.
+        assert_eq!(s.push(b"ab\xe4\xb8"), "ab");
+        assert_eq!(s.push(b"\xad cd"), "中 cd");
+        assert_eq!(s.flush(), "");
+    }
+
+    #[test]
+    fn utf8_stream_replaces_truly_invalid_bytes_and_keeps_going() {
+        let mut s = Utf8Stream::default();
+        // A lone 0xff is not the start of anything: replace it, then keep the
+        // trailing partial character back as usual.
+        assert_eq!(s.push(b"a\xffb\xe4\xb8"), "a\u{fffd}b");
+        assert_eq!(s.push(b"\xad"), "中");
+        // A partial character at end of stream can never complete.
+        assert_eq!(s.push(b"\xe4"), "");
+        assert_eq!(s.flush(), "\u{fffd}");
+        assert_eq!(s.flush(), "");
+    }
+
+    #[test]
+    fn screen_model_reports_a_line_only_once_it_can_no_longer_change() {
+        // Three rows of screen: the fourth line pushes the first one off.
+        let mut m = ScreenModel::new(20, 3);
+        // Still on the live screen, so still rewritable — nothing is final.
+        assert_eq!(m.push(b"one\r\ntwo\r\n"), "");
+        assert_eq!(m.screen(), "one\ntwo");
+        // Scrolling is what makes a line final, in order and exactly once.
+        assert_eq!(m.push(b"three\r\n"), "one");
+        assert_eq!(m.push(b"four\r\nfive\r\n"), "two\nthree");
+        assert_eq!(m.screen(), "four\nfive");
+    }
+
+    #[test]
+    fn screen_model_ignores_a_status_line_repainted_in_place() {
+        // What a TUI does ten times a second: rewrite one row via CR. Every
+        // frame looks like new bytes; none of it is new output.
+        let mut m = ScreenModel::new(40, 3);
+        for frame in [
+            "\r✻ 实现路由表…",
+            "\r✽ 实现路由表… 2",
+            "\r· 实现路由表… 3",
+            "\r✶ 实现路由表… 4",
+        ] {
+            assert_eq!(m.push(frame.as_bytes()), "", "repaint reported as output");
+        }
+        // It is reported once, as the screen, with the newest content.
+        assert_eq!(m.screen(), "✶ 实现路由表… 4");
+    }
+
+    #[test]
+    fn screen_model_keeps_real_output_around_a_repaint() {
+        let mut m = ScreenModel::new(40, 3);
+        // A spinner repainting under a line of real output that then scrolls.
+        assert_eq!(m.push(b"result: ok\r\n"), "");
+        assert_eq!(m.push(b"\rworking 1"), "");
+        assert_eq!(m.push(b"\rworking 2"), "");
+        assert_eq!(m.push(b"\r\nsecond line\r\n"), "result: ok");
+        assert_eq!(m.push(b"third line\r\n"), "working 2");
+        assert_eq!(m.screen(), "second line\nthird line");
+    }
+
+    #[test]
+    fn screen_model_trims_the_blank_rows_below_the_content() {
+        // A screen is always `rows` tall; the padding is not content.
+        let mut m = ScreenModel::new(20, 6);
+        assert_eq!(m.push(b"a\r\nb\r\n"), "");
+        assert_eq!(m.screen(), "a\nb");
+    }
+
+    #[test]
+    fn scrollback_flag_maps_its_three_states() {
+        // Absent, bare, and valued are three different requests.
+        assert_eq!(scrollback_arg(None), Scrollback::None);
+        assert_eq!(scrollback_arg(Some(None)), Scrollback::All);
+        assert_eq!(scrollback_arg(Some(Some(200))), Scrollback::Lines(200));
+        // `--scrollback 0` asks for no history, which is the screen alone.
+        assert_eq!(scrollback_arg(Some(Some(0))), Scrollback::Lines(0));
     }
 
     #[test]

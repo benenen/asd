@@ -20,6 +20,9 @@ asd-vt = { workspace = true }
 clap = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
+# Column alignment for `asd list`: titles are arbitrary text, so the TITLE
+# cell must be measured in display columns, not chars.
+unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
