@@ -4,7 +4,8 @@
 //! A session list answers "what exists"; picking the right session needs "what
 //! is this one *for*". A project already answers that in its own files, so a
 //! card is the session's metadata plus the documents in its working directory:
-//! `README.md`, `CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`.
+//! `README.md`, `CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md` — matched ignoring
+//! case, since projects and filesystems disagree about it.
 //!
 //! Three levels, so a caller reads only as much as the decision needs:
 //! [`list`] is one line per session (where it is, which documents it has),
@@ -266,9 +267,13 @@ pub(crate) fn resolve_in(dir: &Path, path: &str) -> anyhow::Result<PathBuf> {
 
 /// The documents present in a session's directory.
 pub(crate) fn scan_docs(dir: &Path) -> Vec<Doc> {
+    let present = entries(dir);
     let mut docs = Vec::new();
     for file in DOC_FILES {
-        let path = dir.join(file);
+        let Some(name) = match_name(&present, file) else {
+            continue;
+        };
+        let path = dir.join(&name);
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
@@ -278,7 +283,7 @@ pub(crate) fn scan_docs(dir: &Path) -> Vec<Doc> {
         let text = read_head(&path, SCAN_BYTES).unwrap_or_default();
         let (heading, excerpt, cut) = summarize(&text);
         docs.push(Doc {
-            file: (*file).to_string(),
+            file: name,
             bytes: meta.len(),
             modified_ms: modified_ms(&meta),
             heading,
@@ -287,6 +292,38 @@ pub(crate) fn scan_docs(dir: &Path) -> Vec<Doc> {
         });
     }
     docs
+}
+
+/// The names in a directory, unordered (an unreadable directory has none).
+fn entries(dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect()
+}
+
+/// The name in `present` that spells `want`, ignoring case.
+///
+/// Projects do not agree on capitalisation (`readme.md`, `Readme.md`), and on
+/// macOS or Windows the filesystem does not either — so a card that only
+/// matched the canonical spelling would report "no documents" for a project
+/// that has them. The name is returned as written on disk: it is what `card
+/// cat` is handed back, and there the path must match exactly.
+///
+/// An exact match wins over a differently-cased one, which is the only stable
+/// answer when a case-sensitive filesystem holds both — directory order is not.
+fn match_name(present: &[String], want: &str) -> Option<String> {
+    if present.iter().any(|n| n == want) {
+        return Some(want.to_string());
+    }
+    let mut hits: Vec<&String> = present
+        .iter()
+        .filter(|n| n.eq_ignore_ascii_case(want))
+        .collect();
+    hits.sort();
+    hits.first().map(|n| (*n).to_string())
 }
 
 /// A document's `# ` title and opening prose, plus whether prose was cut.
@@ -464,6 +501,35 @@ mod tests {
 
         // A directory with none of them is empty, not an error.
         assert!(scan_docs(&tempdir("empty")).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_docs_finds_documents_whatever_their_case() {
+        let dir = tempdir("case");
+        std::fs::write(dir.join("readme.md"), "# proj\n\nlower case.\n").unwrap();
+        std::fs::write(dir.join("Claude.md"), "# c\n\nmixed case.\n").unwrap();
+
+        let docs = scan_docs(&dir);
+        // Reported in the fixed order, under the name the file actually has —
+        // that name is what `card cat` is given.
+        let names: Vec<&str> = docs.iter().map(|d| d.file.as_str()).collect();
+        assert_eq!(names, ["readme.md", "Claude.md"], "docs: {names:?}");
+        assert_eq!(docs[0].excerpt, "lower case.");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_docs_prefers_the_exactly_named_document() {
+        // Two spellings can coexist on a case-sensitive filesystem; the card
+        // must not pick by directory order.
+        let dir = tempdir("case-clash");
+        std::fs::write(dir.join("readme.md"), "# lower\n\nlower.\n").unwrap();
+        std::fs::write(dir.join("README.md"), "# upper\n\nupper.\n").unwrap();
+
+        let docs = scan_docs(&dir);
+        let names: Vec<&str> = docs.iter().map(|d| d.file.as_str()).collect();
+        assert_eq!(names, ["README.md"], "docs: {names:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

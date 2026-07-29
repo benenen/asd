@@ -128,7 +128,8 @@ asd card cat build AGENTS.md        # one file in full (any path under the sessi
 `list` → `inspect` → `cat` is a deliberate ladder: choosing a session usually
 only needs the first, so an agent does not pull three READMEs into its context
 to pick one. The set of documents is fixed — `README.md`, `CLAUDE.md`,
-`AGENTS.md`, `CONTRIBUTING.md` — and `cat` reaches any file under the
+`AGENTS.md`, `CONTRIBUTING.md`, matched **ignoring case**, so a project
+spelling it `readme.md` still has a card — and `cat` reaches any file under the
 directory, refusing paths that leave it.
 
 `card` works against a **local** daemon: a session's directory is read from its
