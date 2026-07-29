@@ -239,7 +239,7 @@ pub async fn cat(socket: &Path, name: String, path: String, json: bool) -> anyho
     Ok(())
 }
 
-/// Resolve `path` inside a session's directory.
+/// Resolve `path` inside a session's directory, ignoring case.
 ///
 /// Escaping the directory is refused. That is a guardrail, not a privilege
 /// boundary — whoever runs `asd` can read those files anyway — but `card` is
@@ -252,9 +252,15 @@ pub(crate) fn resolve_in(dir: &Path, path: &str) -> anyhow::Result<PathBuf> {
     let root = dir
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("card: {}: {e}", dir.display()))?;
-    let file = target
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("card: {}: {e}", target.display()))?;
+    let file = match target.canonicalize() {
+        Ok(file) => file,
+        // Not there as spelled: the same name in another case is the same
+        // file to whoever asked, and here that is an agent repeating a name
+        // out of a document rather than off the disk.
+        Err(e) => ignoring_case(dir, path)
+            .and_then(|p| p.canonicalize().ok())
+            .ok_or_else(|| anyhow::anyhow!("card: {}: {e}", target.display()))?,
+    };
     if !file.starts_with(&root) {
         bail!(
             "card: {} is outside the session's directory ({})",
@@ -263,6 +269,26 @@ pub(crate) fn resolve_in(dir: &Path, path: &str) -> anyhow::Result<PathBuf> {
         );
     }
     Ok(file)
+}
+
+/// `path` under `dir` with every component matched ignoring case, or `None`
+/// when no such file is there.
+///
+/// Only descends: `..`, a root, or a drive prefix abandons the search rather
+/// than being followed case-blind, so widening the spelling never widens the
+/// reach. The caller's containment check still has the last word.
+fn ignoring_case(dir: &Path, path: &str) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut at = dir.to_path_buf();
+    for c in Path::new(path).components() {
+        match c {
+            Component::CurDir => {}
+            Component::Normal(name) => at.push(match_name(&entries(&at), name.to_str()?)?),
+            _ => return None,
+        }
+    }
+    Some(at)
 }
 
 /// The documents present in a session's directory.
@@ -546,6 +572,34 @@ mod tests {
         // Traversal, absolute paths, and a missing file all fail rather than
         // reaching outside.
         for bad in ["../../../etc/passwd", "/etc/passwd", "nope.md"] {
+            assert!(resolve_in(&dir, bad).is_err(), "allowed {bad}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_in_finds_a_path_whatever_its_case() {
+        let dir = tempdir("case-cat");
+        std::fs::create_dir(dir.join("Docs")).unwrap();
+        std::fs::write(dir.join("Docs/Readme.md"), "# doc\n").unwrap();
+
+        let want = dir.canonicalize().unwrap().join("Docs/Readme.md");
+        // Every component is matched, not just the filename.
+        assert_eq!(resolve_in(&dir, "Docs/Readme.md").unwrap(), want);
+        assert_eq!(resolve_in(&dir, "docs/readme.md").unwrap(), want);
+        assert_eq!(resolve_in(&dir, "DOCS/README.MD").unwrap(), want);
+        assert_eq!(resolve_in(&dir, "./docs/readme.md").unwrap(), want);
+        // A file that is not there is still missing, in any case.
+        assert!(resolve_in(&dir, "docs/nope.md").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn case_insensitive_paths_still_cannot_leave_the_directory() {
+        let dir = tempdir("case-jail");
+        std::fs::write(dir.join("keep.md"), "x").unwrap();
+
+        for bad in ["/ETC/passwd", "../../../ETC/passwd", "../CASE-JAIL/keep.md"] {
             assert!(resolve_in(&dir, bad).is_err(), "allowed {bad}");
         }
         std::fs::remove_dir_all(&dir).ok();

@@ -130,7 +130,7 @@ only needs the first, so an agent does not pull three READMEs into its context
 to pick one. The set of documents is fixed — `README.md`, `CLAUDE.md`,
 `AGENTS.md`, `CONTRIBUTING.md`, matched **ignoring case**, so a project
 spelling it `readme.md` still has a card — and `cat` reaches any file under the
-directory, refusing paths that leave it.
+directory, matching its path the same way, refusing paths that leave it.
 
 `card` works against a **local** daemon: a session's directory is read from its
 own process (`/proc/<pid>/cwd`), so for a session on a remote daemon the card
