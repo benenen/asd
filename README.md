@@ -106,6 +106,7 @@ asd peek build                               # print the rendered screen (--scro
 asd wait build --text PASS --timeout 2m      # block until the screen contains "PASS" …
 asd wait build --idle && asd peek build      # … or until output settles (2s), then read it
 asd follow build                             # stream output live, return when it settles
+asd follow build --forever                   # … or keep streaming until the session ends
 asd inspect build --json                     # full detail: pid, alt-screen, scrollback, mouse, cursor
 ```
 

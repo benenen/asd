@@ -763,6 +763,63 @@ async fn follow_until_idle() {
     }
 }
 
+/// `follow --forever` keeps streaming across a quiet spell that would have
+/// ended the default follow, and still returns when the session itself ends.
+///
+/// The second half matters as much as the first: a follower is not in the
+/// session's client list, so it never sees the `SESSION_EXITED` broadcast, and
+/// `--forever` is precisely the mode that ignores the idle status. Without an
+/// end-of-session signal of its own it would sit there until its timeout for a
+/// session that is already gone.
+#[tokio::test]
+async fn follow_forever_streams_past_a_quiet_spell() {
+    let daemon = Daemon::start("followfvr");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "fvr"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // The gap is longer than IDLE_SETTLE_MS (2s), so a default `follow` would
+    // have returned after FIRST. The trailing `exit` ends the session, which is
+    // what this mode stops on. As above, the markers exist only in the output:
+    // `%s` is what gets echoed.
+    let out = daemon
+        .cli()
+        .args([
+            "send",
+            "fvr",
+            "--text",
+            "sleep 1; printf 'FIRST%s\\n' ''; sleep 3; printf 'SECOND%s\\n' ''; exit",
+            "--enter",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "send failed: {out:?}");
+
+    let out = daemon
+        .cli()
+        .args(["follow", "fvr", "--forever", "--timeout", "20s"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "follow --forever did not end with the session: {out:?}"
+    );
+
+    let streamed = String::from_utf8_lossy(&out.stdout);
+    for marker in ["FIRST", "SECOND"] {
+        assert!(
+            streamed.contains(marker),
+            "{marker} missing from: {streamed}"
+        );
+    }
+}
+
 /// `wait --idle` returns once output settles; a condition that never holds
 /// times out with the documented exit code 4.
 #[tokio::test]

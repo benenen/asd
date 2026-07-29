@@ -316,6 +316,9 @@ pub async fn wait(
 /// The status rides the same connection as the output and is produced by the
 /// session's own thread, so "these bytes, and now it is quiet" arrives in that
 /// order. Nothing polls.
+///
+/// `until_idle` is the default; `follow --forever` clears it to stream across
+/// quiet spells, and then only the session ending (or `--timeout`) stops it.
 pub async fn follow(
     socket: &Path,
     name: String,

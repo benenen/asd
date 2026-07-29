@@ -113,11 +113,11 @@ enum Cmd {
     Follow {
         /// Session name
         name: String,
-        /// Stop once the session has produced no output for 2 seconds. This is
-        /// the default and currently the only mode; the flag is accepted so a
-        /// script can say what it relies on.
+        /// Keep streaming across quiet spells; stop only when the session ends
+        /// (or --timeout expires). Without it, follow returns the first time
+        /// the session has been quiet for 2 seconds.
         #[arg(long)]
-        until_idle: bool,
+        forever: bool,
         /// Give up and exit 4 after this long (500ms, 2s, 1m, 4h, 1d).
         /// Omitted, `follow` streams until the session settles or ends.
         #[arg(long)]
@@ -405,15 +405,9 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
         Cmd::Inspect { name, json } => control::inspect(&socket, name, json).await?,
         Cmd::Follow {
             name,
-            until_idle,
+            forever,
             timeout,
-        } => {
-            // Stopping at idle is the behaviour, not an option: there is no
-            // stream-past-idle mode yet, so the flag's presence changes
-            // nothing. Kept in the signature so adding one later is local.
-            let _ = until_idle;
-            control::follow(&socket, name, true, timeout).await?
-        }
+        } => control::follow(&socket, name, !forever, timeout).await?,
         Cmd::Wait {
             name,
             text,

@@ -769,13 +769,20 @@ fn session_thread(
         // The sink is dropped by the drain; the connection side sees the
         // channel close after writing out the tail of its queue
     }
-    // A follower ends on `running == false`, so it has to be given one even
-    // when the session dies mid-stream rather than falling quiet — otherwise
-    // `follow` would sit there until its timeout for a session that is gone.
+    // Followers get both endings, because they stop on different ones: the
+    // default `follow` returns on `running == false`, while `--forever`
+    // ignores that by definition and needs to be told the session is gone.
+    // Neither can be left out — a follower is not in `clients`, so this is its
+    // only notice, and without it `follow` would sit there until its timeout
+    // for a session that no longer exists.
     for f in followers.drain(..) {
         f.send(Frame::FollowStatus {
             running: false,
             idle_ms: now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed)),
+        });
+        f.send(Frame::Error {
+            code: code::SESSION_EXITED,
+            msg: format!("session '{name}' exited"),
         });
     }
     meta.attached_clients.store(0, Ordering::Relaxed);
