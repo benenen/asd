@@ -873,7 +873,7 @@ pub fn sessions_json(sessions: &[asd_proto::SessionInfo]) -> String {
 
 /// Append `value` as a JSON-escaped string literal (with surrounding quotes)
 /// to `out`. Avoids a serde_json dependency for one small object.
-fn json_string(value: &str, out: &mut String) {
+pub(crate) fn json_string(value: &str, out: &mut String) {
     out.push('"');
     for ch in value.chars() {
         match ch {

@@ -18,6 +18,10 @@ pub struct SessionState {
 /// The cwd of a live process, for the persisted session list. `None` when it
 /// cannot be determined — the session then recreates in the daemon's default
 /// directory rather than failing. Platform detail in `platform::read_cwd`.
+///
+/// Re-exported from the crate root because `asd card` resolves a session's
+/// project directory the same way: one platform implementation, so the CLI and
+/// the persisted list cannot disagree about where a session is.
 pub fn read_cwd(pid: u32) -> Option<PathBuf> {
     crate::platform::read_cwd(pid)
 }

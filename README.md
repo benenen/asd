@@ -115,6 +115,26 @@ asd follow build --json                      # … as JSONL: one event object pe
 asd inspect build --json                     # full detail: pid, alt-screen, scrollback, mouse, cursor
 ```
 
+Which session should a task run in? `asd card` answers from the project itself
+— the documents in each session's working directory:
+
+```bash
+asd card                            # one line per session: where it is, which docs it has
+asd card list --json                # … for a program to choose from
+asd card inspect build --json       # that session's card: each doc's heading + opening lines
+asd card cat build AGENTS.md        # one file in full (any path under the session's directory)
+```
+
+`list` → `inspect` → `cat` is a deliberate ladder: choosing a session usually
+only needs the first, so an agent does not pull three READMEs into its context
+to pick one. The set of documents is fixed — `README.md`, `CLAUDE.md`,
+`AGENTS.md`, `CONTRIBUTING.md` — and `cat` reaches any file under the
+directory, refusing paths that leave it.
+
+`card` works against a **local** daemon: a session's directory is read from its
+own process (`/proc/<pid>/cwd`), so for a session on a remote daemon the card
+reports the directory as unknown rather than guessing at a local pid.
+
 `follow` is `wait --idle` that keeps the output instead of discarding it — for
 watching an agent (Claude Code, Codex) work through a task, where there is no
 string worth matching on because the screen is redrawn continuously. It ends on

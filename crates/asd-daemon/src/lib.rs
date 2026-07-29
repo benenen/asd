@@ -17,6 +17,8 @@ mod server;
 mod session;
 mod store;
 
+pub use store::read_cwd;
+
 use std::path::PathBuf;
 
 use anyhow::Context;

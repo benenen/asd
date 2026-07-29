@@ -1190,6 +1190,114 @@ async fn peek_scrollback_takes_an_optional_limit() {
     );
 }
 
+/// `asd card` answers "what is this session for" — the project documents in its
+/// working directory — so an agent can pick a session before running anything
+/// in it. Three levels: `list` (where each session is), `inspect` (headings and
+/// excerpts), `cat` (one file in full).
+///
+/// The directory comes from the session's own process, so this only works
+/// against a local daemon; the e2e daemon is a child process here, which is
+/// exactly that case.
+#[tokio::test]
+async fn card_reports_the_documents_in_a_session_directory() {
+    let daemon = Daemon::start("card");
+    let proj = daemon.dir.join("proj");
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    std::fs::write(
+        proj.join("README.md"),
+        "# widget-api\n\nA REST service for widget inventory.\n\n## Running\n\n`make dev`\n",
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("AGENTS.md"),
+        "# agents\n\nRun `make test` before every commit.\n",
+    )
+    .unwrap();
+    std::fs::write(proj.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "cardsess", "--cwd"])
+            .arg(&proj)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    // The card reads the *live* cwd, so wait until the shell is actually there.
+    daemon.wait_session_cwd("cardsess", &proj.canonicalize().unwrap());
+
+    // list: one row per session, with where it is and what it holds.
+    let out = daemon
+        .cli()
+        .args(["card", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "card list failed: {out:?}");
+    let json = String::from_utf8_lossy(&out.stdout);
+    assert!(json.contains(r#""session":"cardsess""#), "json: {json}");
+    assert!(
+        json.contains(r#""docs":["README.md","AGENTS.md"]"#),
+        "documents not reported in order: {json}"
+    );
+    // Bare `asd card` is the same listing, in table form.
+    let out = daemon.cli().args(["card"]).output().unwrap();
+    let table = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        table.contains("NAME") && table.contains("cardsess") && table.contains("README.md"),
+        "bare card is not the listing: {table}"
+    );
+
+    // inspect: what each document says, without fetching them.
+    let out = daemon
+        .cli()
+        .args(["card", "inspect", "cardsess", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "card inspect failed: {out:?}");
+    let json = String::from_utf8_lossy(&out.stdout);
+    assert!(json.contains(r#""heading":"widget-api""#), "json: {json}");
+    assert!(
+        json.contains("A REST service for widget inventory."),
+        "excerpt missing: {json}"
+    );
+    // The `## Running` heading is dropped from the excerpt — a card carries
+    // prose, not a table of contents.
+    assert!(!json.contains("## Running"), "heading in excerpt: {json}");
+
+    // cat: any file under the directory, not just the documents.
+    let out = daemon
+        .cli()
+        .args(["card", "cat", "cardsess", "src/main.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "card cat failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "fn main() {}\n");
+
+    // …and nothing outside it: traversal and absolute paths are refused.
+    for bad in ["../../../etc/passwd", "/etc/passwd"] {
+        let out = daemon
+            .cli()
+            .args(["card", "cat", "cardsess", bad])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "card cat allowed {bad}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("outside the session's directory"),
+            "unexpected error for {bad}: {out:?}"
+        );
+    }
+
+    // A missing session reports it the way every other command does.
+    let out = daemon
+        .cli()
+        .args(["card", "inspect", "ghost"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "missing session: {out:?}");
+}
+
 /// `peek --json` emits geometry + screen as one JSON object; `peek`/`send` on a
 /// missing session fail.
 #[tokio::test]

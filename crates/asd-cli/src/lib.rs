@@ -5,6 +5,7 @@
 //! keep this one free of iced).
 
 mod attach;
+mod card;
 mod client;
 mod control;
 mod exit;
@@ -101,6 +102,14 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// What each session is working on: the project documents in its working
+    /// directory, so an agent can tell the sessions apart before running
+    /// something in one. Local daemon only — the directory is read from the
+    /// session's own process.
+    Card {
+        #[command(subcommand)]
+        cmd: Option<CardCmd>,
+    },
     /// Show detailed information about one session (metadata + live terminal
     /// state: pid, alt-screen, scrollback, mouse tracking, cursor)
     Inspect {
@@ -186,6 +195,37 @@ enum Cmd {
     Ui {
         /// Session to pre-select.
         session: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum CardCmd {
+    /// One line per session: where it is and which documents it has (the
+    /// default when `asd card` is run with no subcommand)
+    List {
+        /// Emit a JSON array instead of the table
+        #[arg(long)]
+        json: bool,
+    },
+    /// One session's card: its metadata plus each document's heading and
+    /// opening lines
+    Inspect {
+        /// Session name
+        name: String,
+        /// Emit a JSON object instead of a labeled block
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a file from the session's working directory. The path is relative
+    /// to it and may not leave it.
+    Cat {
+        /// Session name
+        name: String,
+        /// Path relative to the session's working directory
+        path: String,
+        /// Wrap the content in a JSON object instead of printing it raw
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -431,6 +471,11 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             scrollback,
             json,
         } => control::peek(&socket, name, control::scrollback_arg(scrollback), json).await?,
+        Cmd::Card { cmd } => match cmd.unwrap_or(CardCmd::List { json: false }) {
+            CardCmd::List { json } => card::list(&socket, json).await?,
+            CardCmd::Inspect { name, json } => card::inspect(&socket, name, json).await?,
+            CardCmd::Cat { name, path, json } => card::cat(&socket, name, path, json).await?,
+        },
         Cmd::Inspect { name, json } => control::inspect(&socket, name, json).await?,
         Cmd::Follow {
             name,
