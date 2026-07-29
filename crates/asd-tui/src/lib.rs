@@ -273,6 +273,35 @@ fn cursor_tail(tail: Option<(u16, u16, bool)>) -> Vec<u8> {
     }
 }
 
+/// Input bytes for pasted `text`, wrapped in the bracketed-paste markers when
+/// the session program is in mode 2004.
+///
+/// The host terminal brackets a paste for us, but crossterm strips the markers
+/// off before handing over `Event::Paste` — so forwarding the text alone drops
+/// the one signal that says "this was pasted", and every line break in it
+/// lands as Enter. A shell runs each line, an agent prompt submits at the
+/// blank line. Putting the markers back is what makes a multi-line paste stay
+/// one piece of text.
+///
+/// Only when the program asked for them: a program that does not know mode
+/// 2004 shows `[200~` as text instead.
+///
+/// An end marker inside the text is dropped rather than passed on, as xterm
+/// does — otherwise pasted content could close the bracket early and have its
+/// tail read as keystrokes.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    if !bracketed {
+        return text.as_bytes().to_vec();
+    }
+    let mut out = Vec::with_capacity(text.len() + START.len() + END.len());
+    out.extend_from_slice(START);
+    out.extend_from_slice(text.replace("\x1b[201~", "").as_bytes());
+    out.extend_from_slice(END);
+    out
+}
+
 /// Open the TUI against `socket`; `session` preselects one by name. The
 /// daemon must already be running (the `asd ui` wrapper ensures it).
 pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
@@ -433,7 +462,8 @@ fn event_loop(
                             app.pane_needs_render = true;
                         }
                         app.scroll = 0;
-                        app.send(Cmd::Input(text.into_bytes()));
+                        let bytes = app.paste(&text);
+                        app.send(Cmd::Input(bytes));
                     }
                 }
                 Event::Resize(w, h) => {
@@ -583,6 +613,14 @@ impl App {
 
     fn send(&self, cmd: Cmd) {
         let _ = self.conn.cmd_tx.send(cmd);
+    }
+
+    /// Pasted `text` as input bytes for the attached session, bracketed when
+    /// that session wants it (see [`paste_bytes`]). Our own VT tracks the
+    /// session's modes, so it is the one that knows.
+    fn paste(&mut self, text: &str) -> Vec<u8> {
+        let bracketed = self.vt.as_mut().is_some_and(|vt| vt.bracketed_paste());
+        paste_bytes(text, bracketed)
     }
 
     /// Current frame of the attached terminal, if any. Re-clamps the scroll
@@ -1225,12 +1263,13 @@ impl App {
             }
             // Right-click pastes what was last copied here into the session — asd
             // grabs the mouse, so the host terminal's own right-click paste can't
-            // reach us. Sent as plain input, like a host bracketed paste. (A
+            // reach us. Goes in as a paste, same as one from the host. (A
             // mouse-tracking session gets the right-click forwarded above; this
             // arm is reached for a plain shell prompt.)
             MouseEventKind::Down(MouseButton::Right) if in_pane => {
                 if let Some(text) = self.clipboard.clone() {
-                    self.send(Cmd::Input(text.into_bytes()));
+                    let bytes = self.paste(&text);
+                    self.send(Cmd::Input(bytes));
                 }
             }
             _ => {}
@@ -1357,6 +1396,33 @@ fn encode_sgr_mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_bytes_wraps_only_for_a_session_that_asked_for_it() {
+        // The session has bracketed paste on: the markers go back on, so the
+        // program sees one paste instead of two Enters.
+        assert_eq!(
+            paste_bytes("echo one\recho two", true),
+            b"\x1b[200~echo one\recho two\x1b[201~".to_vec()
+        );
+        // It does not: markers would arrive as literal text, so send the text
+        // alone — line breaks act as Enter, which is all such a program has.
+        assert_eq!(
+            paste_bytes("echo one\recho two", false),
+            b"echo one\recho two".to_vec()
+        );
+    }
+
+    #[test]
+    fn paste_bytes_removes_an_end_marker_inside_the_text() {
+        // Pasted text carrying the terminator would end the paste early and
+        // the rest would arrive as keystrokes — i.e. pasting a file could run
+        // commands. The marker is dropped, the text around it is kept.
+        assert_eq!(
+            paste_bytes("safe\x1b[201~rm -rf /\r", true),
+            b"\x1b[200~saferm -rf /\r\x1b[201~".to_vec()
+        );
+    }
 
     #[test]
     fn cursor_tail_places_before_visibility() {

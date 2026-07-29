@@ -109,6 +109,15 @@ pub trait VtBackend: Sized {
         Vec::new()
     }
 
+    /// Whether the program has bracketed paste (DEC mode 2004) enabled: it
+    /// wants pasted text wrapped in `CSI 200~` … `CSI 201~` so it can tell a
+    /// paste from typing and not act on the line breaks in it. A client must
+    /// only send those markers when this is true — a program that does not
+    /// know them takes them as literal text. Default returns false.
+    fn bracketed_paste(&mut self) -> bool {
+        false
+    }
+
     /// Encode a keystroke into input bytes according to the current terminal
     /// modes (DECCKM, kitty protocol, etc.).
     fn encode_key(&mut self, ev: KeyEvent) -> Vec<u8>;

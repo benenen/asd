@@ -13,7 +13,7 @@
 //!   own native selection instead.
 //!
 //! When the session program itself wants the mouse (vim/htop), we mirror its
-//! exact modes to the host and forward the events to it (`sync_host_mouse`).
+//! exact modes to the host and forward the events to it (`sync_host_modes`).
 
 use std::io::Write as _;
 
@@ -31,9 +31,11 @@ use crate::render;
 const DETACH_BYTE: u8 = 0x1c;
 /// Lines the wheel scrolls per tick while in the scrollback view.
 const WHEEL_STEP: usize = 3;
-/// DEC private mouse modes we mirror/disable (ascending — matches
-/// `VtBackend::mouse_modes`).
-const MOUSE_MODES: &[u16] = &[9, 1000, 1002, 1003, 1005, 1006, 1015, 1016];
+/// DEC private modes we mirror onto the host and disable on the way out
+/// (ascending): the mouse set (matching `VtBackend::mouse_modes`) and
+/// bracketed paste. Leaving any of them on would outlive us on the shell we
+/// return to.
+const MIRRORED_MODES: &[u16] = &[9, 1000, 1002, 1003, 1005, 1006, 1015, 1016, 2004];
 
 /// Frames the socket-reader task forwards to the main loop.
 enum Ev {
@@ -70,7 +72,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     eprintln!("[asd: attached to '{name}', detach: Ctrl-\\]");
     let _raw = RawGuard::enable().context("enabling raw terminal mode")?;
     // Alt screen only — no mouse tracking is enabled here. We enable/disable it
-    // dynamically to mirror the session (see `sync_host_mouse`). Dropped before
+    // dynamically to mirror the session (see `sync_host_modes`). Dropped before
     // RawGuard.
     let _screen = ScreenGuard::enter().context("entering alternate screen")?;
 
@@ -81,10 +83,11 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
 
     // Lines scrolled up from the live bottom (0 = following live output).
     let mut scroll = 0usize;
-    // Mouse modes currently enabled on the host terminal. When the session
-    // wants the mouse (vim) we mirror its exact modes; otherwise we keep our
-    // own base (1002+1006) so the wheel scrolls and drags select locally.
-    let mut host_mouse: Vec<u16> = Vec::new();
+    // DEC private modes currently enabled on the host terminal. When the
+    // session wants the mouse (vim) we mirror its exact modes; otherwise we
+    // keep our own base (1002+1006) so the wheel scrolls and drags select
+    // locally. Bracketed paste follows the session either way.
+    let mut host_modes: Vec<u16> = Vec::new();
     // Whether the session program currently wants the mouse (routes events:
     // true → forward to it; false → wheel scrolls / drag selects locally).
     let mut session_mouse = false;
@@ -94,7 +97,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     let mut selecting = false;
 
     render_now(&mut vt, scroll, selection)?;
-    sync_host_mouse(&mut vt, &mut host_mouse, &mut session_mouse)?;
+    sync_host_modes(&mut vt, &mut host_modes, &mut session_mouse)?;
 
     // Socket reader → Ev channel.
     let (ev_tx, mut ev_rx) = mpsc::channel::<Ev>(256);
@@ -155,9 +158,9 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                             vt.feed(&more);
                             let _ = vt.take_pty_responses();
                         }
-                        // The session may have toggled its mouse mode; mirror
-                        // it (or fall back to our base) onto the host terminal.
-                        if sync_host_mouse(&mut vt, &mut host_mouse, &mut session_mouse).is_err() {
+                        // The session may have toggled its mouse or paste mode;
+                        // mirror it (or fall back to our base) onto the host.
+                        if sync_host_modes(&mut vt, &mut host_modes, &mut session_mouse).is_err() {
                             break Exit::DaemonGone;
                         }
                         // While scrolled up we keep the view frozen so reading
@@ -169,7 +172,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                     Ev::Snapshot(dump) => {
                         vt.feed(&dump);
                         let _ = vt.take_pty_responses();
-                        if sync_host_mouse(&mut vt, &mut host_mouse, &mut session_mouse).is_err() {
+                        if sync_host_modes(&mut vt, &mut host_modes, &mut session_mouse).is_err() {
                             break Exit::DaemonGone;
                         }
                         if render_now(&mut vt, scroll, selection).is_err() {
@@ -420,26 +423,24 @@ fn parse_scroll_key(chunk: &[u8]) -> Option<ScrollKey> {
 /// encoding (1006). Matches boo's `boo ui`.
 const BASE_MOUSE: &[u16] = &[1002, 1006];
 
-/// Keep the host terminal's mouse modes in sync. When the session wants the
-/// mouse (vim/htop) we mirror its exact modes so its events arrive in the
-/// encoding it expects; otherwise we assert our own base (1002+1006) so the
-/// wheel scrolls and drags select locally. `host` and `session_mouse` are
-/// updated in place; only the delta is emitted.
-fn sync_host_mouse(
+/// Keep the host terminal's modes in sync with the session's. When the session
+/// wants the mouse (vim/htop) we mirror its exact modes so its events arrive in
+/// the encoding it expects; otherwise we assert our own base (1002+1006) so the
+/// wheel scrolls and drags select locally. Bracketed paste is mirrored either
+/// way. `host` and `session_mouse` are updated in place; only the delta is
+/// emitted.
+fn sync_host_modes(
     vt: &mut GhosttyVt,
     host: &mut Vec<u16>,
     session_mouse: &mut bool,
 ) -> std::io::Result<()> {
     *session_mouse = vt.is_mouse_tracking();
-    let want = if *session_mouse {
-        vt.mouse_modes()
-    } else {
-        BASE_MOUSE.to_vec()
-    };
+    let mouse = session_mouse.then(|| vt.mouse_modes());
+    let want = want_modes(mouse, vt.bracketed_paste());
     if want == *host {
         return Ok(());
     }
-    let seq = mouse_mode_delta(host, &want);
+    let seq = mode_delta(host, &want);
     if !seq.is_empty() {
         write_stdout(&seq)?;
     }
@@ -447,9 +448,26 @@ fn sync_host_mouse(
     Ok(())
 }
 
+/// The DEC private modes to hold on the host: `mouse` when the session wants
+/// the mouse, our base otherwise, plus 2004 when the session is in bracketed
+/// paste. Ascending, so the delta against the host stays stable.
+///
+/// Mirroring 2004 is what makes a multi-line paste survive `asd attach`: only
+/// a host in that mode wraps the paste in `CSI 200~` … `CSI 201~`, and those
+/// markers ride the stdin stream through to the session untouched. Without
+/// them the session sees the line breaks as Enter and runs, or submits, every
+/// line above the last.
+fn want_modes(mouse: Option<Vec<u16>>, bracketed: bool) -> Vec<u16> {
+    let mut want = mouse.unwrap_or_else(|| BASE_MOUSE.to_vec());
+    if bracketed {
+        want.push(2004);
+    }
+    want
+}
+
 /// The DEC private-mode toggles to move the host from `old` to `new`:
 /// `CSI ? n l` for modes being dropped, `CSI ? n h` for modes being added.
-fn mouse_mode_delta(old: &[u16], new: &[u16]) -> Vec<u8> {
+fn mode_delta(old: &[u16], new: &[u16]) -> Vec<u8> {
     let mut out = Vec::new();
     for m in old {
         if !new.contains(m) {
@@ -482,7 +500,7 @@ fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
 /// Alternate-screen guard. Enters the alternate screen (DEC 1049) so detach
 /// restores the caller's screen; on drop, disables every mouse mode we may
 /// have enabled, leaves the alt screen, and resets the cursor shape. It does
-/// not enable mouse tracking itself — `sync_host_mouse` does that right after
+/// not enable mouse tracking itself — `sync_host_modes` does that right after
 /// the first paint (our base 1002+1006, or the session's exact modes).
 struct ScreenGuard;
 
@@ -496,7 +514,7 @@ impl ScreenGuard {
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
         let mut seq = Vec::new();
-        for m in MOUSE_MODES {
+        for m in MIRRORED_MODES {
             seq.extend_from_slice(format!("\x1b[?{m}l").as_bytes());
         }
         // Leave the alt screen, then restore the *global* states our rendering
@@ -531,24 +549,39 @@ mod tests {
     }
 
     #[test]
+    fn host_modes_mirror_the_session_bracketed_paste() {
+        // Shell prompt, no paste mode: our base, so the wheel and drags are
+        // ours.
+        assert_eq!(want_modes(None, false), BASE_MOUSE.to_vec());
+        // The session asked for bracketed paste (bash's readline does by
+        // default): the host must bracket pastes too, or their line breaks
+        // reach the shell as Enter and every pasted line runs.
+        assert_eq!(want_modes(None, true), vec![1002, 1006, 2004]);
+        // A mouse-tracking program: its exact modes, and paste only if it
+        // wants it. Ascending, so the delta against the host is stable.
+        assert_eq!(
+            want_modes(Some(vec![1000, 1006]), true),
+            vec![1000, 1006, 2004]
+        );
+        assert_eq!(want_modes(Some(vec![1000, 1006]), false), vec![1000, 1006]);
+    }
+
+    #[test]
     fn mode_delta_emits_only_changes() {
         // Off → normal+SGR: enable both, in ascending order.
-        assert_eq!(
-            mouse_mode_delta(&[], &[1000, 1006]),
-            b"\x1b[?1000h\x1b[?1006h"
-        );
+        assert_eq!(mode_delta(&[], &[1000, 1006]), b"\x1b[?1000h\x1b[?1006h");
         // Add button tracking (1002): only the new one is enabled.
         assert_eq!(
-            mouse_mode_delta(&[1000, 1006], &[1000, 1002, 1006]),
+            mode_delta(&[1000, 1006], &[1000, 1002, 1006]),
             b"\x1b[?1002h"
         );
         // Session turns mouse off: disable everything that was on.
         assert_eq!(
-            mouse_mode_delta(&[1000, 1002, 1006], &[]),
+            mode_delta(&[1000, 1002, 1006], &[]),
             b"\x1b[?1000l\x1b[?1002l\x1b[?1006l"
         );
         // No change: nothing emitted.
-        assert!(mouse_mode_delta(&[1000, 1006], &[1000, 1006]).is_empty());
+        assert!(mode_delta(&[1000, 1006], &[1000, 1006]).is_empty());
     }
 
     #[test]

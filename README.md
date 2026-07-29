@@ -246,6 +246,10 @@ in plain text, the same trust model as `~/.ssh` on a single-user machine.
 - **Mouse-mode mirroring** — when a program (`vim`/`htop`) asks for the mouse,
   its exact DEC mouse modes are mirrored to the host so events pass through 1:1;
   otherwise the wheel scrolls and drags select locally.
+- **Pastes stay pastes** — multi-line text pasted into `asd ui` or `asd attach`
+  reaches the session bracketed (DEC 2004) whenever the program asked for it, so
+  the line breaks in it are text rather than a series of Enters running every
+  line above the last.
 
 ## License
 

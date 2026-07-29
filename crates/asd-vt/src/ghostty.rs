@@ -453,6 +453,12 @@ impl VtBackend for GhosttyVt {
             .collect()
     }
 
+    fn bracketed_paste(&mut self) -> bool {
+        self.terminal
+            .mode(libghostty_vt::terminal::Mode::BRACKETED_PASTE)
+            .unwrap_or(false)
+    }
+
     fn selection_text(&mut self, sel: crate::Selection) -> String {
         let (cols, rows) = self.cols_rows();
         if cols == 0 || rows == 0 {

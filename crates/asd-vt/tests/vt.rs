@@ -386,6 +386,18 @@ fn alt_screen_and_mouse_tracking_reflect_app_state() {
 }
 
 #[test]
+fn bracketed_paste_reflects_what_the_program_asked_for() {
+    let mut vt = term(20, 4);
+    assert!(!vt.bracketed_paste(), "off until the program asks");
+
+    vt.feed(b"\x1b[?2004h");
+    assert!(vt.bracketed_paste());
+
+    vt.feed(b"\x1b[?2004l");
+    assert!(!vt.bracketed_paste());
+}
+
+#[test]
 fn mouse_modes_reflect_enabled_dec_modes() {
     let mut vt = term(20, 4);
     assert!(vt.mouse_modes().is_empty(), "no mouse by default");
