@@ -413,6 +413,21 @@ fn event_loop(
     };
 
     while !app.quit {
+        // The terminal's own size is the authority, not the resize *event*.
+        // ratatui re-reads it before every draw, so the sidebar/pane/status
+        // layout always follows the real window; the pane grid we negotiate with
+        // the daemon came from a value updated only on `Event::Resize`, and a
+        // SIGWINCH that lands before crossterm installs its handler is lost.
+        // The two would then disagree for the rest of the session — a correct
+        // frame around a session left at the startup size. One ioctl per
+        // iteration (~33/s at the poll rate below) keeps them in step, and makes
+        // the `Event::Resize` arm below nothing but a wake-up.
+        if let Ok(size) = terminal.size()
+            && (size.width, size.height) != app.term_size
+        {
+            app.term_size = (size.width, size.height);
+            app.apply_layout();
+        }
         while let Ok(ev) = app.ev_rx.try_recv() {
             app.on_conn_event(ev);
         }
@@ -466,10 +481,10 @@ fn event_loop(
                         app.send(Cmd::Input(bytes));
                     }
                 }
-                Event::Resize(w, h) => {
-                    app.term_size = (w, h);
-                    app.apply_layout();
-                }
+                // Only a wake-up: the loop head above re-reads the real size and
+                // applies it, on this pass and on every pass after — including
+                // the resizes whose event never reaches us.
+                Event::Resize(_, _) => {}
                 _ => {}
             }
         }
