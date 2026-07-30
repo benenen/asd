@@ -107,6 +107,63 @@ pub(crate) fn term_size() -> (u16, u16) {
     }
 }
 
+// ---- Terminal restore on a fatal signal --------------------------------------
+
+/// The restore sequence and the cooked termios the handler needs, published as
+/// raw pointers because that is all a signal handler may read. Leaked once at
+/// install time; never freed, never rewritten.
+static RESTORE: std::sync::atomic::AtomicPtr<u8> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static RESTORE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ORIG_TERMIOS: std::sync::atomic::AtomicPtr<libc::termios> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// SIGHUP/SIGTERM/SIGINT handler: put the terminal back, then re-raise the
+/// signal with its default disposition so the exit status is unchanged. Only
+/// async-signal-safe calls here (write / tcsetattr / signal / raise).
+extern "C" fn on_terminating_signal(sig: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    unsafe {
+        let seq = RESTORE.load(Ordering::SeqCst);
+        let len = RESTORE_LEN.load(Ordering::SeqCst);
+        if !seq.is_null() && len > 0 {
+            libc::write(libc::STDOUT_FILENO, seq.cast(), len);
+        }
+        let orig = ORIG_TERMIOS.load(Ordering::SeqCst);
+        if !orig.is_null() {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, orig);
+        }
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// Arm `restore` to be written to the terminal if this process is killed, and
+/// capture the cooked termios so the line discipline goes back too. Call before
+/// entering raw mode — being killed skips every `Drop`, which would otherwise
+/// leave the terminal in mouse-tracking mode spewing `ESC[<..M` at the shell
+/// prompt (`asd ui` arms the same thing in `asd-tui`'s platform layer).
+pub(crate) fn install_terminating_signal_restore(restore: Vec<u8>) {
+    use std::sync::atomic::Ordering;
+    unsafe {
+        let leaked = restore.leak();
+        RESTORE_LEN.store(leaked.len(), Ordering::SeqCst);
+        RESTORE.store(leaked.as_mut_ptr(), Ordering::SeqCst);
+
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut t) == 0 {
+            ORIG_TERMIOS.store(Box::into_raw(Box::new(t)), Ordering::SeqCst);
+        }
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_terminating_signal as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        for sig in [libc::SIGHUP, libc::SIGTERM, libc::SIGINT] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Raw mode guard: restores the original termios on drop.
 ///
 /// The guard owns the mode it has to put back, rather than parking it in a

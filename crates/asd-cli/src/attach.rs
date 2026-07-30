@@ -70,6 +70,12 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     };
 
     eprintln!("[asd: attached to '{name}', detach: Ctrl-\\]");
+    // `ScreenGuard`/`RawGuard` hand the terminal back on the way out, but `Drop`
+    // does not run when we are killed: a closed tab (SIGHUP) or a `kill` from
+    // another window (SIGTERM) would leave the shell we return to in mouse
+    // tracking, printing `ESC[<..M` on every mouse move. Arm the same restore
+    // from a signal handler before taking the terminal over.
+    platform::install_terminating_signal_restore(restore_sequence());
     let _raw = RawGuard::enable().context("enabling raw terminal mode")?;
     // Alt screen only — no mouse tracking is enabled here. We enable/disable it
     // dynamically to mirror the session (see `sync_host_modes`). Dropped before
@@ -513,18 +519,27 @@ impl ScreenGuard {
 
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
-        let mut seq = Vec::new();
-        for m in MIRRORED_MODES {
-            seq.extend_from_slice(format!("\x1b[?{m}l").as_bytes());
-        }
-        // Leave the alt screen, then restore the *global* states our rendering
-        // changed but the alt-screen restore does not: show the cursor again
-        // (every frame starts with `?25l`, so a hidden cursor can leak to the
-        // primary screen — leaving the shell prompt with no visible cursor),
-        // reset SGR, and reset the cursor shape.
-        seq.extend_from_slice(b"\x1b[?1049l\x1b[?25h\x1b[0m\x1b[0 q");
-        let _ = write_stdout(&seq);
+        let _ = write_stdout(&restore_sequence());
     }
+}
+
+/// Everything needed to give the terminal back: turn off every mode we may have
+/// mirrored, leave the alt screen, then restore the *global* states our
+/// rendering changed but the alt-screen restore does not — show the cursor again
+/// (every frame starts with `?25l`, so a hidden cursor can leak to the primary
+/// screen, leaving the shell prompt with no visible cursor), reset SGR, and
+/// reset the cursor shape.
+///
+/// One sequence for both exits: `ScreenGuard`'s drop on the normal path, and the
+/// signal handler when we are killed. They must not drift — a mode missing from
+/// one of them outlives us on the user's shell.
+fn restore_sequence() -> Vec<u8> {
+    let mut seq = Vec::new();
+    for m in MIRRORED_MODES {
+        seq.extend_from_slice(format!("\x1b[?{m}l").as_bytes());
+    }
+    seq.extend_from_slice(b"\x1b[?1049l\x1b[?25h\x1b[0m\x1b[0 q");
+    seq
 }
 
 #[cfg(test)]

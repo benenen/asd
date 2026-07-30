@@ -115,6 +115,15 @@ pub(crate) fn term_size() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or((80, 24))
 }
 
+/// Arm a terminal restore for a fatal signal — nothing to arm here.
+///
+/// Windows has no SIGHUP/SIGTERM: a console app is ended with TerminateProcess
+/// (no notification at all) or told to stop through a console control handler,
+/// which is a different mechanism from the unix half's signal handler. Until one
+/// is wired up, `Drop` on the normal exit path is the only restore, so this
+/// keeps the surface identical and does nothing.
+pub(crate) fn install_terminating_signal_restore(_restore: Vec<u8>) {}
+
 /// Raw mode guard: restores the console mode crossterm saved, on drop.
 pub(crate) struct RawGuard;
 

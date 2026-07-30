@@ -2223,6 +2223,125 @@ async fn pty_follows_the_smallest_attached_client() {
     .await;
 }
 
+/// A killed `asd attach` still hands the terminal back.
+///
+/// `attach` turns on mouse tracking (SGR 1002/1006, plus whatever the session
+/// mirrors) and the alternate screen. Those are undone by a `Drop` guard, and
+/// `Drop` does not run when the process is killed — so a closed tab (SIGHUP) or
+/// a `kill` from elsewhere (SIGTERM) used to leave the terminal reporting every
+/// mouse move as `ESC[<..M` text at the shell prompt. The same hole was closed
+/// in `asd ui` before; this pins it shut for `attach`.
+#[test]
+fn killed_attach_restores_the_terminal() {
+    let daemon = Daemon::start("attachsignal");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "term"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let (master, slave_path) = open_pty();
+    let mut child = daemon.cli();
+    child.args(["attach", "term"]);
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&slave_path)
+        .unwrap();
+    let mut child = attach_to_pty(child, slave).spawn().unwrap();
+
+    // Read the pty in the background: `attach` writes its setup, then (with the
+    // fix) the restore sequence as it dies.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let reader = {
+        let seen = seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break; // EIO once the last slave fd closes, i.e. the child is gone
+                }
+                seen.lock().unwrap().extend_from_slice(&buf[..n as usize]);
+            }
+            unsafe { libc::close(master) };
+        })
+    };
+    let saw = |needle: &[u8]| contains(&seen.lock().unwrap(), needle);
+
+    // Wait until it has taken the terminal over (mouse tracking on).
+    let deadline = std::time::Instant::now() + WAIT;
+    while !saw(b"\x1b[?1002h") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "attach never enabled mouse tracking: {:?}",
+            String::from_utf8_lossy(&seen.lock().unwrap())
+        );
+        std::thread::sleep(TICK);
+    }
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let _ = child.wait();
+    reader.join().unwrap();
+
+    let out = seen.lock().unwrap().clone();
+    let dump = String::from_utf8_lossy(&out).into_owned();
+    for off in [b"\x1b[?1002l".as_slice(), b"\x1b[?1006l", b"\x1b[?1049l"] {
+        assert!(
+            contains(&out, off),
+            "terminal left in {:?} after SIGTERM; pty saw: {dump:?}",
+            String::from_utf8_lossy(off)
+        );
+    }
+}
+
+/// A master pty and the path of its slave.
+fn open_pty() -> (libc::c_int, PathBuf) {
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(master >= 0, "posix_openpt failed");
+        assert_eq!(libc::grantpt(master), 0, "grantpt failed");
+        assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
+        let mut name = [0 as libc::c_char; 256];
+        assert_eq!(
+            libc::ptsname_r(master, name.as_mut_ptr(), name.len()),
+            0,
+            "ptsname_r failed"
+        );
+        let path = std::ffi::CStr::from_ptr(name.as_ptr())
+            .to_string_lossy()
+            .into_owned();
+        (master, PathBuf::from(path))
+    }
+}
+
+/// Run `cmd` with `slave` as its controlling terminal, the way a shell would.
+fn attach_to_pty(mut cmd: Command, slave: std::fs::File) -> Command {
+    use std::os::unix::process::CommandExt;
+
+    cmd.stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave);
+    unsafe {
+        // Between fork and exec: async-signal-safe calls only. The slave is
+        // already on fd 0 by now, so that is what to claim as the terminal.
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
 /// Poll `cond` until it holds, or fail with `what`.
 async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);

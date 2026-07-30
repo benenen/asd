@@ -14,6 +14,8 @@
 //!   own no terminal.
 //! - [`stop_daemon`] — end the daemon recorded in the pid file, for a restart.
 //! - [`RawGuard`] — put the terminal in raw mode, restore it on drop.
+//! - [`install_terminating_signal_restore`] — hand the terminal back even when
+//!   the process is killed, which skips every `Drop`.
 //! - [`term_size`] — the terminal's cell dimensions.
 //! - [`Winch`] / [`winch`] — a resize-notification source with a `recv()` that
 //!   simply never fires where the platform has no such signal.
@@ -31,8 +33,8 @@ mod imp;
 mod imp;
 
 pub(crate) use imp::{
-    RawGuard, Winch, configure_detached, connect_stream, run_stdio_proxy, stop_daemon, term_size,
-    winch,
+    RawGuard, Winch, configure_detached, connect_stream, install_terminating_signal_restore,
+    run_stdio_proxy, stop_daemon, term_size, winch,
 };
 
 /// The daemon side of a connection, type-erased for the framed codec.
