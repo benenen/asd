@@ -545,17 +545,53 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The rule that decides which spelling wins, tested where it lives: on a
+    /// list of names. Pinning it through the filesystem instead would pin it
+    /// only where two spellings can coexist — see the test below.
+    #[test]
+    fn match_name_prefers_the_exact_spelling() {
+        let clash: Vec<String> = ["readme.md", "README.md", "Readme.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            match_name(&clash, "README.md").as_deref(),
+            Some("README.md")
+        );
+
+        // No exact spelling: the lowest-sorting match, so the answer does not
+        // depend on the order the directory happened to be read in.
+        let inexact: Vec<String> = ["readme.md", "Readme.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            match_name(&inexact, "README.md").as_deref(),
+            Some("Readme.md")
+        );
+        assert_eq!(match_name(&inexact, "AGENTS.md"), None);
+    }
+
     #[test]
     fn scan_docs_prefers_the_exactly_named_document() {
-        // Two spellings can coexist on a case-sensitive filesystem; the card
-        // must not pick by directory order.
         let dir = tempdir("case-clash");
         std::fs::write(dir.join("readme.md"), "# lower\n\nlower.\n").unwrap();
         std::fs::write(dir.join("README.md"), "# upper\n\nupper.\n").unwrap();
 
         let docs = scan_docs(&dir);
         let names: Vec<&str> = docs.iter().map(|d| d.file.as_str()).collect();
-        assert_eq!(names, ["README.md"], "docs: {names:?}");
+        // Whether there is a clash at all is the filesystem's call, so ask it
+        // rather than the platform: both spellings survive on a case-sensitive
+        // one (Linux), while Windows and a default macOS volume fold the two
+        // writes into a single file. Either way the reported name must be the
+        // one on disk, because that is the path `card cat` is handed.
+        let on_disk = std::fs::read_dir(&dir).unwrap().count();
+        if on_disk == 2 {
+            assert_eq!(names, ["README.md"], "docs: {names:?}");
+        } else {
+            assert_eq!(names.len(), 1, "one file, one doc: {names:?}");
+            assert!(dir.join(names[0]).is_file(), "reported {names:?}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
