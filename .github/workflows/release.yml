@@ -255,8 +255,16 @@ jobs:
   # Highlights come from whichever human source exists, in this order:
   #   1. the body already on the release — what `gh release create --notes` left
   #      at cut time, or a later edit in the UI;
-  #   2. the tag's annotation body (`git tag -a v0.1.11 -m "$(cat notes.md)"`),
-  #      for when the release was created by the upload step with no body.
+  #   2. the tag's annotation body, for when the release was created by the
+  #      upload step with no body:
+  #
+  #        git tag -a v0.1.11 --cleanup=verbatim -F notes.md
+  #
+  #      `--cleanup=verbatim` is not optional. git's default cleanup treats a
+  #      line starting with `#` as a comment and drops it, which silently eats
+  #      every markdown heading in the notes — `### New` and friends vanished
+  #      from v0.1.11's annotation exactly that way. The first line is the tag
+  #      subject (use the version), and the body is everything after it.
   # Neither one: just the changelog, exactly as before.
   notes:
     name: release notes
