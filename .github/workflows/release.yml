@@ -244,6 +244,20 @@ jobs:
   # which appends — so the body collected one "Full Changelog" line per job, and
   # re-releasing a tag doubled the collection again. Generating here and *setting*
   # the body makes the result identical no matter how many times a tag is built.
+  #
+  # The generated part is a commit list, which cannot say the things a reader
+  # actually needs — that v0.1.10 breaks the protocol and both ends must be
+  # upgraded together, say. So the body is two parts: human highlights, then the
+  # generated changelog under a marker. Everything from the marker down belongs
+  # to this job and is rewritten every run; everything above it is kept. That is
+  # what keeps a re-release identical instead of nested.
+  #
+  # Highlights come from whichever human source exists, in this order:
+  #   1. the body already on the release — what `gh release create --notes` left
+  #      at cut time, or a later edit in the UI;
+  #   2. the tag's annotation body (`git tag -a v0.1.11 -m "$(cat notes.md)"`),
+  #      for when the release was created by the upload step with no body.
+  # Neither one: just the changelog, exactly as before.
   notes:
     name: release notes
     needs: [build, windows, macos]
@@ -252,14 +266,57 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Full history so the annotated tag object (and its message) is present.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Set the release body
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           REF_NAME: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
+          marker='<!-- generated notes below; this job rewrites everything under it -->'
+
+          gh release view "$REF_NAME" --repo "$REPO" --json body --jq .body > body.md || : > body.md
+          # Keep what is above the marker. Without one the body is all human
+          # (first run), so it is kept whole.
+          awk -v m="$marker" 'index($0, m) { exit } { print }' body.md > highlights.md
+
+          # A body from before this job wrote a marker (every tag up to v0.1.10)
+          # is entirely generated: one "**Full Changelog**" line. Left alone it
+          # would be promoted to a highlight and printed twice the next time
+          # that tag is re-released — which this repo does to rebuild a broken
+          # asset. Treat it as no highlights at all.
+          if ! grep -v '^[[:space:]]*$' highlights.md | grep -qv '^\*\*Full Changelog\*\*:'; then
+            : > highlights.md
+          fi
+
+          # Nothing there: fall back to the tag annotation, minus its subject
+          # line (that is just the version).
+          if ! grep -q '[^[:space:]]' highlights.md; then
+            git tag -l --format='%(contents:body)' "$REF_NAME" > highlights.md
+          fi
+
           gh api "repos/${REPO}/releases/generate-notes" \
-            -f tag_name="$REF_NAME" --jq .body > notes.md
+            -f tag_name="$REF_NAME" --jq .body > changelog.md
+
+          {
+            if grep -q '[^[:space:]]' highlights.md; then
+              # Drop trailing blank lines: kept as-is they would accumulate one
+              # more blank line on every re-release, and the point of this job
+              # is that re-releasing changes nothing.
+              awk '{ line[NR] = $0 }
+                   END { for (i = 1; i <= NR; i++) if (line[i] ~ /[^[:space:]]/) last = i
+                         for (i = 1; i <= last; i++) print line[i] }' highlights.md
+              printf '\n'
+            fi
+            printf '%s\n\n' "$marker"
+            cat changelog.md
+          } > notes.md
+
           gh release edit "$REF_NAME" --repo "$REPO" --notes-file notes.md
 
   # Publish the npm installer (@shibenenen/asd) to the public npm registry after
