@@ -392,6 +392,94 @@ async fn list_and_kill_via_cli() {
     assert!(!out.status.success());
 }
 
+/// `asd rename` changes a session's name **without touching what is running in
+/// it** — that is the whole point: a session created with an auto-generated or
+/// prefixed name can be corrected instead of killed and recreated.
+///
+/// The daemon has handled `Frame::Rename` since v7 and the TUI has exposed it as
+/// `r` all along; this covers the scripting entry point added on top.
+#[tokio::test]
+async fn rename_via_cli_keeps_the_running_program() {
+    let daemon = Daemon::start("rename");
+
+    // Print a marker, then stay alive: the marker proves the pty survived.
+    let out = daemon
+        .cli()
+        .args([
+            "new",
+            "old-name",
+            "--cmd",
+            "sh -c 'echo RENAME-MARKER; sleep 300'",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Wait for the marker so we know the program actually ran before the rename.
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let out = daemon.cli().args(["peek", "old-name"]).output().unwrap();
+        if String::from_utf8_lossy(&out.stdout).contains("RENAME-MARKER") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "marker never appeared"
+        );
+        std::thread::sleep(TICK);
+    }
+
+    let out = daemon
+        .cli()
+        .args(["rename", "old-name", "new-name"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rename failed: {out:?}");
+    // Echoes the settled name, the way `new` does, so scripts can read it back.
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "new-name");
+
+    let out = daemon.cli().arg("list").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("new-name"), "list output: {stdout}");
+    assert!(!stdout.contains("old-name"), "old name lingers: {stdout}");
+
+    // The running program and its screen are untouched — this is the property
+    // that makes rename worth having over kill-and-recreate.
+    let out = daemon.cli().args(["peek", "new-name"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("RENAME-MARKER"),
+        "screen lost across rename: {out:?}"
+    );
+
+    // A missing session uses the same exit code as peek/send/kill (3), so
+    // scripting wrappers can keep one mapping for "no such session".
+    let out = daemon
+        .cli()
+        .args(["rename", "ghost", "whatever"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Colliding with an existing name is a plain failure, not "no such session".
+    daemon
+        .cli()
+        .args(["new", "taken", "--cmd", "sleep 300"])
+        .output()
+        .unwrap();
+    let out = daemon
+        .cli()
+        .args(["rename", "new-name", "taken"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_ne!(out.status.code(), Some(3));
+}
+
 /// `asd restart` stops the running daemon (by signal, via the pid file) and
 /// brings up a fresh one; sessions are dropped. This is the recovery path for a
 /// protocol-version bump, where the client can't handshake the old daemon.

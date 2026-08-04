@@ -80,6 +80,35 @@ pub async fn send(
     }
 }
 
+/// `asd rename`: give a session a different name.
+///
+/// The daemon has supported `Frame::Rename` since protocol v7 (and the TUI has
+/// exposed it as the `r` key all along) — this is just the scripting entry
+/// point, so a session created with an auto-prefixed name can be corrected
+/// without killing it and losing the running program.
+///
+/// The daemon validates the new name (character set, length, duplicates) and
+/// replies `Ack` or `Error`; nothing to check on this side.
+pub async fn rename(socket: &Path, name: String, new_name: String) -> anyhow::Result<()> {
+    let mut c = client::connect(socket, ClientKind::Cli).await?;
+    c.writer
+        .write_frame(&Frame::Rename {
+            name,
+            new_name: new_name.clone(),
+        })
+        .await?;
+    match c.reader.read_frame().await? {
+        Some(Frame::Ack) => {
+            // Echo the new name the way `new` echoes the name it settled on, so
+            // a script can read it back instead of assuming the rename took.
+            println!("{new_name}");
+            Ok(())
+        }
+        Some(Frame::Error { code, msg }) => Err(exit::daemon("rename", code, &msg)),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
 /// `asd peek`: print a session's rendered screen, optionally with history above
 /// it, as plain text or as a JSON object.
 pub async fn peek(

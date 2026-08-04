@@ -67,6 +67,15 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Rename a session. The running program and its screen are untouched — only
+    /// the name changes, so a session created with an auto-generated or prefixed
+    /// name can be corrected without losing what is running in it
+    Rename {
+        /// Current session name
+        name: String,
+        /// New session name, [A-Za-z0-9_-]{1,64}
+        new_name: String,
+    },
     /// Type into a session, exactly as if typed at the keyboard. --text is sent
     /// literally (no escaping, no implicit newline); with neither --text nor
     /// --key, bytes are read from stdin (binary-safe, NUL excluded).
@@ -459,6 +468,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
 
             attach::run(c, &name).await?;
         }
+        Cmd::Rename { name, new_name } => control::rename(&socket, name, new_name).await?,
         Cmd::Send {
             name,
             text,
