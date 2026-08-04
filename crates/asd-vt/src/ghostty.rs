@@ -27,6 +27,67 @@ use crate::{
 /// only for the terminal's pixel-size reporting (XTWINOPS, etc.).
 const CELL_PX: (u32, u32) = (8, 16);
 
+#[derive(Clone, Copy)]
+enum ColorQuery {
+    Foreground,
+    Background,
+}
+
+impl ColorQuery {
+    fn code(self) -> u8 {
+        match self {
+            Self::Foreground => 10,
+            Self::Background => 11,
+        }
+    }
+
+    fn response_prefix(self) -> &'static [u8] {
+        match self {
+            Self::Foreground => b"\x1b]10;",
+            Self::Background => b"\x1b]11;",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+enum ColorQueryScan {
+    #[default]
+    Ground,
+    Esc,
+    Osc,
+    OscOne,
+    Code(ColorQuery),
+    Semicolon(ColorQuery),
+    Question(ColorQuery),
+    QuestionEsc(ColorQuery),
+}
+
+impl ColorQueryScan {
+    fn push(&mut self, byte: u8) -> Option<(ColorQuery, &'static [u8])> {
+        use ColorQueryScan::{Code, Esc, Ground, Osc, OscOne, Question, QuestionEsc, Semicolon};
+
+        let previous = std::mem::take(self);
+        let (next, response) = match (previous, byte) {
+            (Ground, b'\x1b') => (Esc, None),
+            (Esc, b']') => (Osc, None),
+            (Osc, b'1') => (OscOne, None),
+            (OscOne, b'0') => (Code(ColorQuery::Foreground), None),
+            (OscOne, b'1') => (Code(ColorQuery::Background), None),
+            (Code(query), b';') => (Semicolon(query), None),
+            (Semicolon(query), b'?') => (Question(query), None),
+            (Question(query), b'\x07') => (Ground, Some((query, b"\x07".as_slice()))),
+            (Question(query), b'\x1b') => (QuestionEsc(query), None),
+            (QuestionEsc(query), b'\\') => (Ground, Some((query, b"\x1b\\".as_slice()))),
+            // The ESC that led to QuestionEsc can also start a new OSC.
+            (QuestionEsc(_), b']') => (Osc, None),
+            (_, b'\x1b') => (Esc, None),
+            _ => (Ground, None),
+        };
+        *self = next;
+        response
+    }
+}
+
 /// [`VtBackend`] implementation backed by libghostty-vt. `!Send`, owned
 /// exclusively by its holding thread.
 pub struct GhosttyVt {
@@ -37,6 +98,8 @@ pub struct GhosttyVt {
     encoder: gkey::Encoder<'static>,
     /// Query replies the terminal produces during `vt_write` (DA/DSR/DECRQM...).
     pty_responses: Rc<RefCell<Vec<u8>>>,
+    /// Parser state used to recognize OSC color queries split across PTY reads.
+    color_query_scan: ColorQueryScan,
     /// Cell rows from the previous `render_snapshot()`, keyed by viewport row
     /// index, reused for rows libghostty reports clean. Valid only because a
     /// row is flagged dirty whenever the content at its index changes — see
@@ -61,6 +124,17 @@ impl VtBackend for GhosttyVt {
         })
         .expect("libghostty terminal allocation failed");
 
+        terminal
+            .set_default_fg_color(Some(RgbColor {
+                r: 255,
+                g: 255,
+                b: 255,
+            }))
+            .expect("setting default foreground color failed");
+        terminal
+            .set_default_bg_color(Some(RgbColor { r: 0, g: 0, b: 0 }))
+            .expect("setting default background color failed");
+
         let pty_responses = Rc::new(RefCell::new(Vec::new()));
         terminal
             .on_pty_write({
@@ -76,12 +150,24 @@ impl VtBackend for GhosttyVt {
             cell_iter: CellIterator::new().expect("cell iterator allocation failed"),
             encoder: gkey::Encoder::new().expect("key encoder allocation failed"),
             pty_responses,
+            color_query_scan: ColorQueryScan::default(),
             prev_cells: Vec::new(),
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
-        self.terminal.vt_write(bytes);
+        let mut chunk_start = 0;
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            if let Some((query, terminator)) = self.color_query_scan.push(byte) {
+                let response_start = self.pty_responses.borrow().len();
+                self.terminal.vt_write(&bytes[chunk_start..=index]);
+                if !self.has_color_response_since(query, response_start) {
+                    self.write_color_response(query, terminator);
+                }
+                chunk_start = index + 1;
+            }
+        }
+        self.terminal.vt_write(&bytes[chunk_start..]);
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
@@ -537,6 +623,38 @@ impl VtBackend for GhosttyVt {
 }
 
 impl GhosttyVt {
+    fn has_color_response_since(&self, query: ColorQuery, start: usize) -> bool {
+        let prefix = query.response_prefix();
+        self.pty_responses.borrow()[start..]
+            .windows(prefix.len())
+            .any(|window| window == prefix)
+    }
+
+    fn write_color_response(&self, query: ColorQuery, terminator: &[u8]) {
+        let color = match query {
+            ColorQuery::Foreground => self
+                .terminal
+                .fg_color()
+                .expect("reading foreground color failed")
+                .expect("default foreground color must be configured"),
+            ColorQuery::Background => self
+                .terminal
+                .bg_color()
+                .expect("reading background color failed")
+                .expect("default background color must be configured"),
+        };
+        let response = format!(
+            "\x1b]{};rgb:{:04x}/{:04x}/{:04x}",
+            query.code(),
+            u16::from(color.r) * 257,
+            u16::from(color.g) * 257,
+            u16::from(color.b) * 257
+        );
+        let mut responses = self.pty_responses.borrow_mut();
+        responses.extend_from_slice(response.as_bytes());
+        responses.extend_from_slice(terminator);
+    }
+
     /// Current (cols, rows) of the terminal.
     fn cols_rows(&self) -> (u16, u16) {
         (

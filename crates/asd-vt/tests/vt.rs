@@ -137,6 +137,62 @@ fn da1_query_produces_pty_response() {
     assert!(vt.take_pty_responses().is_empty());
 }
 
+#[test]
+fn default_color_queries_produce_pty_responses() {
+    let mut vt = term(20, 5);
+    assert!(vt.take_pty_responses().is_empty());
+    let initial = vt.render_snapshot();
+    assert_eq!(
+        initial.foreground,
+        Rgb {
+            r: 255,
+            g: 255,
+            b: 255
+        }
+    );
+    assert_eq!(initial.background, Rgb { r: 0, g: 0, b: 0 });
+
+    vt.feed(b"\x1b]10;");
+    vt.feed(b"?\x1b\\\x1b]11");
+    vt.feed(b";?\x07");
+
+    assert_eq!(
+        vt.take_pty_responses(),
+        b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x07"
+    );
+}
+
+#[test]
+fn color_query_response_preserves_device_response_order() {
+    let mut vt = term(20, 5);
+
+    vt.feed(b"\x1b[6n\x1b]10;?\x1b\\\x1b[c");
+
+    let response = vt.take_pty_responses();
+    assert!(
+        response.starts_with(b"\x1b[1;1R"),
+        "response was {response:?}"
+    );
+    assert!(
+        response
+            .windows(b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\".len())
+            .any(|window| window == b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"),
+        "response was {response:?}"
+    );
+    assert!(response.ends_with(b"c"), "response was {response:?}");
+}
+
+#[test]
+fn color_query_reports_the_effective_osc_override() {
+    let mut vt = term(20, 5);
+    vt.feed(b"\x1b]11;rgb:1111/2222/3333\x1b\\");
+    assert!(vt.take_pty_responses().is_empty());
+
+    vt.feed(b"\x1b]11;?\x1b\\");
+
+    assert_eq!(vt.take_pty_responses(), b"\x1b]11;rgb:1111/2222/3333\x1b\\");
+}
+
 // ---- Snapshot fidelity (spec §8 item 2) ----
 
 fn assert_snapshot_fidelity(sample: &[u8], cols: u16, rows: u16) {

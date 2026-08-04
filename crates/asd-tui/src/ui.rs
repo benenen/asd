@@ -4,7 +4,7 @@
 
 use asd_vt::{CellWidth, RenderSnapshot, Rgb, UnderlineKind};
 use ratatui::Frame;
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear};
@@ -492,7 +492,22 @@ fn render_pane(buf: &mut Buffer, area: Rect, snap: &RenderSnapshot, sel: Option<
             } else {
                 target.set_symbol(&cell.grapheme);
             }
-            let mut style = cell_style(cell);
+            // Ghostty is the terminal model and therefore the authority on how
+            // many grid cells this grapheme occupies. Ratatui otherwise
+            // recomputes the width with its own Unicode table; the two disagree
+            // for some emoji-presentation graphemes (for example, Ghostty says
+            // `✔️` is narrow while unicode-width says it is wide). Buffer::diff
+            // would then skip the real cell after the grapheme and leave a
+            // character from the previous frame on screen.
+            let width = match cell.width {
+                CellWidth::Narrow => 1,
+                CellWidth::Wide => 2,
+                CellWidth::SpacerTail | CellWidth::SpacerHead => unreachable!(),
+            };
+            target.set_diff_option(CellDiffOption::ForcedWidth(
+                std::num::NonZeroU16::new(width).unwrap(),
+            ));
+            let mut style = cell_style(cell, snap);
             // Only cells with written content take the selection highlight —
             // blank (never-written) cells stay plain, so clicking or dragging
             // over empty areas shows no reverse-video block (same rule as the
@@ -511,10 +526,10 @@ fn render_pane(buf: &mut Buffer, area: Rect, snap: &RenderSnapshot, sel: Option<
     }
 }
 
-fn cell_style(cell: &asd_vt::CellSnapshot) -> Style {
+fn cell_style(cell: &asd_vt::CellSnapshot, snap: &RenderSnapshot) -> Style {
     let mut style = Style::new()
-        .fg(cell.fg.map(color).unwrap_or(Color::Reset))
-        .bg(cell.bg.map(color).unwrap_or(Color::Reset));
+        .fg(color(cell.fg.unwrap_or(snap.foreground)))
+        .bg(color(cell.bg.unwrap_or(snap.background)));
     let f = &cell.flags;
     if f.bold {
         style = style.add_modifier(Modifier::BOLD);
@@ -639,6 +654,8 @@ fn session_status(count: usize, scroll: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asd_vt::{CellSnapshot, CursorSnapshot, GhosttyVt, VtBackend};
+    use ratatui::backend::{Backend, CrosstermBackend};
 
     #[test]
     fn truncate_respects_display_width() {
@@ -984,5 +1001,121 @@ mod tests {
                 "the spacer at ({x},0) kept its stale content"
             );
         }
+    }
+
+    #[test]
+    fn pane_diff_uses_the_vt_width_for_emoji_presentation_graphemes() {
+        fn cell(grapheme: &str, fg: Rgb) -> CellSnapshot {
+            CellSnapshot {
+                grapheme: grapheme.to_string(),
+                fg: Some(fg),
+                width: CellWidth::Narrow,
+                ..CellSnapshot::default()
+            }
+        }
+
+        fn snapshot(cells: Vec<CellSnapshot>) -> RenderSnapshot {
+            RenderSnapshot {
+                cols: cells.len() as u16,
+                rows: 1,
+                cells: vec![std::sync::Arc::new(cells)],
+                row_dirty: vec![true],
+                cursor: CursorSnapshot::default(),
+                palette: [Rgb::default(); 256],
+                foreground: Rgb::default(),
+                background: Rgb::default(),
+            }
+        }
+
+        fn ansi_diff(previous: &Buffer, next: &Buffer) -> Vec<u8> {
+            let writer = crate::FrameBuf::default();
+            let mut backend = CrosstermBackend::new(writer.clone());
+            backend.draw(previous.diff_iter(next)).unwrap();
+            backend.flush().unwrap();
+            writer.0.borrow().clone()
+        }
+
+        let blue = Rgb {
+            r: 20,
+            g: 80,
+            b: 180,
+        };
+        let green = Rgb {
+            r: 20,
+            g: 180,
+            b: 80,
+        };
+        let area = Rect::new(0, 0, 3, 1);
+
+        // Ghostty treats the VS16 grapheme as one cell. Ratatui's Unicode-width
+        // table treats it as two. When the grapheme stays unchanged between
+        // frames, a diff that recomputes its width skips the following cell as
+        // a hidden tail, leaving the old character visible there.
+        let first = snapshot(vec![
+            cell("✔️", blue),
+            cell("A", green),
+            CellSnapshot::default(),
+        ]);
+        let second = snapshot(vec![
+            cell("✔️", blue),
+            cell("B", green),
+            CellSnapshot::default(),
+        ]);
+
+        let empty = Buffer::empty(area);
+        let mut first_buf = Buffer::empty(area);
+        render_pane(&mut first_buf, area, &first, None);
+        let mut second_buf = Buffer::empty(area);
+        render_pane(&mut second_buf, area, &second, None);
+
+        let mut terminal = GhosttyVt::new(3, 1, 0);
+        terminal.feed(&ansi_diff(&empty, &first_buf));
+        let first_rendered = terminal.render_snapshot();
+        assert_eq!(first_rendered.cells[0][1].grapheme, "A");
+
+        terminal.feed(&ansi_diff(&first_buf, &second_buf));
+        let rendered = terminal.render_snapshot();
+
+        assert_eq!(rendered.cells[0][0].grapheme, "✔️");
+        assert_eq!(
+            rendered.cells[0][1].grapheme, "B",
+            "the cell after a VT-narrow VS16 grapheme kept the previous frame's character"
+        );
+    }
+
+    #[test]
+    fn pane_uses_the_vt_default_colors_for_unstyled_cells() {
+        let foreground = Rgb {
+            r: 240,
+            g: 241,
+            b: 242,
+        };
+        let background = Rgb {
+            r: 10,
+            g: 11,
+            b: 12,
+        };
+        let snap = RenderSnapshot {
+            cols: 1,
+            rows: 1,
+            cells: vec![std::sync::Arc::new(vec![CellSnapshot {
+                grapheme: "x".to_string(),
+                width: CellWidth::Narrow,
+                ..CellSnapshot::default()
+            }])],
+            row_dirty: vec![true],
+            cursor: CursorSnapshot::default(),
+            palette: [Rgb::default(); 256],
+            foreground,
+            background,
+        };
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buf = Buffer::empty(area);
+
+        render_pane(&mut buf, area, &snap, None);
+
+        let cell = &buf[(0, 0)];
+        assert_eq!(cell.fg, color(foreground));
+        assert_eq!(cell.bg, color(background));
     }
 }
