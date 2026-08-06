@@ -116,6 +116,7 @@ pub async fn peek(
     name: String,
     scrollback: Scrollback,
     json: bool,
+    styles: bool,
 ) -> anyhow::Result<()> {
     let mut c = client::connect(socket, ClientKind::Cli).await?;
     c.writer
@@ -140,6 +141,10 @@ pub async fn peek(
     else {
         unreachable!("matched PeekReply above")
     };
+
+    if styles {
+        return crate::styled_peek::print_json(&mut c, &name, cols, rows).await;
+    }
 
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();

@@ -11,6 +11,7 @@ mod control;
 mod exit;
 mod platform;
 mod render;
+mod styled_peek;
 
 use std::path::PathBuf;
 
@@ -110,6 +111,11 @@ enum Cmd {
         /// Emit a JSON object instead of raw text
         #[arg(long)]
         json: bool,
+        /// Include terminal style annotations in JSON. This refuses when a
+        /// viewer is already attached; its zero-size observer avoids resizing
+        /// an otherwise-unattached pty and never sends input.
+        #[arg(long, requires = "json", conflicts_with = "scrollback")]
+        styles: bool,
     },
     /// What each session is working on: the project documents in its working
     /// directory, so an agent can tell the sessions apart before running
@@ -480,7 +486,17 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             name,
             scrollback,
             json,
-        } => control::peek(&socket, name, control::scrollback_arg(scrollback), json).await?,
+            styles,
+        } => {
+            control::peek(
+                &socket,
+                name,
+                control::scrollback_arg(scrollback),
+                json,
+                styles,
+            )
+            .await?
+        }
         Cmd::Card { cmd } => match cmd.unwrap_or(CardCmd::List { json: false }) {
             CardCmd::List { json } => card::list(&socket, json).await?,
             CardCmd::Inspect { name, json } => card::inspect(&socket, name, json).await?,
@@ -600,7 +616,28 @@ pub(crate) fn format_age(created_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TITLE_COL_MAX, clean_title, pad_cell, str_width, title_col_width};
+    use super::{Args, Cmd, TITLE_COL_MAX, clean_title, pad_cell, str_width, title_col_width};
+    use clap::Parser;
+
+    #[test]
+    fn peek_styles_is_a_json_only_public_cli_option() {
+        assert!(Args::try_parse_from(["asd", "peek", "s", "--styles"]).is_err());
+        assert!(
+            Args::try_parse_from(["asd", "peek", "s", "--json", "--styles", "--scrollback"])
+                .is_err()
+        );
+
+        let args = Args::try_parse_from(["asd", "peek", "s", "--json", "--styles"])
+            .expect("--styles should be accepted with --json");
+        assert!(matches!(
+            args.cmd,
+            Some(Cmd::Peek {
+                json: true,
+                styles: true,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn clean_title_trims_and_strips_control_characters() {
