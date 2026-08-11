@@ -13,8 +13,8 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Mutex, mpsc};
 
-use asd_proto::{Frame, IDLE_SETTLE_MS, code};
-use asd_vt::{GhosttyVt, VtBackend};
+use asd_proto::{Frame, IDLE_SETTLE_MS, TerminalAppearance, TerminalColor, code};
+use asd_vt::{ColorQueryFilter, GhosttyVt, Rgb, VtBackend};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tracing::{debug, info, warn};
 
@@ -24,6 +24,8 @@ use crate::registry::Registry;
 /// a full queue means the client is dead → disconnect it; the session is
 /// unaffected.
 pub const OUTPUT_QUEUE_CAP: usize = 4 * 1024 * 1024;
+/// Quiet interval between scripted text and its requested Enter keypress.
+const SCRIPT_ENTER_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Queue element from connection tasks → the socket write loop.
 #[derive(Debug)]
@@ -92,6 +94,13 @@ pub enum SessionMsg {
     PtyEof,
     /// Client input (already-encoded bytes), written to the pty.
     Input(Vec<u8>),
+    /// Attach-free scripted input. The session thread performs the optional
+    /// Enter itself so no other client's input can interleave with the pair.
+    ScriptInput {
+        bytes: Vec<u8>,
+        enter: bool,
+        completed: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    },
     /// Resize policy v1: "last Attach/Resize wins" (spec §5).
     Resize {
         /// Which viewer changed size; the pty is sized from all of them.
@@ -105,6 +114,7 @@ pub enum SessionMsg {
         sink: ClientSink,
         cols: u16,
         rows: u16,
+        appearance: TerminalAppearance,
     },
     Detach {
         client_id: u64,
@@ -567,6 +577,8 @@ fn session_thread(
     registry: Arc<Mutex<Registry>>,
 ) {
     let mut vt = GhosttyVt::new(cols, rows, scrollback);
+    let mut client_output_filter = ColorQueryFilter::default();
+    let mut terminal_appearance = TerminalAppearance::default();
     let mut clients: Vec<ClientSink> = Vec::new();
     // Each attached client's window size; the pty follows the smallest.
     let mut client_sizes: std::collections::HashMap<u64, (u16, u16)> = Default::default();
@@ -602,6 +614,10 @@ fn session_thread(
         };
         match msg {
             SessionMsg::PtyOutput(bytes) => {
+                // Clients render their own terminal models, some of which also
+                // answer OSC queries. Keep theme queries daemon-only so one
+                // shared PTY receives exactly one response.
+                let client_bytes = client_output_filter.push(&bytes);
                 vt.feed(&bytes);
                 // Stamp the output time so the network side can report idle_ms
                 // (drives `asd wait --idle`).
@@ -617,20 +633,30 @@ fn session_thread(
                 // The terminal's replies to DA/DSR-style queries must be
                 // written back to the pty, otherwise capability probes in
                 // vim/htop hang
-                let resp = vt.take_pty_responses();
-                if !resp.is_empty() {
-                    let _ = pty_writer.write_all(&resp);
-                    let _ = pty_writer.flush();
+                if let Err(error) = flush_pty_responses(&mut vt, &mut pty_writer) {
+                    warn!(
+                        session = %name,
+                        error = %error,
+                        "writing terminal query response to pty failed; ending session"
+                    );
+                    request_child_shutdown(&meta);
+                    break;
                 }
-                let output = Frame::Output { bytes };
-                broadcast(&mut clients, &meta, output.clone());
+                let output = (!client_bytes.is_empty()).then_some(Frame::Output {
+                    bytes: client_bytes,
+                });
+                if let Some(output) = &output {
+                    broadcast(&mut clients, &meta, output.clone());
+                }
                 // Followers see the same bytes, then where that leaves the
                 // session. Sending the pair from here — inside the one thread
                 // that serializes everything about this session — is what lets
                 // a follower trust that the status describes the output it just
                 // read, rather than whatever a separate poll happened to catch.
                 if !followers.is_empty() {
-                    followers.retain(|f| f.send(output.clone()));
+                    if let Some(output) = output {
+                        followers.retain(|f| f.send(output.clone()));
+                    }
                     notify_followers(&mut followers, &meta);
                 }
                 idle_announced = false;
@@ -644,6 +670,14 @@ fn session_thread(
                     debug!(session = %name, "pty write failed (child likely exited)");
                 }
             }
+            SessionMsg::ScriptInput {
+                bytes,
+                enter,
+                completed,
+            } => {
+                let result = write_script_input(&mut pty_writer, &bytes, enter, std::thread::sleep);
+                let _ = completed.send(result);
+            }
             SessionMsg::Resize {
                 client_id,
                 cols,
@@ -652,7 +686,42 @@ fn session_thread(
                 client_sizes.insert(client_id, (cols, rows));
                 resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
             }
-            SessionMsg::Attach { sink, cols, rows } => {
+            SessionMsg::Attach {
+                sink,
+                cols,
+                rows,
+                appearance,
+            } => {
+                let adopted = merge_terminal_appearance(terminal_appearance, appearance);
+                let new_foreground = terminal_appearance
+                    .foreground
+                    .is_none()
+                    .then_some(adopted.foreground)
+                    .flatten()
+                    .map(vt_rgb);
+                let new_background = terminal_appearance
+                    .background
+                    .is_none()
+                    .then_some(adopted.background)
+                    .flatten()
+                    .map(vt_rgb);
+                terminal_appearance = adopted;
+                vt.set_default_colors(new_foreground, new_background);
+                // A query can predate the first attach. Release its now-known
+                // reply before taking the Snapshot so the child can continue.
+                if let Err(error) = flush_pty_responses(&mut vt, &mut pty_writer) {
+                    warn!(
+                        session = %name,
+                        error = %error,
+                        "writing terminal query response to pty failed; ending session"
+                    );
+                    sink.send(Frame::Error {
+                        code: code::SESSION_EXITED,
+                        msg: format!("session '{name}' pty write failed"),
+                    });
+                    request_child_shutdown(&meta);
+                    break;
+                }
                 // The newcomer joins the size negotiation before its snapshot
                 // is taken, so the dump it gets already describes the size
                 // everyone ends up at.
@@ -730,18 +799,15 @@ fn session_thread(
             }
             SessionMsg::Kill => {
                 info!(session = %name, "kill requested");
-                kill_child(&meta, false); // graceful
-                // Follow up with SIGKILL after a 2s grace period (skipped if
-                // the child already exited and the liveness check fails)
-                let meta2 = Arc::clone(&meta);
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                    if meta2.alive.load(Ordering::Relaxed) {
-                        kill_child(&meta2, true); // force
-                    }
-                });
+                request_child_shutdown(&meta);
             }
             SessionMsg::PtyEof => {
+                let tail = client_output_filter.finish();
+                if !tail.is_empty() {
+                    let output = Frame::Output { bytes: tail };
+                    broadcast(&mut clients, &meta, output.clone());
+                    followers.retain(|f| f.send(output.clone()));
+                }
                 info!(session = %name, "pty eof, session ending");
                 break;
             }
@@ -787,6 +853,60 @@ fn session_thread(
     }
     meta.attached_clients.store(0, Ordering::Relaxed);
     info!(session = %name, "session ended");
+}
+
+fn merge_terminal_appearance(
+    current: TerminalAppearance,
+    offered: TerminalAppearance,
+) -> TerminalAppearance {
+    TerminalAppearance {
+        foreground: current.foreground.or(offered.foreground),
+        background: current.background.or(offered.background),
+    }
+}
+
+fn vt_rgb(color: TerminalColor) -> Rgb {
+    Rgb {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+    }
+}
+
+fn flush_pty_responses(
+    vt: &mut GhosttyVt,
+    writer: &mut Box<dyn Write + Send>,
+) -> std::io::Result<()> {
+    let responses = vt.take_pty_responses();
+    if !responses.is_empty() {
+        writer.write_all(&responses)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn write_script_input<W, P>(
+    writer: &mut W,
+    bytes: &[u8],
+    enter: bool,
+    mut pause: P,
+) -> std::io::Result<()>
+where
+    W: Write + ?Sized,
+    P: FnMut(std::time::Duration),
+{
+    if !bytes.is_empty() {
+        writer.write_all(bytes)?;
+        writer.flush()?;
+    }
+    if enter {
+        if !bytes.is_empty() {
+            pause(SCRIPT_ENTER_DELAY);
+        }
+        writer.write_all(b"\r")?;
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 /// The pty size every attached client has to live with.
@@ -927,6 +1047,21 @@ pub fn kill_child(meta: &SessionMeta, force: bool) {
     crate::platform::kill_child(pid, force);
 }
 
+/// Ask a child to stop, then force it after the same grace period as `Kill`.
+/// Used for an explicit kill and for a broken PTY response path: continuing a
+/// session whose terminal queries can no longer be answered leaves the child
+/// blocked indefinitely with no usable terminal channel.
+fn request_child_shutdown(meta: &Arc<SessionMeta>) {
+    kill_child(meta, false);
+    let meta = Arc::clone(meta);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if meta.alive.load(Ordering::Relaxed) {
+            kill_child(&meta, true);
+        }
+    });
+}
+
 // The only tests here exercise the macOS argv parser, which is compiled on
 // Linux for exactly that purpose; on any other target there is nothing to test.
 #[cfg(all(test, target_os = "linux"))]
@@ -969,5 +1104,114 @@ mod tests {
     fn parse_procargs2_rejects_malformed() {
         assert_eq!(parse_procargs2(&[]), None); // too short for argc
         assert_eq!(parse_procargs2(&0i32.to_ne_bytes()), None); // argc = 0
+    }
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+    use asd_proto::{TerminalAppearance, TerminalColor};
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "synthetic PTY failure",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn color(r: u8, g: u8, b: u8) -> TerminalColor {
+        TerminalColor { r, g, b }
+    }
+
+    #[test]
+    fn first_known_terminal_color_wins_per_channel() {
+        let first = TerminalAppearance {
+            foreground: None,
+            background: Some(color(1, 2, 3)),
+        };
+        let second = TerminalAppearance {
+            foreground: Some(color(4, 5, 6)),
+            background: Some(color(7, 8, 9)),
+        };
+
+        let adopted = merge_terminal_appearance(TerminalAppearance::default(), first);
+        let adopted = merge_terminal_appearance(adopted, second);
+
+        assert_eq!(
+            adopted,
+            TerminalAppearance {
+                foreground: Some(color(4, 5, 6)),
+                background: Some(color(1, 2, 3)),
+            }
+        );
+    }
+
+    #[test]
+    fn pty_response_write_errors_are_returned_to_the_session_loop() {
+        let mut vt = GhosttyVt::new(10, 3, 0);
+        vt.feed(b"\x1b[6n");
+        let mut writer: Box<dyn Write + Send> = Box::new(FailingWriter);
+
+        let error = flush_pty_responses(&mut vt, &mut writer).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+}
+
+#[cfg(test)]
+mod scripting_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+        flushes: usize,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(buffer.to_vec());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scripted_enter_is_a_separate_pty_write_after_the_quiet_gap() {
+        let mut writer = RecordingWriter::default();
+        let mut pauses = Vec::new();
+
+        write_script_input(&mut writer, b"do work", true, |duration| {
+            pauses.push(duration)
+        })
+        .unwrap();
+
+        assert_eq!(writer.writes, vec![b"do work".to_vec(), b"\r".to_vec()]);
+        assert_eq!(writer.flushes, 2);
+        assert_eq!(pauses, vec![SCRIPT_ENTER_DELAY]);
+    }
+
+    #[test]
+    fn enter_without_a_payload_has_no_artificial_delay() {
+        let mut writer = RecordingWriter::default();
+        let mut pauses = Vec::new();
+
+        write_script_input(&mut writer, b"", true, |duration| pauses.push(duration)).unwrap();
+
+        assert_eq!(writer.writes, vec![b"\r".to_vec()]);
+        assert_eq!(writer.flushes, 1);
+        assert!(pauses.is_empty());
     }
 }

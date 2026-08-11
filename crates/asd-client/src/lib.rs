@@ -3,13 +3,16 @@
 //!
 //! The wire format itself — frames, codec, framed reader/writer, path
 //! contract — lives in `asd-proto`, which the daemon shares. What lives here
-//! is the half only a *client* runs: opening a connection ([`handshake`]) and
+//! is the half only a *client* runs: opening a connection ([`handshake`]),
 //! deciding which arriving frame belongs to the view currently on screen
-//! ([`attach::Attach`]). Keeping it out of `asd-proto` means the daemon does
-//! not compile client bookkeeping it never executes, and the three clients
-//! cannot drift apart on rules they must all observe identically.
+//! ([`attach::Attach`]), and bounded probing of host-terminal capabilities
+//! ([`terminal`]). Keeping it out of `asd-proto` means the daemon does not
+//! compile client bookkeeping it never executes, and the three clients cannot
+//! drift apart on rules they must all observe identically.
 
 pub mod attach;
+mod platform;
+pub mod terminal;
 
 use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, PROTO_VERSION};
 use tokio::io::{AsyncRead, AsyncWrite};

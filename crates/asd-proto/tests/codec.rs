@@ -3,7 +3,7 @@
 
 use asd_proto::{
     ClientKind, Frame, FrameReader, FrameWriter, MAX_FRAME_LEN, ProtoError, Scrollback,
-    SessionInfo, decode_frame, encode_frame,
+    SessionInfo, TerminalAppearance, TerminalColor, decode_frame, encode_frame,
 };
 
 /// Covers all frame kinds of protocol v1. New frames must be added here in
@@ -67,6 +67,24 @@ fn all_frames() -> Vec<Frame> {
             name: "s0".into(),
             cols: 120,
             rows: 40,
+            appearance: TerminalAppearance {
+                foreground: Some(TerminalColor {
+                    r: 0xe7,
+                    g: 0xe2,
+                    b: 0xd6,
+                }),
+                background: Some(TerminalColor {
+                    r: 0x0b,
+                    g: 0x0d,
+                    b: 0x11,
+                }),
+            },
+        },
+        Frame::Attach {
+            name: "unknown-theme".into(),
+            cols: 80,
+            rows: 24,
+            appearance: TerminalAppearance::default(),
         },
         Frame::Snapshot {
             vt: b"\x1b[2J\x1b[Hhello".to_vec(),
@@ -91,7 +109,8 @@ fn all_frames() -> Vec<Frame> {
         Frame::Refresh,
         Frame::SendInput {
             name: "build".into(),
-            bytes: b"make test\r".to_vec(),
+            bytes: b"make test".to_vec(),
+            enter: true,
         },
         Frame::Ack,
         Frame::Peek {
@@ -154,6 +173,11 @@ fn all_frames() -> Vec<Frame> {
             msg: "proto version mismatch".into(),
         },
     ]
+}
+
+#[test]
+fn protocol_version_covers_atomic_send_enter() {
+    assert_eq!(asd_proto::PROTO_VERSION, 12);
 }
 
 #[test]

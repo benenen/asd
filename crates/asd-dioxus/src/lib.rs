@@ -14,6 +14,7 @@ mod model;
 mod platform;
 mod settings;
 mod ssh;
+mod theme;
 
 use std::sync::OnceLock;
 

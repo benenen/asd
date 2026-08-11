@@ -52,12 +52,22 @@ enum Exit {
 
 pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     let (mut cols, mut rows) = term_size();
+    // OSC replies arrive on stdin; raw mode prevents canonical input from
+    // holding them for a newline. This still precedes the alternate screen, so
+    // attach errors remain visible after the guard restores the terminal.
+    platform::install_terminating_signal_restore(restore_sequence());
+    let probe = {
+        let _probe_raw =
+            RawGuard::enable().context("enabling raw terminal mode for color probe")?;
+        asd_client::terminal::probe_terminal_colors().context("probing host terminal colors")?
+    };
     client
         .writer
         .write_frame(&Frame::Attach {
             name: name.to_string(),
             cols,
             rows,
+            appearance: probe.appearance,
         })
         .await?;
 
@@ -70,12 +80,8 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
     };
 
     eprintln!("[asd: attached to '{name}', detach: Ctrl-\\]");
-    // `ScreenGuard`/`RawGuard` hand the terminal back on the way out, but `Drop`
-    // does not run when we are killed: a closed tab (SIGHUP) or a `kill` from
-    // another window (SIGTERM) would leave the shell we return to in mouse
-    // tracking, printing `ESC[<..M` on every mouse move. Arm the same restore
-    // from a signal handler before taking the terminal over.
-    platform::install_terminating_signal_restore(restore_sequence());
+    // The Attach/Snapshot wait above stays in cooked mode, so Ctrl-C can still
+    // interrupt a stalled daemon. Raw mode is needed only for the live client.
     let _raw = RawGuard::enable().context("enabling raw terminal mode")?;
     // Alt screen only — no mouse tracking is enabled here. We enable/disable it
     // dynamically to mirror the session (see `sync_host_modes`). Dropped before
@@ -132,6 +138,12 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
 
     // Stdin reader → raw byte chunks; None on EOF.
     let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
+    if !probe.input.is_empty() {
+        let startup = asd_client::terminal::prepare_probe_input(probe.input, vt.bracketed_paste());
+        in_tx
+            .try_send(startup)
+            .expect("fresh stdin queue has capacity");
+    }
     let stdin_task = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 8192];

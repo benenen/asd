@@ -19,9 +19,10 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use asd_proto::SessionInfo;
+use asd_client::terminal::ProbeResult;
+use asd_proto::{SessionInfo, TerminalAppearance};
 use asd_vt::{GhosttyVt, Key as VtKey, KeyEvent, Mods, RenderSnapshot, VtBackend};
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent as CtKey, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -35,16 +36,48 @@ mod modal;
 mod platform;
 mod ui;
 
-use conn::{Cmd, Conn, Ev};
+use conn::{Cmd, Conn, ConnectionEvent, Ev};
 use modal::{Modal, RenameInput, validate_rename};
 
 /// Scrollback kept by the local terminal.
 const SCROLLBACK: usize = 10_000;
 /// Wheel scroll step in lines.
 const WHEEL_STEP: usize = 3;
+/// Wheel scroll step in sidebar sessions.
+const SIDEBAR_WHEEL_STEP: usize = 1;
 /// Longest the pane defers a repaint while a program holds a synchronized-output
 /// (`?2026`) update open, bounding a lost `?2026l` (matches typical terminals).
 const SYNC_MAX: Duration = Duration::from_millis(150);
+/// Minimum time between frames driven only by the continuous running shimmer.
+/// Windows Terminal refreshes auto-detected URL locations after 100 ms without
+/// output, so leave enough headroom for its trailing debounce to run.
+const RUNNING_SHIMMER_FRAME_INTERVAL: Duration = Duration::from_millis(150);
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(30);
+const FAST_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const FIRST_CONNECTION_GENERATION: u64 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoopTiming {
+    shimmer_due: bool,
+    poll_timeout: Duration,
+}
+
+fn loop_timing(
+    last_frame_flush: Instant,
+    now: Instant,
+    has_running_fx: bool,
+    fast_path: bool,
+) -> LoopTiming {
+    LoopTiming {
+        shimmer_due: has_running_fx
+            && now.saturating_duration_since(last_frame_flush) >= RUNNING_SHIMMER_FRAME_INTERVAL,
+        poll_timeout: if fast_path {
+            FAST_EVENT_POLL_INTERVAL
+        } else {
+            EVENT_POLL_INTERVAL
+        },
+    }
+}
 
 /// A drag selection anchored in **absolute screen-space rows** (0 = oldest
 /// scrollback line, same coordinate system as `scrollback_rows`) so the
@@ -106,8 +139,9 @@ fn row_y(side: ratatui::layout::Rect, i: usize, offset: usize) -> Option<u16> {
 pub(crate) struct App {
     socket: PathBuf,
     conn: Conn,
-    ev_rx: Receiver<Ev>,
-    ev_tx: Sender<Ev>,
+    ev_rx: Receiver<ConnectionEvent>,
+    ev_tx: Sender<ConnectionEvent>,
+    connection_generation: u64,
 
     pub sessions: Vec<SessionInfo>,
     /// The attached session's name.
@@ -126,6 +160,8 @@ pub(crate) struct App {
     term_size: (u16, u16),
     /// Current sidebar width (draggable; [`ui::MIN_SIDEBAR`]..[`ui::MAX_SIDEBAR`]).
     sidebar_w: u16,
+    /// Sessions scrolled past the top of the sidebar.
+    sidebar_scroll: usize,
     /// Sidebar hidden (Ctrl+A b) — the pane takes the full width.
     sidebar_hidden: bool,
     /// Bottom status bar hidden (Ctrl+A s) — the pane takes the full height, so
@@ -164,6 +200,12 @@ pub(crate) struct App {
 
     /// Session named on the command line, consumed by the first auto-select.
     preferred: Option<String>,
+    /// Defaults reported by the real terminal hosting this TUI. Reused for
+    /// every session switch; the daemon adopts each first known channel.
+    terminal_appearance: TerminalAppearance,
+    /// Keys typed during the short startup color probe, forwarded after the
+    /// first session is selected rather than swallowed.
+    startup_input: Vec<u8>,
     /// The session this UI itself runs inside ($ASD_SESSION, set by the
     /// daemon at spawn): attaching it would be a render feedback loop, so it
     /// is never selectable here.
@@ -290,16 +332,7 @@ fn cursor_tail(tail: Option<(u16, u16, bool)>) -> Vec<u8> {
 /// does — otherwise pasted content could close the bracket early and have its
 /// tail read as keystrokes.
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    const START: &[u8] = b"\x1b[200~";
-    const END: &[u8] = b"\x1b[201~";
-    if !bracketed {
-        return text.as_bytes().to_vec();
-    }
-    let mut out = Vec::with_capacity(text.len() + START.len() + END.len());
-    out.extend_from_slice(START);
-    out.extend_from_slice(text.replace("\x1b[201~", "").as_bytes());
-    out.extend_from_slice(END);
-    out
+    asd_client::terminal::paste_bytes(text.as_bytes(), bracketed)
 }
 
 /// Open the TUI against `socket`; `session` preselects one by name. The
@@ -313,6 +346,13 @@ pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
     // Manual `ratatui::init`, with the backend writing into a `FrameBuf`
     // instead of stdout so each frame is flushed as a single write.
     ratatui::crossterm::terminal::enable_raw_mode()?;
+    let probe = match asd_client::terminal::probe_terminal_colors() {
+        Ok(probe) => probe,
+        Err(error) => {
+            let _ = ratatui::crossterm::terminal::disable_raw_mode();
+            return Err(error.into());
+        }
+    };
     let _ = execute!(
         std::io::stdout(),
         ratatui::crossterm::terminal::EnterAlternateScreen
@@ -340,7 +380,7 @@ pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
         event::EnableBracketedPaste
     );
 
-    let result = event_loop(&mut terminal, &frame, socket, session);
+    let result = event_loop(&mut terminal, &frame, socket, session, probe);
 
     let _ = execute!(
         std::io::stdout(),
@@ -360,9 +400,11 @@ fn event_loop(
     frame: &FrameBuf,
     socket: PathBuf,
     preferred: Option<String>,
+    probe: ProbeResult,
 ) -> anyhow::Result<()> {
-    let (ev_tx, ev_rx) = channel::<Ev>();
-    let conn = Conn::spawn(socket.clone(), ev_tx.clone());
+    let (ev_tx, ev_rx) = channel::<ConnectionEvent>();
+    let connection_generation = FIRST_CONNECTION_GENERATION;
+    let conn = Conn::spawn(socket.clone(), connection_generation, ev_tx.clone());
     let size = terminal.size()?;
     let sidebar_w = ui::SIDEBAR_W;
     let grid = ui::pane_grid(
@@ -377,6 +419,7 @@ fn event_loop(
         conn,
         ev_rx,
         ev_tx,
+        connection_generation,
         sessions: Vec::new(),
         active: None,
         vt: None,
@@ -385,6 +428,7 @@ fn event_loop(
         vt_grid: grid,
         term_size: (size.width, size.height),
         sidebar_w,
+        sidebar_scroll: 0,
         sidebar_hidden: false,
         status_hidden: false,
         dragging_divider: false,
@@ -398,6 +442,8 @@ fn event_loop(
         prefix: false,
         now_ms: now_ms(),
         preferred,
+        terminal_appearance: probe.appearance,
+        startup_input: probe.input,
         self_session: std::env::var("ASD_SESSION").ok(),
         cache: None,
         parked: Vec::new(),
@@ -411,6 +457,7 @@ fn event_loop(
         dirty: true,
         quit: false,
     };
+    let mut last_frame_flush = Instant::now();
 
     while !app.quit {
         // The terminal's own size is the authority, not the resize *event*.
@@ -428,14 +475,23 @@ fn event_loop(
             app.term_size = (size.width, size.height);
             app.apply_layout();
         }
-        while let Ok(ev) = app.ev_rx.try_recv() {
-            app.on_conn_event(ev);
+        while let Ok(event) = app.ev_rx.try_recv() {
+            if let Some(ev) = event_for_generation(app.connection_generation, event) {
+                app.on_conn_event(ev);
+            }
         }
+        let timing = loop_timing(
+            last_frame_flush,
+            Instant::now(),
+            !app.running_fx.is_empty(),
+            app.pane_hold.is_some() || !app.row_fx.is_empty(),
+        );
+        app.dirty |= timing.shimmer_due;
         if app.dirty {
             app.now_ms = now_ms();
             // One frame = one write: `FrameBuf` wraps the cell diff in
             // `?2026h ?25l` … `<CUP><?25h|?25l> ?2026l` and flushes it in a
-            // single `write_all`, so the ~33 fps shimmer redraw can neither
+            // single `write_all`, so a shimmer redraw can neither
             // drag the cursor across the sidebar cells nor toggle its
             // visibility at a flush boundary — both historical flicker sources
             // (separate `execute!` flushes made every frame 4–7 writes, and
@@ -444,22 +500,16 @@ fn event_loop(
             frame.begin();
             terminal.draw(|f| ui::draw(f, &mut app))?;
             frame.finish(app.cursor_tail)?;
-            // Effects animate frame-by-frame, and a pane hold must expire on
-            // time: stay dirty while any is pending (the input poll below caps
-            // the frame rate at ~33 fps). The running borders breathe as long
-            // as some session is producing output.
-            app.dirty =
-                !app.row_fx.is_empty() || !app.running_fx.is_empty() || app.pane_hold.is_some();
+            last_frame_flush = Instant::now();
+            // Transient effects and a pane hold need the 5 ms fast path. The
+            // continuous running shimmer is scheduled separately so it leaves
+            // a host-output idle window without slowing input polling.
+            app.dirty = !app.row_fx.is_empty() || app.pane_hold.is_some();
         }
         // Tighten the loop while a switch converges or effects animate:
         // conn events are only drained between polls, so a long poll adds
         // whole quanta of latency to the dump/repaint pipeline.
-        let poll_ms = if app.pane_hold.is_some() || !app.row_fx.is_empty() {
-            5
-        } else {
-            30
-        };
-        if event::poll(Duration::from_millis(poll_ms))? {
+        if event::poll(timing.poll_timeout)? {
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
                 Event::Mouse(m) => app.on_mouse(m, terminal.size()?),
@@ -500,18 +550,64 @@ impl App {
         self.row_fx.push((name, fx));
     }
 
-    /// Sessions scrolled off the top of the sidebar so the active row stays
-    /// visible (see [`ui::sidebar_offset`]). Drawing, effects, and mouse
-    /// hit-testing all use this, so a click maps to the row the user sees.
+    fn sidebar_capacity(&self) -> usize {
+        let total = ratatui::layout::Rect::new(0, 0, self.term_size.0, self.term_size.1);
+        let (side, _, _) = ui::areas(
+            total,
+            self.sidebar_w,
+            self.sidebar_hidden,
+            self.status_hidden,
+        );
+        (side.height / 2) as usize
+    }
+
+    /// Sessions scrolled off the top of the sidebar. Drawing, effects, and
+    /// mouse hit-testing all use this, so a click maps to the row the user sees.
     pub(crate) fn sidebar_offset(&self) -> usize {
-        // The sidebar spans the body height (whole height minus the bottom bar).
-        let cap = (self.term_size.1.saturating_sub(1) / 2) as usize;
-        let active_idx = self
+        ui::scroll_sidebar_offset(
+            self.sidebar_scroll,
+            0,
+            self.sessions.len(),
+            self.sidebar_capacity(),
+        )
+    }
+
+    fn clamp_sidebar_scroll(&mut self) {
+        self.sidebar_scroll = self.sidebar_offset();
+    }
+
+    fn ensure_active_sidebar_visible(&mut self) {
+        let Some(active_idx) = self
             .active
             .as_deref()
             .and_then(|a| self.sessions.iter().position(|s| s.name == a))
-            .unwrap_or(0);
-        ui::sidebar_offset(active_idx, self.sessions.len(), cap)
+        else {
+            self.clamp_sidebar_scroll();
+            return;
+        };
+        let next = ui::sidebar_offset_for_selection(
+            self.sidebar_scroll,
+            active_idx,
+            self.sessions.len(),
+            self.sidebar_capacity(),
+        );
+        if next != self.sidebar_scroll {
+            self.sidebar_scroll = next;
+            self.dirty = true;
+        }
+    }
+
+    fn scroll_sidebar_by(&mut self, delta: isize) {
+        let next = ui::scroll_sidebar_offset(
+            self.sidebar_scroll,
+            delta,
+            self.sessions.len(),
+            self.sidebar_capacity(),
+        );
+        if next != self.sidebar_scroll {
+            self.sidebar_scroll = next;
+            self.dirty = true;
+        }
     }
 
     /// Advance and paint the sidebar effects; called once per drawn frame.
@@ -696,6 +792,7 @@ impl App {
 
     fn select(&mut self, name: String) {
         if self.active.as_deref() == Some(&name) {
+            self.ensure_active_sidebar_visible();
             return;
         }
         // tmux's $TMUX idea: never attach the session hosting this UI — the
@@ -721,6 +818,7 @@ impl App {
             }
         }
         self.active = Some(name.clone());
+        self.ensure_active_sidebar_visible();
         // Hold a frame on screen while the new attach converges — never draw
         // the empty terminal (a black flash). Prefer the target session's own
         // parked frame (instant, boo-style); fall back to what was showing.
@@ -759,6 +857,7 @@ impl App {
             name,
             cols: self.grid.0,
             rows: self.grid.1,
+            appearance: self.terminal_appearance,
         });
         self.dirty = true;
     }
@@ -817,6 +916,7 @@ impl App {
                     }
                 }
                 self.sessions = list;
+                self.clamp_sidebar_scroll();
                 self.follow_session_size();
                 // The attached session vanished (killed elsewhere): fall back
                 // to the first remaining one.
@@ -865,12 +965,19 @@ impl App {
                 }
                 if let Some(vt) = &mut self.vt {
                     vt.feed(&data);
-                    // Query answers (DA/DSR) must reach the pty or vim-like
-                    // programs hang probing.
-                    let replies = vt.take_pty_responses();
-                    if !replies.is_empty() {
-                        self.send(Cmd::Input(replies));
-                    }
+                    // The daemon owns the session VT and is the only query
+                    // responder. A local mirror must drain and discard its
+                    // effects or multiple viewers would answer one PTY query.
+                    let _ = vt.take_pty_responses();
+                }
+                // Probe input is replayed only after the first Snapshot, when
+                // the session's bracketed-paste mode is known. This prevents a
+                // multiline paste during startup from becoming raw Enter keys.
+                if snapshot && !self.startup_input.is_empty() {
+                    let input = std::mem::take(&mut self.startup_input);
+                    let bracketed = self.vt.as_mut().is_some_and(|vt| vt.bracketed_paste());
+                    let input = asd_client::terminal::prepare_probe_input(input, bracketed);
+                    self.send(Cmd::Input(input));
                 }
                 // The terminal changed: the pane must regenerate next draw.
                 self.pane_needs_render = true;
@@ -1079,6 +1186,10 @@ impl App {
                 s.name = new.clone();
             }
         }
+        // The daemon lists sessions by name. Mirror that ordering immediately
+        // so the next refresh cannot move the active row out of the viewport.
+        self.sessions.sort_by(|a, b| a.name.cmp(&b.name));
+        self.ensure_active_sidebar_visible();
         self.send(Cmd::Rename {
             name: target,
             new_name: new,
@@ -1125,6 +1236,14 @@ impl App {
             self.sidebar_hidden,
             self.status_hidden,
         );
+        let wheel_target = ui::wheel_target(
+            area,
+            self.sidebar_w,
+            self.sidebar_hidden,
+            self.status_hidden,
+            m.column,
+            m.row,
+        );
         let in_pane = m.column >= pane.left()
             && m.column < pane.right()
             && m.row >= pane.top()
@@ -1169,8 +1288,16 @@ impl App {
             }
         }
         match m.kind {
-            MouseEventKind::ScrollUp => self.scroll_by(WHEEL_STEP as isize),
-            MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_STEP as isize)),
+            MouseEventKind::ScrollUp => match wheel_target {
+                ui::WheelTarget::Sidebar => self.scroll_sidebar_by(-(SIDEBAR_WHEEL_STEP as isize)),
+                ui::WheelTarget::Pane => self.scroll_by(WHEEL_STEP as isize),
+                ui::WheelTarget::None => {}
+            },
+            MouseEventKind::ScrollDown => match wheel_target {
+                ui::WheelTarget::Sidebar => self.scroll_sidebar_by(SIDEBAR_WHEEL_STEP as isize),
+                ui::WheelTarget::Pane => self.scroll_by(-(WHEEL_STEP as isize)),
+                ui::WheelTarget::None => {}
+            },
             // Grabbing the divider begins a live sidebar resize (consumed by the
             // TUI — never a selection). Left button only: right/middle clicks
             // must not select, kill, or start a drag-selection.
@@ -1314,6 +1441,7 @@ impl App {
                 rows: grid.1,
             });
         }
+        self.clamp_sidebar_scroll();
         self.pane_needs_render = true;
         self.dirty = true;
     }
@@ -1321,12 +1449,24 @@ impl App {
     /// Tear down the old connection actor and start a fresh one.
     fn reconnect(&mut self) {
         self.send(Cmd::Shutdown);
-        self.conn = Conn::spawn(self.socket.clone(), self.ev_tx.clone());
+        self.connection_generation = self
+            .connection_generation
+            .checked_add(1)
+            .expect("connection generation overflow");
+        self.conn = Conn::spawn(
+            self.socket.clone(),
+            self.connection_generation,
+            self.ev_tx.clone(),
+        );
         self.notice = None;
         self.active = None;
         self.vt = None;
         self.dirty = true;
     }
+}
+
+fn event_for_generation(current: u64, event: ConnectionEvent) -> Option<Ev> {
+    (event.generation == current).then_some(event.event)
 }
 
 /// A looping color shimmer for a running session's row: the text's hue rotates
@@ -1411,6 +1551,85 @@ fn encode_sgr_mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_ignores_events_from_superseded_connection() {
+        let stale = [
+            conn::ConnectionEvent {
+                generation: 4,
+                event: Ev::Down("old connection closed".to_string()),
+            },
+            conn::ConnectionEvent {
+                generation: 5,
+                event: Ev::Sessions(Vec::new()),
+            },
+            conn::ConnectionEvent {
+                generation: 6,
+                event: Ev::Bytes {
+                    name: "active".to_string(),
+                    data: b"stale output".to_vec(),
+                    snapshot: false,
+                },
+            },
+        ];
+        let current = conn::ConnectionEvent {
+            generation: 7,
+            event: Ev::Up,
+        };
+
+        for event in stale {
+            assert!(event_for_generation(7, event).is_none());
+        }
+        assert!(matches!(event_for_generation(7, current), Some(Ev::Up)));
+    }
+
+    #[test]
+    fn running_shimmer_leaves_a_host_output_idle_window() {
+        let first_frame = std::time::Instant::now();
+
+        let early = loop_timing(
+            first_frame,
+            first_frame + Duration::from_millis(30),
+            true,
+            false,
+        );
+        assert!(!early.shimmer_due);
+        assert_eq!(early.poll_timeout, Duration::from_millis(30));
+
+        let just_before = loop_timing(
+            first_frame,
+            first_frame + Duration::from_millis(149),
+            true,
+            false,
+        );
+        assert!(!just_before.shimmer_due);
+        assert_eq!(just_before.poll_timeout, Duration::from_millis(30));
+
+        let due = loop_timing(
+            first_frame,
+            first_frame + Duration::from_millis(150),
+            true,
+            false,
+        );
+        assert!(due.shimmer_due);
+        assert_eq!(due.poll_timeout, Duration::from_millis(30));
+
+        let inactive = loop_timing(
+            first_frame,
+            first_frame + Duration::from_secs(1),
+            false,
+            false,
+        );
+        assert!(!inactive.shimmer_due);
+
+        let fast_path = loop_timing(
+            first_frame,
+            first_frame + Duration::from_millis(1),
+            true,
+            true,
+        );
+        assert_eq!(fast_path.poll_timeout, Duration::from_millis(5));
+    }
 
     #[test]
     fn paste_bytes_wraps_only_for_a_session_that_asked_for_it() {

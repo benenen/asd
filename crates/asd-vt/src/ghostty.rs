@@ -4,6 +4,7 @@
 //! confined to this file.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -21,72 +22,14 @@ use libghostty_vt::{
 use crate::{
     CellSnapshot, CellWidth, CursorShape, CursorSnapshot, Key, KeyEvent, RenderSnapshot, Rgb,
     StyleFlags, UnderlineKind, VtBackend,
+    color_query::{ColorQuery, ColorQueryScan, OscTerminator},
 };
 
 /// Nominal cell pixel size. Headless usage has no real glyph metrics; used
 /// only for the terminal's pixel-size reporting (XTWINOPS, etc.).
 const CELL_PX: (u32, u32) = (8, 16);
-
-#[derive(Clone, Copy)]
-enum ColorQuery {
-    Foreground,
-    Background,
-}
-
-impl ColorQuery {
-    fn code(self) -> u8 {
-        match self {
-            Self::Foreground => 10,
-            Self::Background => 11,
-        }
-    }
-
-    fn response_prefix(self) -> &'static [u8] {
-        match self {
-            Self::Foreground => b"\x1b]10;",
-            Self::Background => b"\x1b]11;",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-enum ColorQueryScan {
-    #[default]
-    Ground,
-    Esc,
-    Osc,
-    OscOne,
-    Code(ColorQuery),
-    Semicolon(ColorQuery),
-    Question(ColorQuery),
-    QuestionEsc(ColorQuery),
-}
-
-impl ColorQueryScan {
-    fn push(&mut self, byte: u8) -> Option<(ColorQuery, &'static [u8])> {
-        use ColorQueryScan::{Code, Esc, Ground, Osc, OscOne, Question, QuestionEsc, Semicolon};
-
-        let previous = std::mem::take(self);
-        let (next, response) = match (previous, byte) {
-            (Ground, b'\x1b') => (Esc, None),
-            (Esc, b']') => (Osc, None),
-            (Osc, b'1') => (OscOne, None),
-            (OscOne, b'0') => (Code(ColorQuery::Foreground), None),
-            (OscOne, b'1') => (Code(ColorQuery::Background), None),
-            (Code(query), b';') => (Semicolon(query), None),
-            (Semicolon(query), b'?') => (Question(query), None),
-            (Question(query), b'\x07') => (Ground, Some((query, b"\x07".as_slice()))),
-            (Question(query), b'\x1b') => (QuestionEsc(query), None),
-            (QuestionEsc(query), b'\\') => (Ground, Some((query, b"\x1b\\".as_slice()))),
-            // The ESC that led to QuestionEsc can also start a new OSC.
-            (QuestionEsc(_), b']') => (Osc, None),
-            (_, b'\x1b') => (Esc, None),
-            _ => (Ground, None),
-        };
-        *self = next;
-        response
-    }
-}
+/// Bound unanswered theme probes from an unattached or non-terminal session.
+const MAX_PENDING_COLOR_QUERIES: usize = 32;
 
 /// [`VtBackend`] implementation backed by libghostty-vt. `!Send`, owned
 /// exclusively by its holding thread.
@@ -100,6 +43,9 @@ pub struct GhosttyVt {
     pty_responses: Rc<RefCell<Vec<u8>>>,
     /// Parser state used to recognize OSC color queries split across PTY reads.
     color_query_scan: ColorQueryScan,
+    /// OSC 10/11 queries waiting for a real terminal default. Kept in arrival
+    /// order so applying both colors produces replies in the same order.
+    pending_color_queries: VecDeque<(ColorQuery, OscTerminator)>,
     /// Cell rows from the previous `render_snapshot()`, keyed by viewport row
     /// index, reused for rows libghostty reports clean. Valid only because a
     /// row is flagged dirty whenever the content at its index changes — see
@@ -124,17 +70,6 @@ impl VtBackend for GhosttyVt {
         })
         .expect("libghostty terminal allocation failed");
 
-        terminal
-            .set_default_fg_color(Some(RgbColor {
-                r: 255,
-                g: 255,
-                b: 255,
-            }))
-            .expect("setting default foreground color failed");
-        terminal
-            .set_default_bg_color(Some(RgbColor { r: 0, g: 0, b: 0 }))
-            .expect("setting default background color failed");
-
         let pty_responses = Rc::new(RefCell::new(Vec::new()));
         terminal
             .on_pty_write({
@@ -151,6 +86,7 @@ impl VtBackend for GhosttyVt {
             encoder: gkey::Encoder::new().expect("key encoder allocation failed"),
             pty_responses,
             color_query_scan: ColorQueryScan::default(),
+            pending_color_queries: VecDeque::new(),
             prev_cells: Vec::new(),
         }
     }
@@ -161,13 +97,29 @@ impl VtBackend for GhosttyVt {
             if let Some((query, terminator)) = self.color_query_scan.push(byte) {
                 let response_start = self.pty_responses.borrow().len();
                 self.terminal.vt_write(&bytes[chunk_start..=index]);
-                if !self.has_color_response_since(query, response_start) {
-                    self.write_color_response(query, terminator);
+                if !self.has_color_response_since(query, response_start)
+                    && !self.write_color_response(query, terminator)
+                {
+                    self.queue_color_query(query, terminator);
                 }
                 chunk_start = index + 1;
             }
         }
         self.terminal.vt_write(&bytes[chunk_start..]);
+    }
+
+    fn set_default_colors(&mut self, foreground: Option<Rgb>, background: Option<Rgb>) {
+        if let Some(color) = foreground {
+            self.terminal
+                .set_default_fg_color(Some(rgb_color(color)))
+                .expect("setting default foreground color failed");
+        }
+        if let Some(color) = background {
+            self.terminal
+                .set_default_bg_color(Some(rgb_color(color)))
+                .expect("setting default background color failed");
+        }
+        self.flush_pending_color_queries();
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
@@ -624,24 +576,27 @@ impl VtBackend for GhosttyVt {
 
 impl GhosttyVt {
     fn has_color_response_since(&self, query: ColorQuery, start: usize) -> bool {
-        let prefix = query.response_prefix();
-        self.pty_responses.borrow()[start..]
-            .windows(prefix.len())
-            .any(|window| window == prefix)
+        let responses = self.pty_responses.borrow();
+        query.response_prefixes().iter().any(|prefix| {
+            responses[start..]
+                .windows(prefix.len())
+                .any(|window| window == *prefix)
+        })
     }
 
-    fn write_color_response(&self, query: ColorQuery, terminator: &[u8]) {
+    fn write_color_response(&self, query: ColorQuery, terminator: OscTerminator) -> bool {
         let color = match query {
             ColorQuery::Foreground => self
                 .terminal
                 .fg_color()
-                .expect("reading foreground color failed")
-                .expect("default foreground color must be configured"),
+                .expect("reading foreground color failed"),
             ColorQuery::Background => self
                 .terminal
                 .bg_color()
-                .expect("reading background color failed")
-                .expect("default background color must be configured"),
+                .expect("reading background color failed"),
+        };
+        let Some(color) = color else {
+            return false;
         };
         let response = format!(
             "\x1b]{};rgb:{:04x}/{:04x}/{:04x}",
@@ -652,7 +607,24 @@ impl GhosttyVt {
         );
         let mut responses = self.pty_responses.borrow_mut();
         responses.extend_from_slice(response.as_bytes());
-        responses.extend_from_slice(terminator);
+        responses.extend_from_slice(terminator.bytes());
+        true
+    }
+
+    fn queue_color_query(&mut self, query: ColorQuery, terminator: OscTerminator) {
+        if self.pending_color_queries.len() < MAX_PENDING_COLOR_QUERIES {
+            self.pending_color_queries.push_back((query, terminator));
+        }
+    }
+
+    fn flush_pending_color_queries(&mut self) {
+        let mut waiting = VecDeque::new();
+        while let Some((query, terminator)) = self.pending_color_queries.pop_front() {
+            if !self.write_color_response(query, terminator) {
+                waiting.push_back((query, terminator));
+            }
+        }
+        self.pending_color_queries = waiting;
     }
 
     /// Current (cols, rows) of the terminal.
@@ -666,6 +638,14 @@ impl GhosttyVt {
 
 fn rgb(c: RgbColor) -> Rgb {
     Rgb {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+    }
+}
+
+fn rgb_color(c: Rgb) -> RgbColor {
+    RgbColor {
         r: c.r,
         g: c.g,
         b: c.b,

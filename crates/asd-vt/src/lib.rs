@@ -10,9 +10,11 @@
 //! Dependency contract: iced/wgpu, portable-pty, and asd-proto are forbidden.
 
 pub mod clip;
+mod color_query;
 mod ghostty;
 mod types;
 
+pub use color_query::ColorQueryFilter;
 pub use ghostty::GhosttyVt;
 pub use types::{
     CellSnapshot, CellWidth, CursorShape, CursorSnapshot, Key, KeyEvent, Mods, RenderSnapshot, Rgb,
@@ -40,6 +42,13 @@ pub trait VtBackend: Sized {
 
     /// Feed in pty output.
     fn feed(&mut self, bytes: &[u8]);
+
+    /// Supply host-terminal defaults discovered by an attached client. A
+    /// backend may use them to answer OSC 10/11 queries that arrived before a
+    /// real terminal was present. `None` means unknown and must not be guessed.
+    fn set_default_colors(&mut self, foreground: Option<Rgb>, background: Option<Rgb>) {
+        let _ = (foreground, background);
+    }
 
     /// Resize the terminal (primary screen content reflows as needed).
     fn resize(&mut self, cols: u16, rows: u16);

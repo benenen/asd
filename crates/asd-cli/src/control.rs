@@ -17,8 +17,9 @@ use crate::exit;
 const POLL_MS: u64 = 50;
 
 /// `asd send`: type bytes into a session's pty. The payload is `--text`
-/// (literal), `--key` (named keys), or stdin; `--enter` appends a carriage
-/// return. Nothing is escaped, so there is no quoting layer to fight.
+/// (literal), `--key` (named keys), or stdin; `--enter` sends a carriage return
+/// as a separate keypress after the payload. Nothing is escaped, so there is no
+/// quoting layer to fight.
 pub async fn send(
     socket: &Path,
     name: String,
@@ -28,7 +29,7 @@ pub async fn send(
     stdin: bool,
 ) -> anyhow::Result<()> {
     // clap enforces the --text/--key/--stdin exclusivity; build the payload.
-    let mut payload: Vec<u8> = if let Some(t) = text {
+    let payload: Vec<u8> = if let Some(t) = text {
         t.into_bytes()
     } else if let Some(list) = key {
         let mut out = Vec::new();
@@ -56,14 +57,12 @@ pub async fn send(
         }
         buf
     };
-    if enter {
-        payload = with_enter(payload);
-    }
-    if payload.is_empty() {
-        bail!("send: nothing to send");
-    }
     if payload.contains(&0) {
         bail!("send: cannot send NUL bytes");
+    }
+    let (payload, enter) = prepare_send_payload(payload, enter);
+    if payload.is_empty() && !enter {
+        bail!("send: nothing to send");
     }
 
     let mut c = client::connect(socket, ClientKind::Cli).await?;
@@ -71,6 +70,7 @@ pub async fn send(
         .write_frame(&Frame::SendInput {
             name,
             bytes: payload,
+            enter,
         })
         .await?;
     match c.reader.read_frame().await? {
@@ -770,30 +770,33 @@ pub async fn follow(
     }
 }
 
-/// Append the Enter keypress `--enter` asks for, absorbing a line ending the
-/// payload already carried.
+/// Prepare the payload and the separate Enter operation `--enter` asks for,
+/// absorbing a line ending the payload already carried.
 ///
 /// `echo x | asd send s --stdin --enter` would otherwise put `x\n\r` on the
 /// pty: `echo` supplies the newline, `--enter` the carriage return. A shell
 /// does not care (its line discipline maps both), but a program reading raw
 /// input — Claude Code, an editor, anything with its own key handling — reads
 /// LF as "insert a line break" and CR as "submit", so the text arrives with a
-/// stray newline in it and may not be submitted at all.
+/// stray newline in it and may not be submitted at all. Keeping the carriage
+/// return in the same write is also ambiguous to agent TUIs: their paste-burst
+/// handling can treat it as another pasted newline instead of a submit key.
 ///
 /// The newline in that payload came from the shell, not from the person typing
 /// the command; `--enter` is them saying "and then press Enter". So one
-/// trailing line ending (LF or CRLF) folds into the Enter. Without `--enter`
-/// nothing is touched — `send` stays a byte-exact pipe.
-pub(crate) fn with_enter(mut payload: Vec<u8>) -> Vec<u8> {
-    if payload.last() == Some(&b'\n') {
+/// trailing line ending (LF or CRLF) folds away. The daemon session thread
+/// writes Enter after a short quiet interval while holding the input sequence
+/// atomic. Without `--enter` nothing is touched — `send` stays a byte-exact
+/// pipe.
+pub(crate) fn prepare_send_payload(mut payload: Vec<u8>, enter: bool) -> (Vec<u8>, bool) {
+    if enter && payload.last() == Some(&b'\n') {
         payload.pop();
         // CRLF is one line ending, not two.
         if payload.last() == Some(&b'\r') {
             payload.pop();
         }
     }
-    payload.push(b'\r');
-    payload
+    (payload, enter)
 }
 
 /// What `--scrollback` meant on the command line. clap gives three states for
@@ -1149,15 +1152,42 @@ mod tests {
     fn enter_absorbs_a_line_ending_the_payload_already_had() {
         // What `echo x | send --stdin --enter` produces: the shell's newline
         // must not reach the pty as "insert a line break" before the Enter.
-        assert_eq!(with_enter(b"make test\n".to_vec()), b"make test\r");
-        assert_eq!(with_enter(b"make test\r\n".to_vec()), b"make test\r");
+        assert_eq!(
+            prepare_send_payload(b"make test\n".to_vec(), true),
+            (b"make test".to_vec(), true)
+        );
+        assert_eq!(
+            prepare_send_payload(b"make test\r\n".to_vec(), true),
+            (b"make test".to_vec(), true)
+        );
         // Nothing to absorb: just the Enter.
-        assert_eq!(with_enter(b"make test".to_vec()), b"make test\r");
-        assert_eq!(with_enter(Vec::new()), b"\r");
+        assert_eq!(
+            prepare_send_payload(b"make test".to_vec(), true),
+            (b"make test".to_vec(), true)
+        );
+        assert_eq!(prepare_send_payload(Vec::new(), true), (Vec::new(), true));
         // Only one line ending is folded in — a deliberate blank line stays.
-        assert_eq!(with_enter(b"a\n\n".to_vec()), b"a\n\r");
+        assert_eq!(
+            prepare_send_payload(b"a\n\n".to_vec(), true),
+            (b"a\n".to_vec(), true)
+        );
         // An interior newline is content (a multi-line paste), not the ending.
-        assert_eq!(with_enter(b"line1\nline2".to_vec()), b"line1\nline2\r");
+        assert_eq!(
+            prepare_send_payload(b"line1\nline2".to_vec(), true),
+            (b"line1\nline2".to_vec(), true)
+        );
+    }
+
+    #[test]
+    fn enter_is_not_folded_into_the_raw_payload() {
+        assert_eq!(
+            prepare_send_payload(b"make test".to_vec(), true),
+            (b"make test".to_vec(), true)
+        );
+        assert_eq!(
+            prepare_send_payload(b"literal".to_vec(), false),
+            (b"literal".to_vec(), false)
+        );
     }
 
     #[test]

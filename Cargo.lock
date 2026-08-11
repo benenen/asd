@@ -237,7 +237,9 @@ name = "asd-client"
 version = "0.1.11"
 dependencies = [
  "asd-proto",
+ "libc",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

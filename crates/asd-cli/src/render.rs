@@ -48,21 +48,22 @@ pub fn render_frame(snap: &RenderSnapshot, sel: Option<Selection>) -> Vec<u8> {
                 // Emitted as part of the preceding wide char.
                 continue;
             }
+            let grapheme = cell.host_grapheme();
             // Only cells with written content take the selection highlight —
             // blank (never-written) cells stay plain, so clicking or dragging
             // over empty areas shows no reverse-video block.
             let selected =
                 !cell.grapheme.is_empty() && sel.is_some_and(|s| s.contains(x, y as u16));
-            let sgr = cell_sgr(cell, snap, selected);
+            let sgr = cell_sgr(cell, selected);
             if last_sgr.as_deref() != Some(sgr.as_str()) {
                 out.extend_from_slice(b"\x1b[0m");
                 out.extend_from_slice(sgr.as_bytes());
                 last_sgr = Some(sgr);
             }
-            if cell.grapheme.is_empty() {
+            if grapheme.is_empty() {
                 out.push(b' ');
             } else {
-                out.extend_from_slice(cell.grapheme.as_bytes());
+                out.extend_from_slice(grapheme.as_bytes());
             }
             x += if cell.width == CellWidth::Wide { 2 } else { 1 };
         }
@@ -93,7 +94,7 @@ fn cursor_shape_seq(shape: CursorShape) -> &'static [u8] {
 
 /// Build the SGR parameter sequence for one cell (colors + attributes, with
 /// selection shown as reverse video).
-fn cell_sgr(cell: &CellSnapshot, snap: &RenderSnapshot, selected: bool) -> String {
+fn cell_sgr(cell: &CellSnapshot, selected: bool) -> String {
     let mut s = String::from("\x1b[");
     let push = |code: &str, s: &mut String| {
         if !s.ends_with('[') {
@@ -124,10 +125,14 @@ fn cell_sgr(cell: &CellSnapshot, snap: &RenderSnapshot, selected: bool) -> Strin
     if f.strikethrough {
         push("9", &mut s);
     }
-    let fg = cell.fg.unwrap_or(snap.foreground);
-    let bg = cell.bg.unwrap_or(snap.background);
-    push(&rgb_sgr(38, fg), &mut s);
-    push(&rgb_sgr(48, bg), &mut s);
+    match cell.fg {
+        Some(fg) => push(&rgb_sgr(38, fg), &mut s),
+        None => push("39", &mut s),
+    }
+    match cell.bg {
+        Some(bg) => push(&rgb_sgr(48, bg), &mut s),
+        None => push("49", &mut s),
+    }
     s.push('m');
     s
 }
@@ -327,5 +332,82 @@ mod tests {
         // A written space still counts as content and is highlighted (so an
         // intra-line space in selected text doesn't leave a gap).
         assert!(has_reverse(&render_frame(&mk(vec![cell(" ")]), sel)));
+    }
+
+    #[test]
+    fn default_cells_inherit_the_host_terminal_colors() {
+        use asd_vt::{CursorSnapshot, RenderSnapshot};
+
+        let snap = RenderSnapshot {
+            cols: 1,
+            rows: 1,
+            cells: vec![std::sync::Arc::new(vec![CellSnapshot {
+                grapheme: "x".to_string(),
+                ..CellSnapshot::default()
+            }])],
+            row_dirty: vec![true],
+            cursor: CursorSnapshot::default(),
+            palette: [Rgb::default(); 256],
+            foreground: Rgb { r: 1, g: 2, b: 3 },
+            background: Rgb { r: 4, g: 5, b: 6 },
+        };
+
+        let output = render_frame(&snap, None);
+
+        assert!(output.windows(8).any(|bytes| bytes == b"\x1b[39;49m"));
+        assert!(
+            !output
+                .windows(b"38;2;1;2;3".len())
+                .any(|bytes| bytes == b"38;2;1;2;3")
+        );
+        assert!(
+            !output
+                .windows(b"48;2;4;5;6".len())
+                .any(|bytes| bytes == b"48;2;4;5;6")
+        );
+    }
+
+    #[test]
+    fn vt_narrow_emoji_presentation_is_forced_to_narrow_text_on_the_host() {
+        use asd_vt::{CursorSnapshot, RenderSnapshot};
+
+        let snap = RenderSnapshot {
+            cols: 3,
+            rows: 1,
+            cells: vec![std::sync::Arc::new(vec![
+                CellSnapshot {
+                    // Ghostty treats this VS16 grapheme as one cell, while
+                    // some host terminals treat it as two.
+                    grapheme: "✔️".to_string(),
+                    width: CellWidth::Narrow,
+                    ..CellSnapshot::default()
+                },
+                CellSnapshot {
+                    grapheme: "B".to_string(),
+                    ..CellSnapshot::default()
+                },
+                CellSnapshot::default(),
+            ])],
+            row_dirty: vec![true],
+            cursor: CursorSnapshot::default(),
+            palette: [Rgb::default(); 256],
+            foreground: Rgb::default(),
+            background: Rgb::default(),
+        };
+
+        let output = render_frame(&snap, None);
+        let narrow_text = "✔︎B".as_bytes();
+
+        assert!(
+            output
+                .windows(narrow_text.len())
+                .any(|bytes| bytes == narrow_text),
+            "the host must receive VS15 so the second cell cannot shift: {output:?}"
+        );
+        assert!(
+            !output
+                .windows("✔️".len())
+                .any(|bytes| bytes == "✔️".as_bytes())
+        );
     }
 }

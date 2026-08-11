@@ -221,7 +221,12 @@ async fn drive(
                     if at.begin(name.clone()) {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
-                    if writer.write_frame(&Frame::Attach { name, cols, rows }).await.is_err() {
+                    if writer.write_frame(&Frame::Attach {
+                        name,
+                        cols,
+                        rows,
+                        appearance: crate::theme::TERMINAL_APPEARANCE,
+                    }).await.is_err() {
                         return Err("attach write failed".to_string());
                     }
                 }
@@ -277,4 +282,22 @@ async fn drive(
 /// A supervisor-side handle to one running host actor.
 pub struct HostHandle {
     pub cmd_tx: UnboundedSender<HostCmd>,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn embedded_web_theme_reads_the_shared_css_properties() {
+        let bridge = include_str!("../assets/bridge.js");
+        let css = include_str!("../assets/app.css");
+
+        assert!(bridge.contains("getPropertyValue('--asd-terminal-background')"));
+        assert!(bridge.contains("getPropertyValue('--asd-terminal-foreground')"));
+        assert!(css.contains("var(--asd-terminal-background)"));
+        assert!(css.contains("var(--asd-terminal-foreground)"));
+        assert!(!bridge.contains("#0B0D11"));
+        assert!(!bridge.contains("#E7E2D6"));
+        assert!(!css.contains("#0B0D11"));
+        assert!(!css.contains("#E7E2D6"));
+    }
 }

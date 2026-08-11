@@ -4,6 +4,7 @@
 //! `!Send` Terminal owned exclusively by its holding thread, then handed over
 //! a channel to the GUI/other threads.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// RGB color.
@@ -69,6 +70,33 @@ pub struct CellSnapshot {
     pub bg: Option<Rgb>,
     pub flags: StyleFlags,
     pub width: CellWidth,
+}
+
+impl CellSnapshot {
+    /// Grapheme to write to a host terminal without changing this cell's width.
+    ///
+    /// Ghostty is authoritative for the session grid, but some host terminals
+    /// render VS16 (`U+FE0F`) as two columns even when Ghostty assigned the
+    /// grapheme one. Explicit text presentation keeps the base glyph in the
+    /// single cell recorded by this snapshot.
+    pub fn host_grapheme(&self) -> Cow<'_, str> {
+        if self.width == CellWidth::Narrow && self.grapheme.contains('\u{fe0f}') {
+            Cow::Owned(
+                self.grapheme
+                    .chars()
+                    .map(|character| {
+                        if character == '\u{fe0f}' {
+                            '\u{fe0e}'
+                        } else {
+                            character
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            Cow::Borrowed(&self.grapheme)
+        }
+    }
 }
 
 /// Cursor shape.

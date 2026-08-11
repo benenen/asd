@@ -140,7 +140,12 @@ pub async fn handle_conn(
                     Err((code, msg)) => reply(Frame::Error { code, msg }),
                 }
             }
-            Frame::Attach { name, cols, rows } => {
+            Frame::Attach {
+                name,
+                cols,
+                rows,
+                appearance,
+            } => {
                 // Attaching supersedes any prior attachment on this connection.
                 // A session that dies while attached cannot clear this
                 // read-side bookkeeping — the session thread only reaches the
@@ -166,7 +171,12 @@ pub async fn handle_conn(
                 let sink = ClientSink::new(conn_id, out_tx.clone(), Arc::clone(&queued));
                 if handle
                     .tx
-                    .send(SessionMsg::Attach { sink, cols, rows })
+                    .send(SessionMsg::Attach {
+                        sink,
+                        cols,
+                        rows,
+                        appearance,
+                    })
                     .is_err()
                 {
                     reply(Frame::Error {
@@ -229,16 +239,44 @@ pub async fn handle_conn(
             }
             // Scripting (v4): name-addressed, attach-free — the connection's
             // `attached` state is untouched.
-            Frame::SendInput { name, bytes } => match registry.lock().unwrap().get(&name) {
-                Some(handle) => {
-                    let _ = handle.tx.send(SessionMsg::Input(bytes));
-                    reply(Frame::Ack);
+            Frame::SendInput { name, bytes, enter } => {
+                let handle = registry.lock().unwrap().get(&name);
+                match handle {
+                    Some(handle) => {
+                        let (completed, applied) = tokio::sync::oneshot::channel();
+                        if handle
+                            .tx
+                            .send(SessionMsg::ScriptInput {
+                                bytes,
+                                enter,
+                                completed,
+                            })
+                            .is_err()
+                        {
+                            reply(Frame::Error {
+                                code: code::SESSION_EXITED,
+                                msg: format!("session '{name}' exited before input"),
+                            });
+                        } else {
+                            match applied.await {
+                                Ok(Ok(())) => reply(Frame::Ack),
+                                Ok(Err(error)) => reply(Frame::Error {
+                                    code: code::SESSION_EXITED,
+                                    msg: format!("session '{name}' input failed: {error}"),
+                                }),
+                                Err(_) => reply(Frame::Error {
+                                    code: code::SESSION_EXITED,
+                                    msg: format!("session '{name}' exited during input"),
+                                }),
+                            }
+                        }
+                    }
+                    None => reply(Frame::Error {
+                        code: code::NO_SUCH_SESSION,
+                        msg: format!("no such session '{name}'"),
+                    }),
                 }
-                None => reply(Frame::Error {
-                    code: code::NO_SUCH_SESSION,
-                    msg: format!("no such session '{name}'"),
-                }),
-            },
+            }
             // Following is a subscription, not an attachment: it shares the
             // connection sink with the one-shot scripting frames, but the
             // session keeps it out of its client list. Tracked here only so

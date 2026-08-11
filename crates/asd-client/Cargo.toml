@@ -1,14 +1,21 @@
 [package]
 name = "asd-client"
-description = "asd shared client logic: handshake and the Attach convergence state machine"
+description = "asd shared client logic: handshake, attach convergence, and host-terminal probing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# Contract (spec §3): the client half of the protocol, shared by asd-cli,
-# asd-tui and asd-dioxus. Depends on asd-proto and the tokio runtime only —
-# no GUI framework, and above all no portable-pty or process management, since
-# asd-dioxus links this and must stay PTY-free (the Windows client's basis).
+# Contract (spec §3): the client half of the protocol plus bounded host-terminal
+# capability probing, shared by asd-cli, asd-tui and asd-dioxus. Platform APIs
+# are limited to libc/Win32 console I/O — no GUI framework, and above all no
+# portable-pty or process management, since asd-dioxus links this and must stay
+# PTY-free (the Windows client's basis).
 [dependencies]
 asd-proto = { workspace = true }
 tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

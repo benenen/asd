@@ -138,33 +138,45 @@ fn da1_query_produces_pty_response() {
 }
 
 #[test]
-fn default_color_queries_produce_pty_responses() {
+fn color_queries_wait_for_real_terminal_defaults() {
     let mut vt = term(20, 5);
     assert!(vt.take_pty_responses().is_empty());
-    let initial = vt.render_snapshot();
-    assert_eq!(
-        initial.foreground,
-        Rgb {
-            r: 255,
-            g: 255,
-            b: 255
-        }
-    );
-    assert_eq!(initial.background, Rgb { r: 0, g: 0, b: 0 });
 
     vt.feed(b"\x1b]10;");
     vt.feed(b"?\x1b\\\x1b]11");
     vt.feed(b";?\x07");
+    assert!(vt.take_pty_responses().is_empty());
+
+    vt.set_default_colors(
+        Some(Rgb {
+            r: 0xe7,
+            g: 0xe2,
+            b: 0xd6,
+        }),
+        Some(Rgb {
+            r: 0x0b,
+            g: 0x0d,
+            b: 0x11,
+        }),
+    );
 
     assert_eq!(
         vt.take_pty_responses(),
-        b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x07"
+        b"\x1b]10;rgb:e7e7/e2e2/d6d6\x1b\\\x1b]11;rgb:0b0b/0d0d/1111\x07"
     );
 }
 
 #[test]
 fn color_query_response_preserves_device_response_order() {
     let mut vt = term(20, 5);
+    vt.set_default_colors(
+        Some(Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        }),
+        None,
+    );
 
     vt.feed(b"\x1b[6n\x1b]10;?\x1b\\\x1b[c");
 
@@ -187,10 +199,31 @@ fn color_query_reports_the_effective_osc_override() {
     let mut vt = term(20, 5);
     vt.feed(b"\x1b]11;rgb:1111/2222/3333\x1b\\");
     assert!(vt.take_pty_responses().is_empty());
+    vt.set_default_colors(None, Some(Rgb { r: 9, g: 8, b: 7 }));
 
     vt.feed(b"\x1b]11;?\x1b\\");
 
     assert_eq!(vt.take_pty_responses(), b"\x1b]11;rgb:1111/2222/3333\x1b\\");
+}
+
+#[test]
+fn c1_color_query_waits_for_defaults_and_preserves_c1_st() {
+    let mut vt = term(20, 5);
+
+    vt.feed(b"\x9d10;");
+    vt.feed(b"?\x9c");
+    assert!(vt.take_pty_responses().is_empty());
+
+    vt.set_default_colors(
+        Some(Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+        }),
+        None,
+    );
+
+    assert_eq!(vt.take_pty_responses(), b"\x1b]10;rgb:1212/3434/5656\x9c");
 }
 
 // ---- Snapshot fidelity (spec §8 item 2) ----

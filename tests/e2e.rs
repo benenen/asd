@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, PROTO_VERSION, code};
+use asd_proto::{
+    ClientKind, Frame, FrameReader, FrameWriter, PROTO_VERSION, TerminalAppearance, TerminalColor,
+    code,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
@@ -241,6 +244,7 @@ impl ProtoClient {
             name: name.into(),
             cols,
             rows,
+            appearance: asd_proto::TerminalAppearance::default(),
         })
         .await;
         match self.recv().await {
@@ -349,6 +353,161 @@ async fn two_clients_both_receive_broadcast() {
     .await;
     a.read_output_until(b"dual-57").await;
     b.read_output_until(b"dual-57").await;
+}
+
+/// A program can query its terminal theme before anyone attaches. The daemon
+/// must hold that query rather than invent black, then answer it from the first
+/// real terminal appearance carried by Attach.
+#[tokio::test]
+async fn appearance_answers_query_that_predates_attach() {
+    let daemon = Daemon::start("appearance");
+    let command = "stty raw -echo; printf '\\033]11;?\\007QUERY_READY\\n'; \
+                   dd bs=1 count=24 2>/dev/null | od -An -tx1 | tr -d ' \\n'; \
+                   printf '\\n'; sleep 5";
+    let out = daemon
+        .cli()
+        .args(["new", "colors", "--cmd", command])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "create failed: {out:?}");
+
+    let waited = daemon
+        .cli()
+        .args(["wait", "colors", "--text", "QUERY_READY", "--timeout", "5s"])
+        .output()
+        .unwrap();
+    assert!(
+        waited.status.success(),
+        "query was not pending before attach: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+
+    let mut client = ProtoClient::connect(&daemon.socket).await;
+    client
+        .send(Frame::Attach {
+            name: "colors".into(),
+            cols: 80,
+            rows: 24,
+            appearance: TerminalAppearance {
+                foreground: None,
+                background: Some(TerminalColor {
+                    r: 0x0a,
+                    g: 0x14,
+                    b: 0x1e,
+                }),
+            },
+        })
+        .await;
+    match client.recv().await {
+        Frame::Snapshot { .. } => {}
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+
+    client
+        .read_output_until(b"1b5d31313b7267623a306130612f313431342f3165316507")
+        .await;
+}
+
+/// Once attached, clients must not see an OSC color query: GUI terminal
+/// mirrors would answer it too. The daemon keeps the query for its own VT and
+/// the child receives exactly one response.
+#[tokio::test]
+async fn attached_color_query_is_daemon_only_and_answered_once() {
+    let daemon = Daemon::start("attached-appearance");
+    let command = "stty raw -echo; printf 'ATTACHED_READY\\n'; \
+                   dd bs=1 count=1 >/dev/null 2>&1; \
+                   printf '\\033]11;?\\007\\23511;?\\234REPLY:'; \
+                   dd bs=1 count=48 2>/dev/null | od -An -tx1 | tr -d ' \\n'; \
+                   printf '\\nEXTRA:'; \
+                   timeout 1 dd bs=1 count=48 2>/dev/null | od -An -tx1 | tr -d ' \\n'; \
+                   printf '\\n'; sleep 5";
+    let out = daemon
+        .cli()
+        .args(["new", "attached-colors", "--cmd", command])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "create failed: {out:?}");
+    let waited = daemon
+        .cli()
+        .args([
+            "wait",
+            "attached-colors",
+            "--text",
+            "ATTACHED_READY",
+            "--timeout",
+            "5s",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        waited.status.success(),
+        "child was not ready before attach: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+
+    let mut client = ProtoClient::connect(&daemon.socket).await;
+    client
+        .send(Frame::Attach {
+            name: "attached-colors".into(),
+            cols: 80,
+            rows: 24,
+            appearance: TerminalAppearance {
+                foreground: None,
+                background: Some(TerminalColor {
+                    r: 0x0a,
+                    g: 0x14,
+                    b: 0x1e,
+                }),
+            },
+        })
+        .await;
+    match client.recv().await {
+        Frame::Snapshot { .. } => {}
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+    client.send(Frame::Input { bytes: vec![b'g'] }).await;
+
+    let expected = b"REPLY:1b5d31313b7267623a306130612f313431342f3165316507\
+                     1b5d31313b7267623a306130612f313431342f316531659c\nEXTRA:\n";
+    let mut observed = Vec::new();
+    while !observed
+        .windows(expected.len())
+        .any(|window| window == expected)
+    {
+        match client.recv().await {
+            Frame::Output { bytes } => observed.extend_from_slice(&bytes),
+            Frame::Error { code, msg } => {
+                panic!("daemon error {code}: {msg}; output={observed:?}")
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        !observed
+            .windows(b"\x1b]11;?\x07".len())
+            .any(|window| window == b"\x1b]11;?\x07"),
+        "client saw the daemon-only 7-bit query: {observed:?}"
+    );
+    assert!(
+        !observed
+            .windows(b"\x9d11;?\x9c".len())
+            .any(|window| window == b"\x9d11;?\x9c"),
+        "client saw the daemon-only C1 query: {observed:?}"
+    );
+    for reply_hex in [
+        b"1b5d31313b7267623a306130612f313431342f3165316507".as_slice(),
+        b"1b5d31313b7267623a306130612f313431342f316531659c".as_slice(),
+    ] {
+        assert_eq!(
+            observed
+                .windows(reply_hex.len())
+                .filter(|window| *window == reply_hex)
+                .count(),
+            1,
+            "child did not receive exactly one reply: {observed:?}"
+        );
+    }
 }
 
 /// The list/kill CLI surface + session lifecycle.
@@ -795,6 +954,61 @@ async fn send_wait_peek_round_trip() {
     assert!(out.status.success(), "peek failed: {out:?}");
     let screen = String::from_utf8_lossy(&out.stdout);
     assert!(screen.contains("sendmark-42"), "peek screen: {screen}");
+}
+
+/// `send --enter` is one session-thread operation: concurrent callers may be
+/// ordered either way, but one caller's text cannot land between the other's
+/// text and Enter.
+#[tokio::test]
+async fn concurrent_send_enter_sequences_do_not_interleave() {
+    let daemon = Daemon::start("sendatomic");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let spawn_send = |marker: &str, value: &str| {
+        let mut command = daemon.cli();
+        command
+            .args([
+                "send",
+                "work",
+                "--text",
+                &format!("printf '{marker}-%s\\n' {value}"),
+                "--enter",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().unwrap()
+    };
+    let first = spawn_send("atomic-A", "17");
+    let second = spawn_send("atomic-B", "23");
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert!(first.status.success(), "first send failed: {first:?}");
+    assert!(second.status.success(), "second send failed: {second:?}");
+
+    let deadline = std::time::Instant::now() + WAIT;
+    let screen = loop {
+        let output = daemon.cli().args(["peek", "work"]).output().unwrap();
+        assert!(output.status.success(), "peek failed: {output:?}");
+        let screen = String::from_utf8_lossy(&output.stdout).into_owned();
+        if screen.contains("atomic-A-17") && screen.contains("atomic-B-23") {
+            break screen;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "concurrent commands did not both execute: {screen}"
+        );
+        std::thread::sleep(TICK);
+    };
+    assert!(screen.contains("atomic-A-17"));
+    assert!(screen.contains("atomic-B-23"));
 }
 
 /// `asd follow` streams a session's output as it is produced and returns on its
@@ -1456,6 +1670,7 @@ async fn running_flag_tracks_activity() {
     c.send(Frame::SendInput {
         name: "act".into(),
         bytes: b"printf act-running\n".to_vec(),
+        enter: false,
     })
     .await;
     match c.recv().await {
@@ -1670,6 +1885,7 @@ async fn attach_after_attached_session_dies_is_not_wedged() {
         name: "b".into(),
         cols: 80,
         rows: 24,
+        appearance: asd_proto::TerminalAppearance::default(),
     })
     .await;
     match c.recv_skipping_output().await {
@@ -2383,6 +2599,115 @@ fn killed_attach_restores_the_terminal() {
             contains(&out, off),
             "terminal left in {:?} after SIGTERM; pty saw: {dump:?}",
             String::from_utf8_lossy(off)
+        );
+    }
+}
+
+/// A killed `asd ui` must close the host terminal's synchronized-update mode
+/// before restoring mouse/paste/alternate-screen state. Normal frames already
+/// contain `?2026l`, so inspect only bytes emitted after a quiet pre-kill
+/// boundary; otherwise a completed frame could make the assertion pass while
+/// the signal handler itself still omitted the close.
+#[test]
+fn killed_ui_closes_synchronized_update_before_restoring_terminal() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut daemon = Daemon::start("uisignal");
+    let (master, slave_path) = open_pty();
+    let mut command = daemon.cli();
+    command.arg("ui");
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&slave_path)
+        .unwrap();
+    let mut child = attach_to_pty(command, slave).spawn().unwrap();
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let reader = {
+        let seen = seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                seen.lock().unwrap().extend_from_slice(&buf[..n as usize]);
+            }
+            unsafe { libc::close(master) };
+        })
+    };
+
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let output = seen.lock().unwrap();
+        if contains(&output, b"\x1b[?1002h")
+            && contains(&output, b"\x1b[?2026h")
+            && contains(&output, b"\x1b[?2026l")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ui never completed its first frame: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        drop(output);
+        std::thread::sleep(TICK);
+    }
+
+    // Find a quiet interval between the 1.5 s session-list polls, then record
+    // the boundary immediately before SIGTERM. This makes the checked suffix
+    // signal-handler output rather than an earlier normal frame.
+    let mut last_len = seen.lock().unwrap().len();
+    let mut stable_since = std::time::Instant::now();
+    loop {
+        std::thread::sleep(TICK);
+        let len = seen.lock().unwrap().len();
+        if len != last_len {
+            last_len = len;
+            stable_since = std::time::Instant::now();
+        }
+        if stable_since.elapsed() >= Duration::from_millis(250) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ui output never settled before SIGTERM"
+        );
+    }
+    let kill_offset = seen.lock().unwrap().len();
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "killing the ui also stopped its daemon"
+    );
+    let out = seen.lock().unwrap().clone();
+    let suffix = &out[kill_offset..];
+    let restore = b"\x1b[?2026l\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m";
+    assert!(
+        suffix.starts_with(restore),
+        "ui did not emit a complete ordered restore after SIGTERM; post-kill bytes: {:?}",
+        String::from_utf8_lossy(suffix)
+    );
+    for off in [
+        b"\x1b[?1002l".as_slice(),
+        b"\x1b[?2004l",
+        b"\x1b[?1049l",
+        b"\x1b[?25h",
+        b"\x1b[0m",
+    ] {
+        assert!(
+            contains(suffix, off),
+            "ui terminal restore omitted {:?}; post-kill bytes: {:?}",
+            String::from_utf8_lossy(off),
+            String::from_utf8_lossy(suffix)
         );
     }
 }

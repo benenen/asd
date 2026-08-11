@@ -9,7 +9,7 @@
 use std::io::Write as _;
 
 use anyhow::bail;
-use asd_proto::{Frame, Scrollback};
+use asd_proto::{Frame, Scrollback, TerminalAppearance};
 use asd_vt::{GhosttyVt, RenderSnapshot, VtBackend};
 
 use crate::client::Client;
@@ -41,6 +41,7 @@ pub(crate) async fn print_json(
             // apply_resize. This obtains Snapshot without sending SIGWINCH.
             cols: 0,
             rows: 0,
+            appearance: TerminalAppearance::default(),
         })
         .await?;
     let snapshot_vt = match client.reader.read_frame().await? {

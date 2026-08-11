@@ -20,7 +20,11 @@
 //! `SessionInfo.pid` (so `list` answers what previously took an `inspect` per
 //! session); v9 added the following frames (`Follow`/`Unfollow`/`FollowStatus`)
 //! behind `asd follow` — an output subscription that reports quiescence inline
-//! rather than making the client poll for it.
+//! rather than making the client poll for it; v10 replaced `Peek.scrollback`'s
+//! boolean with [`Scrollback`]; v11 added `Attach.appearance`, letting a real
+//! terminal client report its default colors so the daemon can answer OSC
+//! 10/11 queries without guessing a theme; v12 added `SendInput.enter`, making
+//! a scripted payload plus Enter one atomic session-thread operation.
 
 mod codec;
 pub mod paths;
@@ -31,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 10;
+pub const PROTO_VERSION: u32 = 12;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -120,6 +124,23 @@ pub enum Scrollback {
     Lines(u32),
 }
 
+/// One RGB color reported by a terminal client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+/// The real host terminal's default colors, when it answered the client's
+/// startup OSC 10/11 probes. Either channel may be unknown on terminals that
+/// do not implement the corresponding query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalAppearance {
+    pub foreground: Option<TerminalColor>,
+    pub background: Option<TerminalColor>,
+}
+
 /// All frames of protocol v1 (spec §4).
 ///
 /// Handshake: each side sends once after connecting; the client sends
@@ -170,6 +191,10 @@ pub enum Frame {
         name: String,
         cols: u16,
         rows: u16,
+        /// Defaults probed from the client's real terminal. The session locks
+        /// each first non-`None` channel so multiple viewers cannot flip an
+        /// application's theme underneath it.
+        appearance: TerminalAppearance,
     },
     /// Formatter dump; the attach reply, also used for M3 flow-control recovery.
     Snapshot {
@@ -214,6 +239,9 @@ pub enum Frame {
     SendInput {
         name: String,
         bytes: Vec<u8>,
+        /// After writing `bytes`, pause outside the target TUI's paste burst and
+        /// write one carriage return before acknowledging the request.
+        enter: bool,
     },
     /// daemon → client: generic success reply (answers `SendInput`).
     Ack,

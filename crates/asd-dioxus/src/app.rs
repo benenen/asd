@@ -234,6 +234,7 @@ pub fn App() -> Element {
         // to the executable. The vendor <script> lands before the bridge eval
         // needs it; the bridge polls for `window.GhosttyWeb` regardless.
         document::Script { {crate::VENDOR_JS} }
+        document::Style { {crate::theme::css_custom_properties()} }
         document::Style { {crate::APP_CSS} }
         div { class: "app-container",
             // ── sidebar ─────────────────────────────────────────────

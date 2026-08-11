@@ -9,10 +9,10 @@
 //! clients).
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SendError, Sender};
 use std::time::Duration;
 
-use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, code};
+use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, TerminalAppearance, code};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// How often the session list is re-polled.
@@ -26,6 +26,7 @@ pub enum Cmd {
         name: String,
         cols: u16,
         rows: u16,
+        appearance: TerminalAppearance,
     },
     /// Raw input bytes for the attached session.
     Input(Vec<u8>),
@@ -70,6 +71,30 @@ pub enum Ev {
     Renamed(Result<(), String>),
 }
 
+/// An actor event tagged with the connection generation that produced it.
+/// Reconnect starts a new generation, so buffered events from the superseded
+/// actor cannot overwrite the new connection's state.
+#[derive(Debug)]
+pub struct ConnectionEvent {
+    pub generation: u64,
+    pub event: Ev,
+}
+
+#[derive(Clone)]
+struct EventSink {
+    generation: u64,
+    tx: Sender<ConnectionEvent>,
+}
+
+impl EventSink {
+    fn send(&self, event: Ev) -> Result<(), SendError<ConnectionEvent>> {
+        self.tx.send(ConnectionEvent {
+            generation: self.generation,
+            event,
+        })
+    }
+}
+
 use asd_client::attach::Attach;
 
 /// Handle to the running actor thread.
@@ -80,8 +105,12 @@ pub struct Conn {
 impl Conn {
     /// Spawn the actor thread with its own current-thread runtime. Events —
     /// including connect/handshake failures — arrive on `ev_tx`.
-    pub fn spawn(socket: PathBuf, ev_tx: Sender<Ev>) -> Self {
+    pub fn spawn(socket: PathBuf, generation: u64, ev_tx: Sender<ConnectionEvent>) -> Self {
         let (cmd_tx, cmd_rx) = unbounded_channel::<Cmd>();
+        let events = EventSink {
+            generation,
+            tx: ev_tx,
+        };
         std::thread::Builder::new()
             .name("asd-tui-conn".into())
             .spawn(move || {
@@ -91,13 +120,13 @@ impl Conn {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        let _ = ev_tx.send(Ev::Down(format!("runtime: {e}")));
+                        let _ = events.send(Ev::Down(format!("runtime: {e}")));
                         return;
                     }
                 };
                 rt.block_on(async move {
-                    if let Err(reason) = drive(&socket, cmd_rx, &ev_tx).await {
-                        let _ = ev_tx.send(Ev::Down(reason));
+                    if let Err(reason) = drive(&socket, cmd_rx, &events).await {
+                        let _ = events.send(Ev::Down(reason));
                     }
                 });
             })
@@ -111,7 +140,7 @@ impl Conn {
 async fn drive(
     socket: &Path,
     mut cmd_rx: UnboundedReceiver<Cmd>,
-    ev_tx: &Sender<Ev>,
+    ev_tx: &EventSink,
 ) -> Result<(), String> {
     let (r, w) = crate::platform::connect_stream(socket).await?;
     let mut reader = FrameReader::new(r);
@@ -201,12 +230,17 @@ async fn drive(
                 Ok(None) | Err(_) => return Err("connection closed".to_string()),
             },
             cmd = cmd_rx.recv() => match cmd {
-                Some(Cmd::Attach { name, cols, rows }) => {
+                Some(Cmd::Attach {
+                    name,
+                    cols,
+                    rows,
+                    appearance,
+                }) => {
                     // Switching sessions on one connection means detach first.
                     if at.begin(name.clone()) {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
-                    if writer.write_frame(&Frame::Attach { name, cols, rows }).await.is_err() {
+                    if writer.write_frame(&Frame::Attach { name, cols, rows, appearance }).await.is_err() {
                         return Err("attach write failed".to_string());
                     }
                 }

@@ -88,16 +88,20 @@
   }
   if (!el) { log('FATAL: #terminal not found'); return; }
 
+  var rootStyle = getComputedStyle(document.documentElement);
+  var terminalBackground = rootStyle.getPropertyValue('--asd-terminal-background').trim();
+  var terminalForeground = rootStyle.getPropertyValue('--asd-terminal-foreground').trim();
+
   // Build (or rebuild) the terminal inside #terminal.
   var buildTerm = function() {
     var term = new window.GhosttyWeb.Terminal({
       fontSize: 14,
       fontFamily: "'JetBrains Mono', Menlo, Monaco, monospace",
       theme: {
-        background: '#0B0D11', foreground: '#E7E2D6', cursor: '#E7E2D6',
+        background: terminalBackground, foreground: terminalForeground, cursor: terminalForeground,
         selectionBackground: '#4A5568',
         black: '#1A202C', red: '#E5595E', green: '#79D18C', yellow: '#F3B24C',
-        blue: '#54C7DA', magenta: '#B98EFF', cyan: '#54C7DA', white: '#E7E2D6',
+        blue: '#54C7DA', magenta: '#B98EFF', cyan: '#54C7DA', white: terminalForeground,
         brightBlack: '#4A5568', brightRed: '#FF6B6B', brightGreen: '#9AE6B4',
         brightYellow: '#FBD38D', brightBlue: '#76E4F7', brightMagenta: '#D6BCFF',
         brightCyan: '#76E4F7', brightWhite: '#FFFFFF',

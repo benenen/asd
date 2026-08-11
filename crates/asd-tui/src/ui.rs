@@ -109,20 +109,73 @@ pub fn sidebar_from_drag(x: u16, total_w: u16) -> u16 {
     clamp_sidebar(x as i32 + 1, total_w)
 }
 
-/// How many sessions are scrolled past the top of the sidebar so the active row
-/// (`active_idx`) stays visible in a viewport `cap` rows tall (each session is
-/// one row here). Derived from the active index every frame — no stored scroll
-/// position — so the list simply follows the selection.
-pub fn sidebar_offset(active_idx: usize, len: usize, cap: usize) -> usize {
+/// Move a stored sidebar offset by `delta` sessions and clamp it to the list.
+pub fn scroll_sidebar_offset(current: usize, delta: isize, len: usize, cap: usize) -> usize {
     if cap == 0 || len <= cap {
-        return 0; // everything fits — no scroll
+        return 0;
     }
-    let max_off = len - cap;
-    if active_idx < cap {
-        0 // active is within the first page
+    let max = len - cap;
+    current.min(max).saturating_add_signed(delta).min(max)
+}
+
+/// Adjust a stored sidebar offset just enough to reveal `active_idx`.
+pub fn sidebar_offset_for_selection(
+    current: usize,
+    active_idx: usize,
+    len: usize,
+    cap: usize,
+) -> usize {
+    if cap == 0 || len <= cap {
+        return 0;
+    }
+    let max = len - cap;
+    let current = current.min(max);
+    let active_idx = active_idx.min(len - 1);
+    if active_idx < current {
+        active_idx
+    } else if active_idx >= current.saturating_add(cap) {
+        active_idx + 1 - cap
     } else {
-        // Pin the active row to the bottom of the viewport, never past the end.
-        (active_idx + 1 - cap).min(max_off)
+        current
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelTarget {
+    Sidebar,
+    Pane,
+    None,
+}
+
+/// Which scrollable region is under a mouse position. The sidebar's rightmost
+/// column is its draggable divider, not list content; the status row scrolls
+/// neither region.
+pub fn wheel_target(
+    total: Rect,
+    sidebar_w: u16,
+    hidden: bool,
+    status_hidden: bool,
+    col: u16,
+    row: u16,
+) -> WheelTarget {
+    let (side, pane, _) = areas(total, sidebar_w, hidden, status_hidden);
+    let in_sidebar = side.width > 1
+        && col >= side.left()
+        && col < side.right() - 1
+        && row >= side.top()
+        && row < side.bottom();
+    if in_sidebar {
+        return WheelTarget::Sidebar;
+    }
+    let in_pane = pane.width > 0
+        && col >= pane.left()
+        && col < pane.right()
+        && row >= pane.top()
+        && row < pane.bottom();
+    if in_pane {
+        WheelTarget::Pane
+    } else {
+        WheelTarget::None
     }
 }
 
@@ -487,10 +540,11 @@ fn render_pane(buf: &mut Buffer, area: Rect, snap: &RenderSnapshot, sel: Option<
                 target.reset();
                 continue;
             }
-            if cell.grapheme.is_empty() {
+            let grapheme = cell.host_grapheme();
+            if grapheme.is_empty() {
                 target.set_symbol(" ");
             } else {
-                target.set_symbol(&cell.grapheme);
+                target.set_symbol(grapheme.as_ref());
             }
             // Ghostty is the terminal model and therefore the authority on how
             // many grid cells this grapheme occupies. Ratatui otherwise
@@ -507,7 +561,7 @@ fn render_pane(buf: &mut Buffer, area: Rect, snap: &RenderSnapshot, sel: Option<
             target.set_diff_option(CellDiffOption::ForcedWidth(
                 std::num::NonZeroU16::new(width).unwrap(),
             ));
-            let mut style = cell_style(cell, snap);
+            let mut style = cell_style(cell);
             // Only cells with written content take the selection highlight —
             // blank (never-written) cells stay plain, so clicking or dragging
             // over empty areas shows no reverse-video block (same rule as the
@@ -526,10 +580,10 @@ fn render_pane(buf: &mut Buffer, area: Rect, snap: &RenderSnapshot, sel: Option<
     }
 }
 
-fn cell_style(cell: &asd_vt::CellSnapshot, snap: &RenderSnapshot) -> Style {
+fn cell_style(cell: &asd_vt::CellSnapshot) -> Style {
     let mut style = Style::new()
-        .fg(color(cell.fg.unwrap_or(snap.foreground)))
-        .bg(color(cell.bg.unwrap_or(snap.background)));
+        .fg(cell.fg.map(color).unwrap_or(Color::Reset))
+        .bg(cell.bg.map(color).unwrap_or(Color::Reset));
     let f = &cell.flags;
     if f.bold {
         style = style.add_modifier(Modifier::BOLD);
@@ -719,6 +773,58 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_wheel_offset_moves_and_clamps_to_the_list() {
+        assert_eq!(scroll_sidebar_offset(0, 1, 8, 3), 1);
+        assert_eq!(scroll_sidebar_offset(1, -1, 8, 3), 0);
+        assert_eq!(scroll_sidebar_offset(0, -1, 8, 3), 0);
+        assert_eq!(scroll_sidebar_offset(4, 10, 8, 3), 5);
+        assert_eq!(scroll_sidebar_offset(5, 1, 8, 3), 5);
+        assert_eq!(scroll_sidebar_offset(5, 1, 2, 3), 0);
+        assert_eq!(scroll_sidebar_offset(5, 1, 0, 3), 0);
+        assert_eq!(scroll_sidebar_offset(5, 1, 8, 0), 0);
+    }
+
+    #[test]
+    fn selecting_a_session_keeps_it_inside_the_sidebar_viewport() {
+        assert_eq!(sidebar_offset_for_selection(2, 1, 8, 3), 1);
+        assert_eq!(sidebar_offset_for_selection(2, 2, 8, 3), 2);
+        assert_eq!(sidebar_offset_for_selection(2, 4, 8, 3), 2);
+        assert_eq!(sidebar_offset_for_selection(2, 5, 8, 3), 3);
+        assert_eq!(sidebar_offset_for_selection(5, 7, 8, 3), 5);
+        assert_eq!(sidebar_offset_for_selection(5, 0, 2, 3), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_target_follows_the_region_under_the_pointer() {
+        let total = Rect::new(0, 0, 100, 10);
+
+        assert_eq!(
+            wheel_target(total, SIDEBAR_W, false, false, 5, 4),
+            WheelTarget::Sidebar
+        );
+        assert_eq!(
+            wheel_target(total, SIDEBAR_W, false, false, SIDEBAR_W, 4),
+            WheelTarget::Pane
+        );
+        assert_eq!(
+            wheel_target(total, SIDEBAR_W, false, false, SIDEBAR_W - 1, 4),
+            WheelTarget::None
+        );
+        assert_eq!(
+            wheel_target(total, SIDEBAR_W, false, false, 5, 9),
+            WheelTarget::None
+        );
+        assert_eq!(
+            wheel_target(total, SIDEBAR_W, true, false, 5, 4),
+            WheelTarget::Pane
+        );
+        assert_eq!(
+            wheel_target(Rect::new(0, 0, 30, 10), SIDEBAR_W, false, false, 5, 4),
+            WheelTarget::Pane
+        );
+    }
+
+    #[test]
     fn session_status_prefixes_scroll_offset() {
         assert_eq!(session_status(3, 0), "● 3 sessions");
         assert_eq!(session_status(3, 12), "[+12] ● 3 sessions");
@@ -808,19 +914,19 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_offset_follows_the_active_row() {
+    fn sidebar_selection_from_the_top_follows_the_active_row() {
         // Everything fits (len <= cap) → no scroll.
-        assert_eq!(sidebar_offset(0, 5, 10), 0);
-        assert_eq!(sidebar_offset(4, 5, 10), 0);
+        assert_eq!(sidebar_offset_for_selection(0, 0, 5, 10), 0);
+        assert_eq!(sidebar_offset_for_selection(0, 4, 5, 10), 0);
         // Active within the first page → still no scroll.
-        assert_eq!(sidebar_offset(9, 30, 10), 0);
+        assert_eq!(sidebar_offset_for_selection(0, 9, 30, 10), 0);
         // Active past the fold → pinned to the viewport bottom.
-        assert_eq!(sidebar_offset(10, 30, 10), 1);
-        assert_eq!(sidebar_offset(15, 30, 10), 6);
+        assert_eq!(sidebar_offset_for_selection(0, 10, 30, 10), 1);
+        assert_eq!(sidebar_offset_for_selection(0, 15, 30, 10), 6);
         // Never scroll past the end.
-        assert_eq!(sidebar_offset(29, 30, 10), 20);
+        assert_eq!(sidebar_offset_for_selection(0, 29, 30, 10), 20);
         // Degenerate: zero-height viewport.
-        assert_eq!(sidebar_offset(5, 30, 0), 0);
+        assert_eq!(sidebar_offset_for_selection(0, 5, 30, 0), 0);
     }
 
     #[test]
@@ -1048,9 +1154,8 @@ mod tests {
         let area = Rect::new(0, 0, 3, 1);
 
         // Ghostty treats the VS16 grapheme as one cell. Ratatui's Unicode-width
-        // table treats it as two. When the grapheme stays unchanged between
-        // frames, a diff that recomputes its width skips the following cell as
-        // a hidden tail, leaving the old character visible there.
+        // table treats it as two. The host output uses VS15 so the real terminal
+        // also keeps it narrow, while ForcedWidth keeps ratatui's diff aligned.
         let first = snapshot(vec![
             cell("✔️", blue),
             cell("A", green),
@@ -1076,7 +1181,7 @@ mod tests {
         terminal.feed(&ansi_diff(&first_buf, &second_buf));
         let rendered = terminal.render_snapshot();
 
-        assert_eq!(rendered.cells[0][0].grapheme, "✔️");
+        assert_eq!(rendered.cells[0][0].grapheme, "✔︎");
         assert_eq!(
             rendered.cells[0][1].grapheme, "B",
             "the cell after a VT-narrow VS16 grapheme kept the previous frame's character"
@@ -1084,7 +1189,96 @@ mod tests {
     }
 
     #[test]
-    fn pane_uses_the_vt_default_colors_for_unstyled_cells() {
+    fn pane_diff_clears_a_line_on_a_host_that_renders_vs16_wide() {
+        fn snapshot(cells: Vec<CellSnapshot>) -> RenderSnapshot {
+            RenderSnapshot {
+                cols: cells.len() as u16,
+                rows: 1,
+                cells: vec![std::sync::Arc::new(cells)],
+                row_dirty: vec![true],
+                cursor: CursorSnapshot::default(),
+                palette: [Rgb::default(); 256],
+                foreground: Rgb::default(),
+                background: Rgb::default(),
+            }
+        }
+
+        fn ansi_diff(previous: &Buffer, next: &Buffer) -> Vec<u8> {
+            let writer = crate::FrameBuf::default();
+            let mut backend = CrosstermBackend::new(writer.clone());
+            backend.draw(previous.diff_iter(next)).unwrap();
+            backend.flush().unwrap();
+            writer.0.borrow().clone()
+        }
+
+        // The captured reproduction contains this exact VS16 warning followed
+        // by text ending in `d`. Ghostty assigns the warning one cell, while
+        // the user's host terminal renders it as two. Replacing it with a known
+        // wide glyph lets Ghostty emulate that host-side width disagreement.
+        let suffix = " no covering tests found";
+        let mut first_cells = Vec::with_capacity(suffix.chars().count() + 2);
+        first_cells.push(CellSnapshot {
+            grapheme: "⚠️".to_string(),
+            width: CellWidth::Narrow,
+            ..CellSnapshot::default()
+        });
+        first_cells.extend(suffix.chars().map(|character| CellSnapshot {
+            grapheme: character.to_string(),
+            width: CellWidth::Narrow,
+            ..CellSnapshot::default()
+        }));
+        // The trailing blank is unchanged in the next frame, so ratatui will
+        // not emit it. A host-side width drift leaves the old final `d` there.
+        first_cells.push(CellSnapshot::default());
+        let width = first_cells.len() as u16;
+        let area = Rect::new(0, 0, width, 1);
+
+        let mut first_buf = Buffer::empty(area);
+        render_pane(&mut first_buf, area, &snapshot(first_cells), None);
+        let mut previous_cells = vec![
+            CellSnapshot {
+                grapheme: "X".to_string(),
+                width: CellWidth::Narrow,
+                ..CellSnapshot::default()
+            };
+            width as usize - 1
+        ];
+        previous_cells.push(CellSnapshot::default());
+        let mut previous_buf = Buffer::empty(area);
+        render_pane(&mut previous_buf, area, &snapshot(previous_cells), None);
+        let mut blank_buf = Buffer::empty(area);
+        render_pane(
+            &mut blank_buf,
+            area,
+            &snapshot(vec![CellSnapshot::default(); width as usize]),
+            None,
+        );
+
+        let emulate_wide_vs16 = |bytes: Vec<u8>| {
+            String::from_utf8(bytes)
+                .unwrap()
+                .replace("⚠️", "中")
+                .into_bytes()
+        };
+        let mut host = GhosttyVt::new(width, 1, 0);
+        host.feed(&ansi_diff(&blank_buf, &previous_buf));
+        let first_diff = ansi_diff(&previous_buf, &first_buf);
+        let blank_diff = ansi_diff(&first_buf, &blank_buf);
+        host.feed(&emulate_wide_vs16(first_diff));
+        host.feed(&emulate_wide_vs16(blank_diff));
+
+        let rendered = host.render_snapshot();
+        assert!(
+            rendered.cells[0]
+                .iter()
+                .all(|cell| cell.grapheme.trim().is_empty()),
+            "clearing the shorter line left old text on the host: {:?}",
+            rendered.cells[0]
+        );
+    }
+
+    #[test]
+    fn pane_leaves_unstyled_cells_on_the_host_terminal_colors() {
         let foreground = Rgb {
             r: 240,
             g: 241,
@@ -1115,7 +1309,7 @@ mod tests {
         render_pane(&mut buf, area, &snap, None);
 
         let cell = &buf[(0, 0)];
-        assert_eq!(cell.fg, color(foreground));
-        assert_eq!(cell.bg, color(background));
+        assert_eq!(cell.fg, Color::Reset);
+        assert_eq!(cell.bg, Color::Reset);
     }
 }
