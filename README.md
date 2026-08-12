@@ -295,6 +295,25 @@ The list belongs to the **data directory, not the socket**: `ASD_SOCKET` alone
 does not isolate it, so a second daemon run for experiments wants
 `XDG_DATA_HOME` pointed elsewhere too, or it will rewrite the real list.
 
+### Logs
+
+The daemon logs to **stderr** at `info` level; `RUST_LOG` sets the filter
+(`RUST_LOG=debug`, `RUST_LOG=asd_daemon=trace`, …). Where that stderr lands
+depends on who started it:
+
+- **Auto-spawned** — `asd new`, `asd attach -A`, and `asd ui` start the daemon
+  detached, with its stdout and stderr redirected to `daemon.log` in the data
+  directory: `~/.local/share/asd/daemon.log`, or
+  `%LOCALAPPDATA%\asd\daemon.log` on Windows. Set `RUST_LOG` in the
+  environment of whichever command spawns it, since the daemon inherits it.
+- **Foreground** — `asd daemon` writes to your terminal and touches no file.
+
+The log is opened for **append and never rotated or truncated**, so it grows
+for as long as you keep using asd; deleting it is safe at any time, and the
+next spawn recreates it. Like the session list it is keyed to the data
+directory rather than the socket, so daemons started on different
+`--socket`/`$ASD_SOCKET` paths all append to this one file.
+
 ## Recent highlights
 
 - **Running/idle status + sidebar shimmer** — each session reports whether its
