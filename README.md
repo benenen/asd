@@ -229,6 +229,38 @@ in plain text, the same trust model as `~/.ssh` on a single-user machine.
 → `/tmp/asd-$UID/asd.sock`; the GUI's `config.json`, the daemon log, and the
 session list below live in the data directory, `~/.local/share/asd/`.
 
+### Configuration
+
+The daemon's config file is optional, read-only, and never auto-created — a
+missing file simply means "all defaults":
+
+| | |
+|---|---|
+| Linux/macOS | `~/.config/asd/config.toml` (`$XDG_CONFIG_HOME/asd/config.toml` when set) |
+| Windows | `%APPDATA%\asd\config.toml` |
+
+`$ASD_CONFIG` overrides that path entirely. Note it is the *config* directory,
+deliberately apart from the data directory above, so a file you hand-edit never
+sits among the ones the daemon rewrites. (It is also not the GUI's
+`config.json` of saved SSH connections, which is machine-local state and does
+live in the data directory.)
+
+```toml
+[session]
+# Lines of scrollback history each session's terminal keeps — how far you can
+# scroll back, and how much `asd peek --scrollback` can return. Default 10000;
+# 0 disables scrollback. Memory grows only with the lines actually produced.
+scrollback_lines = 10000
+```
+
+That is the only knob today. Every key is optional and unknown keys are
+ignored, so a partial file merges onto the defaults and an older daemon
+tolerates a newer file. A malformed one is not fatal either — the daemon logs a
+warning and serves with defaults rather than refusing to start.
+
+The file is read **once, at daemon startup**, so run `asd restart` to apply an
+edit. `config.example.toml` in the repository root is a ready-to-copy template.
+
 ### Session persistence
 
 Session **names and working directories** outlive the daemon; the live processes
