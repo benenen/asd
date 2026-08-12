@@ -1,12 +1,18 @@
 # asd daemon configuration — example.
 #
-# Copy this to your config path and edit. The daemon looks for it at:
-#   $ASD_CONFIG                      (if set, wins)
-#   $XDG_CONFIG_HOME/asd/config.toml (if XDG_CONFIG_HOME is set)
-#   ~/.config/asd/config.toml        (default)
+# Copy this to your config path and edit — the file is never auto-created, and
+# the daemon looks for it at:
+#   $ASD_CONFIG                        (if set, wins everywhere)
+#   $XDG_CONFIG_HOME/asd/config.toml   (unix, if XDG_CONFIG_HOME is set)
+#   ~/.config/asd/config.toml          (unix default)
+#   %APPDATA%\asd\config.toml          (Windows)
 #
 #   mkdir -p ~/.config/asd
 #   cp config.example.toml ~/.config/asd/config.toml
+#
+# That is the *config* directory, deliberately apart from the data directory
+# the daemon rewrites (~/.local/share/asd, %LOCALAPPDATA%\asd) — nothing here
+# is ever overwritten behind your back.
 #
 # The daemon reads it once at startup, so run `asd restart` after editing to
 # apply changes. Every key is optional — anything omitted uses the default
