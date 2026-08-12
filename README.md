@@ -226,7 +226,42 @@ keys; `passphrase` is optional) or `password`. Host keys are verified against
 in plain text, the same trust model as `~/.ssh` on a single-user machine.
 
 **Paths.** The daemon socket resolves as `$ASD_SOCKET` → `$XDG_RUNTIME_DIR/asd.sock`
-→ `/tmp/asd-$UID/asd.sock`; config and logs live in `~/.local/share/asd/`.
+→ `/tmp/asd-$UID/asd.sock`; the GUI's `config.json`, the daemon log, and the
+session list below live in the data directory, `~/.local/share/asd/`.
+
+### Session persistence
+
+Session **names and working directories** outlive the daemon; the live processes
+and screens do not. The daemon keeps them in a tab-separated file, rewritten
+atomically (temp file + `rename`) on every create/rename/kill and read back on
+every startup:
+
+| | |
+|---|---|
+| Linux/macOS | `~/.local/share/asd/sessions.tsv` (`$XDG_DATA_HOME/asd/sessions.tsv` when set) |
+| Windows | `%LOCALAPPDATA%\asd\sessions.tsv` |
+
+One line per session, `name` TAB `cwd`:
+
+```tsv
+web	/home/me/proj
+logs	/var/log
+s0	
+```
+
+The cwd is empty when it could not be read — as on macOS, or for a session whose
+process is already gone (`s0` above); those come back in the daemon's default
+directory. Blank and nameless lines are skipped on read. Session names are
+`[A-Za-z0-9_-]` and paths don't contain tabs in practice, so no quoting or
+escaping is defined; the file is meant to be read, not hand-edited.
+
+On the next startup — `asd restart`, a reboot, or a crash — every entry is
+recreated as a fresh `$SHELL` in its saved directory. Killing a session or
+letting its shell exit rewrites the file without it, so it stays gone.
+
+The list belongs to the **data directory, not the socket**: `ASD_SOCKET` alone
+does not isolate it, so a second daemon run for experiments wants
+`XDG_DATA_HOME` pointed elsewhere too, or it will rewrite the real list.
 
 ## Recent highlights
 
