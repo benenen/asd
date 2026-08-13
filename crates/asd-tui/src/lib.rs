@@ -17,6 +17,7 @@
 //! vim, htop) the event is forwarded to it instead (SGR-encoded); Shift keeps
 //! the mouse local, and Shift+PageUp/PageDown scroll too.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -49,9 +50,14 @@ const SIDEBAR_WHEEL_STEP: usize = 1;
 /// (`?2026`) update open, bounding a lost `?2026l` (matches typical terminals).
 const SYNC_MAX: Duration = Duration::from_millis(150);
 /// Minimum time between frames driven only by the continuous running shimmer.
-/// Windows Terminal refreshes auto-detected URL locations after 100 ms without
-/// output, so leave enough headroom for its trailing debounce to run.
-const RUNNING_SHIMMER_FRAME_INTERVAL: Duration = Duration::from_millis(150);
+/// Windows Terminal starts refreshing auto-detected URL locations after 100 ms
+/// without output, but the scan and UI update are asynchronous. Leave a broad
+/// idle window for its observed asynchronous refresh to complete.
+const RUNNING_SHIMMER_FRAME_INTERVAL: Duration = Duration::from_millis(500);
+/// Windows Terminal's trailing debounce before rebuilding auto-detected URL
+/// coordinates. Once this much host-output quiet has elapsed, assume the
+/// visible URL footprint may have been cached and invalidate it if it moves.
+const HOST_URL_SCAN_DEBOUNCE: Duration = Duration::from_millis(100);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const FAST_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const FIRST_CONNECTION_GENERATION: u64 = 1;
@@ -62,21 +68,256 @@ struct LoopTiming {
     poll_timeout: Duration,
 }
 
+type HostUrlMarker = (u16, u16, String);
+
+#[derive(Default)]
+struct HostLinkState {
+    footprint: Vec<HostUrlMarker>,
+    may_be_cached: bool,
+}
+
+impl HostLinkState {
+    /// Observe the next visible pane frame. Returns true exactly when a URL
+    /// footprint that the host may have scanned has moved or disappeared.
+    fn before_frame(&mut self, snapshot: Option<&RenderSnapshot>, host_quiet: Duration) -> bool {
+        if host_quiet >= HOST_URL_SCAN_DEBOUNCE && !self.footprint.is_empty() {
+            self.may_be_cached = true;
+        }
+
+        let footprint = snapshot.map(host_url_footprint).unwrap_or_default();
+        let reset = self.may_be_cached && self.footprint != footprint;
+        self.footprint = footprint;
+        if reset {
+            // The synchronous host reset clears the pattern tree. Further
+            // movement during continuous output needs no additional reset.
+            self.may_be_cached = false;
+        }
+        reset
+    }
+}
+
+fn host_url_footprint(snapshot: &RenderSnapshot) -> Vec<HostUrlMarker> {
+    // Keep this list aligned with Windows Terminal's auto-link regex. Other
+    // pattern kinds may be highlighted, but only this URI pattern is returned
+    // by GetHyperlinkAtBufferPosition as a clickable destination.
+    const SCHEMES: [&str; 4] = ["https://", "http://", "ftp://", "file://"];
+    let mut urls = Vec::new();
+    let cols = snapshot.cols as usize;
+    let rows = snapshot.rows.min(snapshot.cells.len() as u16) as usize;
+    let cell_count = cols.saturating_mul(rows);
+
+    for index in 0..cell_count {
+        let Some(scheme) = SCHEMES
+            .iter()
+            .find(|scheme| scheme_cells_match(snapshot, index, scheme.as_bytes()))
+        else {
+            continue;
+        };
+        let mut token = String::from(*scheme);
+        for next in index + scheme.len()..cell_count {
+            let Some(cell) = snapshot_cell(snapshot, next) else {
+                break;
+            };
+            let text = cell.grapheme.as_str();
+            if text.is_empty()
+                || text
+                    .chars()
+                    .any(|character| character.is_whitespace() || "<>\"'".contains(character))
+            {
+                break;
+            }
+            token.push_str(text);
+        }
+        urls.push(((index / cols) as u16, (index % cols) as u16, token));
+    }
+    urls
+}
+
+fn snapshot_cell(snapshot: &RenderSnapshot, index: usize) -> Option<&asd_vt::CellSnapshot> {
+    let cols = snapshot.cols as usize;
+    (cols != 0)
+        .then_some(())
+        .and_then(|()| snapshot.cells.get(index / cols))
+        .and_then(|row| row.get(index % cols))
+}
+
+fn scheme_cells_match(snapshot: &RenderSnapshot, start: usize, scheme: &[u8]) -> bool {
+    scheme.iter().enumerate().all(|(offset, expected)| {
+        snapshot_cell(snapshot, start + offset).is_some_and(|cell| {
+            let grapheme = cell.grapheme.as_bytes();
+            grapheme.len() == 1 && grapheme[0] == *expected
+        })
+    })
+}
+
 fn loop_timing(
     last_frame_flush: Instant,
     now: Instant,
     has_running_fx: bool,
     fast_path: bool,
+    next_running_expiry: Option<Duration>,
 ) -> LoopTiming {
+    let base_poll_timeout = if fast_path {
+        FAST_EVENT_POLL_INTERVAL
+    } else {
+        EVENT_POLL_INTERVAL
+    };
     LoopTiming {
         shimmer_due: has_running_fx
             && now.saturating_duration_since(last_frame_flush) >= RUNNING_SHIMMER_FRAME_INTERVAL,
-        poll_timeout: if fast_path {
-            FAST_EVENT_POLL_INTERVAL
-        } else {
-            EVENT_POLL_INTERVAL
-        },
+        poll_timeout: next_running_expiry
+            .map_or(base_poll_timeout, |expiry| base_poll_timeout.min(expiry)),
     }
+}
+
+fn aged_idle_ms(session: &SessionInfo, elapsed_since_list: Duration) -> u64 {
+    let elapsed_ms = u64::try_from(elapsed_since_list.as_millis()).unwrap_or(u64::MAX);
+    session.idle_ms.saturating_add(elapsed_ms)
+}
+
+fn session_running_after(session: &SessionInfo, elapsed_since_list: Duration) -> bool {
+    session.running && aged_idle_ms(session, elapsed_since_list) < asd_proto::IDLE_SETTLE_MS
+}
+
+fn running_time_left(session: &SessionInfo, elapsed_since_list: Duration) -> Option<Duration> {
+    session_running_after(session, elapsed_since_list).then(|| {
+        Duration::from_millis(asd_proto::IDLE_SETTLE_MS - aged_idle_ms(session, elapsed_since_list))
+    })
+}
+
+#[derive(Clone, Default)]
+struct RunningActivity {
+    deadlines: HashMap<String, RunningDeadline>,
+}
+
+#[derive(Clone, Copy)]
+struct RunningDeadline {
+    at: Instant,
+    from_local_output: bool,
+}
+
+impl RunningActivity {
+    fn with_list(&self, sessions: &[SessionInfo], observed_at: Instant) -> Self {
+        let deadlines = sessions
+            .iter()
+            .filter_map(|session| {
+                let listed =
+                    running_time_left(session, Duration::ZERO).map(|left| RunningDeadline {
+                        at: observed_at + left,
+                        from_local_output: false,
+                    });
+                let local = self
+                    .deadlines
+                    .get(&session.name)
+                    .copied()
+                    .filter(|deadline| deadline.from_local_output && observed_at < deadline.at);
+                let deadline = match (listed, local) {
+                    (Some(listed), Some(local)) if local.at > listed.at => local,
+                    (Some(listed), _) => listed,
+                    (None, Some(local)) => local,
+                    (None, None) => return None,
+                };
+                Some((session.name.clone(), deadline))
+            })
+            .collect();
+        Self { deadlines }
+    }
+
+    fn with_output(&self, name: &str, observed_at: Instant) -> Self {
+        let deadline = RunningDeadline {
+            at: observed_at + Duration::from_millis(asd_proto::IDLE_SETTLE_MS),
+            from_local_output: true,
+        };
+        let deadlines = self
+            .deadlines
+            .iter()
+            .filter(|(session, _)| session.as_str() != name)
+            .map(|(session, deadline)| (session.clone(), *deadline))
+            .chain(std::iter::once((name.to_string(), deadline)))
+            .collect();
+        Self { deadlines }
+    }
+
+    fn with_rename(&self, old: &str, new: &str) -> Self {
+        let deadlines = self
+            .deadlines
+            .iter()
+            .map(|(session, deadline)| {
+                let session = if session == old {
+                    new.to_string()
+                } else {
+                    session.clone()
+                };
+                (session, *deadline)
+            })
+            .collect();
+        Self { deadlines }
+    }
+
+    fn is_running(&self, name: &str, now: Instant) -> bool {
+        self.deadlines
+            .get(name)
+            .is_some_and(|deadline| now < deadline.at)
+    }
+
+    fn expired_names(&self, now: Instant) -> Vec<String> {
+        self.deadlines
+            .iter()
+            .filter(|(name, _)| !self.is_running(name, now))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    fn without_expired(&self, now: Instant) -> Self {
+        let deadlines = self
+            .deadlines
+            .iter()
+            .filter(|(_, deadline)| now < deadline.at)
+            .map(|(name, deadline)| (name.clone(), *deadline))
+            .collect();
+        Self { deadlines }
+    }
+
+    fn next_expiry(&self, now: Instant, excluded_name: Option<&str>) -> Option<Duration> {
+        self.deadlines
+            .iter()
+            .filter(|(name, _)| excluded_name != Some(name.as_str()))
+            .map(|(_, deadline)| deadline.at.saturating_duration_since(now))
+            .min()
+    }
+}
+
+fn sessions_with_activity(
+    sessions: &[SessionInfo],
+    activity: &RunningActivity,
+    now: Instant,
+) -> Vec<SessionInfo> {
+    sessions
+        .iter()
+        .cloned()
+        .map(|session| SessionInfo {
+            running: activity.is_running(&session.name, now),
+            ..session
+        })
+        .collect()
+}
+
+fn sessions_with_running(
+    sessions: &[SessionInfo],
+    names: &[String],
+    running: bool,
+) -> Vec<SessionInfo> {
+    sessions
+        .iter()
+        .cloned()
+        .map(|session| {
+            if names.contains(&session.name) {
+                SessionInfo { running, ..session }
+            } else {
+                session
+            }
+        })
+        .collect()
 }
 
 /// A drag selection anchored in **absolute screen-space rows** (0 = oldest
@@ -144,6 +385,14 @@ pub(crate) struct App {
     connection_generation: u64,
 
     pub sessions: Vec<SessionInfo>,
+    /// Monotonic idle deadlines derived from the last list response and from
+    /// live output for the attached session. This removes list-poll lag without
+    /// letting an older list sample override output observed locally afterward.
+    running_activity: RunningActivity,
+    /// URL coordinates in the pane that Windows Terminal may have auto-detected.
+    /// When a scanned footprint moves, the next frame recreates the host's
+    /// alternate buffer so stale click targets cannot point at replacement text.
+    host_links: HostLinkState,
     /// The attached session's name.
     pub active: Option<String>,
     /// Local terminal for the attached session (recreated per attach).
@@ -236,11 +485,11 @@ pub(crate) struct App {
     /// Sidebar row effects (tachyonfx), keyed by session name: sweep-in on
     /// newly listed sessions, a brief accent fade on selection.
     row_fx: Vec<(String, tachyonfx::Effect)>,
-    /// A continuous color shimmer for each *running* session's row text (its
-    /// `running` flag is set — the agent is producing output), keyed by session
-    /// name. Added/dropped as the flag toggles; the UI's own host session is
-    /// excluded (it always produces output — the TUI itself — so it would
-    /// always shimmer).
+    /// A continuous color shimmer for each *running* session's row text, keyed
+    /// by session name. Daemon snapshots turn it on; local idle aging turns it
+    /// off exactly at the shared settle threshold instead of waiting for the
+    /// next list poll. The UI's own host session is excluded (it always
+    /// produces output — the TUI itself — so it would always shimmer).
     running_fx: Vec<(String, tachyonfx::Effect)>,
     /// Previous frame instant, for effect timing.
     last_frame: std::time::Instant,
@@ -271,6 +520,17 @@ impl FrameBuf {
         let mut b = self.0.borrow_mut();
         b.clear();
         b.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+    }
+
+    /// Recreate the host alternate buffer before a full repaint. Windows
+    /// Terminal synchronously rebuilds URL detection on each buffer switch;
+    /// the newly created alternate buffer is blank, so stale coordinates are
+    /// gone before the current frame is painted. This remains inside the
+    /// synchronized-update envelope opened by [`Self::begin`].
+    fn reset_host_links(&self) {
+        self.0
+            .borrow_mut()
+            .extend_from_slice(b"\x1b[?1049l\x1b[?1049h");
     }
 
     /// Close a frame with the cursor tail and hand it to the terminal as a
@@ -421,6 +681,8 @@ fn event_loop(
         ev_tx,
         connection_generation,
         sessions: Vec::new(),
+        running_activity: RunningActivity::default(),
+        host_links: HostLinkState::default(),
         active: None,
         vt: None,
         scroll: 0,
@@ -480,14 +742,19 @@ fn event_loop(
                 app.on_conn_event(ev);
             }
         }
+        let now = Instant::now();
+        app.dirty |= app.expire_running_sessions(now);
         let timing = loop_timing(
             last_frame_flush,
-            Instant::now(),
+            now,
             !app.running_fx.is_empty(),
             app.pane_hold.is_some() || !app.row_fx.is_empty(),
+            app.next_running_expiry(now),
         );
         app.dirty |= timing.shimmer_due;
         if app.dirty {
+            let reset_host_links = app
+                .host_link_reset_needed(Instant::now().saturating_duration_since(last_frame_flush));
             app.now_ms = now_ms();
             // One frame = one write: `FrameBuf` wraps the cell diff in
             // `?2026h ?25l` … `<CUP><?25h|?25l> ?2026l` and flushes it in a
@@ -498,6 +765,15 @@ fn event_loop(
             // terminals without DEC-2026 render freely between writes). The
             // tail is `app.cursor_tail`, recomputed by `ui::draw`.
             frame.begin();
+            if reset_host_links {
+                frame.reset_host_links();
+                terminal.resize(ratatui::layout::Rect::new(
+                    0,
+                    0,
+                    app.term_size.0,
+                    app.term_size.1,
+                ))?;
+            }
             terminal.draw(|f| ui::draw(f, &mut app))?;
             frame.finish(app.cursor_tail)?;
             last_frame_flush = Instant::now();
@@ -544,6 +820,27 @@ fn event_loop(
 }
 
 impl App {
+    fn host_link_reset_needed(&mut self, host_quiet: Duration) -> bool {
+        let snapshot = self.snapshot();
+        self.host_links.before_frame(snapshot.as_ref(), host_quiet)
+    }
+
+    fn expire_running_sessions(&mut self, now: Instant) -> bool {
+        let expired = self.running_activity.expired_names(now);
+        if expired.is_empty() {
+            return false;
+        }
+
+        self.sessions = sessions_with_running(&self.sessions, &expired, false);
+        self.running_activity = self.running_activity.without_expired(now);
+        true
+    }
+
+    fn next_running_expiry(&self, now: Instant) -> Option<Duration> {
+        self.running_activity
+            .next_expiry(now, self.self_session.as_deref())
+    }
+
     /// Schedule (or replace) a sidebar effect for a session row.
     fn add_fx(&mut self, name: String, fx: tachyonfx::Effect) {
         self.row_fx.retain(|(n, _)| n != &name);
@@ -897,6 +1194,9 @@ impl App {
                 self.pane_cache = None;
             }
             Ev::Sessions(list) => {
+                let observed_at = Instant::now();
+                self.running_activity = self.running_activity.with_list(&list, observed_at);
+                let list = sessions_with_activity(&list, &self.running_activity, observed_at);
                 // Drop parked terminals of sessions that no longer exist.
                 self.parked
                     .retain(|(n, _)| list.iter().any(|s| &s.name == n));
@@ -952,6 +1252,12 @@ impl App {
                 // Bytes from a session we already left can still be in flight.
                 if self.active.as_deref() != Some(&name) {
                     return;
+                }
+                if !snapshot {
+                    self.running_activity =
+                        self.running_activity.with_output(&name, Instant::now());
+                    self.sessions =
+                        sessions_with_running(&self.sessions, std::slice::from_ref(&name), true);
                 }
                 if snapshot {
                     // A snapshot is a full redraw into a clean terminal.
@@ -1186,6 +1492,7 @@ impl App {
                 s.name = new.clone();
             }
         }
+        self.running_activity = self.running_activity.with_rename(&target, &new);
         // The daemon lists sessions by name. Mirror that ordering immediately
         // so the next refresh cannot move the active row out of the viewport.
         self.sessions.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1592,24 +1899,39 @@ mod tests {
             first_frame + Duration::from_millis(30),
             true,
             false,
+            None,
         );
         assert!(!early.shimmer_due);
         assert_eq!(early.poll_timeout, Duration::from_millis(30));
 
-        let just_before = loop_timing(
-            first_frame,
-            first_frame + Duration::from_millis(149),
-            true,
-            false,
-        );
-        assert!(!just_before.shimmer_due);
-        assert_eq!(just_before.poll_timeout, Duration::from_millis(30));
-
-        let due = loop_timing(
+        let old_interval = loop_timing(
             first_frame,
             first_frame + Duration::from_millis(150),
             true,
             false,
+            None,
+        );
+        assert!(
+            !old_interval.shimmer_due,
+            "the former 150 ms interval does not leave Windows Terminal enough time to refresh links"
+        );
+        assert_eq!(old_interval.poll_timeout, Duration::from_millis(30));
+
+        let just_before = loop_timing(
+            first_frame,
+            first_frame + Duration::from_millis(499),
+            true,
+            false,
+            None,
+        );
+        assert!(!just_before.shimmer_due);
+
+        let due = loop_timing(
+            first_frame,
+            first_frame + Duration::from_millis(500),
+            true,
+            false,
+            None,
         );
         assert!(due.shimmer_due);
         assert_eq!(due.poll_timeout, Duration::from_millis(30));
@@ -1619,6 +1941,7 @@ mod tests {
             first_frame + Duration::from_secs(1),
             false,
             false,
+            None,
         );
         assert!(!inactive.shimmer_due);
 
@@ -1627,8 +1950,189 @@ mod tests {
             first_frame + Duration::from_millis(1),
             true,
             true,
+            None,
         );
         assert_eq!(fast_path.poll_timeout, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn running_session_expires_locally_without_another_list_response() {
+        let session = SessionInfo {
+            name: "agent".to_string(),
+            command: "codex".to_string(),
+            title: String::new(),
+            created_ms: 0,
+            idle_ms: asd_proto::IDLE_SETTLE_MS - 100,
+            running: true,
+            attached_clients: 0,
+            pid: 1,
+            cols: 80,
+            rows: 24,
+        };
+
+        assert!(session_running_after(&session, Duration::from_millis(99)));
+        assert!(!session_running_after(&session, Duration::from_millis(100)));
+        assert!(!session_running_after(&session, Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn event_poll_wakes_at_the_local_running_expiry() {
+        let first_frame = Instant::now();
+        let timing = loop_timing(
+            first_frame,
+            first_frame,
+            true,
+            false,
+            Some(Duration::from_millis(7)),
+        );
+        assert_eq!(timing.poll_timeout, Duration::from_millis(7));
+
+        let normal_poll_wins = loop_timing(
+            first_frame,
+            first_frame,
+            true,
+            false,
+            Some(Duration::from_millis(40)),
+        );
+        assert_eq!(normal_poll_wins.poll_timeout, Duration::from_millis(30));
+
+        let fast_poll_wins = loop_timing(
+            first_frame,
+            first_frame,
+            true,
+            true,
+            Some(Duration::from_millis(7)),
+        );
+        assert_eq!(fast_poll_wins.poll_timeout, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn output_resets_local_running_expiry() {
+        let listed_at = Instant::now();
+        let session = SessionInfo {
+            name: "agent".to_string(),
+            command: "codex".to_string(),
+            title: String::new(),
+            created_ms: 0,
+            idle_ms: asd_proto::IDLE_SETTLE_MS - 100,
+            running: true,
+            attached_clients: 0,
+            pid: 1,
+            cols: 80,
+            rows: 24,
+        };
+        let listed =
+            RunningActivity::default().with_list(std::slice::from_ref(&session), listed_at);
+        assert!(!listed.is_running("agent", listed_at + Duration::from_millis(100)));
+
+        let output_at = listed_at + Duration::from_millis(10);
+        let refreshed = listed.with_output("agent", output_at);
+        assert!(refreshed.is_running("agent", listed_at + Duration::from_millis(100)));
+        assert!(refreshed.is_running("agent", output_at + Duration::from_millis(1999)));
+        assert!(!refreshed.is_running("agent", output_at + Duration::from_millis(2000)));
+    }
+
+    #[test]
+    fn stale_list_cannot_override_output_observed_locally() {
+        let listed_at = Instant::now();
+        let idle_session = SessionInfo {
+            name: "agent".to_string(),
+            command: "codex".to_string(),
+            title: String::new(),
+            created_ms: 0,
+            idle_ms: asd_proto::IDLE_SETTLE_MS,
+            running: false,
+            attached_clients: 0,
+            pid: 1,
+            cols: 80,
+            rows: 24,
+        };
+        let output_at = listed_at + Duration::from_millis(10);
+        let activity = RunningActivity::default().with_output("agent", output_at);
+        let merged = activity.with_list(std::slice::from_ref(&idle_session), output_at);
+
+        assert!(merged.is_running("agent", output_at + Duration::from_millis(1999)));
+        assert!(!merged.is_running("agent", output_at + Duration::from_millis(2000)));
+    }
+
+    #[test]
+    fn moved_url_resets_a_scanned_host_cache_once() {
+        fn snapshot(lines: &[&str]) -> RenderSnapshot {
+            let cols = lines.iter().map(|line| line.len()).max().unwrap_or(0) as u16;
+            let cells = lines
+                .iter()
+                .map(|line| {
+                    let mut row: Vec<asd_vt::CellSnapshot> = line
+                        .chars()
+                        .map(|character| asd_vt::CellSnapshot {
+                            grapheme: character.to_string(),
+                            ..asd_vt::CellSnapshot::default()
+                        })
+                        .collect();
+                    row.resize(cols as usize, asd_vt::CellSnapshot::default());
+                    std::sync::Arc::new(row)
+                })
+                .collect();
+            RenderSnapshot {
+                cols,
+                rows: lines.len() as u16,
+                cells,
+                row_dirty: vec![true; lines.len()],
+                cursor: asd_vt::CursorSnapshot::default(),
+                palette: [asd_vt::Rgb::default(); 256],
+                foreground: asd_vt::Rgb::default(),
+                background: asd_vt::Rgb::default(),
+            }
+        }
+
+        let mut state = HostLinkState::default();
+        let first = snapshot(&["answer", "http://example.test/task"]);
+        assert!(!state.before_frame(Some(&first), Duration::ZERO));
+
+        let same = snapshot(&["answer", "http://example.test/task"]);
+        assert!(!state.before_frame(Some(&same), HOST_URL_SCAN_DEBOUNCE));
+
+        let moved = snapshot(&["http://example.test/task", "more output"]);
+        assert!(state.before_frame(Some(&moved), Duration::ZERO));
+
+        let moved_again = snapshot(&["more output", "http://example.test/task"]);
+        assert!(
+            !state.before_frame(Some(&moved_again), Duration::ZERO),
+            "the synchronous reset left no cached host coordinates to invalidate again"
+        );
+
+        let mut wrapped_state = HostLinkState::default();
+        let wrapped = snapshot(&["http://example.", "test/task"]);
+        assert!(!wrapped_state.before_frame(Some(&wrapped), Duration::ZERO));
+        assert!(!wrapped_state.before_frame(Some(&wrapped), HOST_URL_SCAN_DEBOUNCE));
+        let changed_continuation = snapshot(&["http://example.", "test/other"]);
+        assert!(
+            wrapped_state.before_frame(Some(&changed_continuation), Duration::ZERO),
+            "a changed soft-wrapped URL continuation must invalidate the old host range"
+        );
+    }
+
+    #[test]
+    fn daemon_idle_sample_is_never_resurrected_locally() {
+        let session = SessionInfo {
+            name: "idle".to_string(),
+            command: "bash".to_string(),
+            title: String::new(),
+            created_ms: 0,
+            idle_ms: 0,
+            running: false,
+            attached_clients: 0,
+            pid: 1,
+            cols: 80,
+            rows: 24,
+        };
+
+        assert!(!session_running_after(&session, Duration::ZERO));
+        let recent_but_idle = SessionInfo {
+            idle_ms: asd_proto::IDLE_SETTLE_MS - 1,
+            ..session
+        };
+        assert!(!session_running_after(&recent_but_idle, Duration::ZERO));
     }
 
     #[test]
@@ -1687,6 +2191,21 @@ mod tests {
         // begin() starts the next frame from scratch.
         frame.begin();
         assert_eq!(frame.0.borrow().as_slice(), b"\x1b[?2026h\x1b[?25l");
+    }
+
+    #[test]
+    fn host_link_reset_precedes_the_repaint_in_one_atomic_frame() {
+        use std::io::Write;
+        let frame = FrameBuf::default();
+        frame.begin();
+        frame.reset_host_links();
+        let mut backend_handle = frame.clone();
+        backend_handle.write_all(b"<full repaint>").unwrap();
+
+        assert_eq!(
+            frame.0.borrow().as_slice(),
+            b"\x1b[?2026h\x1b[?25l\x1b[?1049l\x1b[?1049h<full repaint>"
+        );
     }
 
     #[test]
