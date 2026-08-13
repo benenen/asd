@@ -9,8 +9,75 @@ permissions:
   contents: write # create the release and upload assets
 
 jobs:
+  # Create the release exactly once, before anything can attach to it. The four
+  # build jobs each ran "create or find" against a brand-new tag, and on v0.1.12
+  # they raced: three landed on one release, the macOS job's create call made a
+  # SECOND (draft) release, uploaded its asset there, then died finalizing it
+  # with `already_exists: tag_name`. That failure then skipped the notes and npm
+  # jobs, so a release that had built fine on every platform shipped with three
+  # assets, an empty body, and nothing on npm.
+  #
+  # Serializing creation here leaves the build jobs with nothing to do but
+  # upload to a release that already exists, which is not a race. The job is
+  # deliberately NOT gated on a tag ref — a skipped job skips everything that
+  # needs it, which would break the workflow_dispatch build check; the step
+  # inside it is gated instead, so a manual run passes through in seconds.
+  prepare:
+    name: create release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the release if the tag has none yet
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # The tag annotation's body, read from the API instead of from a
+          # checkout. `git tag -l --format='%(contents:body)'` is the obvious
+          # way and it is WRONG here: actions/checkout force-updates the local
+          # ref to point straight at the commit
+          # (`git fetch ... +<sha>:refs/tags/<tag>`), so the annotated tag
+          # object never reaches the runner and the format string silently
+          # falls back to the COMMIT message. That is how v0.1.12 published a
+          # body consisting of nothing but a Co-Authored-By trailer. The API
+          # has the real object, and this job then needs no checkout at all.
+          # No annotation, or the tag is lightweight, or the API is having a
+          # bad day: print nothing and let the caller carry on. `|| return 0`
+          # rather than `|| true` on the substitution — a failing `gh api`
+          # prints the error JSON on stdout, so masking its exit status would
+          # assign that JSON to $sha and go on to request a garbage path.
+          annotation_body() {
+            local sha
+            sha="$(gh api "repos/${REPO}/git/ref/tags/$1" \
+                     --jq 'select(.object.type == "tag") | .object.sha' \
+                   2>/dev/null)" || return 0
+            [ -n "$sha" ] || return 0
+            # Drop the subject line and the blank line under it, as
+            # `%(contents:body)` would.
+            gh api "repos/${REPO}/git/tags/${sha}" --jq .message 2>/dev/null \
+              | sed '1d' | sed '/./,$!d' || return 0
+          }
+
+          if gh release view "$REF_NAME" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release $REF_NAME already exists; nothing to create"
+            exit 0
+          fi
+          # Seed the body from the tag annotation so a release is never empty,
+          # even if the notes job later fails. That job rewrites everything
+          # under its marker anyway, so this is a starting point, not the
+          # final text.
+          annotation_body "$REF_NAME" > notes.md
+          gh release create "$REF_NAME" --repo "$REPO" \
+            --title "$REF_NAME" --notes-file notes.md
+
   build:
     name: ${{ matrix.target }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -91,6 +158,7 @@ jobs:
   # crypto; asd-vt needs Zig for the vendored ghostty.
   windows:
     name: x86_64-pc-windows-msvc
+    needs: prepare
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -175,6 +243,7 @@ jobs:
   # runners are frequently unavailable and were blocking the whole release.
   macos:
     name: ${{ matrix.target }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -253,32 +322,38 @@ jobs:
   # what keeps a re-release identical instead of nested.
   #
   # Highlights come from whichever human source exists, in this order:
-  #   1. the body already on the release — what `gh release create --notes` left
-  #      at cut time, or a later edit in the UI;
-  #   2. the tag's annotation body, for when the release was created by the
-  #      upload step with no body:
-  #
-  #        git tag -a v0.1.11 --cleanup=verbatim -F notes.md
-  #
-  #      `--cleanup=verbatim` is not optional. git's default cleanup treats a
-  #      line starting with `#` as a comment and drops it, which silently eats
-  #      every markdown heading in the notes — `### New` and friends vanished
-  #      from v0.1.11's annotation exactly that way. The first line is the tag
-  #      subject (use the version), and the body is everything after it.
+  #   1. the body already on the release — normally the tag annotation the
+  #      `prepare` job seeded it with, or a later edit in the UI;
+  #   2. the tag's annotation, read again here, for a release created by hand
+  #      or by the upload step with no body.
   # Neither one: just the changelog, exactly as before.
+  #
+  # So the way to write release notes is to put them in the tag:
+  #
+  #     git tag -a v0.1.12 --cleanup=verbatim -F notes.md
+  #
+  # `--cleanup=verbatim` is not optional. git's default cleanup treats a line
+  # starting with `#` as a comment and drops it, which silently eats every
+  # markdown heading — `### New` and friends vanished from v0.1.11's annotation
+  # exactly that way. The first line is the tag subject (use the version); the
+  # body is everything after it.
   notes:
     name: release notes
     needs: [build, windows, macos]
-    if: startsWith(github.ref, 'refs/tags/')
+    # Not `success()`: one platform failing should not also cost the release its
+    # body, which is how v0.1.12 came out bodiless. The job SETS the text under
+    # its marker, so running it on a partial release and again after the missing
+    # platform is re-run produces the same result — there is nothing to lose by
+    # writing it early.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # No checkout: everything this job reads (the release body, the tag
+    # annotation, the generated changelog) comes from the API. It used to check
+    # out with fetch-depth 0 "so the annotated tag object is present", which was
+    # never true — checkout overwrites that ref with the commit.
     steps:
-      # Full history so the annotated tag object (and its message) is present.
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Set the release body
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -287,6 +362,18 @@ jobs:
         run: |
           set -euo pipefail
           marker='<!-- generated notes below; this job rewrites everything under it -->'
+
+          # Identical to the helper in `prepare` — see there for why the tag
+          # annotation has to come from the API and not from `git tag -l`.
+          annotation_body() {
+            local sha
+            sha="$(gh api "repos/${REPO}/git/ref/tags/$1" \
+                     --jq 'select(.object.type == "tag") | .object.sha' \
+                   2>/dev/null)" || return 0
+            [ -n "$sha" ] || return 0
+            gh api "repos/${REPO}/git/tags/${sha}" --jq .message 2>/dev/null \
+              | sed '1d' | sed '/./,$!d' || return 0
+          }
 
           gh release view "$REF_NAME" --repo "$REPO" --json body --jq .body > body.md || : > body.md
           # Keep what is above the marker. Without one the body is all human
@@ -303,9 +390,12 @@ jobs:
           fi
 
           # Nothing there: fall back to the tag annotation, minus its subject
-          # line (that is just the version).
+          # line (that is just the version). Read from the API, not from the
+          # checkout — see the identical helper in the `prepare` job for why
+          # `git tag -l --format='%(contents:body)'` returns the commit message
+          # here instead of the annotation.
           if ! grep -q '[^[:space:]]' highlights.md; then
-            git tag -l --format='%(contents:body)' "$REF_NAME" > highlights.md
+            annotation_body "$REF_NAME" > highlights.md
           fi
 
           gh api "repos/${REPO}/releases/generate-notes" \
@@ -335,6 +425,10 @@ jobs:
   # shibenenen account (automation tokens bypass publish 2FA, as CI needs).
   npm:
     name: npm publish
+    # Stays gated on every platform succeeding, unlike the notes job: the
+    # package ships no binary, so publishing while an asset is missing hands
+    # that platform's users a postinstall that 404s — and npm will not let the
+    # version be republished once the asset lands.
     needs: [build, windows, macos]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
