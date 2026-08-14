@@ -434,21 +434,6 @@ fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
             c.set_style(Style::new().bg(RULE));
         }
     }
-    let (hint, style) = if app.prefix {
-        (
-            "PREFIX  j/k ↑/↓ switch · 1-9 jump · c new · r rename · x kill · b sidebar · R reconnect · q quit · Esc cancel",
-            Style::new().fg(ACCENT).bg(RULE),
-        )
-    } else {
-        ("Keybinds: Ctrl+A", Style::new().fg(DIM).bg(RULE))
-    };
-    buf.set_string(
-        area.left() + 1,
-        y,
-        truncate(hint, area.width.saturating_sub(2) as usize),
-        style,
-    );
-
     let (status, sstyle) = if let Some(notice) = &app.notice {
         (notice.clone(), Style::new().fg(ALERT).bg(RULE))
     } else if app.daemon_up {
@@ -469,15 +454,62 @@ fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
             Style::new().fg(ALERT).bg(RULE),
         )
     };
+    draw_bar_text(
+        buf,
+        area,
+        app.prefix,
+        &server_time_at(app.now_ms),
+        &status,
+        sstyle,
+    );
+}
+
+fn draw_bar_text(
+    buf: &mut Buffer,
+    area: Rect,
+    prefix: bool,
+    server_time: &str,
+    status: &str,
+    status_style: Style,
+) {
     let max = (area.width / 2) as usize;
-    let status = truncate(&status, max);
+    let status = truncate(status, max);
     let x = area.right().saturating_sub(str_width(&status) as u16 + 1);
-    // Only draw the status when it clears the hint actually painted on the left
-    // (the *truncated* hint width, not the full string).
-    let hint_w = str_width(&truncate(hint, area.width.saturating_sub(2) as usize));
-    if x > area.left() + 1 + hint_w as u16 {
-        buf.set_string(x, y, status, sstyle);
-    }
+    buf.set_string(x, area.top(), status, status_style);
+
+    // Preserve daemon health and notices on narrow terminals. The clock is
+    // optional there; the keybind hint shrinks into the space left of status.
+    let left_width = x.saturating_sub(area.left() + 2) as usize;
+    draw_bar_left(buf, area, prefix, server_time, left_width);
+}
+
+fn draw_bar_left(buf: &mut Buffer, area: Rect, prefix: bool, server_time: &str, max_width: usize) {
+    let (hint, style) = if prefix {
+        (
+            "PREFIX  j/k ↑/↓ switch · 1-9 jump · c new · r rename · x kill · b sidebar · R reconnect · q quit · Esc cancel",
+            Style::new().fg(ACCENT).bg(RULE),
+        )
+    } else {
+        ("Keybinds: Ctrl+A", Style::new().fg(DIM).bg(RULE))
+    };
+    let with_time = format!("{hint}  {server_time}");
+    let line = if str_width(&with_time) <= max_width {
+        with_time
+    } else {
+        truncate(hint, max_width)
+    };
+    buf.set_string(area.left() + 1, area.top(), &line, style);
+}
+
+fn server_time_at(timestamp_ms: u64) -> String {
+    let timestamp_ms = i64::try_from(timestamp_ms).unwrap_or(i64::MAX);
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|time| format_server_time(time.with_timezone(&chrono::Local)))
+        .unwrap_or_default()
+}
+
+fn format_server_time(time: chrono::DateTime<chrono::Local>) -> String {
+    time.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// Which sidebar session row (and whether its kill mark) a click lands on.
@@ -890,6 +922,58 @@ mod tests {
         assert_eq!(session_status(3, 0), "● 3 sessions");
         assert_eq!(session_status(3, 12), "[+12] ● 3 sessions");
         assert_eq!(session_status(0, 0), "● 0 sessions");
+    }
+
+    #[test]
+    fn bottom_bar_places_the_full_server_time_after_keybinds() {
+        use chrono::{Local, TimeZone};
+
+        let time = Local
+            .with_ymd_and_hms(2026, 8, 14, 9, 5, 7)
+            .single()
+            .expect("the daytime fixture is unambiguous");
+        let shown = format_server_time(time);
+        assert_eq!(shown, "2026-08-14 09:05:07");
+
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        draw_bar_text(
+            &mut buf,
+            area,
+            false,
+            &shown,
+            "● 3 sessions",
+            Style::default(),
+        );
+        let line = (0..area.width)
+            .map(|x| buf.cell(Position::new(x, 0)).unwrap().symbol())
+            .collect::<String>();
+        assert!(
+            line.starts_with(" Keybinds: Ctrl+A  2026-08-14 09:05:07"),
+            "bar: {line}"
+        );
+        assert!(line.contains("● 3 sessions"), "bar: {line}");
+    }
+
+    #[test]
+    fn narrow_bottom_bar_keeps_daemon_status_before_the_clock() {
+        let area = Rect::new(0, 0, 42, 1);
+        let mut buf = Buffer::empty(area);
+        draw_bar_text(
+            &mut buf,
+            area,
+            false,
+            "2026-08-14 09:05:07",
+            "● 3 sessions",
+            Style::default(),
+        );
+        let line = (0..area.width)
+            .map(|x| buf.cell(Position::new(x, 0)).unwrap().symbol())
+            .collect::<String>();
+
+        assert!(line.contains("Keybinds: Ctrl+A"), "bar: {line}");
+        assert!(line.contains("● 3 sessions"), "bar: {line}");
+        assert!(!line.contains("2026-08-14"), "bar: {line}");
     }
 
     #[test]

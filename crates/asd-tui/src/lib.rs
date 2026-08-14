@@ -170,6 +170,10 @@ fn loop_timing(
     }
 }
 
+fn wall_clock_tick_due(displayed_ms: u64, current_ms: u64, visible: bool) -> bool {
+    visible && displayed_ms / 1_000 != current_ms / 1_000
+}
+
 fn aged_idle_ms(session: &SessionInfo, elapsed_since_list: Duration) -> u64 {
     let elapsed_ms = u64::try_from(elapsed_since_list.as_millis()).unwrap_or(u64::MAX);
     session.idle_ms.saturating_add(elapsed_ms)
@@ -770,6 +774,8 @@ fn event_loop(
             }
         }
         let now = Instant::now();
+        let wall_now_ms = now_ms();
+        app.dirty |= wall_clock_tick_due(app.now_ms, wall_now_ms, !app.status_hidden);
         app.dirty |= app.expire_running_sessions(now);
         let timing = loop_timing(
             last_frame_flush,
@@ -782,7 +788,7 @@ fn event_loop(
         if app.dirty {
             let reset_host_links = app
                 .host_link_reset_needed(Instant::now().saturating_duration_since(last_frame_flush));
-            app.now_ms = now_ms();
+            app.now_ms = wall_now_ms;
             // One frame = one write: `FrameBuf` wraps the cell diff in
             // `?2026h ?25l` … `<CUP><?25h|?25l> ?2026l` and flushes it in a
             // single `write_all`, so a shimmer redraw can neither
@@ -2061,6 +2067,17 @@ mod tests {
             None,
         );
         assert_eq!(fast_path.poll_timeout, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn wall_clock_redraws_when_the_displayed_second_changes() {
+        assert!(!wall_clock_tick_due(1_000, 1_999, true));
+        assert!(wall_clock_tick_due(1_999, 2_000, true));
+        assert!(!wall_clock_tick_due(2_000, 2_000, true));
+        assert!(
+            !wall_clock_tick_due(1_999, 2_000, false),
+            "a hidden status bar must not generate invisible host writes"
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ anyhow = { workspace = true }
 asd-client = { workspace = true }
 asd-proto = { workspace = true }
 asd-vt = { workspace = true }
+chrono = { workspace = true }
 ratatui = { workspace = true }
 tachyonfx = "0.25"
 # Display-width-aware truncation for sidebar rows (CJK glyphs are 2 cols); the
