@@ -6,8 +6,9 @@
 //! background thread ([`conn`]) owns the daemon connection and exchanges plain
 //! data over channels — the same split as every other asd client.
 //!
-//! Keys: everything is forwarded to the attached session except the `Ctrl+A`
-//! prefix (screen-style): `j/k` or arrows switch sessions, `1-9` jump, `c`
+//! Keys: [`keymap::Keymap`] owns the declarative bindings used by both routing
+//! and UI hints. The defaults forward everything except the `Ctrl+A` prefix
+//! (screen-style): `j/k` or arrows switch sessions, `1-9` jump, `c`
 //! creates, `r` renames (input modal), `x` kills (confirmation modal), `b`/`s`
 //! hide the sidebar / bottom status bar (the latter frees the pane's bottom row
 //! so an input line can reach the window edge, keeping the IME box from covering
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use asd_client::terminal::ProbeResult;
 use asd_proto::{SessionInfo, TerminalAppearance};
-use asd_vt::{GhosttyVt, Key as VtKey, KeyEvent, Mods, RenderSnapshot, VtBackend};
+use asd_vt::{GhosttyVt, KeyEvent, RenderSnapshot, VtBackend};
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent as CtKey, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -33,11 +34,13 @@ use ratatui::crossterm::execute;
 
 mod conn;
 mod key;
+mod keymap;
 mod modal;
 mod platform;
 mod ui;
 
 use conn::{Cmd, Conn, ConnectionEvent, Ev};
+use keymap::{KeyAction, KeyResolution, Keymap};
 use modal::{Modal, RenameInput, validate_rename};
 
 /// Scrollback kept by the local terminal.
@@ -473,8 +476,8 @@ pub(crate) struct App {
     /// An open modal overlay (rename input or kill confirmation); captures all
     /// keys until it closes.
     pub modal: Option<Modal>,
-    /// True while waiting for the key after Ctrl+A.
-    pub prefix: bool,
+    /// Declarative global/PREFIX bindings and their pending leader state.
+    pub keymap: Keymap,
     pub now_ms: u64,
 
     /// Session named on the command line, consumed by the first auto-select.
@@ -732,7 +735,7 @@ fn event_loop(
         daemon_up: false,
         notice: None,
         modal: None,
-        prefix: false,
+        keymap: Keymap::default(),
         now_ms: now_ms(),
         preferred,
         terminal_appearance: probe.appearance,
@@ -983,7 +986,7 @@ impl App {
     /// would keep whatever was last drawn there — nothing revisits them, so the
     /// leftovers sit on screen until something forces a full repaint. Following
     /// the real size makes the snapshot honest about how much of the pane the
-    /// session actually covers; `ui::render_pane` blanks the rest.
+    /// session actually covers; the pane renderer blanks the rest.
     fn follow_session_size(&mut self) {
         let Some(active) = self.active.clone() else {
             return;
@@ -1006,7 +1009,7 @@ impl App {
 
     /// Keep one color-shimmer effect per running (non-self) session, then
     /// advance each over its two sidebar rows. The text is drawn (in accent)
-    /// by [`ui::draw_sidebar`]; the effect only rotates its hue, via a
+    /// by the sidebar renderer; the effect only rotates its hue, via a
     /// `CellFilter::Text` limited to written cells. The right-edge rule column
     /// is excluded from the processed area so the separator stays put.
     fn process_running_fx(
@@ -1395,81 +1398,56 @@ impl App {
             self.on_modal_key(k);
             return;
         }
-        let ctrl_a = k.code == KeyCode::Char('a') && k.modifiers.contains(KeyModifiers::CONTROL);
-
-        if self.prefix {
-            self.prefix = false;
-            match k.code {
-                KeyCode::Char('j') | KeyCode::Down => self.select_by_offset(1),
-                KeyCode::Char('k') | KeyCode::Up => self.select_by_offset(-1),
-                KeyCode::Char(c @ '1'..='9') => {
-                    if let Some(i) = ui::jump_index(c)
-                        && let Some(s) = self.sessions.get(i)
-                    {
-                        self.select(s.name.clone());
-                    }
+        match self.keymap.resolve(&k) {
+            KeyResolution::PassThrough => {
+                if let Some(ev) = key::map_key(&k) {
+                    self.forward(ev);
                 }
-                KeyCode::Char('c') => self.send(Cmd::Create),
-                // Toggle the sidebar; the pane grid + session resize follow.
-                KeyCode::Char('b') => {
-                    self.sidebar_hidden = !self.sidebar_hidden;
-                    self.apply_layout();
-                }
-                KeyCode::Char('s') => {
-                    // Toggle the bottom status bar: hidden gives the pane the
-                    // full window height so an input line can reach the true
-                    // bottom (keeps the OS IME candidate box from covering it).
-                    self.status_hidden = !self.status_hidden;
-                    self.apply_layout();
-                }
-                // Kill asks first (confirmation modal); rename opens an input.
-                KeyCode::Char('x') => {
-                    if let Some(name) = self.active.clone() {
-                        self.modal = Some(Modal::KillConfirm { target: name });
-                    }
-                }
-                KeyCode::Char('r') => {
-                    if let Some(name) = self.active.clone() {
-                        self.modal = Some(Modal::Rename(RenameInput::new(name)));
-                    }
-                }
-                // Reconnect moved to R (r now renames).
-                KeyCode::Char('R') => self.reconnect(),
-                // `q` quits; `Esc` (and any other unmapped key) just cancels the
-                // prefix. `d` is intentionally not a quit alias — in screen/tmux
-                // muscle memory it means detach, which here would read as an
-                // accidental quit.
-                KeyCode::Char('q') => self.quit = true,
-                // Ctrl+A twice sends a literal Ctrl+A to the session.
-                KeyCode::Char('a') if ctrl_a => self.forward(KeyEvent {
-                    key: VtKey::Char('a'),
-                    mods: Mods {
-                        ctrl: true,
-                        ..Mods::default()
-                    },
-                    text: Some("a".into()),
-                }),
-                _ => {} // unknown prefix key: swallow
             }
-            return;
+            KeyResolution::Consumed => {}
+            KeyResolution::Action(action) => self.apply_key_action(action),
         }
-        if ctrl_a {
-            self.prefix = true;
-            return;
-        }
+    }
 
-        // Shift+PageUp/PageDown drive the local scrollback (like attach).
-        if k.modifiers.contains(KeyModifiers::SHIFT) {
-            let page = self.grid.1.saturating_sub(1) as usize;
-            match k.code {
-                KeyCode::PageUp => return self.scroll_by(page as isize),
-                KeyCode::PageDown => return self.scroll_by(-(page as isize)),
-                _ => {}
+    fn apply_key_action(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::SelectNext => self.select_by_offset(1),
+            KeyAction::SelectPrevious => self.select_by_offset(-1),
+            KeyAction::JumpTo(ordinal) => {
+                let index = usize::from(ordinal.saturating_sub(1));
+                if let Some(name) = self.sessions.get(index).map(|session| session.name.clone()) {
+                    self.select(name);
+                }
             }
-        }
-
-        if let Some(ev) = key::map_key(&k) {
-            self.forward(ev);
+            KeyAction::Create => self.send(Cmd::Create),
+            KeyAction::ToggleSidebar => {
+                self.sidebar_hidden = !self.sidebar_hidden;
+                self.apply_layout();
+            }
+            KeyAction::ToggleStatus => {
+                self.status_hidden = !self.status_hidden;
+                self.apply_layout();
+            }
+            KeyAction::Kill => {
+                if let Some(name) = self.active.clone() {
+                    self.modal = Some(Modal::KillConfirm { target: name });
+                }
+            }
+            KeyAction::Rename => {
+                if let Some(name) = self.active.clone() {
+                    self.modal = Some(Modal::Rename(RenameInput::new(name)));
+                }
+            }
+            KeyAction::Reconnect => self.reconnect(),
+            KeyAction::Quit => self.quit = true,
+            KeyAction::ScrollPageUp => self.scroll_by(self.grid.1.saturating_sub(1) as isize),
+            KeyAction::ScrollPageDown => self.scroll_by(-(self.grid.1.saturating_sub(1) as isize)),
+            KeyAction::SendLeaderLiteral => {
+                if let Some(event) = key::map_key(&self.keymap.literal_leader()) {
+                    self.forward(event);
+                }
+            }
+            KeyAction::CancelPrefix => {}
         }
     }
 

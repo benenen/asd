@@ -1,16 +1,20 @@
-//! Drawing: session sidebar (two-line rows: name + kill mark, command + age)
-//! on the left, the live terminal pane on the right, a keybind hint at the
-//! bottom of the sidebar — the layout in `images/image.png`.
+//! TUI layout and drawing orchestration.
+//!
+//! Region renderers live in [`side`], [`pane`], and [`bar`]; this module owns
+//! shared layout, modal layering, and the stable helpers used by the event loop.
 
-use asd_vt::{CellWidth, RenderSnapshot, Rgb, UnderlineKind};
 use ratatui::Frame;
-use ratatui::buffer::{Buffer, CellDiffOption};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear};
 
 use crate::App;
-use crate::modal::Modal;
+use crate::modal::{Modal, RenameInput};
+
+mod bar;
+mod pane;
+mod side;
 
 /// Sidebar width in cells (incl. its 1-cell right border).
 pub const SIDEBAR_W: u16 = 28;
@@ -19,15 +23,6 @@ pub const SIDEBAR_W: u16 = 28;
 /// the ordinal, so text begins right after at col 3. Shared with the running
 /// shimmer so only the text — not the ordinal — is hue-shifted.
 pub const ROW_TEXT_X: u16 = 3;
-
-/// The session index that the `Ctrl+A <digit>` quick-switch selects, or `None`
-/// for a digit with no target. Only `1..=9` map (to the 1st..9th session); the
-/// 10th and later have an ordinal but no shortcut.
-pub fn jump_index(digit: char) -> Option<usize> {
-    ('1'..='9')
-        .contains(&digit)
-        .then(|| digit as usize - '1' as usize)
-}
 
 // Palette (the asd theme, same values as asd-dioxus's app.css).
 const TEXT: Color = Color::Rgb(0xE7, 0xE2, 0xD6);
@@ -188,7 +183,6 @@ pub struct Selection {
 }
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
-    // Recomputed every frame by the cursor blocks below; default hidden.
     app.cursor_tail = None;
     let (side, pane, bar) = areas(
         f.area(),
@@ -196,57 +190,46 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
         app.sidebar_hidden,
         app.status_hidden,
     );
-    draw_sidebar(f.buffer_mut(), side, app);
-    draw_bar(f.buffer_mut(), bar, app);
+    side::draw(f.buffer_mut(), side, app);
+    bar::draw(f.buffer_mut(), bar, app);
     app.process_fx(f.buffer_mut(), side);
+    draw_pane(f, app, pane);
 
-    let sel = app.sel_viewport();
+    if let Some(modal) = &app.modal
+        && let Some(position) = draw_modal(f, modal)
+    {
+        app.cursor_tail = Some((position.x, position.y, true));
+    }
+}
+
+fn draw_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let selection = app.sel_viewport();
     let modal_open = app.modal.is_some();
-    if let Some(snap) = app.snapshot() {
-        render_pane(f.buffer_mut(), pane, &snap, sel);
+    if let Some(snapshot) = app.snapshot() {
+        pane::render(f.buffer_mut(), area, &snapshot, selection);
         // Anchor the OS input-method (IME) popup and TUI programs like codex/vim
-        // at the pane's cursor — the REAL terminal cursor, not a painted cell
-        // (IME and child-TUI focus both anchor to the hardware cursor). The
-        // session's own visibility carries over: pi / Claude Code hide theirs
-        // and draw their own caret, so the host cursor is moved there but kept
-        // hidden — the IME box still floats at the app's input. Emitted as the
-        // frame's closing bytes by `FrameBuf::finish`, after the body painted
-        // with the cursor hidden. Suppressed under a modal / while scrolled
-        // back.
+        // at the real terminal cursor. Suppress it under a modal or scrollback.
         if !modal_open
             && app.scroll == 0
-            && let Some((cx, cy)) = snap.cursor.position
-            && cx < pane.width
-            && cy < pane.height
+            && let Some((cx, cy)) = snapshot.cursor.position
+            && cx < area.width
+            && cy < area.height
         {
-            app.cursor_tail = Some((pane.x + cx, pane.y + cy, snap.cursor.visible));
+            app.cursor_tail = Some((area.x + cx, area.y + cy, snapshot.cursor.visible));
         }
-        // The scrollback offset is shown in the status bar (next to the session
-        // count), not over the pane's top row — see `draw_bar`.
     } else {
-        // Whether any listed session can actually be selected here (the session
-        // hosting this UI is shown but not attachable).
         let selectable = app
             .sessions
             .iter()
             .any(|s| app.self_session.as_deref() != Some(&s.name));
-        draw_empty_pane(
+        pane::draw_empty(
             f.buffer_mut(),
-            pane,
+            area,
             app.view_revoked.as_deref(),
             app.sessions.is_empty(),
             selectable,
+            &app.keymap,
         );
-    }
-
-    let caret = match &app.modal {
-        Some(modal) => draw_modal(f, modal),
-        None => None,
-    };
-    if let Some(pos) = caret {
-        // Rename caret: the REAL cursor, shown, so the IME popup anchors to it
-        // while typing (e.g. a CJK session name).
-        app.cursor_tail = Some((pos.x, pos.y, true));
     }
 }
 
@@ -268,248 +251,70 @@ fn draw_modal(f: &mut Frame<'_>, modal: &Modal) -> Option<Position> {
     let inner = block.inner(m);
     f.render_widget(block, m);
 
-    let bg = Style::new().bg(MODAL_BG);
-    let ix = inner.x;
-    let iw = inner.width as usize;
-    let buf = f.buffer_mut();
-    let mut cursor: Option<Position> = None;
     match modal {
         Modal::KillConfirm { target } => {
-            let title = format!(
-                "Kill session \"{}\"?",
-                truncate(target, iw.saturating_sub(16))
-            );
-            buf.set_string(
-                ix,
-                inner.y,
-                &title,
-                bg.fg(TEXT).add_modifier(Modifier::BOLD),
-            );
-            buf.set_string(
-                ix,
-                inner.y + 2,
-                truncate("[y / Enter] confirm    [n / Esc] cancel", iw),
-                bg.fg(MUTED),
-            );
+            draw_kill_modal(f.buffer_mut(), inner, target);
+            None
         }
-        Modal::Rename(input) => {
-            buf.set_string(
-                ix,
-                inner.y,
-                format!(
-                    "Rename \"{}\"",
-                    truncate(&input.target, iw.saturating_sub(10))
-                ),
-                bg.fg(TEXT).add_modifier(Modifier::BOLD),
-            );
-            // Input field on the next line: a leading marker + the edited text.
-            let fy = inner.y + 1;
-            let text = input.text();
-            let field = Style::new().bg(SELECT_BG).fg(TEXT);
-            for xx in ix..inner.right() {
-                if let Some(c) = buf.cell_mut(Position::new(xx, fy)) {
-                    c.set_symbol(" ").set_style(field);
-                }
-            }
-            buf.set_string(ix + 1, fy, truncate(&text, iw.saturating_sub(2)), field);
-            // Caret at the char index (exact for the valid ASCII name set).
-            let cx = ix + 1 + (input.cursor() as u16).min(inner.width.saturating_sub(2));
-            cursor = Some(Position::new(cx, fy));
-            // Error, or the key hint.
-            let (line, style) = match &input.error {
-                Some(e) => (format!("! {e}"), bg.fg(ALERT)),
-                None => ("[Enter] rename    [Esc] cancel".to_string(), bg.fg(MUTED)),
-            };
-            buf.set_string(ix, inner.y + 3, truncate(&line, iw), style);
-        }
-    }
-    cursor
-}
-
-fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &App) {
-    if area.width < 4 || area.height < 3 {
-        return;
-    }
-    // Right border rule.
-    for y in area.top()..area.bottom() {
-        buf.set_string(area.right() - 1, y, "│", Style::new().fg(RULE));
-    }
-    let inner_w = (area.width - 1) as usize;
-
-    // Session rows: two lines each, scrolled so the active row stays visible.
-    let offset = app.sidebar_offset();
-    let list_bottom = area.bottom();
-    let mut y = area.top();
-    for (i, s) in app.sessions.iter().enumerate().skip(offset) {
-        if y + 1 >= list_bottom {
-            break;
-        }
-        let selected = app.active.as_deref() == Some(&s.name);
-        let is_self = app.self_session.as_deref() == Some(&s.name);
-        let row_bg = if selected {
-            Style::new().bg(SELECT_BG)
-        } else {
-            Style::new()
-        };
-        // Paint the row background.
-        for line in 0..2 {
-            for x in area.left()..area.right() - 1 {
-                if let Some(c) = buf.cell_mut(Position::new(x, y + line)) {
-                    c.set_style(row_bg);
-                }
-            }
-        }
-        let text_x = area.left() + ROW_TEXT_X;
-        // Line 1: [ordinal][name] … kill mark. Column 0 is left blank (it only
-        // ever carries the selected row's accent bar, drawn below).
-        // 1-based ordinal, LEFT-aligned in 2 cols so a single-digit number hugs
-        // the frame (col 1) instead of floating a column in; the name stays put
-        // at ROW_TEXT_X, so the two are no longer jammed together. Matches the
-        // Ctrl+A <n> quick-switch for the first nine rows (dimmer past nine).
-        let n = i + 1;
-        let num_style = if selected {
-            row_bg.fg(ACCENT)
-        } else if i < 9 {
-            row_bg.fg(MUTED)
-        } else {
-            row_bg.fg(DIM)
-        };
-        buf.set_string(area.left() + 1, y, format!("{n:<2}"), num_style);
-        // The session hosting this UI is shown but not selectable: dim it. A
-        // running session's text is drawn in the saturated accent so the hue
-        // shimmer (`App::process_running_fx`) has color to rotate — hue-shifting
-        // near-white text would barely change it.
-        let name_style = if is_self {
-            row_bg.fg(DIM)
-        } else if s.running {
-            row_bg.fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else {
-            row_bg.fg(TEXT).add_modifier(Modifier::BOLD)
-        };
-        let name = truncate(&s.name, inner_w.saturating_sub(ROW_TEXT_X as usize + 3));
-        buf.set_string(text_x, y, &name, name_style);
-        buf.set_string(area.right() - 3, y, "x", row_bg.fg(DIM));
-        // Line 2: the terminal title (what the session says it's doing),
-        // falling back to the foreground command; plus the age, dim.
-        let age = short_age(s.created_ms, app.now_ms);
-        let cmd_w = inner_w.saturating_sub(ROW_TEXT_X as usize + age.len() + 2);
-        let label = if s.title.trim().is_empty() {
-            short_cmd(&s.command)
-        } else {
-            s.title.trim().to_string()
-        };
-        let cmd = truncate(&label, cmd_w);
-        let cmd_fg = if s.running && !is_self { ACCENT } else { MUTED };
-        buf.set_string(text_x, y + 1, &cmd, row_bg.fg(cmd_fg));
-        buf.set_string(
-            area.right() - 2 - age.len() as u16,
-            y + 1,
-            &age,
-            row_bg.fg(DIM),
-        );
-        // The selected session's row is framed with a vertical bar on each
-        // edge (left column and the right rule column).
-        if selected {
-            for line in 0..2 {
-                buf.set_string(area.left(), y + line, "│", row_bg.fg(ACCENT));
-                buf.set_string(area.right() - 1, y + line, "│", Style::new().fg(ACCENT));
-            }
-        }
-        // Remember the row for mouse hit-testing.
-        let _ = i;
-        y += 2;
+        Modal::Rename(input) => Some(draw_rename_modal(f.buffer_mut(), inner, input)),
     }
 }
 
-/// Full-width bottom bar: keybind hint on the left, daemon status / notice on
-/// the right.
-fn draw_bar(buf: &mut Buffer, area: Rect, app: &App) {
-    if area.height == 0 || area.width < 8 {
-        return;
-    }
-    let y = area.top();
-    // Bar background.
-    for x in area.left()..area.right() {
-        if let Some(c) = buf.cell_mut(Position::new(x, y)) {
-            c.set_style(Style::new().bg(RULE));
-        }
-    }
-    let (status, sstyle) = if let Some(notice) = &app.notice {
-        (notice.clone(), Style::new().fg(ALERT).bg(RULE))
-    } else if app.daemon_up {
-        // Exclude the session hosting this UI — it can't be attached here, so
-        // counting it would overstate what the user can switch to.
-        let count = app
-            .sessions
-            .iter()
-            .filter(|s| app.self_session.as_deref() != Some(&s.name))
-            .count();
-        (
-            session_status(count, app.scroll),
-            Style::new().fg(OK).bg(RULE),
-        )
-    } else {
-        (
-            "daemon down — Ctrl+A R".to_string(),
-            Style::new().fg(ALERT).bg(RULE),
-        )
-    };
-    draw_bar_text(
-        buf,
-        area,
-        app.prefix,
-        &server_time_at(app.now_ms),
-        &status,
-        sstyle,
+fn draw_kill_modal(buf: &mut Buffer, area: Rect, target: &str) {
+    let bg = Style::new().bg(MODAL_BG);
+    let width = area.width as usize;
+    let title = format!(
+        "Kill session \"{}\"?",
+        truncate(target, width.saturating_sub(16))
+    );
+    buf.set_string(
+        area.x,
+        area.y,
+        &title,
+        bg.fg(TEXT).add_modifier(Modifier::BOLD),
+    );
+    buf.set_string(
+        area.x,
+        area.y + 2,
+        truncate("[y / Enter] confirm    [n / Esc] cancel", width),
+        bg.fg(MUTED),
     );
 }
 
-fn draw_bar_text(
-    buf: &mut Buffer,
-    area: Rect,
-    prefix: bool,
-    server_time: &str,
-    status: &str,
-    status_style: Style,
-) {
-    let max = (area.width / 2) as usize;
-    let status = truncate(status, max);
-    let x = area.right().saturating_sub(str_width(&status) as u16 + 1);
-    buf.set_string(x, area.top(), status, status_style);
-
-    // Preserve daemon health and notices on narrow terminals. The clock is
-    // optional there; the keybind hint shrinks into the space left of status.
-    let left_width = x.saturating_sub(area.left() + 2) as usize;
-    draw_bar_left(buf, area, prefix, server_time, left_width);
-}
-
-fn draw_bar_left(buf: &mut Buffer, area: Rect, prefix: bool, server_time: &str, max_width: usize) {
-    let (hint, style) = if prefix {
-        (
-            "PREFIX  j/k ↑/↓ switch · 1-9 jump · c new · r rename · x kill · b sidebar · R reconnect · q quit · Esc cancel",
-            Style::new().fg(ACCENT).bg(RULE),
-        )
-    } else {
-        ("Keybinds: Ctrl+A", Style::new().fg(DIM).bg(RULE))
+fn draw_rename_modal(buf: &mut Buffer, area: Rect, input: &RenameInput) -> Position {
+    let bg = Style::new().bg(MODAL_BG);
+    let width = area.width as usize;
+    buf.set_string(
+        area.x,
+        area.y,
+        format!(
+            "Rename \"{}\"",
+            truncate(&input.target, width.saturating_sub(10))
+        ),
+        bg.fg(TEXT).add_modifier(Modifier::BOLD),
+    );
+    let field_y = area.y + 1;
+    let field = Style::new().bg(SELECT_BG).fg(TEXT);
+    for x in area.left()..area.right() {
+        if let Some(cell) = buf.cell_mut(Position::new(x, field_y)) {
+            cell.set_symbol(" ").set_style(field);
+        }
+    }
+    buf.set_string(
+        area.x + 1,
+        field_y,
+        truncate(&input.text(), width.saturating_sub(2)),
+        field,
+    );
+    let (hint, style) = match &input.error {
+        Some(error) => (format!("! {error}"), bg.fg(ALERT)),
+        None => ("[Enter] rename    [Esc] cancel".to_string(), bg.fg(MUTED)),
     };
-    let with_time = format!("{hint}  {server_time}");
-    let line = if str_width(&with_time) <= max_width {
-        with_time
-    } else {
-        truncate(hint, max_width)
-    };
-    buf.set_string(area.left() + 1, area.top(), &line, style);
-}
-
-fn server_time_at(timestamp_ms: u64) -> String {
-    let timestamp_ms = i64::try_from(timestamp_ms).unwrap_or(i64::MAX);
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
-        .map(|time| format_server_time(time.with_timezone(&chrono::Local)))
-        .unwrap_or_default()
-}
-
-fn format_server_time(time: chrono::DateTime<chrono::Local>) -> String {
-    time.format("%Y-%m-%d %H:%M:%S").to_string()
+    buf.set_string(area.x, area.y + 3, truncate(&hint, width), style);
+    Position::new(
+        area.x + 1 + (input.cursor() as u16).min(area.width.saturating_sub(2)),
+        field_y,
+    )
 }
 
 /// Which sidebar session row (and whether its kill mark) a click lands on.
@@ -525,130 +330,7 @@ pub fn sidebar_hit(
     row: u16,
 ) -> Option<(usize, bool)> {
     let (side, _, _) = areas(area, sidebar_w, hidden, false);
-    if side.width == 0 || col >= side.right().saturating_sub(1) || row >= side.bottom() {
-        return None;
-    }
-    let idx = offset + ((row.checked_sub(side.top())?) / 2) as usize;
-    if idx >= sessions {
-        return None;
-    }
-    let on_kill = row.saturating_sub(side.top()) % 2 == 0 && col >= side.right().saturating_sub(4);
-    Some((idx, on_kill))
-}
-
-/// Whether viewport cell `(x, y)` falls inside the row-major selection.
-fn in_selection(sel: Option<Selection>, x: u16, y: u16) -> bool {
-    let Some(s) = sel else { return false };
-    let after_start = y > s.start.1 || (y == s.start.1 && x >= s.start.0);
-    let before_end = y < s.end.1 || (y == s.end.1 && x <= s.end.0);
-    after_start && before_end
-}
-
-/// Paint a [`RenderSnapshot`] into the pane area, reversing the cells covered
-/// by the drag selection (the CLI attach client's self-drawn highlight).
-fn render_pane(buf: &mut Buffer, area: Rect, snap: &RenderSnapshot, sel: Option<Selection>) {
-    let rows = snap.rows.min(area.height);
-    let cols = snap.cols.min(area.width);
-    for y in 0..area.height {
-        for x in 0..area.width {
-            let Some(target) = buf.cell_mut(Position::new(area.x + x, area.y + y)) else {
-                continue;
-            };
-            // The pane and the session's grid are not always the same size —
-            // hiding the sidebar widens the pane a frame or two before the
-            // resize round-trips through the daemon. Blank what the grid does
-            // not cover: this function is the only thing that writes the pane,
-            // and ratatui emits only changed cells, so anything left here would
-            // stay on screen indefinitely.
-            let Some(cell) = (y < rows && x < cols).then(|| &snap.cells[y as usize][x as usize])
-            else {
-                target.reset();
-                continue;
-            };
-            // The cells a wide character reserves render as nothing, but they
-            // still have to be *written*: skipping them leaves the previous
-            // frame's cell in place for as long as the spacer lasts, and
-            // ratatui only emits cells that changed. Blanking also keeps the
-            // buffer well-formed for `Buffer::diff`, which assumes no
-            // double-width cell is ever followed by a non-blank one.
-            if matches!(cell.width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
-                target.reset();
-                continue;
-            }
-            let grapheme = cell.host_grapheme();
-            if grapheme.is_empty() {
-                target.set_symbol(" ");
-            } else {
-                target.set_symbol(grapheme.as_ref());
-            }
-            // Ghostty is the terminal model and therefore the authority on how
-            // many grid cells this grapheme occupies. Ratatui otherwise
-            // recomputes the width with its own Unicode table; the two disagree
-            // for some emoji-presentation graphemes (for example, Ghostty says
-            // `✔️` is narrow while unicode-width says it is wide). Buffer::diff
-            // would then skip the real cell after the grapheme and leave a
-            // character from the previous frame on screen.
-            let width = match cell.width {
-                CellWidth::Narrow => 1,
-                CellWidth::Wide => 2,
-                CellWidth::SpacerTail | CellWidth::SpacerHead => unreachable!(),
-            };
-            target.set_diff_option(CellDiffOption::ForcedWidth(
-                std::num::NonZeroU16::new(width).unwrap(),
-            ));
-            let mut style = cell_style(cell);
-            // Only cells with written content take the selection highlight —
-            // blank (never-written) cells stay plain, so clicking or dragging
-            // over empty areas shows no reverse-video block (same rule as the
-            // CLI attach client's render).
-            if !cell.grapheme.is_empty() && in_selection(sel, x, y) {
-                style = style.add_modifier(Modifier::REVERSED);
-            }
-            target.set_style(style);
-        }
-        // Clear any pane cells right of the snapshot (after shrink).
-        for x in cols..area.width {
-            if let Some(t) = buf.cell_mut(Position::new(area.x + x, area.y + y)) {
-                t.reset();
-            }
-        }
-    }
-}
-
-fn cell_style(cell: &asd_vt::CellSnapshot) -> Style {
-    let mut style = Style::new()
-        .fg(cell.fg.map(color).unwrap_or(Color::Reset))
-        .bg(cell.bg.map(color).unwrap_or(Color::Reset));
-    let f = &cell.flags;
-    if f.bold {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if f.italic {
-        style = style.add_modifier(Modifier::ITALIC);
-    }
-    if f.faint {
-        style = style.add_modifier(Modifier::DIM);
-    }
-    if f.inverse {
-        style = style.add_modifier(Modifier::REVERSED);
-    }
-    if f.blink {
-        style = style.add_modifier(Modifier::SLOW_BLINK);
-    }
-    if f.invisible {
-        style = style.add_modifier(Modifier::HIDDEN);
-    }
-    if f.strikethrough {
-        style = style.add_modifier(Modifier::CROSSED_OUT);
-    }
-    if f.underline != UnderlineKind::None {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    style
-}
-
-fn color(c: Rgb) -> Color {
-    Color::Rgb(c.r, c.g, c.b)
+    side::hit(side, sessions, offset, col, row)
 }
 
 /// Display width of a single char in terminal cells (CJK/wide = 2, control = 0).
@@ -688,121 +370,9 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// Compact a session's command for the sidebar (same rules as the GUIs): a
-/// bare path shows its basename; anything with arguments is kept whole.
-pub fn short_cmd(cmd: &str) -> String {
-    let cmd = cmd.trim();
-    if cmd.is_empty() {
-        return String::new();
-    }
-    if !cmd.contains(char::is_whitespace) && cmd.contains('/') {
-        cmd.rsplit('/').next().unwrap_or(cmd).to_string()
-    } else {
-        cmd.to_string()
-    }
-}
-
-/// Compact "time since creation": `now`, `5m`, `2h`, `3d`.
-pub fn short_age(created_ms: u64, now_ms: u64) -> String {
-    let secs = now_ms.saturating_sub(created_ms) / 1000;
-    if secs < 60 {
-        "now".to_string()
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86_400)
-    }
-}
-
-const ASD_WORDMARK: [&str; 4] = [
-    "  __ _ ___  __| |",
-    " / _` / __|/ _` |",
-    "| (_| \\__ \\ (_| |",
-    " \\__,_|___/\\__,_|",
-];
-
-/// Clear and paint the pane's empty state. A revoked view keeps the selected
-/// session visible in the sidebar while the pane becomes an explicit takeover
-/// placard; every other empty state reuses the same wordmark with its own hint.
-fn draw_empty_pane(
-    buf: &mut Buffer,
-    area: Rect,
-    revoked: Option<&str>,
-    is_empty: bool,
-    any_selectable: bool,
-) {
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
-                cell.reset();
-            }
-        }
-    }
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-
-    let mut lines: Vec<(String, Style)> = ASD_WORDMARK
-        .iter()
-        .map(|line| ((*line).to_string(), Style::new().fg(ACCENT)))
-        .collect();
-    lines.push((String::new(), Style::new()));
-    if let Some(name) = revoked {
-        lines.push((
-            format!("Session \"{name}\" is open in another asd ui"),
-            Style::new().fg(TEXT),
-        ));
-        lines.push((
-            "Select it again to take over".to_string(),
-            Style::new().fg(DIM),
-        ));
-    } else {
-        lines.push((
-            empty_pane_hint(is_empty, any_selectable).to_string(),
-            Style::new().fg(DIM),
-        ));
-    }
-
-    let visible = lines.len().min(area.height as usize);
-    let top = area.y + area.height.saturating_sub(visible as u16) / 2;
-    for (offset, (line, style)) in lines.into_iter().take(visible).enumerate() {
-        let line = truncate(&line, area.width as usize);
-        let x = area.x + area.width.saturating_sub(str_width(&line) as u16) / 2;
-        buf.set_string(x, top + offset as u16, line, style);
-    }
-}
-
-/// The centered pane hint when no session is being viewed. Distinguishes "no
-/// sessions at all" from "the only session is this UI's own host" (which `j/k`
-/// can't select) — the latter must point at creating one, not at selecting.
-fn empty_pane_hint(is_empty: bool, any_selectable: bool) -> &'static str {
-    if is_empty {
-        "no sessions — Ctrl+A c creates one"
-    } else if !any_selectable {
-        "only this UI's own session — Ctrl+A c for a new one"
-    } else {
-        "select a session (Ctrl+A j/k)"
-    }
-}
-
-/// The right-side status string: the session count, prefixed with the local
-/// scrollback offset when scrolled back (shown here, next to the count, rather
-/// than over the pane's top row).
-fn session_status(count: usize, scroll: usize) -> String {
-    if scroll > 0 {
-        format!("[+{scroll}] ● {count} sessions")
-    } else {
-        format!("● {count} sessions")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asd_vt::{CellSnapshot, CursorSnapshot, GhosttyVt, VtBackend};
-    use ratatui::backend::{Backend, CrosstermBackend};
 
     #[test]
     fn truncate_respects_display_width() {
@@ -825,26 +395,6 @@ mod tests {
         // Degenerate budgets.
         assert_eq!(truncate("abc", 0), "");
         assert_eq!(truncate("abc", 1), "…");
-    }
-
-    #[test]
-    fn long_title_never_overlaps_the_age_box() {
-        // Mirror draw_sidebar's line-2 budget for a 28-wide sidebar.
-        let area_w: u16 = 28;
-        let age = "13h";
-        let inner_w = (area_w - 1) as usize;
-        let budget = inner_w.saturating_sub(ROW_TEXT_X as usize + str_width(age) + 2);
-        let title = "远端一个非常非常长的会话标题名字啊啊啊啊";
-        let shown = truncate(title, budget);
-        // The text (starting at ROW_TEXT_X) ends strictly before the age box.
-        let text_end = ROW_TEXT_X as usize + str_width(&shown);
-        let age_start = (area_w as usize) - 2 - str_width(age);
-        assert!(
-            text_end < age_start,
-            "text_end {text_end} < age_start {age_start}"
-        );
-        assert!(shown.ends_with('…'));
-        assert!(str_width(&shown) <= budget);
     }
 
     #[test]
@@ -918,134 +468,6 @@ mod tests {
     }
 
     #[test]
-    fn session_status_prefixes_scroll_offset() {
-        assert_eq!(session_status(3, 0), "● 3 sessions");
-        assert_eq!(session_status(3, 12), "[+12] ● 3 sessions");
-        assert_eq!(session_status(0, 0), "● 0 sessions");
-    }
-
-    #[test]
-    fn bottom_bar_places_the_full_server_time_after_keybinds() {
-        use chrono::{Local, TimeZone};
-
-        let time = Local
-            .with_ymd_and_hms(2026, 8, 14, 9, 5, 7)
-            .single()
-            .expect("the daytime fixture is unambiguous");
-        let shown = format_server_time(time);
-        assert_eq!(shown, "2026-08-14 09:05:07");
-
-        let area = Rect::new(0, 0, 80, 1);
-        let mut buf = Buffer::empty(area);
-        draw_bar_text(
-            &mut buf,
-            area,
-            false,
-            &shown,
-            "● 3 sessions",
-            Style::default(),
-        );
-        let line = (0..area.width)
-            .map(|x| buf.cell(Position::new(x, 0)).unwrap().symbol())
-            .collect::<String>();
-        assert!(
-            line.starts_with(" Keybinds: Ctrl+A  2026-08-14 09:05:07"),
-            "bar: {line}"
-        );
-        assert!(line.contains("● 3 sessions"), "bar: {line}");
-    }
-
-    #[test]
-    fn narrow_bottom_bar_keeps_daemon_status_before_the_clock() {
-        let area = Rect::new(0, 0, 42, 1);
-        let mut buf = Buffer::empty(area);
-        draw_bar_text(
-            &mut buf,
-            area,
-            false,
-            "2026-08-14 09:05:07",
-            "● 3 sessions",
-            Style::default(),
-        );
-        let line = (0..area.width)
-            .map(|x| buf.cell(Position::new(x, 0)).unwrap().symbol())
-            .collect::<String>();
-
-        assert!(line.contains("Keybinds: Ctrl+A"), "bar: {line}");
-        assert!(line.contains("● 3 sessions"), "bar: {line}");
-        assert!(!line.contains("2026-08-14"), "bar: {line}");
-    }
-
-    #[test]
-    fn empty_pane_hint_distinguishes_self_only() {
-        assert_eq!(
-            empty_pane_hint(true, false),
-            "no sessions — Ctrl+A c creates one"
-        );
-        // Sessions exist but none selectable (only the UI's own host): point at
-        // creating one, not selecting — j/k can't reach it.
-        let self_only = empty_pane_hint(false, false);
-        assert!(self_only.contains("Ctrl+A c"));
-        assert!(self_only.contains("own session"));
-        assert_eq!(
-            empty_pane_hint(false, true),
-            "select a session (Ctrl+A j/k)"
-        );
-    }
-
-    #[test]
-    fn revoked_view_draws_the_asd_wordmark_and_takeover_hint() {
-        let area = Rect::new(0, 0, 80, 20);
-        let mut buf = Buffer::empty(area);
-        draw_empty_pane(&mut buf, area, Some("review"), false, true);
-        let text = (0..area.height)
-            .map(|y| {
-                (0..area.width)
-                    .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(text.contains("__ _ ___"), "pane: {text}");
-        assert!(
-            text.contains("Session \"review\" is open in another asd ui"),
-            "pane: {text}"
-        );
-        assert!(
-            text.contains("Select it again to take over"),
-            "pane: {text}"
-        );
-    }
-
-    #[test]
-    fn jump_index_maps_1_9_and_ignores_others() {
-        assert_eq!(jump_index('1'), Some(0)); // 1 → first session
-        assert_eq!(jump_index('9'), Some(8)); // 9 → ninth session
-        assert_eq!(jump_index('0'), None);
-        assert_eq!(jump_index('a'), None);
-        // Only the first nine rows are reachable; the 10th (index 9) and beyond
-        // have an ordinal but no digit shortcut.
-        assert!(('1'..='9').all(|d| jump_index(d).unwrap() < 9));
-    }
-
-    #[test]
-    fn short_cmd_basenames_paths_but_keeps_args() {
-        assert_eq!(short_cmd("/usr/bin/bash"), "bash");
-        assert_eq!(short_cmd("journalctl -f"), "journalctl -f");
-        assert_eq!(short_cmd(""), "");
-    }
-
-    #[test]
-    fn short_age_buckets() {
-        let m = 60_000;
-        assert_eq!(short_age(0, 30 * 1000), "now");
-        assert_eq!(short_age(0, 5 * m), "5m");
-        assert_eq!(short_age(0, 120 * m), "2h");
-        assert_eq!(short_age(1_000, 0), "now"); // clock skew never panics
-    }
-
-    #[test]
     fn pane_grid_reserves_the_sidebar_and_bottom_bar() {
         let (cols, rows) = pane_grid(Rect::new(0, 0, 120, 40), SIDEBAR_W, false, false);
         assert_eq!(cols, 120 - SIDEBAR_W);
@@ -1110,376 +532,5 @@ mod tests {
         assert_eq!(sidebar_from_drag(200, 120), MAX_SIDEBAR); // capped
         // A wide sidebar never squeezes the pane below MIN_PANE.
         assert_eq!(clamp_sidebar(45, 50), 50 - MIN_PANE);
-    }
-
-    #[test]
-    fn selection_highlights_text_but_not_blank_cells() {
-        use asd_vt::{CellSnapshot, CursorSnapshot, RenderSnapshot};
-        let cell = |g: &str| CellSnapshot {
-            grapheme: g.to_string(),
-            ..CellSnapshot::default()
-        };
-        // Row: text, written space, two never-written blanks.
-        let snap = RenderSnapshot {
-            cols: 4,
-            rows: 1,
-            cells: vec![std::sync::Arc::new(vec![
-                cell("a"),
-                cell(" "),
-                cell(""),
-                cell(""),
-            ])],
-            row_dirty: vec![true],
-            cursor: CursorSnapshot::default(),
-            palette: [Rgb::default(); 256],
-            foreground: Rgb::default(),
-            background: Rgb::default(),
-        };
-        let area = Rect::new(0, 0, 4, 1);
-        let mut buf = Buffer::empty(area);
-        let sel = Some(Selection {
-            start: (0, 0),
-            end: (3, 0),
-        });
-        render_pane(&mut buf, area, &snap, sel);
-        let reversed = |x: u16| {
-            buf[(x, 0)]
-                .style()
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        };
-        // Text and a written space take the highlight...
-        assert!(reversed(0));
-        assert!(reversed(1));
-        // ...never-written blanks do not (clicking empty areas shows nothing).
-        assert!(!reversed(2));
-        assert!(!reversed(3));
-    }
-
-    /// A snapshot smaller than the pane must not leave the rest of the pane
-    /// showing whatever happened to be there before.
-    ///
-    /// The pane and the session's grid are not always the same size — hiding
-    /// the sidebar widens the pane a frame or two before the resize round-trips
-    /// through the daemon. Anything painted outside the snapshot's extent
-    /// during that window persists indefinitely otherwise: this function never
-    /// writes there again, and ratatui only emits cells that changed, so
-    /// nothing downstream clears it either.
-    #[test]
-    fn pane_clears_beyond_a_smaller_snapshot() {
-        use asd_vt::{CellSnapshot, CursorSnapshot, RenderSnapshot};
-        let cell = |g: &str| CellSnapshot {
-            grapheme: g.to_string(),
-            ..CellSnapshot::default()
-        };
-        // Session grid is 2x1; the pane is 6x2.
-        let snap = RenderSnapshot {
-            cols: 2,
-            rows: 1,
-            cells: vec![std::sync::Arc::new(vec![cell("a"), cell("b")])],
-            row_dirty: vec![true],
-            cursor: CursorSnapshot::default(),
-            palette: [Rgb::default(); 256],
-            foreground: Rgb::default(),
-            background: Rgb::default(),
-        };
-        let area = Rect::new(0, 0, 6, 2);
-        // What an untouched cell looks like, to compare the cleared ones with.
-        let pristine = Buffer::empty(area)
-            .cell(Position::new(0, 0))
-            .unwrap()
-            .clone();
-
-        let mut buf = Buffer::empty(area);
-        // Leftovers from an earlier, larger frame — a coloured block is exactly
-        // what a stale cell looks like on screen.
-        let stale = [(4u16, 0u16), (1, 1), (5, 1)];
-        for (x, y) in stale {
-            buf.cell_mut(Position::new(x, y))
-                .unwrap()
-                .set_symbol("X")
-                .set_style(Style::new().bg(Color::Rgb(0, 95, 0)));
-        }
-
-        render_pane(&mut buf, area, &snap, None);
-
-        assert_eq!(buf.cell(Position::new(0, 0)).unwrap().symbol(), "a");
-        assert_eq!(buf.cell(Position::new(1, 0)).unwrap().symbol(), "b");
-        for (x, y) in stale {
-            let c = buf.cell(Position::new(x, y)).unwrap();
-            assert_eq!(
-                (c.symbol(), c.style()),
-                (pristine.symbol(), pristine.style()),
-                "({x},{y}) outside the snapshot kept its stale content"
-            );
-        }
-    }
-
-    /// The cells a wide character reserves must be written too, not skipped.
-    ///
-    /// Same trap as `pane_clears_beyond_a_smaller_snapshot`, one layer in: this
-    /// function is the pane's only writer and ratatui emits only cells that
-    /// changed, so a cell skipped here keeps what was there before for as long
-    /// as it stays a spacer. `SpacerHead` — the placeholder a soft wrap leaves
-    /// at the end of a line when the next character is wide — is the worse of
-    /// the two, since nothing precedes it to cover the stale cell up. Skipping
-    /// `SpacerTail` also broke ratatui's documented requirement that a
-    /// double-width cell be followed by a blank one (`Buffer::diff`).
-    #[test]
-    fn pane_clears_wide_char_spacers() {
-        use asd_vt::{CellSnapshot, CursorSnapshot, RenderSnapshot};
-        let cell = |g: &str, width: CellWidth| CellSnapshot {
-            grapheme: g.to_string(),
-            width,
-            ..CellSnapshot::default()
-        };
-        // "中" covers cells 0-1; cell 3 is a soft-wrap placeholder.
-        let snap = RenderSnapshot {
-            cols: 4,
-            rows: 1,
-            cells: vec![std::sync::Arc::new(vec![
-                cell("中", CellWidth::Wide),
-                cell("", CellWidth::SpacerTail),
-                cell("a", CellWidth::Narrow),
-                cell("", CellWidth::SpacerHead),
-            ])],
-            row_dirty: vec![true],
-            cursor: CursorSnapshot::default(),
-            palette: [Rgb::default(); 256],
-            foreground: Rgb::default(),
-            background: Rgb::default(),
-        };
-        let area = Rect::new(0, 0, 4, 1);
-        let pristine = Buffer::empty(area)
-            .cell(Position::new(0, 0))
-            .unwrap()
-            .clone();
-
-        let mut buf = Buffer::empty(area);
-        // A green block from an earlier frame, sitting on both spacers.
-        let stale = [1u16, 3];
-        for x in stale {
-            buf.cell_mut(Position::new(x, 0))
-                .unwrap()
-                .set_symbol("X")
-                .set_style(Style::new().bg(Color::Rgb(0, 95, 0)));
-        }
-
-        render_pane(&mut buf, area, &snap, None);
-
-        assert_eq!(buf.cell(Position::new(0, 0)).unwrap().symbol(), "中");
-        assert_eq!(buf.cell(Position::new(2, 0)).unwrap().symbol(), "a");
-        for x in stale {
-            let c = buf.cell(Position::new(x, 0)).unwrap();
-            assert_eq!(
-                (c.symbol(), c.style()),
-                (pristine.symbol(), pristine.style()),
-                "the spacer at ({x},0) kept its stale content"
-            );
-        }
-    }
-
-    #[test]
-    fn pane_diff_uses_the_vt_width_for_emoji_presentation_graphemes() {
-        fn cell(grapheme: &str, fg: Rgb) -> CellSnapshot {
-            CellSnapshot {
-                grapheme: grapheme.to_string(),
-                fg: Some(fg),
-                width: CellWidth::Narrow,
-                ..CellSnapshot::default()
-            }
-        }
-
-        fn snapshot(cells: Vec<CellSnapshot>) -> RenderSnapshot {
-            RenderSnapshot {
-                cols: cells.len() as u16,
-                rows: 1,
-                cells: vec![std::sync::Arc::new(cells)],
-                row_dirty: vec![true],
-                cursor: CursorSnapshot::default(),
-                palette: [Rgb::default(); 256],
-                foreground: Rgb::default(),
-                background: Rgb::default(),
-            }
-        }
-
-        fn ansi_diff(previous: &Buffer, next: &Buffer) -> Vec<u8> {
-            let writer = crate::FrameBuf::default();
-            let mut backend = CrosstermBackend::new(writer.clone());
-            backend.draw(previous.diff_iter(next)).unwrap();
-            backend.flush().unwrap();
-            writer.0.borrow().clone()
-        }
-
-        let blue = Rgb {
-            r: 20,
-            g: 80,
-            b: 180,
-        };
-        let green = Rgb {
-            r: 20,
-            g: 180,
-            b: 80,
-        };
-        let area = Rect::new(0, 0, 3, 1);
-
-        // Ghostty treats the VS16 grapheme as one cell. Ratatui's Unicode-width
-        // table treats it as two. The host output uses VS15 so the real terminal
-        // also keeps it narrow, while ForcedWidth keeps ratatui's diff aligned.
-        let first = snapshot(vec![
-            cell("✔️", blue),
-            cell("A", green),
-            CellSnapshot::default(),
-        ]);
-        let second = snapshot(vec![
-            cell("✔️", blue),
-            cell("B", green),
-            CellSnapshot::default(),
-        ]);
-
-        let empty = Buffer::empty(area);
-        let mut first_buf = Buffer::empty(area);
-        render_pane(&mut first_buf, area, &first, None);
-        let mut second_buf = Buffer::empty(area);
-        render_pane(&mut second_buf, area, &second, None);
-
-        let mut terminal = GhosttyVt::new(3, 1, 0);
-        terminal.feed(&ansi_diff(&empty, &first_buf));
-        let first_rendered = terminal.render_snapshot();
-        assert_eq!(first_rendered.cells[0][1].grapheme, "A");
-
-        terminal.feed(&ansi_diff(&first_buf, &second_buf));
-        let rendered = terminal.render_snapshot();
-
-        assert_eq!(rendered.cells[0][0].grapheme, "✔︎");
-        assert_eq!(
-            rendered.cells[0][1].grapheme, "B",
-            "the cell after a VT-narrow VS16 grapheme kept the previous frame's character"
-        );
-    }
-
-    #[test]
-    fn pane_diff_clears_a_line_on_a_host_that_renders_vs16_wide() {
-        fn snapshot(cells: Vec<CellSnapshot>) -> RenderSnapshot {
-            RenderSnapshot {
-                cols: cells.len() as u16,
-                rows: 1,
-                cells: vec![std::sync::Arc::new(cells)],
-                row_dirty: vec![true],
-                cursor: CursorSnapshot::default(),
-                palette: [Rgb::default(); 256],
-                foreground: Rgb::default(),
-                background: Rgb::default(),
-            }
-        }
-
-        fn ansi_diff(previous: &Buffer, next: &Buffer) -> Vec<u8> {
-            let writer = crate::FrameBuf::default();
-            let mut backend = CrosstermBackend::new(writer.clone());
-            backend.draw(previous.diff_iter(next)).unwrap();
-            backend.flush().unwrap();
-            writer.0.borrow().clone()
-        }
-
-        // The captured reproduction contains this exact VS16 warning followed
-        // by text ending in `d`. Ghostty assigns the warning one cell, while
-        // the user's host terminal renders it as two. Replacing it with a known
-        // wide glyph lets Ghostty emulate that host-side width disagreement.
-        let suffix = " no covering tests found";
-        let mut first_cells = Vec::with_capacity(suffix.chars().count() + 2);
-        first_cells.push(CellSnapshot {
-            grapheme: "⚠️".to_string(),
-            width: CellWidth::Narrow,
-            ..CellSnapshot::default()
-        });
-        first_cells.extend(suffix.chars().map(|character| CellSnapshot {
-            grapheme: character.to_string(),
-            width: CellWidth::Narrow,
-            ..CellSnapshot::default()
-        }));
-        // The trailing blank is unchanged in the next frame, so ratatui will
-        // not emit it. A host-side width drift leaves the old final `d` there.
-        first_cells.push(CellSnapshot::default());
-        let width = first_cells.len() as u16;
-        let area = Rect::new(0, 0, width, 1);
-
-        let mut first_buf = Buffer::empty(area);
-        render_pane(&mut first_buf, area, &snapshot(first_cells), None);
-        let mut previous_cells = vec![
-            CellSnapshot {
-                grapheme: "X".to_string(),
-                width: CellWidth::Narrow,
-                ..CellSnapshot::default()
-            };
-            width as usize - 1
-        ];
-        previous_cells.push(CellSnapshot::default());
-        let mut previous_buf = Buffer::empty(area);
-        render_pane(&mut previous_buf, area, &snapshot(previous_cells), None);
-        let mut blank_buf = Buffer::empty(area);
-        render_pane(
-            &mut blank_buf,
-            area,
-            &snapshot(vec![CellSnapshot::default(); width as usize]),
-            None,
-        );
-
-        let emulate_wide_vs16 = |bytes: Vec<u8>| {
-            String::from_utf8(bytes)
-                .unwrap()
-                .replace("⚠️", "中")
-                .into_bytes()
-        };
-        let mut host = GhosttyVt::new(width, 1, 0);
-        host.feed(&ansi_diff(&blank_buf, &previous_buf));
-        let first_diff = ansi_diff(&previous_buf, &first_buf);
-        let blank_diff = ansi_diff(&first_buf, &blank_buf);
-        host.feed(&emulate_wide_vs16(first_diff));
-        host.feed(&emulate_wide_vs16(blank_diff));
-
-        let rendered = host.render_snapshot();
-        assert!(
-            rendered.cells[0]
-                .iter()
-                .all(|cell| cell.grapheme.trim().is_empty()),
-            "clearing the shorter line left old text on the host: {:?}",
-            rendered.cells[0]
-        );
-    }
-
-    #[test]
-    fn pane_leaves_unstyled_cells_on_the_host_terminal_colors() {
-        let foreground = Rgb {
-            r: 240,
-            g: 241,
-            b: 242,
-        };
-        let background = Rgb {
-            r: 10,
-            g: 11,
-            b: 12,
-        };
-        let snap = RenderSnapshot {
-            cols: 1,
-            rows: 1,
-            cells: vec![std::sync::Arc::new(vec![CellSnapshot {
-                grapheme: "x".to_string(),
-                width: CellWidth::Narrow,
-                ..CellSnapshot::default()
-            }])],
-            row_dirty: vec![true],
-            cursor: CursorSnapshot::default(),
-            palette: [Rgb::default(); 256],
-            foreground,
-            background,
-        };
-        let area = Rect::new(0, 0, 1, 1);
-        let mut buf = Buffer::empty(area);
-
-        render_pane(&mut buf, area, &snap, None);
-
-        let cell = &buf[(0, 0)];
-        assert_eq!(cell.fg, Color::Reset);
-        assert_eq!(cell.bg, Color::Reset);
     }
 }

@@ -186,13 +186,16 @@ Bare `asd` (or `asd gui [session]`) opens the desktop GUI.
 
 ### TUI keybindings
 
-`asd ui` uses a `Ctrl+A` prefix (screen-style): press it, then a key.
+These are the current defaults. `asd ui` uses a `Ctrl+A` prefix
+(screen-style): press it, then a key. Runtime hints and key dispatch are both
+generated from the same keymap registry so they stay in sync.
 
 - `j`/`k` or arrows — switch session; `1`–`9` — jump to session *N* (each sidebar row shows its matching ordinal prefix)
 - `c` — new session
 - `r` — rename the selected session (input modal; `Enter` confirms, `Esc` cancels; empty and duplicate names are rejected)
 - `x` — kill the selected session (asks a `y`/`n` confirmation first)
 - `b` — hide/show the sidebar (the pane goes full-width when hidden; showing it restores the current width)
+- `s` — hide/show the bottom status bar
 - `R` — reconnect · `q` — quit · `Ctrl+A Ctrl+A` — send a literal `Ctrl+A` to the session
 
 Mouse: click a sidebar row to switch (or its `x` to kill), drag in the pane to select (copied via OSC 52), and **drag the sidebar↔pane divider** to resize the sidebar (clamped to a sensible min/max). `Shift+PageUp`/`PageDown` page the scrollback.
