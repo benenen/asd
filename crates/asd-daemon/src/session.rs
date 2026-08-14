@@ -86,14 +86,48 @@ pub fn data_frame_size(frame: &Frame) -> usize {
     }
 }
 
+/// Whether an attached client is a shared viewer or the one exclusive
+/// ratatui view. This policy stays behind the daemon's session seam; wire
+/// clients only declare their connection kind during the handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachClass {
+    Shared,
+    ExclusiveTui,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuiOwner {
+    client_id: u64,
+    view_id: u64,
+}
+
+fn attach_view_rename(
+    class: AttachClass,
+    requested_name: &str,
+    canonical_name: &str,
+    view_id: u64,
+) -> Option<Frame> {
+    (class == AttachClass::ExclusiveTui && requested_name != canonical_name).then(|| {
+        Frame::ViewRenamed {
+            old_name: requested_name.to_string(),
+            new_name: canonical_name.to_string(),
+            view_id,
+        }
+    })
+}
+
 /// Messages sent to the session thread.
 pub enum SessionMsg {
     /// Raw output fed in by the pty read thread.
     PtyOutput(Vec<u8>),
     /// The pty read hit EOF/error — the end of the session's lifetime.
     PtyEof,
-    /// Client input (already-encoded bytes), written to the pty.
-    Input(Vec<u8>),
+    /// Client input (already-encoded bytes), written only while that client is
+    /// still attached. Revocation takes effect at this membership check.
+    Input {
+        client_id: u64,
+        bytes: Vec<u8>,
+    },
     /// Attach-free scripted input. The session thread performs the optional
     /// Enter itself so no other client's input can interleave with the pair.
     ScriptInput {
@@ -112,9 +146,18 @@ pub enum SessionMsg {
     /// ordering is guaranteed by the single channel.
     Attach {
         sink: ClientSink,
+        class: AttachClass,
+        requested_name: String,
+        view_id: u64,
         cols: u16,
         rows: u16,
         appearance: TerminalAppearance,
+    },
+    /// Keep the exclusive TUI owner's client-side view tag aligned with the
+    /// canonical session name, including renames initiated by another client.
+    ViewRenamed {
+        old_name: String,
+        new_name: String,
     },
     Detach {
         client_id: u64,
@@ -580,6 +623,9 @@ fn session_thread(
     let mut client_output_filter = ColorQueryFilter::default();
     let mut terminal_appearance = TerminalAppearance::default();
     let mut clients: Vec<ClientSink> = Vec::new();
+    // At most one ratatui client owns the interactive TUI view. Shared CLI/GUI
+    // attachments remain in `clients` and are never displaced by this slot.
+    let mut tui_owner: Option<TuiOwner> = None;
     // Each attached client's window size; the pty follows the smallest.
     let mut client_sizes: std::collections::HashMap<u64, (u16, u16)> = Default::default();
     // `asd follow` subscribers. Deliberately not `clients`: they get Output but
@@ -646,7 +692,13 @@ fn session_thread(
                     bytes: client_bytes,
                 });
                 if let Some(output) = &output {
-                    broadcast(&mut clients, &meta, output.clone());
+                    let dropped = broadcast(&mut clients, &meta, output.clone());
+                    if dropped > 0 {
+                        tui_owner = tui_owner.filter(|owner| {
+                            clients.iter().any(|client| client.id == owner.client_id)
+                        });
+                        resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
+                    }
                 }
                 // Followers see the same bytes, then where that leaves the
                 // session. Sending the pair from here — inside the one thread
@@ -661,7 +713,10 @@ fn session_thread(
                 }
                 idle_announced = false;
             }
-            SessionMsg::Input(bytes) => {
+            SessionMsg::Input { client_id, bytes } => {
+                if !clients.iter().any(|client| client.id == client_id) {
+                    continue;
+                }
                 if pty_writer
                     .write_all(&bytes)
                     .and_then(|()| pty_writer.flush())
@@ -683,15 +738,49 @@ fn session_thread(
                 cols,
                 rows,
             } => {
+                if !clients.iter().any(|client| client.id == client_id) {
+                    continue;
+                }
                 client_sizes.insert(client_id, (cols, rows));
                 resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
             }
             SessionMsg::Attach {
                 sink,
+                class,
+                requested_name,
+                view_id,
                 cols,
                 rows,
                 appearance,
             } => {
+                let canonical_name = meta
+                    .name
+                    .lock()
+                    .map(|name| name.clone())
+                    .unwrap_or_else(|_| name.clone());
+                if class == AttachClass::ExclusiveTui
+                    && let Some(previous) = tui_owner.take()
+                    && previous.client_id != sink.id
+                    && let Some(index) = clients
+                        .iter()
+                        .position(|client| client.id == previous.client_id)
+                {
+                    let displaced = clients.remove(index);
+                    client_sizes.remove(&previous.client_id);
+                    displaced.send(Frame::ViewRevoked {
+                        name: canonical_name.clone(),
+                        view_id: previous.view_id,
+                    });
+                    meta.attached_clients
+                        .store(clients.len() as u32, Ordering::Relaxed);
+                }
+                if let Some(rename) =
+                    attach_view_rename(class, &requested_name, &canonical_name, view_id)
+                    && !sink.send(rename)
+                {
+                    resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
+                    continue;
+                }
                 let adopted = merge_terminal_appearance(terminal_appearance, appearance);
                 let new_foreground = terminal_appearance
                     .foreground
@@ -725,7 +814,8 @@ fn session_thread(
                 // The newcomer joins the size negotiation before its snapshot
                 // is taken, so the dump it gets already describes the size
                 // everyone ends up at.
-                client_sizes.insert(sink.id, (cols, rows));
+                let new_id = sink.id;
+                client_sizes.insert(new_id, (cols, rows));
                 let mut with_new: Vec<ClientSink> = clients.clone();
                 with_new.push(sink.clone());
                 resize_to_clients(&*master, &mut vt, &meta, &with_new, &mut client_sizes);
@@ -734,13 +824,47 @@ fn session_thread(
                 // single channel preserves order)
                 if sink.send(Frame::Snapshot { vt: snapshot }) {
                     clients.push(sink);
+                    if class == AttachClass::ExclusiveTui {
+                        tui_owner = Some(TuiOwner {
+                            client_id: new_id,
+                            view_id,
+                        });
+                    }
                     meta.attached_clients
                         .store(clients.len() as u32, Ordering::Relaxed);
                     info!(session = %name, clients = clients.len(), "client attached");
+                } else {
+                    client_sizes.remove(&new_id);
+                    resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
+                }
+            }
+            SessionMsg::ViewRenamed { old_name, new_name } => {
+                if let Some(owner) = tui_owner
+                    && let Some(client) = clients.iter().find(|client| client.id == owner.client_id)
+                    && !client.send(Frame::ViewRenamed {
+                        old_name,
+                        new_name,
+                        view_id: owner.view_id,
+                    })
+                {
+                    remove_client_membership(
+                        owner.client_id,
+                        &mut clients,
+                        &mut tui_owner,
+                        &mut client_sizes,
+                    );
+                    meta.attached_clients
+                        .store(clients.len() as u32, Ordering::Relaxed);
+                    resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
                 }
             }
             SessionMsg::Detach { client_id } => {
-                clients.retain(|c| c.id != client_id);
+                remove_client_membership(
+                    client_id,
+                    &mut clients,
+                    &mut tui_owner,
+                    &mut client_sizes,
+                );
                 meta.attached_clients
                     .store(clients.len() as u32, Ordering::Relaxed);
                 resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
@@ -763,21 +887,49 @@ fn session_thread(
                 debug!(session = %name, client = client_id, "follower left");
             }
             SessionMsg::FetchHistory { sink, start, count } => {
+                if !clients.iter().any(|client| client.id == sink.id) {
+                    continue;
+                }
                 let count = count.min(MAX_HISTORY_ROWS_PER_FETCH);
                 let total_rows = vt.history_len() as u32;
                 let rows = vt.fetch_history(start, count);
                 // Reply on the requesting client's own sink. History is not a
                 // data-plane frame, so it does not consume the flow-control
                 // quota; the window is bounded by MAX_HISTORY_ROWS_PER_FETCH.
-                sink.send(Frame::History {
+                let client_id = sink.id;
+                if !sink.send(Frame::History {
                     total_rows,
                     start,
                     rows,
-                });
+                }) && remove_client_membership(
+                    client_id,
+                    &mut clients,
+                    &mut tui_owner,
+                    &mut client_sizes,
+                ) {
+                    meta.attached_clients
+                        .store(clients.len() as u32, Ordering::Relaxed);
+                    resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
+                }
             }
             SessionMsg::Refresh { sink } => {
+                if !clients.iter().any(|client| client.id == sink.id) {
+                    continue;
+                }
                 let snapshot = vt.snapshot_vt();
-                sink.send(Frame::Snapshot { vt: snapshot });
+                let client_id = sink.id;
+                if !sink.send(Frame::Snapshot { vt: snapshot })
+                    && remove_client_membership(
+                        client_id,
+                        &mut clients,
+                        &mut tui_owner,
+                        &mut client_sizes,
+                    )
+                {
+                    meta.attached_clients
+                        .store(clients.len() as u32, Ordering::Relaxed);
+                    resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
+                }
             }
             SessionMsg::Peek { sink, scrollback } => {
                 sink.send(render_peek(&mut vt, scrollback));
@@ -1029,10 +1181,32 @@ fn notify_followers(followers: &mut Vec<ClientSink>, meta: &SessionMeta) -> bool
     !running
 }
 
-fn broadcast(clients: &mut Vec<ClientSink>, meta: &SessionMeta, frame: Frame) {
-    clients.retain(|c| c.send(frame.clone()));
+fn retain_live_clients(clients: &mut Vec<ClientSink>, frame: Frame) -> usize {
+    let before = clients.len();
+    clients.retain(|client| client.send(frame.clone()));
+    before - clients.len()
+}
+
+fn remove_client_membership(
+    client_id: u64,
+    clients: &mut Vec<ClientSink>,
+    tui_owner: &mut Option<TuiOwner>,
+    client_sizes: &mut std::collections::HashMap<u64, (u16, u16)>,
+) -> bool {
+    let before = clients.len();
+    clients.retain(|client| client.id != client_id);
+    client_sizes.remove(&client_id);
+    if tui_owner.is_some_and(|owner| owner.client_id == client_id) {
+        *tui_owner = None;
+    }
+    clients.len() != before
+}
+
+fn broadcast(clients: &mut Vec<ClientSink>, meta: &SessionMeta, frame: Frame) -> usize {
+    let dropped = retain_live_clients(clients, frame);
     meta.attached_clients
         .store(clients.len() as u32, Ordering::Relaxed);
+    dropped
 }
 
 /// Kill the session's child process (ignored when the pid is already zeroed).
@@ -1163,6 +1337,64 @@ mod appearance_tests {
         let error = flush_pty_responses(&mut vt, &mut writer).unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    #[test]
+    fn failed_broadcast_reports_the_removed_client() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let mut clients = vec![ClientSink::new(7, tx, queued)];
+
+        assert_eq!(retain_live_clients(&mut clients, Frame::Ack), 1);
+        assert!(clients.is_empty());
+    }
+
+    #[test]
+    fn stale_attach_name_is_retagged_before_the_tui_snapshot() {
+        assert_eq!(
+            attach_view_rename(AttachClass::ExclusiveTui, "old", "new", 11),
+            Some(Frame::ViewRenamed {
+                old_name: "old".to_string(),
+                new_name: "new".to_string(),
+                view_id: 11,
+            })
+        );
+        assert_eq!(
+            attach_view_rename(AttachClass::Shared, "old", "new", 0),
+            None
+        );
+        assert_eq!(
+            attach_view_rename(AttachClass::ExclusiveTui, "same", "same", 11),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_direct_reply_removes_membership_owner_and_size() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let mut clients = vec![ClientSink::new(7, tx, queued)];
+        let mut owner = Some(TuiOwner {
+            client_id: 7,
+            view_id: 11,
+        });
+        let mut sizes = std::collections::HashMap::from([(7, (40, 10))]);
+
+        assert!(remove_client_membership(
+            7,
+            &mut clients,
+            &mut owner,
+            &mut sizes
+        ));
+        assert!(clients.is_empty());
+        assert!(owner.is_none());
+        assert!(sizes.is_empty());
     }
 }
 

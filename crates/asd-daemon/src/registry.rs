@@ -188,6 +188,10 @@ impl Registry {
         if let Ok(mut n) = handle.meta.name.lock() {
             *n = new.to_string();
         }
+        let _ = handle.tx.send(SessionMsg::ViewRenamed {
+            old_name: old.to_string(),
+            new_name: new.to_string(),
+        });
         self.sessions.insert(new.to_string(), handle);
         self.persist();
         info!(from = %old, to = %new, "session renamed");

@@ -41,6 +41,7 @@ pub(crate) async fn print_json(
             // apply_resize. This obtains Snapshot without sending SIGWINCH.
             cols: 0,
             rows: 0,
+            view_id: 0,
             appearance: TerminalAppearance::default(),
         })
         .await?;

@@ -67,6 +67,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
             name: name.to_string(),
             cols,
             rows,
+            view_id: 0,
             appearance: probe.appearance,
         })
         .await?;

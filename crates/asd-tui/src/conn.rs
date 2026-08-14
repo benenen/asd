@@ -67,6 +67,17 @@ pub enum Ev {
         name: String,
         msg: String,
     },
+    /// Another ratatui client took this session's exclusive view. The actor
+    /// stays connected for list polling and an explicit re-attach.
+    ViewRevoked {
+        previous_name: String,
+        name: String,
+    },
+    /// The currently viewed session was renamed, possibly by another client.
+    ViewRenamed {
+        old_name: String,
+        new_name: String,
+    },
     /// A `Rename` completed (`Ok`) or was rejected by the daemon (`Err(msg)`).
     Renamed(Result<(), String>),
 }
@@ -146,7 +157,7 @@ async fn drive(
     let mut reader = FrameReader::new(r);
     let mut writer = FrameWriter::new(w);
 
-    asd_client::handshake(&mut writer, &mut reader, ClientKind::Cli)
+    asd_client::handshake(&mut writer, &mut reader, ClientKind::Tui)
         .await
         .map_err(|msg| format!("handshake: {msg}"))?;
     let _ = ev_tx.send(Ev::Up);
@@ -154,6 +165,8 @@ async fn drive(
     // Attach bookkeeping (see `Attach`): which session's frames to forward and
     // whether a switch is still converging.
     let mut at = Attach::default();
+    let mut next_view_id = 1u64;
+    let mut listed_sessions = Vec::new();
 
     let mut ticker = tokio::time::interval(LIST_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -167,6 +180,12 @@ async fn drive(
             }
             frame = reader.read_frame() => match frame {
                 Ok(Some(Frame::SessionList { sessions })) => {
+                    if let Some((old_name, new_name)) =
+                        retag_from_session_list(&mut at, &listed_sessions, &sessions)
+                    {
+                        let _ = ev_tx.send(Ev::ViewRenamed { old_name, new_name });
+                    }
+                    listed_sessions = sessions.clone();
                     let _ = ev_tx.send(Ev::Sessions(sessions));
                 }
                 Ok(Some(Frame::Snapshot { vt: dump })) => {
@@ -185,6 +204,16 @@ async fn drive(
                             data: bytes,
                             snapshot: false,
                         });
+                    }
+                }
+                Ok(Some(Frame::ViewRevoked { name, view_id })) => {
+                    if let Some(previous_name) = at.on_view_revoked(view_id) {
+                        let _ = ev_tx.send(Ev::ViewRevoked { previous_name, name });
+                    }
+                }
+                Ok(Some(Frame::ViewRenamed { old_name, new_name, view_id })) => {
+                    if at.on_view_renamed(view_id, &old_name, &new_name) {
+                        let _ = ev_tx.send(Ev::ViewRenamed { old_name, new_name });
                     }
                 }
                 Ok(Some(Frame::Created { name })) => {
@@ -236,11 +265,15 @@ async fn drive(
                     rows,
                     appearance,
                 }) => {
+                    let view_id = next_view_id;
+                    next_view_id = next_view_id
+                        .checked_add(1)
+                        .expect("TUI view id overflow");
                     // Switching sessions on one connection means detach first.
-                    if at.begin(name.clone()) {
+                    if at.begin_view(name.clone(), view_id) {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
-                    if writer.write_frame(&Frame::Attach { name, cols, rows, appearance }).await.is_err() {
+                    if writer.write_frame(&Frame::Attach { name, cols, rows, view_id, appearance }).await.is_err() {
                         return Err("attach write failed".to_string());
                     }
                 }
@@ -270,9 +303,10 @@ async fn drive(
                     let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(Cmd::Rename { name, new_name }) => {
-                    // Keep the frame tag in step with the TUI's optimistic
-                    // rename of its active session (see `Attach::on_rename`).
-                    at.on_rename(&name, &new_name);
+                    // The daemon's ViewRenamed retags `at` after the rename is
+                    // accepted. Retagging optimistically here would strand the
+                    // actor on a rejected name and make a later revoke look
+                    // stale.
                     if writer.write_frame(&Frame::Rename { name, new_name }).await.is_err() {
                         return Err("rename write failed".to_string());
                     }
@@ -287,5 +321,54 @@ async fn drive(
                 }
             },
         }
+    }
+}
+
+/// Retag a settled view before its renamed SessionList reaches the App. This
+/// closes the cross-task ordering window where the registry reply can overtake
+/// the session thread's explicit ViewRenamed notification.
+fn retag_from_session_list(
+    attach: &mut Attach,
+    previous: &[asd_proto::SessionInfo],
+    current: &[asd_proto::SessionInfo],
+) -> Option<(String, String)> {
+    let showing = attach.on_output()?;
+    let renamed = super::renamed_active_session(Some(&showing), previous, current)?;
+    attach.on_rename(&renamed.0, &renamed.1);
+    Some(renamed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(name: &str, pid: u32, created_ms: u64) -> asd_proto::SessionInfo {
+        asd_proto::SessionInfo {
+            name: name.to_string(),
+            command: "shell".to_string(),
+            title: String::new(),
+            created_ms,
+            idle_ms: 0,
+            running: true,
+            attached_clients: 1,
+            pid,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    #[test]
+    fn session_list_retags_the_actor_before_forwarding_more_output() {
+        let mut attach = Attach::default();
+        attach.begin("old".to_string());
+        attach.on_snapshot();
+        let previous = vec![info("old", 42, 100)];
+        let current = vec![info("new", 42, 100)];
+
+        assert_eq!(
+            retag_from_session_list(&mut attach, &previous, &current),
+            Some(("old".to_string(), "new".to_string()))
+        );
+        assert_eq!(attach.on_output().as_deref(), Some("new"));
     }
 }

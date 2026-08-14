@@ -29,6 +29,7 @@
 pub struct Attach {
     pending: usize,
     showing: Option<String>,
+    view_id: u64,
 }
 
 impl Attach {
@@ -36,9 +37,16 @@ impl Attach {
     /// attached (so the caller writes a `Detach` first — switching sessions on
     /// one connection is detach-then-attach).
     pub fn begin(&mut self, name: String) -> bool {
+        self.begin_view(name, 0)
+    }
+
+    /// Begin a view with an opaque client-generated identity. Ratatui uses a
+    /// fresh nonzero id for every attach; shared GUI clients use [`begin`].
+    pub fn begin_view(&mut self, name: String, view_id: u64) -> bool {
         let was_attached = self.showing.is_some();
         self.pending += 1;
         self.showing = Some(name);
+        self.view_id = view_id;
         was_attached
     }
 
@@ -69,6 +77,19 @@ impl Attach {
     /// Snapshot of the new one.
     pub fn on_session_exited(&mut self) -> Option<String> {
         if self.pending == 0 {
+            self.view_id = 0;
+            self.showing.take()
+        } else {
+            None
+        }
+    }
+
+    /// Another TUI took this exact view attempt. The opaque id, rather than the
+    /// mutable session name, prevents delayed revocations from clearing a later
+    /// attach and remains valid across external renames.
+    pub fn on_view_revoked(&mut self, view_id: u64) -> Option<String> {
+        if self.pending == 0 && self.view_id == view_id {
+            self.view_id = 0;
             self.showing.take()
         } else {
             None
@@ -84,6 +105,15 @@ impl Attach {
         }
     }
 
+    /// Apply a daemon rename only when it belongs to this exact TUI view.
+    pub fn on_view_renamed(&mut self, view_id: u64, old: &str, new: &str) -> bool {
+        if self.view_id != view_id || self.showing.as_deref() != Some(old) {
+            return false;
+        }
+        self.showing = Some(new.to_string());
+        true
+    }
+
     /// A pending Attach failed (`NO_SUCH_SESSION`: the session died before we
     /// attached). Drains one pending count; returns the ended name only if that
     /// was the newest attach, so the client stops holding the pane for a
@@ -91,6 +121,7 @@ impl Attach {
     pub fn on_attach_failed(&mut self) -> Option<String> {
         self.pending -= 1;
         if self.pending == 0 {
+            self.view_id = 0;
             self.showing.take()
         } else {
             None
@@ -118,6 +149,7 @@ impl Attach {
         // pending stays: any Snapshot still in flight must drain through
         // on_snapshot (showing is None, nothing is forwarded) so the count
         // stays aligned.
+        self.view_id = 0;
         self.showing.take()
     }
 }
@@ -239,5 +271,49 @@ mod tests {
         assert_eq!(at.detach(), s("a"));
         // Snapshot still in flight drains harmlessly — showing is None.
         assert_eq!(at.on_snapshot(), None);
+    }
+
+    #[test]
+    fn revoking_the_shown_view_detaches_it() {
+        let mut at = Attach::default();
+        at.begin_view("a".into(), 7);
+        at.on_snapshot();
+        assert!(at.on_view_renamed(7, "a", "renamed"));
+
+        assert_eq!(at.on_view_revoked(7), s("renamed"));
+        assert!(!at.is_attached());
+    }
+
+    #[test]
+    fn stale_view_identity_cannot_rename_the_replacement_view() {
+        let mut at = Attach::default();
+        at.begin_view("replacement".into(), 8);
+        at.on_snapshot();
+
+        assert!(!at.on_view_renamed(7, "replacement", "wrong"));
+        assert_eq!(at.on_output(), s("replacement"));
+    }
+
+    #[test]
+    fn duplicate_view_rename_is_not_forwarded_after_list_retag() {
+        let mut at = Attach::default();
+        at.begin_view("old".into(), 7);
+        at.on_snapshot();
+        at.on_rename("old", "new");
+
+        assert!(!at.on_view_renamed(7, "old", "new"));
+        assert_eq!(at.on_output(), s("new"));
+    }
+
+    #[test]
+    fn stale_revocation_does_not_cancel_a_pending_reattach() {
+        let mut at = Attach::default();
+        at.begin_view("a".into(), 7);
+        at.on_snapshot();
+        at.begin_view("a".into(), 8);
+
+        assert_eq!(at.on_view_revoked(7), None);
+        assert_eq!(at.on_snapshot(), s("a"));
+        assert!(at.is_attached());
     }
 }

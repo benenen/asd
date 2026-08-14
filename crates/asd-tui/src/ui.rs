@@ -230,10 +230,13 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
             .sessions
             .iter()
             .any(|s| app.self_session.as_deref() != Some(&s.name));
-        let hint = empty_pane_hint(app.sessions.is_empty(), selectable);
-        let y = pane.y + pane.height / 2;
-        let x = pane.x + (pane.width.saturating_sub(hint.len() as u16)) / 2;
-        f.buffer_mut().set_string(x, y, hint, Style::new().fg(DIM));
+        draw_empty_pane(
+            f.buffer_mut(),
+            pane,
+            app.view_revoked.as_deref(),
+            app.sessions.is_empty(),
+            selectable,
+        );
     }
 
     let caret = match &app.modal {
@@ -681,6 +684,64 @@ pub fn short_age(created_ms: u64, now_ms: u64) -> String {
     }
 }
 
+const ASD_WORDMARK: [&str; 4] = [
+    "  __ _ ___  __| |",
+    " / _` / __|/ _` |",
+    "| (_| \\__ \\ (_| |",
+    " \\__,_|___/\\__,_|",
+];
+
+/// Clear and paint the pane's empty state. A revoked view keeps the selected
+/// session visible in the sidebar while the pane becomes an explicit takeover
+/// placard; every other empty state reuses the same wordmark with its own hint.
+fn draw_empty_pane(
+    buf: &mut Buffer,
+    area: Rect,
+    revoked: Option<&str>,
+    is_empty: bool,
+    any_selectable: bool,
+) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                cell.reset();
+            }
+        }
+    }
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let mut lines: Vec<(String, Style)> = ASD_WORDMARK
+        .iter()
+        .map(|line| ((*line).to_string(), Style::new().fg(ACCENT)))
+        .collect();
+    lines.push((String::new(), Style::new()));
+    if let Some(name) = revoked {
+        lines.push((
+            format!("Session \"{name}\" is open in another asd ui"),
+            Style::new().fg(TEXT),
+        ));
+        lines.push((
+            "Select it again to take over".to_string(),
+            Style::new().fg(DIM),
+        ));
+    } else {
+        lines.push((
+            empty_pane_hint(is_empty, any_selectable).to_string(),
+            Style::new().fg(DIM),
+        ));
+    }
+
+    let visible = lines.len().min(area.height as usize);
+    let top = area.y + area.height.saturating_sub(visible as u16) / 2;
+    for (offset, (line, style)) in lines.into_iter().take(visible).enumerate() {
+        let line = truncate(&line, area.width as usize);
+        let x = area.x + area.width.saturating_sub(str_width(&line) as u16) / 2;
+        buf.set_string(x, top + offset as u16, line, style);
+    }
+}
+
 /// The centered pane hint when no session is being viewed. Distinguishes "no
 /// sessions at all" from "the only session is this UI's own host" (which `j/k`
 /// can't select) — the latter must point at creating one, not at selecting.
@@ -845,6 +906,31 @@ mod tests {
         assert_eq!(
             empty_pane_hint(false, true),
             "select a session (Ctrl+A j/k)"
+        );
+    }
+
+    #[test]
+    fn revoked_view_draws_the_asd_wordmark_and_takeover_hint() {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        draw_empty_pane(&mut buf, area, Some("review"), false, true);
+        let text = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("__ _ ___"), "pane: {text}");
+        assert!(
+            text.contains("Session \"review\" is open in another asd ui"),
+            "pane: {text}"
+        );
+        assert!(
+            text.contains("Select it again to take over"),
+            "pane: {text}"
         );
     }
 

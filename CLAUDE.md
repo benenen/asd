@@ -1,80 +1,82 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file is the always-loaded agent guide for this repository. `AGENTS.md` is
+a symlink to it. Keep this file short: durable implementation details belong in
+[`docs/`](docs/README.md), while public installation and usage belong in
+[`README.md`](README.md).
 
-## 项目定位
+## Project boundaries
 
-`asd` = GPU 终端客户端 + headless mux daemon，定位 **shpool 而非 tmux**：一个 session 即一个 PTY，不做 pane/window 分屏。规格与里程碑文档在 Obsidian：`idea/spacs/gmux GPU 终端 Spec`、`idea/plans/gmux GPU 终端计划`（文档用 `gmux-*` 命名，本仓库对应为 `asd-*`）。M0 五个模块 asd-proto / asd-vt / asd-daemon / asd-cli / GUI 均已落地（GUI 最初是 iced 版 asd-gui，2026-07-17 删除，只留 asd-dioxus）。
+`asd` is a GPU terminal client plus a headless session daemon. It is closer to
+shpool than tmux: one session owns exactly one PTY; there are no panes or
+windows inside a session.
 
-**单二进制分发（有意偏离 spec §2，用户决定）**：只产出**一个** `asd` 可执行文件，CLI + 内嵌 daemon + GUI 全在里面。**bin 是 workspace 根 package `asd`（`Cargo.toml` 既是 `[workspace]` 又是 `[package]`，`src/main.rs`）**；asd-daemon/asd-cli/asd-dioxus 都是 **library crate**，根 bin 用 **feature** 组合：`local`（=asd-cli，带 daemon/portable-pty）+ `dioxus`（=asd-dioxus，webview+ghostty-web，唯一 GUI；`gui` 是兼容别名），`default=["local","dioxus"]`。（iced 版 asd-gui 曾并存于 `iced` feature，2026-07-17 删除。）**裸 `asd` 开 GUI**，`asd gui [session]` 也开 GUI，`new/attach/list/kill/daemon/restart` 是 CLI 子命令。**纯客户端 = `--no-default-features --features dioxus`**（无 portable-pty，`cargo tree` 验证 0 个；曾经也是 Windows 的发布形态，Named Pipe 传输层落地后 **Windows 改发 full**——GUI-only 的 bin 里没有 CLI，`asd.exe list` 只会开窗并把 `list` 当 session 名）；**服务器端只装 daemon/CLI 用 `--no-default-features --features local`**（不链 GUI 库——dioxus 版链 libwebkit2gtk，拷到没有 WebKitGTK 的服务器会起不来）。daemon 仍以 `asd daemon` 子命令运行，自愈拉起 = re-exec `current_exe()` + `daemon`。GUI 入口 `asd_dioxus::run(session)`；CLI 入口 `asd_cli::run(gui: Option<GuiLauncher>)`（GUI 启动器由 bin 注入，asd-cli 不碰任何 GUI 框架）。
+The repository intentionally ships one root-package `asd` executable. Feature
+`local` provides CLI/TUI/daemon/PTY support; `dioxus` provides the desktop GUI
+(`gui` is an alias); the default enables both. Bare `asd` opens the GUI. A
+headless server uses `--no-default-features --features local`; a GUI-only
+client uses `--no-default-features --features dioxus`.
 
-## 代码规范
+## Non-negotiable rules
 
-- **代码中的注释一律使用英文**（doc comments、行内注释、Cargo.toml 注释都算）。
-- **协议加帧或改帧结构必须 bump `asd-proto` 的 `PROTO_VERSION`**（双端同升，不做多版本兼容运行），并在 `crates/asd-proto/tests/codec.rs` 的 `all_frames()` 里补/改 roundtrip 用例。当前 `PROTO_VERSION = 12`（v12 给 `SendInput` 加 `enter`：`asd send --enter` 由 daemon session 线程原子执行“写正文 → 300ms 静默 → 写 CR → Ack”，避免 agent TUI 把 CR 当粘贴换行，也不允许并发输入插进正文与 Enter 之间；v11 给 `Attach` 加 `TerminalAppearance{foreground,background}`：CLI/TUI 在 raw mode 下向真实宿主终端探测 OSC 10/11，随 attach 原子交给 daemon；session 对每个通道采用第一个非 None 值锁定，未知时绝不猜黑/白，查询早于 attach 就有界排队、颜色到达后按原 BEL/ST 终止符回 PTY；daemon 是共享 PTY 的唯一查询应答者，本地 VT 镜像只 drain/drop replies；默认 cell 使用宿主 Reset/SGR 39/49；v10 把 `Peek.scrollback` 从 `bool` 改成枚举 `Scrollback{None,All,Lines(u32)}`——`asd peek <name> [--scrollback [LINES]]`：不给标志=只要屏幕、裸标志=全部历史、带值=屏幕之上最多 N 行（`clap` 的 `Option<Option<u32>>` 正好三态，`control.rs::scrollback_arg` 直接映射到线格式）。**行数上限必须由 daemon 施加、不能客户端裁**：session 能留几万行，整份 dump 要塞进单帧（`MAX_FRAME_LEN` 4 MiB），"最后 10 行"得是"只发 10 行"；daemon 侧 `render_peek` 按 `start = scrollback_rows - n` 往回数，所以屏幕永远包含在内、给超过存量的 N 就等于 All；v9 加了 attach-free 的订阅帧 `Follow`/`Unfollow`/`FollowStatus`（`asd follow <name>`：实时流式输出 + **静默判定内联在同一条流里**，不轮询）——conn 层 `registry.get` 后走 `SessionMsg::Follow{sink}`，session 线程把 follower 存在**独立于 `clients` 的 `followers` 里**（不参与尺寸协商、不计入 `attached_clients`、不发 Snapshot，所以"看"不会改变别人看到的东西）；订阅时先回一帧当前 `FollowStatus`，之后每批 pty 输出都发 `Output` + `FollowStatus`。**关键坑**：`running = idle_ms < IDLE_SETTLE_MS` 是紧跟输出时间戳算的，恒为 true——所以"变静默"这件事**只会以"什么都没发生"的形式出现**，session 线程必须在**有 follower 且尚未通告过静默时**改用 `rx.recv_timeout(距离 IDLE_SETTLE_MS 的剩余时间)`，超时才发得出 `running:false`（`idle_announced` 标志防止重复通告和忙等；没有 follower 时照旧阻塞 `recv()`，零开销）。session 结束时也要给 followers 补一帧 `running:false`，否则 follow 会一直等到超时；v8 一次带两个字段：`Create.cwd`（`asd new --cwd <dir>`——会话直接在该目录启动，不必把 `cd` 折进 `--cmd`；后者会让 create 时刻采样到的 cwd 是错的）与 `SessionInfo.pid`（`asd list --json` 直接带 pid，调用方不必为拿 pid 逐个 `inspect`，N+1 降为 1 次）；v1 加了 scrollback 的 `FetchHistory`/`History` 与 `Refresh`；v7 加了 `Rename`(改 session 名，daemon 端 `registry.rename` 校验+搬 map key+更新 `SessionMeta.name`(Mutex，session 线程退出按它摘除、`info()` 也读它)，回 `Ack`)；v6 加了 `Inspect`/`InspectReply`（`asd inspect <name>`：单 session 详情——conn 层 `handle.info()` 出元数据、路由 `SessionMsg::Inspect` 到 session 线程补 VT 现场：child_pid/alt-screen/scrollback 深度/mouse tracking+modes/cursor；CLI 打标签块或 `--json`）；v5 给 `SessionInfo` 加了 `running` 字段——daemon 端 `info()` 里由 `idle_ms < asd_proto::IDLE_SETTLE_MS`(2s，与 `wait --idle` 同一常量) 导出的活动标志；对 agent(claude/codex/opencode)= 在干活 vs 已完成/等输入（title 只标"是什么"、不随忙闲翻转——实测 claude title 恒为 `✳ Claude Code`）；`asd list` 加 STATUS 列(running/idle)；v4 加了 attach-free 脚本帧 `SendInput`/`Ack`（`asd send`：按名往 session pty 写字节，conn 层 `registry.get` 后走 `SessionMsg::ScriptInput`，由 session 线程写完正文/可选 Enter 后回 Ack，无需 attach）、`Peek`/`PeekReply`（`asd peek`：session 线程用 `render_snapshot()` 取光标/几何 + `fetch_history()` 取纯文本行渲染屏幕，`--scrollback` 带全历史）、`SessionInfo.idle_ms`（session 线程每批输出后 `SessionMeta.last_output_ms` 打时间戳，网络侧算 idle，喂 `asd wait --idle`）；`asd wait --text` 轮询 `peek`、`--idle` 轮询 `list`、超时退出码 4；v3 给 `SessionInfo` 加了 `title` 字段——终端标题（OSC 0/2），daemon session 线程每次输出后把 `vt.title()` 导出到 `SessionMeta.title`（Mutex），TUI 侧栏第二行优先显示 title、为空回落 command；`asd list` 在 COMMAND 之前加了 TITLE 列（`clean_title` 滤控制字符+trim，免得脏 title 打乱表格/移光标；`title_col_width` 按本次最宽 title 定宽、下限=表头 5 上限 `TITLE_COL_MAX`=32；`pad_cell` 按**显示宽度**截断/补白——CJK 两列宽，用字符数会把 COMMAND 顶歪）；v2 给 `SessionInfo` 加了 `command` 字段——daemon 报**实时前台进程**：`tcgetpgrp(pty master fd)` 取前台进程组 → **Linux** 读 `/proc/<pgid>/cmdline`（argv0 basename、剥 `sh -c` 包装前缀，有 args）；**macOS** 用 `sysctl(KERN_PROCARGS2)` 拿完整 argv（`[argc][exec_path\0][pad][argv…]`，`parse_procargs2` 解析——argv0 basename、剥 `sh -c`、与 Linux 同形），失败回退 libproc `libc::proc_pidpath`（只可执行名）；其他平台回退。都最终回退到 spawn 命令/默认 shell。交互式 shell 里跑的作业靠 job control 各自成组，故能显 `vim`/`npm run dev`/`top`。CLI `list` 与 GUI 侧栏显示。master fd 存在 `SessionMeta.pty_master_fd`（borrow 不 dup，否则 slave 收不到 hangup）。`proc_command` 按 `cfg(target_os)` 三分支；macOS 分支沙箱(Linux)编译不到——`parse_procargs2` 用 `cfg(any(macos,test))` 在 Linux test 里跑纯解析单测，整段 macOS FFI 靠隔离 crate `cargo check --target x86_64-apple-darwin` 验证签名。
-- **平台差异一律收进 `src/platform/`，调用点不准出现 `#[cfg(unix)]`/`#[cfg(windows)]`**。约定：`platform/mod.rs` 里两个 `#[path]` 把 `unix.rs`/`win.rs` 都挂成 `imp`，然后**无 cfg** 地 `pub(crate) use imp::{...}` 显式列出接口——于是「两个平台必须提供完全相同的接口」由编译器强制（少一项就报错并点名），两侧不会悄悄跑偏。目前 asd-proto(`paths/`)、asd-daemon、asd-cli、asd-tui、asd-dioxus 都是这个形状；全仓 cfg 只剩每个模块挂载点的 2 处，加上 `session.rs` 的 `foreground_command` 家族（linux/macos/windows 三路 `target_os` 分叉，不是 unix/win 二分，暂未拆）。加平台代码就往对应 `platform/{unix,win}.rs` 里加，别在调用处开分支。
-- crate 依赖边界是硬契约（spec §3），违反即架构回归：
+- Write all code comments in English, including doc comments, inline comments,
+  and comments in Cargo files.
+- Any new protocol frame or frame-shape change must bump
+  `asd_proto::PROTO_VERSION` and update `all_frames()` in
+  `crates/asd-proto/tests/codec.rs`, including its explicit version assertion.
+  Both endpoints upgrade together; there is no multi-version compatibility.
+  Update the protocol module history and run `cargo test -p asd-proto`.
+- Put Unix/Windows differences behind each crate's `src/platform/` module.
+  Call sites must not introduce `#[cfg(unix)]` or `#[cfg(windows)]`. Both
+  platform implementations must export the same explicit interface through
+  `platform/mod.rs`. The Linux/macOS/Windows foreground-process lookup is the
+  existing exception because it is a three-way OS split.
+- Preserve crate dependency boundaries. In particular, `asd-client` and
+  `asd-dioxus` must remain free of PTY/process-management dependencies, and GUI
+  frameworks must not leak into CLI or daemon crates.
+- Update the matching document under `docs/` when an implementation change
+  alters one of its stated invariants. Do not grow this file with incident
+  histories or command tutorials.
 
-| crate | 职责 | 禁止依赖 |
-|---|---|---|
-| asd-proto | 帧枚举、postcard 编解码、framed reader/writer、路径契约（**daemon 与客户端共用的线格式层**，只放两端都跑的东西） | tokio 之外的运行时、任何业务 crate |
-| asd-client（**lib**） | **只有客户端才跑的那一半协议**：`handshake()`（发 Hello / 等 HelloAck）+ `attach::Attach`（Attach 收敛状态机——判定到达的帧属不属于当前视图；规则三端必须完全一致，故收敛于此）。被 asd-cli / asd-tui / asd-dioxus 共用 | GUI 框架、**portable-pty 及一切 PTY/进程管理**（asd-dioxus 链它，必须保持 PTY-free）、asd-vt |
-| asd-vt | `VtBackend` trait + libghostty-vt 实现（逃生门边界） | GUI 框架、portable-pty、asd-proto |
-| asd-daemon（lib） | session 管理、UDS 服务 | GUI 框架（含传递依赖） |
-| asd-cli（**lib**，`pub fn run`） | 调试客户端、`attach --stdio` 代理、内嵌 daemon（`asd daemon`）；被根 bin 的 `local` feature 组合 | GUI 框架（GUI 启动器由 bin 注入） |
-| asd-tui（**lib**，`pub fn run`，ratatui 0.30） | `asd ui`：session 侧栏+实时终端面板的 TUI（对应 images/image.png），Ctrl+A 前缀切换/新建/杀 session，本地 vt 渲染（同 attach 客户端），OSC52 选区复制；被 asd-cli 依赖。侧栏交互：Ctrl+A r 改名(输入 modal，char-based 编辑/CJK 安全，校验空/非法/重名)、x 杀(确认 modal)、b 隐藏侧栏、1-9 跳到第 n 个 session(行首显序号，与快捷键对应)；侧栏↔pane 分割线鼠标可拖动改宽(clamp `ui::MIN_SIDEBAR`..`MAX_SIDEBAR`，`sidebar_w`/`sidebar_hidden`/`term_size` 状态，`apply_layout` 重算 grid+resize)。侧边栏视觉（tachyonfx 0.25）：**running session 行文字彩色流光**（`running_shimmer`=`repeating(hsl_shift_fg([360,0,0]).with_pattern(SweepPattern::left_to_right(160)))`+`CellFilter::Text`，只转前景 hue、背景不动，行文字底色画成 accent 才有色可转；daemon 的 `idle_ms` 在客户端用单调 deadline 继续老化，精确到 `IDLE_SETTLE_MS` 就停流光，不再多等下一轮 1.5s list；当前 attach 的真实 Output 会续期 2s，且本地观测不能被并发到达的陈旧 list 覆盖；`SweepPattern`/`with_pattern` 要 tachyonfx≥0.22，但 0.22 起转 ratatui 0.30，所以整体升到 ratatui 0.30.2+tachyonfx 0.25）；**选中 session 行左右加 accent `│` 边框**；shimmer 处理区内缩 1 列避开边框与右分隔线。**pane 抗撕裂**：`App::snapshot()` 缓存上一整帧（`pane_cache`），只在真有输出/滚动/切换（`pane_needs_render`）时重渲染——shimmer 每 500ms 最多重画一帧（输入 poll 仍为 30ms），给 Windows Terminal 的 URL 检测留下足够的异步扫描与 UI 更新窗口，且重画不再每帧重建快照；程序处于同步输出（`VtBackend::synchronized_output` = libghostty `Mode::SYNC_OUTPUT` 2026，`?2026h`…`?2026l`）中途时复用缓存、150ms 死线兜底丢失的 `?2026l`，于是 Claude 之类高频重画的底部 UI 不会被采样到半成品帧 | GUI 框架、portable-pty/进程管理；OSC52/base64 用共享的 `asd_vt::clip` |
-| asd-dioxus（**lib**，`pub fn run`，Dioxus Desktop+ghostty-web） | GUI：host 分组侧栏/SSH remote/设置，渲染交给 webview 里的 ghostty-web（吃原始 PTY 字节，无 asd-vt）；被根 bin 的 `dioxus` feature（默认）组合 | **portable-pty 及一切 PTY/进程管理**（Windows 客户端可行性的根基）。**SSH 走纯 Rust `russh`（网络客户端，不 spawn 进程/不用 ssh.exe，不违反边界）**。JS 依赖由 npm+esbuild 打包（build.rs 驱动，见 crate README），产物 include_str! 内嵌保单二进制 |
-| asd（**根 package**，唯一 bin `asd`） | 组合上面的 lib 成单一可执行文件（feature `local`/`dioxus`）；除组合外无逻辑 | 直接依赖 GUI 框架或 portable-pty（应经由 feature 拉对应 lib，保持边界纯净） |
+The complete crate ownership table is in
+[`docs/architecture.md`](docs/architecture.md#crate-boundaries).
 
-Windows Terminal 的自动 URL 检测另有一层宿主缓存：它按屏幕坐标缓存链接，连续 pane 输出会让文字已滚动但点击区仍短暂留在旧位置。500ms shimmer 限流只负责 animation-only 帧；`asd ui` 还会记录 `http/https/ftp/file` URL footprint（含软换行），当宿主静默超过其 100ms debounce 后 URL 移动或消失，就在同一个 `?2026` 原子帧内执行 `?1049l`→`?1049h`，随后同尺寸 `Terminal::resize` 清屏并全量重绘。Windows Terminal 在两次 buffer switch 中同步重建、最终清空旧 pattern tree，所以后续 pane 持续输出也不会继续命中旧坐标；一次清理后直到宿主可能重新扫描前不重复切 buffer。代价是该次切换会取消宿主的原生 Shift 选区，asd 自绘选区不受影响。
+## Runtime invariants
 
-## 常用命令
+- Each session has a blocking PTY reader thread and one session thread. The
+  session thread exclusively owns its `GhosttyVt`; PTY output and all session
+  messages are serialized through its channel. This ordering is what makes an
+  attach Snapshot precede later Output.
+- The daemon is the only owner of the session-side terminal model and query
+  responses. Rendering clients may keep a local VT, but they must drain/drop
+  its generated PTY replies rather than answering the application themselves.
+- Ordinary `asd attach` clients and the desktop GUI are shared clients. Only
+  `asd ui` has one exclusive interactive viewer per session; a new TUI viewer
+  displaces the previous TUI without displacing shared clients.
+- PTY size is the per-axis minimum of all still-attached clients. A revoked or
+  dead client must be removed from both membership and size negotiation.
+- Follow subscriptions are not attachments: they receive Output and activity
+  status but do not receive Snapshots, count as attached clients, or affect PTY
+  size.
+- `asd daemon` owns a Tokio runtime. Dispatch that subcommand before entering
+  any outer `#[tokio::main]` runtime; nested runtimes are invalid.
+- libghostty-vt is an unstable dependency. Direct upstream API calls stay in
+  `crates/asd-vt/src/ghostty.rs`; other crates use `VtBackend` and
+  `RenderSnapshot`.
+
+## Required checks
+
+Run checks proportional to the change. Before handing off a repository-wide
+change, use:
 
 ```bash
-cargo build --workspace              # 首次构建会用 Zig 编译 libghostty-vt-sys（vendored），需 PATH 里有 zig 0.15.x；asd-dioxus 的 build.rs 会跑 npm install + esbuild（需 node/npm）
-cargo test --workspace               # e2e 测试会真实拉起 asd-daemon 进程（独立 socket，互不干扰）
-cargo test -p asd-vt                 # 单 crate
-cargo test --test e2e sigterm        # 单个 e2e（e2e 在根 package tests/，非 asd-cli）
-cargo clippy --workspace --all-targets
-cargo fmt --all
-
-# Windows 代码的本地预检（约 3 分钟，整条 daemon 路径都过一遍）：
-env -i PATH="$PATH" HOME="$HOME" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" \
-  LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast \
-  cargo check --target x86_64-pc-windows-gnu --no-default-features --features local
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
 ```
 
-**在 Linux 上预检 Windows 代码：用 `x86_64-pc-windows-gnu`，不是 `-msvc`。** msvc 目标会死在 libghostty-vt-sys 的 Zig 构建里（zig 不带 MSVC SDK 头文件，highway/simdutf 卡在 `<mm_malloc.h>`）——这条死路曾让人误以为「Windows 代码没法本地检查」，转而去抠隔离 crate 验证片段，白白多花了好几轮 CI。而 **zig 自带 mingw**，所以 gnu 目标能把 vendored C++ 编出来，asd-proto/client/vt/daemon/tui/cli 连同根 bin 一次全查。必须用 `env -i` 起干净环境：被污染的 shell env/stdin 会让 cargo 的 target 探测把垃圾喂给 `rustc -`，报出莫名其妙的 `unknown start of token: \u{0}`。**边界**：加 `--all-targets` 会失败（cc-rs 找不到 `x86_64-w64-mingw32-gcc`，是某个 dev-dep 的 build script 要 mingw C 编译器），所以这招只覆盖 **build 层**；`cfg(test)` 专属的错误和 clippy 的死代码告警仍然只有 `windows-check.yml` 能发现——三层各有各的价值，别拿一层当全部。
-
-**跨平台差异不止编译，还有文件系统语义**：Windows 与默认的 macOS 卷**大小写不敏感**，会让某些测试的**前提本身无法表示**——`card` 那条「`readme.md` 与 `README.md` 并存，取精确拼写」在那儿两次写会折成一个文件，于是挂了 4 轮 Windows CI（ci.yml 只跑 Linux，看不见）。本地能造出真的折叠卷来验证：
-
-```bash
-mkfs.ext4 -O casefold -F ci.img && mount -o loop ci.img mnt && mkdir mnt/tmp && chattr +F mnt/tmp
-TMPDIR=$PWD/mnt/tmp cargo test -p asd-cli --lib card   # env::temp_dir() 认 $TMPDIR，fixture 就落在折叠目录里
-```
-
-**偏差（别把模拟当真相）**：Linux 的 `canonicalize()` 不纠正大小写、NTFS 的会，所以「拿 canonicalize 结果对比预期路径」的测试在模拟卷上会假失败，而真实 Windows 上通过——判定前务必拿 CI 日志核对那条测试的真实结论。写测试的原则由此而来：**规则测在它所在的层级**（`match_name` 是名字列表上的纯函数，任何平台都跑得了），文件系统那层要**问目录**实际有几条目录项，而不是假设它能表示什么。
-
-手工冒烟：`cargo run -- attach -A demo`（根 bin `asd`；自动拉起 daemon + 创建 session；detach 键 Ctrl-\）；TUI 客户端 `cargo run -- ui [session]`（ratatui 版侧栏+实时终端，Ctrl+A 前缀键切换/新建/杀 session，自动拉起 daemon）。`cargo run` 裸跑 = 开 GUI。`cargo build --workspace` 编所有 crate；`cargo test --workspace` 跑所有测试（`cargo test` 不带 `--workspace` 只测根 package）。脚本化（对标 boo，v4，attach-free）：`asd send <name> --text 'make test' --enter`（也支持 `--key Enter,C-c,Up` 具名键 / stdin 管道）、`asd peek <name> [--scrollback|--json]`（打印渲染后的屏幕）、`asd wait <name> (--text <s>|--idle) [--timeout 30s]`（阻塞到匹配/静默，超时退出码 4）、`asd card [list|inspect <name>|cat <name> <path>]`（**给编排 agent 选 session 用**：卡片 = session 元数据 + 其 cwd 里的项目文档 `README.md`/`CLAUDE.md`/`AGENTS.md`/`CONTRIBUTING.md`（**文件名忽略大小写匹配**：`card.rs::scan_docs` 先 `read_dir` 列目录、再 `match_name` 按 `eq_ignore_ascii_case` 找——项目和文件系统对大小写各有各的写法，只认标准拼写会让一堆 `readme.md` 的项目报「没有文档」；报出来的是**磁盘上的真名**，因为 `card cat` 收到的就是它、那条路径必须精确。同时存在 `README.md` 与 `readme.md` 时精确拼写优先，否则排序取第一个——目录顺序不是稳定答案）。三级下钻是刻意的——`list` 只报「在哪个目录、有哪些文档」(一行/session)、`inspect` 才带标题与摘要(每份 ~1KB 上限、剥掉小标题只留正文)、`cat` 才给全文,于是选一个 session 不必把三份 README 拉进上下文。**纯客户端实现,协议零改动**(用户定的)：`ListSessions` 拿 pid(v8 起 `SessionInfo.pid` 就在,不必逐个 inspect) → `asd_daemon::read_cwd(pid)` 读 `/proc/<pid>/cwd`。**因此只对本机 daemon 有效**——远程 session 的 pid 在本地毫无意义,甚至可能撞上本地同号进程给出错误目录,所以拿不到就诚实报 `cwd: unknown / null`,绝不猜;同理 macOS 上 `read_cwd` 本就返回 None(daemon 持久化那边也一样回落 `$HOME`),要真支持得走 libproc,不在此次范围。`read_cwd` 从 asd-daemon **pub 复用**而不是在 CLI 抄第二份——平台分支只有一处,CLI 与持久化列表不会对「session 在哪」产生分歧。`cat` 的路径相对 cwd 解析、canonicalize 后必须仍在子树内(`resolve_in`)：这是**给 agent 的护栏不是权限边界**(跑命令的人本来就能读那些文件),防的是「agent 顺着路径读到项目外」。`cat` 的路径**逐段忽略大小写**(`ignoring_case`)：先按原样 canonicalize,失败才逐 component 用 `match_name` 找——**只下行**,遇到 `..`/绝对根/盘符前缀就放弃模糊匹配(放宽拼写不等于放宽可达范围),最终仍要过 `starts_with(root)` 那道检查。`asd follow <name> [--forever] [--json] [--timeout 30s]`（v9：实时打印输出、静默即返回——等价于「`wait --idle` 但不丢输出」；对 claude/codex 这类满屏重画的 TUI，文本匹配不可靠，只有 daemon 的 idle 信号可信；已经静默的 session 会立刻返回，缺失 session 退出码 3，超时 4。`--forever` 跨过静默继续流，只在 session 结束或超时才停——所以 session 退出时 daemon 必须给 followers **同时**发 `FollowStatus{running:false}` 和 `Error{SESSION_EXITED}`：默认模式停在前者、`--forever` 按定义忽略前者只认后者，而 follower 不在 `clients` 里、这是它唯一的通知。`--json` 把同一条流转成 **JSONL**（每行一个事件对象 `output`/`screen`/`status`/`exit`/`timeout` + `time_ms`，`control.rs::follow_event_json`）：① **默认不是"剥转义"而是"过终端模型"**（`control.rs::ScreenModel`，`--raw` 退回逐字节原样）——客户端自带一份 `GhosttyVt`（asd-cli 本来就为 attach 链了 asd-vt；`follow` 跑在 current_thread runtime 上，`!Send` 的 vt 才能跨 await 持有），字节喂进去后**用行号分辨"新输出"与"重画"**：screen space 里 `< scrollback_rows()` 的行已经滚出活动屏、**永远不可能再被改写**⇒ 内容已定案，按序、只报一次，作为 `output`；`[scrollback_rows(), history_len())` 是活动屏，重画只动这里 ⇒ 只在**每次停顿**（settle / session 结束 / 超时）报一帧 `screen`（与上次相同则不报）。**这是"剥转义"根本做不到的事**：claude/codex 的状态行每秒重画十次（`✻实现路由表…`→`✽实现路由表…2`→`·实现路由表…`），在字节流里和新输出完全同形——区分它们的**正是那些转义序列本身**，剥掉就等于把判据扔了（实测剥转义版：40+ 条噪音记录/3 秒，且裸 CR 归一后每帧还拖一串空行）；终端有行身份，所以知道。代价两条，写进 README：**没滚出屏的输出要等到 settle 才随 `screen` 出现**（短命令不再逐行流），**交替屏程序（vim/htop/less）按定义不产生 committed 行**、只有 `screen` 可报。VT 尺寸必须等于 session pty 尺寸（否则换行位置不同、行边界全错），故订阅前先 `ListSessions` 取 `cols/rows`（`session_size()`；查不到就 80x24 兜底，让 `Follow` 自己回 NO_SUCH_SESSION 保住退出码 3）；`--raw` 那条路仍要 `Utf8Stream` 把跨批切开的多字节字符拼回；② daemon 每批输出都跟一帧 `FollowStatus`，全打会把 output 淹掉，故 status **只在 running 翻转时**记一行）。
-
-**`asd attach` 是 VT 渲染客户端（2026-07-14，对标 boo 的 `boo ui`）**，不是哑管道：客户端自带一份 `GhosttyVt`（asd-cli 因此依赖 asd-vt），把 daemon 的 Snapshot+Output 喂进去、自己渲染（`render.rs`：RenderSnapshot→ANSI）。本地 VT 模型让 live 视图同时有：① 交替屏（`1049h`）detach 恢复原屏；② 滚回历史（滚自己的视口 `set_scroll`，**滚轮** 或键盘 `Shift+PageUp/PageDown/Home/End`；**客户端本地、不影响其他 attach 的人**）；③ 拖选复制。
-
-**鼠标：抢鼠标 + 自绘选区，vim 时镜像转发（2026-07-14 定稿，对标 boo ui）**。关键教训：**用 `1002`（button-event，报拖动）不是 `1000`（只报按下松开，拖选取不到文本）**——boo 就是 `1002h+1006h`。客户端基线在提示符处开 `1002+1006`（`BASE_MOUSE`），于是滚轮被截获→本地滚，拖拽→自绘反显选区、松开经 `selection_text_screen` 取文本 **OSC52** 写系统剪贴板（和 boo 一样，不靠终端原生选区）。**选区锚定屏幕空间（不是视口行）**：`Sel{anchor,head}` 存的是绝对 `(x, screen_row)`（0=最老的 scrollback 行，和 `history_len`/`fetch_history` 同坐标系），滚动只改 `scroll`、`Sel::viewport(scrollback,scroll,…)` 每帧投影回视口行并裁剪到可见区——于是**高亮跟着文字走、滚轮滚动时不再"选区飘在固定屏幕行上盖住别的字"**（对标 boo 的 content-pin 选区）。复制走 `selection_text_screen`（screen-space、与 scroll 无关，滚出视口的部分也能整段拿到）。想用宿主原生选区就 **Shift+拖拽**（终端 bypass）。当 session 自己要鼠标（vim/htop，`is_mouse_tracking`）时，`sync_host_modes` 改镜像 session 的**确切模式**（`mouse_modes()` 读 DEC `9/1000/1002/1003`+`1005/1006/1015/1016`，`mode_delta` 只发增量），鼠标事件 `is_mouse_report` 在 live 视图原样透传给 session（宿主镜像了它的编码，坐标 1:1，无需转换）。多人 attach：每客户端各自 vt+host_modes，天然隔离。**bracketed paste（DEC 2004）同样要镜像/补回，否则多行粘贴的换行会被当成一串回车、把最后一行以上的内容全部提交**（2026-07-29 实测复现：`asd ui` 里粘 `echo one\recho two\r` 两条都执行了）——两个客户端的断点不同：`asd attach` 是**从没往宿主开过 2004**，宿主自然不加标记，修法是把 2004 并入 `want_modes` 一起镜像（宿主加的 `ESC[200~`…`ESC[201~` 随 stdin 原样透传到 session，客户端不必解析）；`asd ui` 是宿主**开了** 2004（crossterm `EnableBracketedPaste`）、但 crossterm 把标记**剥掉**只给 `Event::Paste(text)`，转发裸 payload 就把「这是粘贴」这个信号丢了，修法是 `paste_bytes` 按 session 的 2004 状态**把标记补回去**。两处都**必须条件判断**（`VtBackend::bracketed_paste()` 读 `Mode::BRACKETED_PASTE`）：给不认 2004 的程序发标记会显示成字面 `[200~`——这也正是 ghostty-web 的做法（`hasBracketedPaste() ? 包裹 : 原样`，所以 GUI 那条路本来就是对的，无需改）。补标记时要**剔除文本里自带的 `ESC[201~`**（照 xterm），否则粘贴内容能提前闭合括号、剩下的部分被当按键执行。`MIRRORED_MODES` 退出时要把 2004 一起关掉，别把它留给退回去的那个 shell。渲染要点：`render_frame` 只在 `cursor.position` 有值时才 `?25h`（滚出视口 position=None 时绝不显示，否则右下角留光标残影）。**退出清理**：`ScreenGuard` drop 除了 `?1049l` 还要 `?25h`（`?25` 是全局状态，不随交替屏恢复，否则回到 shell 光标不见）+ `0m`（复位 SGR）+ `0 q`（光标形状）。**但 `Drop` 覆盖不到被杀死的那条路**：SIGHUP（关标签页 / SSH 断开）、SIGTERM（别处 `kill`）跳过所有 `Drop`，终端留在鼠标追踪模式，回到 shell 后鼠标一动就刷 `ESC[<35;..M`（这个坑犯了两次：先只给 `asd ui` 装了信号复原，`asd attach` 同一个洞又漏了一轮，用户报「乱码又出现了」）。两个客户端都要在**进 raw mode 之前**装 `platform::install_terminating_signal_restore`（SIGHUP/SIGTERM/SIGINT；处理器里只做异步信号安全的调用——`write` 吐复原序列 + `tcsetattr` 回 cooked，随后恢复默认行为重抛信号，退出码不变）。**复原序列只留一份**（`attach.rs::restore_sequence`），`Drop` 与信号处理器共用：两份必然漂移，任一份少一个模式就留在用户的 shell 上。`SIGKILL` 无解（谁都拦不住），只能事后 `reset`。回归测试在真 pty 里 SIGTERM 掉客户端、断言 pty 上出现 `?1002l/?1006l/?1049l`（`tests/e2e.rs::killed_attach_restores_the_terminal`）。**退出方式**：detach 后 `attach::run` 末尾直接 `std::process::exit(0)`——`tokio::io::stdin()` 的阻塞读线程无法取消，正常返回会让 runtime 关闭卡在那个 read 上、**直到用户按回车**（tokio 文档明说的坑）；终端已恢复、消息已 flush，硬退干净。
-
-多人 attach 语义：滚动/选区是各客户端本地的、互不影响；键盘输入（同一个 shell）和 pty 尺寸是共享的。**pty 尺寸 = 所有已 attach 客户端逐轴取 min**（`session.rs::negotiated_size`/`resize_to_clients`，session 线程持 `client_sizes: HashMap<client_id,(cols,rows)>`，Attach/Resize/Detach 三处重算；无客户端时保持最后尺寸）——一个 pty 只能跟最小的那扇窗一样大，否则大窗口会收到自己放不下的内容。取 min 也是唯一与「谁最后动」无关的规则，且小窗口一关就自动长回去。**曾经是「最后 resize 者胜」，那会让小客户端单方面永久裁掉别人的视野，并在大客户端留下再也不会被重写的陈旧格子（见 asd-tui 的 `follow_session_size` + `render_pane` 留白，两边配套）。** 客户端**自己**那一侧的尺寸则是**每轮循环重读真实终端尺寸**，不靠 resize 事件（asd-tui `event_loop` 头部一次 ioctl，~33 次/秒）：crossterm 的 SIGWINCH 处理器是**首次 `event::poll` 才装**的，在那之前到达的 resize 走默认处理被丢弃；而 ratatui 每帧都用真实尺寸排版（`ui::draw` 取 `f.area()`）。两份真相不一致的后果是「外框正确、里面的 session 永远停在启动尺寸」，且此后无人纠正——所以 `Event::Resize` 只当唤醒用。**由此得到一条判据**：`asd ui` 若**整个界面**（连侧栏一起）挤在终端左上角，那不是 asd 记错了尺寸，而是那一刻内核里的 winsize 真的就是小的（SSH / 终端建 pty 时给了陈旧尺寸，动一下窗口触发 window-change 才补上）；只有**面板内容小、侧栏正常**才是 asd 这边的问题。协议里的 `FetchHistory`/`History`/`Refresh`（v1）现在渲染客户端不再用（改用本地 scrollback），但保留给别的客户端/测试，e2e 仍直接测 daemon 的这几帧。`asd new` 也会自动拉起 daemon（tmux 语义）；`list`/`kill`/裸 `attach` 则要求 daemon 已在跑。`asd daemon` 可前台手动跑 daemon。`--socket`/`$ASD_SOCKET` 可把 socket 指到任意路径做隔离实验。注意 daemon 自带 tokio runtime，`main()` 必须在进入 `#[tokio::main]` 之前分发 `Cmd::Daemon`（不能嵌套 runtime）。
-
-## 架构（跨文件才能看懂的部分）
-
-**线程模型（spec §5）**：网络侧全 tokio；每个 session 两个 std 线程——pty 读线程（阻塞 read → channel）+ session 线程（独占 `GhosttyVt`，它是 `!Send`，编译期保证不出线程）。pty 输出、Input、Resize、Attach 全部经 `std::sync::mpsc` 进 session 线程串行处理，这就是顺序保证的来源：attach 时 Snapshot 帧先于任何后续 Output 入同一条出站队列。
-
-**一条连接的数据通路**（`asd-daemon/src/conn.rs`）：入站与出站拆成两个任务，因为 `FrameReader::read_frame` 不是取消安全的，不能放进 `tokio::select!`。所有写 socket 的帧（控制面应答 + session 广播）都汇入同一条 unbounded out-queue 由写任务串行写出。流控（M0 版）：`ClientSink` 只对数据面帧（Snapshot/Output）记字节配额，上限 4 MiB（`session.rs::OUTPUT_QUEUE_CAP`），写任务写出后归还；超限即向 out-queue 发 `Close` 断连该客户端，session 不受影响。
-
-**session 生命周期**：连接断开即 detach（无显式状态）；pty EOF 是 session 终点——收尸（`child.wait()`）、从 registry 摘除、给所有 attached 客户端发 `Error{SESSION_EXITED}`。`Kill` = SIGHUP + 2s 后 SIGKILL 兜底；daemon SIGTERM = 对所有 session SIGHUP → 等 2s → SIGKILL 残余 → 删 socket。session 的活进程/屏幕不持久化——但 name+cwd 会：`Registry` 每次 create/rename/kill 把全部 session 的 `{name, cwd}` 原子写到 `paths::session_list_path()`（`<data_dir>/sessions.tsv`，`store::write_atomic` 临时文件+rename），daemon **每次启动**都 `store::read` 复原（同名默认 shell + 原 cwd 的新 shell，含崩溃恢复/`asd restart`；`registry.snapshot` 出、cwd 读 `/proc/<pid>/cwd` 取不到回落 `$HOME`）。关键不变量：关机时先 `freeze_and_persist`（读 live cwd 写一次 + 置 `persist_frozen`），使随后 SIGHUP 收尸触发的 `registry.remove` 不清空文件。kill/shell 自己退出=从列表移除、不复活；硬 SIGKILL 保留最后一次写入的 cwd。取代了旧的 SIGUSR1 consume-once `<socket>.restart`（模块 `restart.rs`→`store.rs`）。见 `crates/asd-daemon/src/store.rs`。
-
-**协议（spec §4）**：`u32 LE 长度前缀 + postcard`，单帧上限 4 MiB（超限=协议错误断连，编码/解码两侧都拦）。握手客户端先发 `Hello`，版本不相等 daemon 回 `Error{code=1}` 后断连。`Frame::Kill` 没有 ack 帧——CLI 用「Kill 后紧跟 ListSessions」借 daemon 的按序处理来确认（见 `asd-cli/src/main.rs`）。
-
-**asd-vt 是逃生门边界**：libghostty-vt 0.2.x API 未稳定，所有直接调用收敛在 `crates/asd-vt/src/ghostty.rs`；daemon/GUI 只面向 `VtBackend` trait 和全 `Send` 的 `RenderSnapshot` 纯数据。三个跨层关键点：① `feed()` 期间终端对 DA/DSR 查询的应答积在 `take_pty_responses()`，session 线程必须取出回写 pty，否则 vim 类程序探测挂起；② `snapshot_vt()` 末尾手工补一个 CUP——上游 Formatter 在光标恢复序列之后才发 tabstops/滚动区序列（会挪光标）；③ **dump 两段式（2026-07-17）**：上游 Formatter 把 history+屏幕当一条行流输出且**无条件裁掉尾部空行**（formatter.zig："Trailing blank lines are always trimmed"，不受 trim 选项控制），屏幕以空行结尾时回放滚不到位、整屏错位（TUI 切 session 后光标不在输入栏、prompt 下冒历史尾巴的根因）——修法照 boo window.zig 的 historyReplay/repaint 拆分：pass1 `with_selection(History 区)` 只出内容流、补 `rows` 个 CRLF 把历史全滚进 scrollback，pass2 `2J+H` 后 `with_selection(Active 区)`+全部状态选项绝对定位重绘屏幕（模式序列先于内容，alt-screen 内容落对屏）。快照保真性测试（`asd-vt/tests/vt.rs`，含 scrollback 溢出/清屏后/alt-screen 三个回归）钉死这些行为。**回放即真相**：asd-tui 借此删掉 resize-jiggle、ED-below 清理和自适应 settle 定时器，Snapshot 喂完立即揭幕（boo `.screen` 标记语义；含 5000 行 scrollback 的 session 首访切换实测 ~11ms）。
-
-**路径契约（spec §2）**：collected in `asd-proto::paths` —— socket 解析优先级 `$ASD_SOCKET` > `$XDG_RUNTIME_DIR/asd.sock` > `/tmp/asd-$UID/asd.sock`（0700），daemon 与所有客户端共用这一份实现；数据目录 `~/.local/share/asd/`（daemon 日志 `daemon.log` 在此，由 `asd attach -A` 拉起时重定向）。**Windows 分支**（同一组函数按 `cfg` 分流）：监听端不是 UDS 而是**命名管道** `$ASD_SOCKET` > `\\.\pipe\asd-<USERNAME>`；数据目录 `%LOCALAPPDATA%\asd`、配置目录 `%APPDATA%\asd`（**两者必须是不同目录**——用户手写的 config.toml 不能和 daemon 反复重写的 sessions.tsv 混在一起）。**`pid_path()` 在 Windows 上不能由管道名推导**（管道在内核命名空间里，挂不住文件，`with_extension("pid")` 只会得到另一个管道名），改为落在 `<data_dir>/<管道名>.pid`，自定义 `ASD_SOCKET` 仍各自隔离。daemon 第一个管道实例用 `first_pipe_instance(true)` **独占名字**——否则第二个 daemon 能往同一名字上挂实例，客户端被随机路由、session 裂成两半；`asd restart` 因此必须先真正停掉旧 daemon（Windows 无信号，读 pid 文件后 `TerminateProcess`）。**配置文件** `paths::config_path()` = `$ASD_CONFIG` > `$XDG_CONFIG_HOME/asd/config.toml` > `~/.config/asd/config.toml`，**只读、不自动创建**；daemon 启动时 `config::Config::load()` 读一次（缺失/损坏都回落默认、绝不因坏配置起不来），值经 `Registry::new(scrollback_lines)` 存进 registry、每次 `spawn_session` 取用（含 restart 恢复的 session），改配置需 `asd restart` 生效。当前唯一 knob：`[session] scrollback_lines`（每 session 保留的 scrollback 行数，默认 10000，喂 `GhosttyVt::new` 的 `max_scrollback`——单位是"行"不是字节；0=不留历史；仓库根 `config.example.toml` 是模板）。加 knob 就往 `RawConfig`/`Config` 补字段（每个 field `Option`+`#[serde(default)]`，未知键忽略保前后兼容）。
-
-**asd-dioxus（spec §7 GUI，M2 两栏布局，对标 boo `boo ui`）**：**host 分组的 session 侧栏 + ghostty-web 终端面板 + 底部状态栏 + 设置浮层（保存的 SSH 连接，Name 必填，认证=口令或密钥）**。架构分层：① **supervisor**（`app.rs`，跑在 `use_coroutine` 里）：路由 `AppCmd`→对应 host 的 actor，把所有 host 的 `UiEvent` 折进 Dioxus signals；host actor 跑在独立多线程 runtime（`app.rs::bg`），与 webview 内嵌 runtime 隔离。② **host actor**（`conn.rs::run_host`，纯 tokio task，无本地 vt——ghostty-web 直接吃原始 PTY 字节）：握手后按 `LIST_INTERVAL`(1.5s) 轮询 `ListSessions`→喂侧栏；**只有当前查看的 session 那台**发 `Attach` 并流式转发 Snapshot/Output（`pending_attach` 计数丢弃被换掉的 attach 的帧）。传输用 `BoxRead/BoxWrite`（`Box<dyn AsyncRead/Write>`）——本地 `UnixStream`、remote russh `ChannelStream` 共用一条 drive loop。③ **SSH remote**（`ssh.rs`，russh）：`check_server_key` 查 `~/.ssh/known_hosts`（未知/变更即拒）→ 口令或 key-file 认证（passphrase 支持；ssh-agent/2FA 是后续）→`channel.exec("asd attach --stdio")`→`into_stream()`。remote 侧靠已有的 `--stdio` 透传代理，于是 GUI 对 remote daemon 说的还是同一套协议。**GUI 不能自启 daemon（进程管理边界），本地 daemon 没跑就点侧栏底部「daemon down · click to reconnect」**（点击重生 actor）。配色在 `assets/app.css`：**host origin 用双色 rail 编码——本地 amber、SSH remote cyan**。Rust↔JS 桥的 0.8-alpha 坑（eval 首通道聋、Rust→JS 只能 evaluate_script、PTY 字节直传不过 JSON.parse、ghostty-web 挂死自愈重建）见 `assets/bridge.js` 头注释与 crate README。**GUI 靠人肉验收**（沙箱/CI 无显示器，只编译 + 跑纯函数单测：`model.rs`/`settings.rs`）。
+`cargo test` without `--workspace` only tests the root package. Protocol work
+also requires `cargo test -p asd-proto`. Platform-sensitive work must follow
+[`docs/cross-platform-development.md`](docs/cross-platform-development.md),
+including the Windows GNU cross-check when applicable.

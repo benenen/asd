@@ -54,6 +54,9 @@ speak a length-prefixed `postcard` protocol. `Attach` replies with a full
 `Snapshot`, then streams live `Output`. The daemon starts on demand — the first
 `asd new` or `asd attach -A` spawns it.
 
+Contributor-facing ownership, protocol, terminal, and cross-platform contracts
+are indexed in [`docs/`](docs/README.md).
+
 ## Install / build
 
 Requires a recent Rust (edition 2024), **Zig 0.15.x** on `PATH` (it builds the
@@ -193,6 +196,12 @@ Bare `asd` (or `asd gui [session]`) opens the desktop GUI.
 - `R` — reconnect · `q` — quit · `Ctrl+A Ctrl+A` — send a literal `Ctrl+A` to the session
 
 Mouse: click a sidebar row to switch (or its `x` to kill), drag in the pane to select (copied via OSC 52), and **drag the sidebar↔pane divider** to resize the sidebar (clamped to a sensible min/max). `Shift+PageUp`/`PageDown` page the scrollback.
+
+Each session can be shown by only one `asd ui` at a time. Selecting a session
+in another TUI transfers the view to that TUI; the displaced TUI stays open,
+shows an ASD placard, and can select the session again to take it back. This
+only governs TUI rendering: ordinary `asd attach` clients remain shared and
+continue to view and control the same session.
 
 ### Remote SSH sessions
 

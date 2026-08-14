@@ -1,6 +1,6 @@
 # asd-dioxus
 
-Terminal client built with [Dioxus Desktop][dioxus] + [ghostty-web][ghostty-web]: a host-grouped session sidebar, saved SSH connections, a settings overlay, and pure-Rust SSH remotes (the M2 feature set).
+Terminal client built with [Dioxus Desktop][dioxus] + [ghostty-web][ghostty-web]: a host-grouped session sidebar, saved SSH connections, a settings overlay, and pure-Rust SSH remotes.
 
 This is a **library crate**: the root `asd` binary combines it via the `dioxus` feature. Entry point: `asd_dioxus::run(session: Option<String>)`.
 
@@ -15,11 +15,11 @@ This is a **library crate**: the root `asd` binary combines it via the `dioxus` 
 │        routes AppCmd → per-host actors, folds UiEvent → signals│
 │                                                                │
 │  conn.rs — one actor per host on a dedicated tokio runtime     │
-│   ├─ local: UnixStream → asd-daemon                            │
+│   ├─ local: platform stream → asd-daemon                       │
 │   └─ remote: ssh.rs (russh) → `asd attach --stdio` far end     │
 │                                                                │
 │  model.rs / settings.rs — Send data: hosts, sessions,          │
-│   saved SSH connections (~/.local/share/asd/config.json)       │
+│   saved SSH connections (<platform data dir>/config.json)      │
 └────────────┬───────────────────────────────────▲───────────────┘
              │ evaluate_script:                  │ dioxus.send:
              │  __asdWrite / __asdReset          │  input/resize/status
@@ -32,6 +32,10 @@ This is a **library crate**: the root `asd` binary combines it via the `dioxus` 
 
 Session semantics: one connection per host, polling `ListSessions` for the sidebar; only the viewed session is attached; switching sends `Detach`+`Attach` on the same connection. The `pending_attach` counter drops Snapshots/Output of superseded attaches so a quick A→B→A switch can't paint stale content, and every `UiEvent::Bytes` carries its session name so the app discards in-flight bytes from a session it just left.
 
+The local platform stream is a Unix socket on Linux/macOS and a named pipe on
+Windows. Saved connections use `asd_proto::paths::data_dir()`, so their exact
+path follows the platform contract rather than a hard-coded Unix location.
+
 ## Files
 
 | File | Purpose |
@@ -42,6 +46,7 @@ Session semantics: one connection per host, polling `ListSessions` for the sideb
 | `src/ssh.rs` | russh transport: known_hosts check, password/key auth, `asd attach --stdio` exec |
 | `src/model.rs` | Hosts/sessions/selection model (+ unit tests) |
 | `src/settings.rs` | Saved SSH connections, config persistence, form validation (+ unit tests) |
+| `src/theme.rs` | One terminal palette shared by CSS variables, ghostty-web, and `Attach.appearance` |
 | `src/bridge.rs` | `JsMessage` types + `include_str!` of the bridge script |
 | `assets/bridge.js` | Terminal setup, fit-to-pane, JS→Rust events, `__asdWrite`/`__asdReset` |
 | `assets/vendor-entry.js` | npm dependency roll-up: imports each package, assigns to `window` |

@@ -8,8 +8,8 @@
 //!     they belong to;
 //!   * obeys [`HostCmd`]s (attach/detach/input/resize/create/kill).
 //!
-//! The transport is boxed so one `drive` loop serves both a local `UnixStream`
-//! and a remote russh `ChannelStream` (see [`crate::ssh`]).
+//! The transport is boxed so one `drive` loop serves both the local platform
+//! stream and a remote russh `ChannelStream` (see [`crate::ssh`]).
 
 use std::time::Duration;
 
@@ -225,6 +225,7 @@ async fn drive(
                         name,
                         cols,
                         rows,
+                        view_id: 0,
                         appearance: crate::theme::TERMINAL_APPEARANCE,
                     }).await.is_err() {
                         return Err("attach write failed".to_string());

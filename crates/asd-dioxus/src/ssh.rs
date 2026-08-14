@@ -2,10 +2,10 @@
 //! subprocess, so the client stays viable on Windows.
 //!
 //! We open a session channel and `exec` `asd attach --stdio` on the far end,
-//! which transparently proxies the remote daemon's Unix socket to the channel's
-//! stdio. The channel's [`tokio::io::AsyncRead`]+[`tokio::io::AsyncWrite`]
-//! stream then speaks the normal asd protocol, exactly like a local
-//! `UnixStream`.
+//! which transparently proxies the remote daemon's local endpoint to the
+//! channel's stdio. The channel's
+//! [`tokio::io::AsyncRead`]+[`tokio::io::AsyncWrite`] stream then speaks the
+//! normal asd protocol, exactly like the local platform stream.
 //!
 //! Auth follows the saved connection's [`SshAuth`]: a stored password, an
 //! explicit private-key file (with optional passphrase), or — when no key path

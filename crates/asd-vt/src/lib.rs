@@ -1,4 +1,4 @@
-//! asd's VT backend boundary (spec §3/§6).
+//! asd's VT backend boundary.
 //!
 //! This layer is the **escape-hatch boundary** for libghostty-vt: the daemon
 //! and GUI program only against the [`VtBackend`] trait and the
@@ -21,7 +21,7 @@ pub use types::{
     Selection, StyleFlags, UnderlineKind,
 };
 
-/// VT backend trait (spec §6).
+/// VT backend trait.
 ///
 /// Implementations are expected to be `!Send`, owned exclusively by their
 /// holding thread; only plain data such as [`RenderSnapshot`] and `Vec<u8>`
@@ -56,9 +56,8 @@ pub trait VtBackend: Sized {
     /// Current screen → VT sequence (attach snapshot; includes cursor/style/
     /// modes/palette).
     ///
-    /// Contract (spec §8): after feeding the return value to a fresh terminal
-    /// of the same size, both `render_snapshot`s must match (snapshot
-    /// fidelity).
+    /// Snapshot fidelity contract: after feeding the return value to a fresh
+    /// terminal of the same size, both `render_snapshot`s must match.
     fn snapshot_vt(&mut self) -> Vec<u8>;
 
     /// Produce a plain-data render snapshot to hand to the GUI across threads.
@@ -140,7 +139,7 @@ pub trait VtBackend: Sized {
 
     /// Total number of rows in "screen space": scrollback history plus the
     /// live screen. Row 0 is the oldest scrollback line; the live view is the
-    /// bottom `rows` of this space. Backs the M1 scrollback viewer.
+    /// bottom `rows` of this space. Backs client-side scrollback viewers.
     fn history_len(&mut self) -> usize {
         0
     }

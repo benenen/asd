@@ -1,4 +1,4 @@
-//! asd wire protocol v1 (spec §4).
+//! asd wire protocol.
 //!
 //! Frame format: `u32 LE length prefix + postcard serialization`, 4 MiB cap
 //! per frame; exceeding it is a protocol error → disconnect. Works over any
@@ -24,7 +24,10 @@
 //! boolean with [`Scrollback`]; v11 added `Attach.appearance`, letting a real
 //! terminal client report its default colors so the daemon can answer OSC
 //! 10/11 queries without guessing a theme; v12 added `SendInput.enter`, making
-//! a scripted payload plus Enter one atomic session-thread operation.
+//! a scripted payload plus Enter one atomic session-thread operation; v13
+//! identifies TUI clients and adds `ViewRevoked`/`ViewRenamed`, allowing one
+//! interactive TUI viewer per session while ordinary attach clients remain
+//! shared and external renames keep the owner tagged correctly.
 
 mod codec;
 pub mod paths;
@@ -35,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 12;
+pub const PROTO_VERSION: u32 = 13;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -71,8 +74,10 @@ pub mod code {
 pub enum ClientKind {
     Gui,
     Cli,
-    /// Remote proxy behind `asd attach --stdio` (used by M2/M3, reserved in protocol v0).
+    /// Remote proxy behind `asd attach --stdio`.
     Proxy,
+    /// Ratatui `asd ui`; only one TUI may hold a session's interactive view.
+    Tui,
 }
 
 /// Metadata for a single session in `SessionList`.
@@ -141,7 +146,7 @@ pub struct TerminalAppearance {
     pub background: Option<TerminalColor>,
 }
 
-/// All frames of protocol v1 (spec §4).
+/// All frames in the current protocol.
 ///
 /// Handshake: each side sends once after connecting; the client sends
 /// `Hello` first.
@@ -177,6 +182,9 @@ pub enum Frame {
     Created {
         name: String,
     },
+    /// client → daemon: terminate a session. There is no success reply. CLI
+    /// callers confirm ordered handling by immediately sending `ListSessions`
+    /// and waiting for its `SessionList`; failures still use `Error`.
     Kill {
         name: String,
     },
@@ -191,12 +199,16 @@ pub enum Frame {
         name: String,
         cols: u16,
         rows: u16,
+        /// Client-generated identity for this view attempt. TUI clients use a
+        /// fresh nonzero value so a delayed revoke cannot target a later view;
+        /// shared clients send zero.
+        view_id: u64,
         /// Defaults probed from the client's real terminal. The session locks
         /// each first non-`None` channel so multiple viewers cannot flip an
         /// application's theme underneath it.
         appearance: TerminalAppearance,
     },
-    /// Formatter dump; the attach reply, also used for M3 flow-control recovery.
+    /// Formatter dump used for attach and flow-control recovery.
     Snapshot {
         vt: Vec<u8>,
     },
@@ -213,7 +225,7 @@ pub enum Frame {
         rows: u16,
     },
     Detach,
-    // Scrollback (v1, spec §4). Rows are indexed in "screen space": row 0 is
+    // Scrollback. Rows are indexed in "screen space": row 0 is
     // the oldest scrollback line, row `total_rows - 1` is the bottom of the
     // live screen. The live view is the bottom `rows` of this space.
     /// client → daemon: request the row window `[start, start + count)`.
@@ -310,6 +322,21 @@ pub enum Frame {
     FollowStatus {
         running: bool,
         idle_ms: u64,
+    },
+    /// daemon → TUI: another `asd ui` took this session's exclusive view.
+    /// The connection stays open so the displaced UI can keep listing sessions
+    /// and explicitly select this one again to take it back.
+    ViewRevoked {
+        name: String,
+        view_id: u64,
+    },
+    /// daemon → owning TUI: the viewed session was renamed by any client.
+    /// This keeps frame routing and sidebar identity aligned even when a list
+    /// response and the session-thread notification race across daemon tasks.
+    ViewRenamed {
+        old_name: String,
+        new_name: String,
+        view_id: u64,
     },
     // Errors
     Error {

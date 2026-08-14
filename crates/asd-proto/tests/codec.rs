@@ -1,4 +1,4 @@
-//! Protocol test contract (spec §8): roundtrip for every frame kind +
+//! Protocol codec contract: roundtrip for every frame kind plus
 //! truncated/oversized frame error paths.
 
 use asd_proto::{
@@ -6,13 +6,13 @@ use asd_proto::{
     SessionInfo, TerminalAppearance, TerminalColor, decode_frame, encode_frame,
 };
 
-/// Covers all frame kinds of protocol v1. New frames must be added here in
-/// lockstep.
+/// Covers every frame kind in the current protocol. Add new frames here in
+/// lockstep with the protocol version bump and explicit assertion below.
 fn all_frames() -> Vec<Frame> {
     vec![
         Frame::Hello {
             proto_version: 0,
-            kind: ClientKind::Gui,
+            kind: ClientKind::Tui,
         },
         Frame::HelloAck {
             proto_version: 0,
@@ -67,6 +67,7 @@ fn all_frames() -> Vec<Frame> {
             name: "s0".into(),
             cols: 120,
             rows: 40,
+            view_id: 7,
             appearance: TerminalAppearance {
                 foreground: Some(TerminalColor {
                     r: 0xe7,
@@ -84,6 +85,7 @@ fn all_frames() -> Vec<Frame> {
             name: "unknown-theme".into(),
             cols: 80,
             rows: 24,
+            view_id: 0,
             appearance: TerminalAppearance::default(),
         },
         Frame::Snapshot {
@@ -168,6 +170,15 @@ fn all_frames() -> Vec<Frame> {
             running: false,
             idle_ms: 2500,
         },
+        Frame::ViewRevoked {
+            name: "build".into(),
+            view_id: 7,
+        },
+        Frame::ViewRenamed {
+            old_name: "build".into(),
+            new_name: "review".into(),
+            view_id: 7,
+        },
         Frame::Error {
             code: asd_proto::code::VERSION_MISMATCH,
             msg: "proto version mismatch".into(),
@@ -176,8 +187,8 @@ fn all_frames() -> Vec<Frame> {
 }
 
 #[test]
-fn protocol_version_covers_atomic_send_enter() {
-    assert_eq!(asd_proto::PROTO_VERSION, 12);
+fn protocol_version_covers_exclusive_tui_viewers() {
+    assert_eq!(asd_proto::PROTO_VERSION, 13);
 }
 
 #[test]

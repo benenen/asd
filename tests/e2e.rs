@@ -196,19 +196,27 @@ impl Drop for Daemon {
 struct ProtoClient {
     reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
     writer: FrameWriter<tokio::net::unix::OwnedWriteHalf>,
+    kind: ClientKind,
+    next_view_id: u64,
 }
 
 impl ProtoClient {
     async fn connect(socket: &Path) -> Self {
+        Self::connect_kind(socket, ClientKind::Cli).await
+    }
+
+    async fn connect_kind(socket: &Path, kind: ClientKind) -> Self {
         let stream = UnixStream::connect(socket).await.expect("connect failed");
         let (r, w) = stream.into_split();
         let mut c = Self {
             reader: FrameReader::new(r),
             writer: FrameWriter::new(w),
+            kind,
+            next_view_id: 1,
         };
         c.send(Frame::Hello {
             proto_version: PROTO_VERSION,
-            kind: ClientKind::Cli,
+            kind,
         })
         .await;
         match c.recv().await {
@@ -240,10 +248,18 @@ impl ProtoClient {
 
     /// Attach as a client of a given window size.
     async fn attach_sized(&mut self, name: &str, cols: u16, rows: u16) -> Vec<u8> {
+        let view_id = if self.kind == ClientKind::Tui {
+            let view_id = self.next_view_id;
+            self.next_view_id += 1;
+            view_id
+        } else {
+            0
+        };
         self.send(Frame::Attach {
             name: name.into(),
             cols,
             rows,
+            view_id,
             appearance: asd_proto::TerminalAppearance::default(),
         })
         .await;
@@ -388,6 +404,7 @@ async fn appearance_answers_query_that_predates_attach() {
             name: "colors".into(),
             cols: 80,
             rows: 24,
+            view_id: 0,
             appearance: TerminalAppearance {
                 foreground: None,
                 background: Some(TerminalColor {
@@ -451,6 +468,7 @@ async fn attached_color_query_is_daemon_only_and_answered_once() {
             name: "attached-colors".into(),
             cols: 80,
             rows: 24,
+            view_id: 0,
             appearance: TerminalAppearance {
                 foreground: None,
                 background: Some(TerminalColor {
@@ -1885,6 +1903,7 @@ async fn attach_after_attached_session_dies_is_not_wedged() {
         name: "b".into(),
         cols: 80,
         rows: 24,
+        view_id: 0,
         appearance: asd_proto::TerminalAppearance::default(),
     })
     .await;
@@ -2527,6 +2546,105 @@ async fn pty_follows_the_smallest_attached_client() {
     .await;
 }
 
+/// `asd ui` views are exclusive without changing the shared `asd attach`
+/// contract. A second TUI revokes the first, removes its size from negotiation,
+/// and invalidates its input capability; an ordinary CLI attach stays live.
+#[tokio::test]
+async fn second_tui_revokes_the_first_but_keeps_cli_attach_shared() {
+    let daemon = Daemon::start("tuirevoke");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "shared"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let mut invalid_tui = ProtoClient::connect_kind(&daemon.socket, ClientKind::Tui).await;
+    invalid_tui
+        .send(Frame::Attach {
+            name: "shared".into(),
+            cols: 80,
+            rows: 24,
+            view_id: 0,
+            appearance: TerminalAppearance::default(),
+        })
+        .await;
+    assert!(matches!(
+        invalid_tui.recv().await,
+        Frame::Error {
+            code: asd_proto::code::BAD_HANDSHAKE,
+            ..
+        }
+    ));
+
+    let size = |d: &Daemon| {
+        let out = d.cli().args(["list", "--json"]).output().unwrap();
+        let json = String::from_utf8_lossy(&out.stdout).to_string();
+        let pick = |key: &str| -> u16 {
+            json.split(&format!("\"{key}\":"))
+                .nth(1)
+                .and_then(|text| text.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|digits| digits.parse().ok())
+                .unwrap_or_else(|| panic!("no {key} in {json}"))
+        };
+        (pick("cols"), pick("rows"))
+    };
+
+    let mut cli = ProtoClient::connect(&daemon.socket).await;
+    cli.attach_sized("shared", 200, 70).await;
+    let mut first = ProtoClient::connect_kind(&daemon.socket, ClientKind::Tui).await;
+    first.attach_sized("shared", 90, 30).await;
+    wait_for(
+        || size(&daemon) == (90, 30),
+        "first TUI to constrain the shared pty",
+    )
+    .await;
+
+    let mut second = ProtoClient::connect_kind(&daemon.socket, ClientKind::Tui).await;
+    second.attach_sized("shared", 150, 50).await;
+    assert_eq!(
+        first.recv_skipping_output().await,
+        Frame::ViewRevoked {
+            name: "shared".into(),
+            view_id: 1,
+        }
+    );
+    wait_for(
+        || size(&daemon) == (150, 50),
+        "revoked TUI size to leave negotiation",
+    )
+    .await;
+
+    first.send(Frame::Resize { cols: 60, rows: 20 }).await;
+    tokio::time::sleep(TICK).await;
+    assert_eq!(size(&daemon), (150, 50));
+
+    first
+        .send(Frame::Input {
+            bytes: b"printf 'REVOKED_BAD\\n'\r".to_vec(),
+        })
+        .await;
+    cli.send(Frame::Input {
+        bytes: b"printf 'SHARED_OK\\n'\r".to_vec(),
+    })
+    .await;
+    let output = cli.read_output_until(b"SHARED_OK").await;
+    assert!(contains(&output, b"SHARED_OK"), "output: {output:?}");
+    assert!(!contains(&output, b"REVOKED_BAD"), "output: {output:?}");
+
+    first.attach_sized("shared", 120, 40).await;
+    assert_eq!(
+        second.recv_skipping_output().await,
+        Frame::ViewRevoked {
+            name: "shared".into(),
+            view_id: 1,
+        }
+    );
+}
+
 /// A killed `asd attach` still hands the terminal back.
 ///
 /// `attach` turns on mouse tracking (SGR 1002/1006, plus whatever the session
@@ -2710,6 +2828,118 @@ fn killed_ui_closes_synchronized_update_before_restoring_terminal() {
             String::from_utf8_lossy(suffix)
         );
     }
+}
+
+/// Two real `asd ui` processes exercise the user-facing half of TUI takeover:
+/// the displaced process stays alive, clears the terminal pane, and paints the
+/// asd wordmark plus an actionable message.
+#[test]
+fn displaced_ui_shows_the_takeover_placard() {
+    let daemon = Daemon::start("uiplacard");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "shared"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let spawn_ui = |tag: &str, session: &str| {
+        let (master, slave_path) = open_pty();
+        let window = libc::winsize {
+            ws_row: 30,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &window) },
+            0,
+            "setting {tag} pty size failed"
+        );
+        let mut command = daemon.cli();
+        command.args(["ui", session]);
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&slave_path)
+            .unwrap();
+        let child = attach_to_pty(command, slave).spawn().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let reader = {
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+                    if n <= 0 {
+                        break;
+                    }
+                    seen.lock().unwrap().extend_from_slice(&buf[..n as usize]);
+                }
+                unsafe { libc::close(master) };
+            })
+        };
+        (child, seen, reader)
+    };
+
+    let (mut first, first_output, first_reader) = spawn_ui("first", "shared");
+    let attached = || {
+        let out = daemon.cli().args(["list", "--json"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains("\"attached_clients\":1")
+    };
+    let deadline = std::time::Instant::now() + WAIT;
+    while !attached() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first ui never attached"
+        );
+        std::thread::sleep(TICK);
+    }
+
+    assert!(
+        daemon
+            .cli()
+            .args(["rename", "shared", "renamed"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let (mut second, _second_output, second_reader) = spawn_ui("second", "renamed");
+    let deadline = std::time::Instant::now() + WAIT;
+    let saw_placard = loop {
+        let output = first_output.lock().unwrap();
+        if contains(&output, b"__ _ ___")
+            && contains(&output, b"Session \"renamed\" is open in another asd ui")
+            && contains(&output, b"Select it again to take over")
+        {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        drop(output);
+        std::thread::sleep(TICK);
+    };
+
+    unsafe {
+        libc::kill(first.id() as i32, libc::SIGTERM);
+        libc::kill(second.id() as i32, libc::SIGTERM);
+    }
+    let _ = first.wait();
+    let _ = second.wait();
+    first_reader.join().unwrap();
+    second_reader.join().unwrap();
+
+    assert!(
+        saw_placard,
+        "displaced ui output: {:?}",
+        String::from_utf8_lossy(&first_output.lock().unwrap())
+    );
 }
 
 /// A master pty and the path of its slave.

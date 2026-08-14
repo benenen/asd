@@ -320,6 +320,27 @@ fn sessions_with_running(
         .collect()
 }
 
+/// Find a rename of the active live session between two list samples. Names
+/// are mutable; the process id plus creation timestamp identify this daemon
+/// session across that change without confusing it with a newly created name.
+fn renamed_active_session(
+    active: Option<&str>,
+    previous: &[SessionInfo],
+    current: &[SessionInfo],
+) -> Option<(String, String)> {
+    let old = previous
+        .iter()
+        .find(|session| Some(session.name.as_str()) == active)?;
+    current
+        .iter()
+        .find(|session| {
+            session.pid == old.pid
+                && session.created_ms == old.created_ms
+                && session.name != old.name
+        })
+        .map(|session| (old.name.clone(), session.name.clone()))
+}
+
 /// A drag selection anchored in **absolute screen-space rows** (0 = oldest
 /// scrollback line, same coordinate system as `scrollback_rows`) so the
 /// highlight tracks the text while scrolling — the CLI attach client's model.
@@ -395,6 +416,11 @@ pub(crate) struct App {
     host_links: HostLinkState,
     /// The attached session's name.
     pub active: Option<String>,
+    /// The active sidebar selection whose exclusive TUI view was taken by
+    /// another `asd ui`. It stays selected so choosing it again is an explicit
+    /// takeover, while the pane renders a placard instead of stale terminal
+    /// cells.
+    pub view_revoked: Option<String>,
     /// Local terminal for the attached session (recreated per attach).
     vt: Option<GhosttyVt>,
     /// Local scrollback offset: 0 = follow live output.
@@ -684,6 +710,7 @@ fn event_loop(
         running_activity: RunningActivity::default(),
         host_links: HostLinkState::default(),
         active: None,
+        view_revoked: None,
         vt: None,
         scroll: 0,
         grid,
@@ -1088,7 +1115,7 @@ impl App {
     }
 
     fn select(&mut self, name: String) {
-        if self.active.as_deref() == Some(&name) {
+        if self.active.as_deref() == Some(&name) && self.view_revoked.as_deref() != Some(&name) {
             self.ensure_active_sidebar_visible();
             return;
         }
@@ -1115,6 +1142,7 @@ impl App {
             }
         }
         self.active = Some(name.clone());
+        self.view_revoked = None;
         self.ensure_active_sidebar_visible();
         // Hold a frame on screen while the new attach converges — never draw
         // the empty terminal (a black flash). Prefer the target session's own
@@ -1190,10 +1218,21 @@ impl App {
                 self.daemon_up = false;
                 self.notice = Some(reason);
                 self.active = None;
+                self.view_revoked = None;
                 self.vt = None;
                 self.pane_cache = None;
             }
             Ev::Sessions(list) => {
+                // A list reply can overtake the session thread's ViewRenamed
+                // notification because they share a socket queue but originate
+                // from different daemon threads. Match the stable live-session
+                // identity before replacing the old list so that a rename is
+                // never mistaken for "old vanished, auto-attach the new one".
+                let renamed_active =
+                    renamed_active_session(self.active.as_deref(), &self.sessions, &list);
+                if let Some((old_name, new_name)) = renamed_active {
+                    self.apply_rename(&old_name, &new_name);
+                }
                 let observed_at = Instant::now();
                 self.running_activity = self.running_activity.with_list(&list, observed_at);
                 let list = sessions_with_activity(&list, &self.running_activity, observed_at);
@@ -1224,6 +1263,7 @@ impl App {
                     && !self.sessions.iter().any(|s| &s.name == a)
                 {
                     self.active = None;
+                    self.view_revoked = None;
                     self.vt = None;
                 }
                 if self.active.is_none() {
@@ -1260,6 +1300,7 @@ impl App {
                         sessions_with_running(&self.sessions, std::slice::from_ref(&name), true);
                 }
                 if snapshot {
+                    self.view_revoked = None;
                     // A snapshot is a full redraw into a clean terminal.
                     self.vt = Some(GhosttyVt::new(self.grid.0, self.grid.1, SCROLLBACK));
                     self.vt_grid = self.grid;
@@ -1304,9 +1345,35 @@ impl App {
                     self.cache = None;
                 }
             }
+            Ev::ViewRevoked {
+                previous_name,
+                name,
+            } => {
+                if self.active.as_deref() == Some(&previous_name)
+                    || self.active.as_deref() == Some(&name)
+                {
+                    self.apply_rename(&previous_name, &name);
+                    self.view_revoked = Some(name.clone());
+                    self.notice = Some(format!("{name} — view opened in another asd ui"));
+                    self.vt = None;
+                    self.cache = None;
+                    self.pane_hold = None;
+                    self.pane_cache = None;
+                    self.pane_needs_render = true;
+                    self.sync_since = None;
+                    self.scroll = 0;
+                    self.sel = None;
+                    self.selecting = false;
+                    self.parked
+                        .retain(|(parked, _)| parked != &previous_name && parked != &name);
+                }
+            }
+            Ev::ViewRenamed { old_name, new_name } => {
+                self.apply_rename(&old_name, &new_name);
+            }
             Ev::Renamed(res) => {
-                // Success is already reflected optimistically; the poll that
-                // followed the rename confirms it. Surface a rejection.
+                // ViewRenamed applies a success; Ack only confirms completion.
+                // Surface a validation race or other rejection here.
                 if let Err(msg) = res {
                     self.notice = Some(format!("rename failed: {msg}"));
                 }
@@ -1477,30 +1544,42 @@ impl App {
         }
     }
 
-    /// Send a rename and optimistically update the local sidebar/active name so
-    /// it reflects immediately; the daemon's follow-up `ListSessions` confirms
-    /// (or a `Renamed(Err)` reverts it via a notice).
+    /// Send a rename request. The daemon's `ViewRenamed` event applies the name
+    /// only after registry validation succeeds, so a concurrent duplicate-name
+    /// rejection cannot leave the pane tagged with a name it never acquired.
     fn submit_rename(&mut self, target: String, new: String) {
         if target == new {
             return;
         }
-        if self.active.as_deref() == Some(&target) {
-            self.active = Some(new.clone());
-        }
-        for s in &mut self.sessions {
-            if s.name == target {
-                s.name = new.clone();
-            }
-        }
-        self.running_activity = self.running_activity.with_rename(&target, &new);
-        // The daemon lists sessions by name. Mirror that ordering immediately
-        // so the next refresh cannot move the active row out of the viewport.
-        self.sessions.sort_by(|a, b| a.name.cmp(&b.name));
-        self.ensure_active_sidebar_visible();
         self.send(Cmd::Rename {
             name: target,
             new_name: new,
         });
+    }
+
+    /// Apply a rename observed locally or announced by the daemon. Keeping this
+    /// separate from `submit_rename` prevents an external rename from being
+    /// echoed back as a second protocol command.
+    fn apply_rename(&mut self, target: &str, new: &str) {
+        if target == new {
+            return;
+        }
+        if self.active.as_deref() == Some(target) {
+            self.active = Some(new.to_string());
+        }
+        if self.view_revoked.as_deref() == Some(target) {
+            self.view_revoked = Some(new.to_string());
+        }
+        for s in &mut self.sessions {
+            if s.name == target {
+                s.name = new.to_string();
+            }
+        }
+        self.running_activity = self.running_activity.with_rename(target, new);
+        // The daemon lists sessions by name. Mirror that ordering immediately
+        // so the next refresh cannot move the active row out of the viewport.
+        self.sessions.sort_by(|a, b| a.name.cmp(&b.name));
+        self.ensure_active_sidebar_visible();
         self.dirty = true;
     }
 
@@ -1888,6 +1967,35 @@ mod tests {
             assert!(event_for_generation(7, event).is_none());
         }
         assert!(matches!(event_for_generation(7, current), Some(Ev::Up)));
+    }
+
+    #[test]
+    fn list_race_recognizes_an_external_rename_by_session_identity() {
+        let info = |name: &str, pid: u32, created_ms: u64| SessionInfo {
+            name: name.to_string(),
+            command: "shell".to_string(),
+            title: String::new(),
+            created_ms,
+            idle_ms: 0,
+            running: true,
+            attached_clients: 1,
+            pid,
+            cols: 80,
+            rows: 24,
+        };
+        let previous = vec![info("old", 42, 100)];
+        let renamed = vec![info("new", 42, 100)];
+        let replacement = vec![info("new", 42, 101)];
+
+        assert_eq!(
+            renamed_active_session(Some("old"), &previous, &renamed),
+            Some(("old".to_string(), "new".to_string()))
+        );
+        assert_eq!(
+            renamed_active_session(Some("old"), &previous, &replacement),
+            None,
+            "a reused pid for a newly created session is not a rename"
+        );
     }
 
     #[test]

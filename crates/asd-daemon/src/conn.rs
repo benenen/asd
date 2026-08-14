@@ -9,13 +9,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use asd_proto::{Frame, FrameReader, FrameWriter, PROTO_VERSION, code};
+use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, PROTO_VERSION, code};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::registry::Registry;
-use crate::session::{ClientSink, ConnItem, SessionMsg, data_frame_size};
+use crate::session::{AttachClass, ClientSink, ConnItem, SessionMsg, data_frame_size};
 
 /// The client↔session association after attach.
 struct Attached {
@@ -33,8 +33,11 @@ pub async fn handle_conn(
     let mut writer = FrameWriter::new(w);
 
     // ---- Handshake: the client sends Hello first ----
-    match reader.read_frame().await {
-        Ok(Some(Frame::Hello { proto_version, .. })) => {
+    let client_kind = match reader.read_frame().await {
+        Ok(Some(Frame::Hello {
+            proto_version,
+            kind,
+        })) => {
             if proto_version != PROTO_VERSION {
                 // Contract: version mismatch → Error{code=1} then disconnect
                 let _ = writer
@@ -57,6 +60,7 @@ pub async fn handle_conn(
             {
                 return;
             }
+            kind
         }
         Ok(Some(_)) => {
             let _ = writer
@@ -68,7 +72,7 @@ pub async fn handle_conn(
             return;
         }
         _ => return,
-    }
+    };
 
     // ---- Outbound queue: the sole channel for all frames written on this connection ----
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ConnItem>();
@@ -144,8 +148,16 @@ pub async fn handle_conn(
                 name,
                 cols,
                 rows,
+                view_id,
                 appearance,
             } => {
+                if client_kind == ClientKind::Tui && view_id == 0 {
+                    reply(Frame::Error {
+                        code: code::BAD_HANDSHAKE,
+                        msg: "TUI Attach requires a nonzero view_id".to_string(),
+                    });
+                    continue;
+                }
                 // Attaching supersedes any prior attachment on this connection.
                 // A session that dies while attached cannot clear this
                 // read-side bookkeeping — the session thread only reaches the
@@ -173,6 +185,13 @@ pub async fn handle_conn(
                     .tx
                     .send(SessionMsg::Attach {
                         sink,
+                        class: if client_kind == ClientKind::Tui {
+                            AttachClass::ExclusiveTui
+                        } else {
+                            AttachClass::Shared
+                        },
+                        requested_name: name.clone(),
+                        view_id,
                         cols,
                         rows,
                         appearance,
@@ -192,7 +211,10 @@ pub async fn handle_conn(
             }
             Frame::Input { bytes } => {
                 if let Some(a) = &attached {
-                    let _ = a.session_tx.send(SessionMsg::Input(bytes));
+                    let _ = a.session_tx.send(SessionMsg::Input {
+                        client_id: a.client_id,
+                        bytes,
+                    });
                 }
             }
             Frame::Resize { cols, rows } => {
