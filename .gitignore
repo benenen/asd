@@ -37,3 +37,5 @@ target
 node_modules
 
 crates/asd-dioxus/dist
+
+.playwright-cli
