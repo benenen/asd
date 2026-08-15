@@ -53,17 +53,18 @@ button { font-family: inherit; }
 .host-reason:hover { color:#E5595E; text-decoration:underline; }
 .trust-btn { margin:0 0 4px 18px; background:none; border:1px solid rgba(229,89,94,0.5); border-radius:4px; color:#E5595E; padding:1px 8px; cursor:pointer; font-size:10px; }
 .trust-btn:hover { background:rgba(229,89,94,0.12); }
-.session-row { padding:6px 8px 6px 14px; margin:2px 0 2px 4px; border-radius:6px; cursor:pointer; display:flex; align-items:center; gap:8px; font-size:13px; }
+.session-row { padding:6px 8px 6px 14px; margin:2px 0 2px 4px; border-radius:6px; cursor:pointer; display:flex; flex-direction:column; gap:3px; font-size:13px; }
 .session-row:hover { background:#171D25; }
 .session-row.active { background:rgba(243,178,76,0.12); }
+.session-main { display:flex; align-items:center; gap:8px; min-width:0; }
 .session-dot { width:8px; height:8px; border-radius:50%; border:2px solid #F3B24C; flex:none; }
 .session-dot.attached { background:#F3B24C; }
 .session-dot.remote { border-color:#54C7DA; }
 .session-dot.remote.attached { background:#54C7DA; }
-.session-name { font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.session-name { font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
 .session-rename { font:inherit; font-weight:bold; background:var(--asd-terminal-background); border:1px solid #54C7DA; border-radius:4px; color:var(--asd-terminal-foreground); padding:0 4px; outline:none; width:120px; }
 .rename-error { color:#E5595E; font-weight:bold; cursor:help; }
-.session-cmd { font-size:11px; color:#8B94A2; margin-left:auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.session-cmd { font-size:11px; color:#8B94A2; padding-left:16px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .session-age { font-size:10px; color:#5A6472; flex:none; }
 .sidebar-footer { padding:10px 16px; border-top:1px solid #232A34; font-size:11px; color:#5A6472; }
 .status-dot { width:7px; height:7px; border-radius:50%; display:inline-block; margin-right:6px; }
@@ -76,6 +77,7 @@ button { font-family: inherit; }
 .terminal-pane { flex:1; display:flex; flex-direction:column; min-width:0; }
 .term-head { height:40px; display:flex; align-items:center; padding:0 14px; background:#0E1218; border-bottom:1px solid #1B212A; font-size:12px; gap:10px; }
 .term-title { font-weight:bold; min-width:0; flex-shrink:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.term-subtitle { font-size:11px; color:#8B94A2; min-width:0; flex-shrink:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .host-tag { font-size:9px; letter-spacing:1px; color:#F3B24C; border:1px solid rgba(243,178,76,0.4); border-radius:8px; padding:1px 7px; }
 .host-tag.remote { color:#54C7DA; border-color:rgba(84,199,218,0.4); }
 .term-note { font-size:11px; color:#D98A8D; }

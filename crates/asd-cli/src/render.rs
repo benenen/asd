@@ -70,15 +70,22 @@ pub fn render_frame(snap: &RenderSnapshot, sel: Option<Selection>) -> Vec<u8> {
         out.extend_from_slice(b"\x1b[0m\x1b[K");
     }
 
-    // Cursor: only show it when it has a real viewport position. Scrolled back
-    // into history the cursor is off-viewport (position None) — showing it
-    // would strand a stray cursor at the last painted cell (bottom-right).
-    if snap.cursor.visible
-        && let Some((cx, cy)) = snap.cursor.position
-    {
+    // Position the host cursor whenever it has a real viewport position, even
+    // when the application hides it: the OS input-method (IME) popup and TUI
+    // programs such as codex/vim anchor to the REAL terminal cursor, so Claude
+    // Code / pi draw their own caret while Chinese input must still follow the
+    // app's input point. Only re-show the cursor when the app wants it visible.
+    // Scrolled back into history the cursor is off-viewport (position None) —
+    // emitting a position then would strand a stray cursor at the last painted
+    // cell (bottom-right), so it stays hidden there.
+    if let Some((cx, cy)) = snap.cursor.position {
         out.extend_from_slice(format!("\x1b[{};{}H", cy + 1, cx + 1).as_bytes());
-        out.extend_from_slice(cursor_shape_seq(snap.cursor.shape));
-        out.extend_from_slice(b"\x1b[?25h");
+        if snap.cursor.visible {
+            out.extend_from_slice(cursor_shape_seq(snap.cursor.shape));
+            out.extend_from_slice(b"\x1b[?25h");
+        } else {
+            out.extend_from_slice(b"\x1b[?25l");
+        }
     }
     out
 }
@@ -263,9 +270,9 @@ mod tests {
     }
 
     #[test]
-    fn cursor_shown_only_with_a_viewport_position() {
+    fn cursor_positioned_when_visible_hidden_or_offscreen() {
         use asd_vt::{CursorSnapshot, RenderSnapshot};
-        let mk = |pos| RenderSnapshot {
+        let mk = |pos, visible| RenderSnapshot {
             cols: 10,
             rows: 3,
             cells: (0..3)
@@ -273,7 +280,7 @@ mod tests {
                 .collect(),
             row_dirty: vec![true; 3],
             cursor: CursorSnapshot {
-                visible: true,
+                visible,
                 position: pos,
                 ..CursorSnapshot::default()
             },
@@ -283,15 +290,24 @@ mod tests {
         };
         let contains = |h: &[u8], n: &[u8]| h.windows(n.len()).any(|w| w == n);
 
-        // Live view (has a position): cursor is shown and positioned.
-        let out = render_frame(&mk(Some((2, 1))), None);
+        // Live view with a visible cursor: shown and positioned.
+        let out = render_frame(&mk(Some((2, 1)), true), None);
         assert!(contains(&out, b"\x1b[?25h"));
         assert!(contains(&out, b"\x1b[2;3H"));
 
+        // Hidden-cursor application (Claude Code / pi draw their own caret):
+        // the host cursor stays hidden but is STILL positioned, so the OS IME
+        // box anchors to the app's input point.
+        let out = render_frame(&mk(Some((2, 1)), false), None);
+        assert!(!contains(&out, b"\x1b[?25h"));
+        assert!(contains(&out, b"\x1b[2;3H"));
+        assert!(contains(&out, b"\x1b[?25l"));
+
         // Scrolled back (no position): cursor stays hidden — no residual cursor.
-        let out = render_frame(&mk(None), None);
+        let out = render_frame(&mk(None, true), None);
         assert!(!contains(&out, b"\x1b[?25h"));
         assert!(contains(&out, b"\x1b[?25l"));
+        assert!(!contains(&out, b"\x1b[2;3H"));
     }
 
     #[test]

@@ -120,6 +120,72 @@
     }
     term.open(el);
 
+    // ghostty-web leaves its hidden textarea at the pane origin except while
+    // a context menu is open. Native IME panels (notably Chinese input) anchor
+    // to that textarea, so keep it parked on the terminal cursor. onRender is
+    // needed because the library only emits onCursorMove when the row changes.
+    var placeTextareaAtCursor = function() {
+      if (!term.textarea || !term.renderer) return;
+      var canvas = term.renderer.getCanvas();
+      if (!canvas) return;
+      var metrics = term.renderer.getMetrics();
+      if (!metrics || !metrics.width || !metrics.height) return;
+      var rect = canvas.getBoundingClientRect();
+      var x = term.buffer.active.cursorX;
+      var y = term.buffer.active.cursorY;
+      term.textarea.style.position = 'fixed';
+      term.textarea.style.left = (rect.left + x * metrics.width) + 'px';
+      term.textarea.style.top = (rect.top + y * metrics.height) + 'px';
+      term.textarea.style.width = '1px';
+      term.textarea.style.height = metrics.height + 'px';
+      term.textarea.style.fontSize = metrics.height + 'px';
+      term.textarea.style.lineHeight = metrics.height + 'px';
+      term.textarea.style.clipPath = 'none';
+      term.textarea.style.pointerEvents = 'none';
+      term.textarea.style.zIndex = '-10';
+    };
+    var textareaPositionFrame = null;
+    var positionTextareaAtCursor = function() {
+      if (textareaPositionFrame !== null) return;
+      textareaPositionFrame = requestAnimationFrame(function() {
+        textareaPositionFrame = null;
+        placeTextareaAtCursor();
+      });
+    };
+    term.onCursorMove(positionTextareaAtCursor);
+    term.onRender(positionTextareaAtCursor);
+    positionTextareaAtCursor();
+
+    // On macOS/Windows WebKit, composition events are sent to the focused
+    // editing host. ghostty-web keeps focus on the terminal container, whose
+    // caret sits at the pane origin, so the IME candidate window would open
+    // there even after the hidden textarea is moved. For IME keydowns, move
+    // focus to the positioned textarea just before composition starts and
+    // forward only the committed text back to Rust.
+    var imeComposing = false;
+    term.element.addEventListener('keydown', function(e) {
+      var isImeKey = e.keyCode === 229 || e.isComposing || e.key === 'Process';
+      if (!isImeKey) return;
+      placeTextareaAtCursor();
+      var textarea = term.textarea;
+      if (!textarea) return;
+      textarea.value = '';
+      textarea.setSelectionRange(0, 0);
+      textarea.focus();
+      imeComposing = true;
+    }, true);
+    term.textarea.addEventListener('compositionstart', function() {
+      imeComposing = true;
+    });
+    term.textarea.addEventListener('compositionend', function(e) {
+      if (!imeComposing) return;
+      imeComposing = false;
+      var data = e.data || '';
+      if (data) send({ type: 'input', data: data });
+      term.textarea.value = '';
+      if (term.element && typeof term.element.focus === 'function') term.element.focus();
+    });
+
     // JS → Rust: keystrokes and size. Registered before the first fit() so
     // Rust learns the real grid before the first attach.
     term.onData(function(data) {

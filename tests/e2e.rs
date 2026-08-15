@@ -19,6 +19,7 @@ use tokio::time::timeout;
 
 const TICK: Duration = Duration::from_millis(50);
 const WAIT: Duration = Duration::from_secs(10);
+static PTSNAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn cli_exe() -> &'static str {
     env!("CARGO_BIN_EXE_asd")
@@ -2847,6 +2848,8 @@ fn displaced_ui_shows_the_takeover_placard() {
     );
 
     let spawn_ui = |tag: &str, session: &str| {
+        use std::os::fd::AsRawFd;
+
         let (master, slave_path) = open_pty();
         let window = libc::winsize {
             ws_row: 30,
@@ -2854,18 +2857,18 @@ fn displaced_ui_shows_the_takeover_placard() {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        assert_eq!(
-            unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &window) },
-            0,
-            "setting {tag} pty size failed"
-        );
-        let mut command = daemon.cli();
-        command.args(["ui", session]);
         let slave = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&slave_path)
             .unwrap();
+        assert_eq!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &window) },
+            0,
+            "setting {tag} pty size failed"
+        );
+        let mut command = daemon.cli();
+        command.args(["ui", session]);
         let child = attach_to_pty(command, slave).spawn().unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let reader = {
@@ -2949,15 +2952,14 @@ fn open_pty() -> (libc::c_int, PathBuf) {
         assert!(master >= 0, "posix_openpt failed");
         assert_eq!(libc::grantpt(master), 0, "grantpt failed");
         assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
-        let mut name = [0 as libc::c_char; 256];
-        assert_eq!(
-            libc::ptsname_r(master, name.as_mut_ptr(), name.len()),
-            0,
-            "ptsname_r failed"
-        );
-        let path = std::ffi::CStr::from_ptr(name.as_ptr())
-            .to_string_lossy()
-            .into_owned();
+        let path = {
+            let _guard = PTSNAME_LOCK.lock().unwrap();
+            let name_ptr = libc::ptsname(master);
+            assert!(!name_ptr.is_null(), "ptsname failed");
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
         (master, PathBuf::from(path))
     }
 }
@@ -2976,7 +2978,7 @@ fn attach_to_pty(mut cmd: Command, slave: std::fs::File) -> Command {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0 {
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY.into(), 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

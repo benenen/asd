@@ -370,18 +370,7 @@ mod tests {
     fn open_raw_pty() -> (OwnedFd, OwnedFd) {
         let mut master = -1;
         let mut slave = -1;
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            },
-            0
-        );
+        assert_eq!(openpty(&mut master, &mut slave), 0);
         let master = unsafe { OwnedFd::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         let mut termios = unsafe { std::mem::zeroed() };
@@ -395,5 +384,34 @@ mod tests {
             0
         );
         (master, slave)
+    }
+
+    // Linux declares openpty's termios/winsize pointers as `*const`, while
+    // macOS (and the BSDs) declares them as `*mut`. Keep that libc difference
+    // local to the test helper rather than adding a cfg to every call site.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn openpty(master: *mut libc::c_int, slave: *mut libc::c_int) -> libc::c_int {
+        unsafe {
+            libc::openpty(
+                master,
+                slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn openpty(master: *mut libc::c_int, slave: *mut libc::c_int) -> libc::c_int {
+        unsafe {
+            libc::openpty(
+                master,
+                slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        }
     }
 }

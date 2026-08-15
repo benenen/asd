@@ -79,6 +79,46 @@ struct Rename {
     error: Option<String>,
 }
 
+/// Reassembles UTF-8 text across daemon frame boundaries.
+///
+/// The daemon frames raw PTY bytes; a frame can split a multi-byte character
+/// in half. Converting each frame independently with `from_utf8_lossy` turns
+/// those fragments into replacement characters, which shows up as `�` in the
+/// rendered pane.
+#[derive(Default)]
+struct Utf8Accumulator {
+    pending: Vec<u8>,
+}
+
+impl Utf8Accumulator {
+    fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    fn push(&mut self, data: &[u8]) -> String {
+        self.pending.extend_from_slice(data);
+        match std::str::from_utf8(&self.pending) {
+            Ok(text) => {
+                let out = text.to_owned();
+                self.pending.clear();
+                out
+            }
+            Err(error) if error.error_len().is_none() => {
+                let valid = error.valid_up_to();
+                let out =
+                    String::from_utf8(self.pending[..valid].to_vec()).expect("valid UTF-8 prefix");
+                self.pending.drain(..valid);
+                out
+            }
+            Err(_) => {
+                let out = String::from_utf8_lossy(&self.pending).into_owned();
+                self.pending.clear();
+                out
+            }
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -216,7 +256,17 @@ pub fn App() -> Element {
             .host(*h)
             .map(|host| host.label().to_uppercase())
             .unwrap_or_default();
-        (n.clone(), tag, m.host(*h).is_some_and(|h| h.is_remote()))
+        let title = m
+            .host(*h)
+            .and_then(|host| host.sessions.iter().find(|s| &s.name == n))
+            .map(|s| s.title.trim().to_string())
+            .unwrap_or_default();
+        (
+            n.clone(),
+            tag,
+            m.host(*h).is_some_and(|h| h.is_remote()),
+            title,
+        )
     });
     let (gc, gr) = *grid.read();
     let local_up = m.host(LOCAL_ID).is_some_and(|h| h.state == HostState::Up);
@@ -330,11 +380,14 @@ pub fn App() -> Element {
             // ── terminal pane ───────────────────────────────────────
             div { class: "terminal-pane",
                 div { class: "term-head",
-                    if let Some((name, tag, remote)) = active_label {
+                    if let Some((name, tag, remote, title)) = active_label {
                         span { class: "term-title", "{name}" }
                         span {
                             class: if remote { "host-tag remote" } else { "host-tag" },
                             "{tag}"
+                        }
+                        if !title.is_empty() {
+                            span { class: "term-subtitle", "{title}" }
                         }
                         {match status.read().clone() {
                             Status::Live => rsx! {},
@@ -608,6 +661,7 @@ fn host_group(
                             class: "{row}",
                             key: "s-{id}-{name}",
                             onclick: move |_| select(id, name_click.clone()),
+                            div { class: "session-main",
                             span { class: "{sdot}" }
                             if let Some(rn) = renaming {
                                 input {
@@ -673,7 +727,6 @@ fn host_group(
                                     "{name}"
                                 }
                             }
-                            span { class: "session-cmd", "{cmd}" }
                             span { class: "session-age", "{age}" }
                             button {
                                 class: "icon-btn kill",
@@ -684,6 +737,8 @@ fn host_group(
                                 },
                                 "×"
                             }
+                            }
+                            div { class: "session-cmd", "{cmd}" }
                         }
                     }
                 }
@@ -1031,6 +1086,7 @@ async fn supervisor(
     let mut pending_create = false;
     // The session named on the command line, consumed by the first auto-select.
     let mut preferred = crate::preferred_session();
+    let mut utf8 = Utf8Accumulator::default();
 
     spawn_host(LOCAL_ID, HostKind::Local, &ui_tx, &mut hosts, &mut kinds);
 
@@ -1173,11 +1229,23 @@ async fn supervisor(
                         if !model.read().is_active(host, &name) {
                             continue;
                         }
+                        // A Snapshot starts a fresh screen. Drop any incomplete
+                        // character left over from the previous session rather
+                        // than prepending it to the new dump.
+                        let text = if snapshot {
+                            utf8.clear();
+                            String::from_utf8_lossy(&data).into_owned()
+                        } else {
+                            utf8.push(&data)
+                        };
+                        if text.is_empty() {
+                            continue;
+                        }
                         // A JSON string is a valid JS string literal
                         // (control chars come out as backslash-u escapes), so
                         // it is passed directly - routing it through
                         // JSON.parse would un-escape twice and choke on ESC.
-                        let json = serde_json::to_string(&String::from_utf8_lossy(&data))
+                        let json = serde_json::to_string(&text)
                             .unwrap_or_else(|_| "\"\"".into());
                         let script = if snapshot {
                             format!(
@@ -1303,4 +1371,32 @@ fn spawn_host(
     // runtime that keeps running while the window is idle.
     bg().spawn(conn::run_host(id, kind, cmd_rx, ev));
     hosts.insert(id, HostHandle { cmd_tx });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Utf8Accumulator;
+
+    #[test]
+    fn utf8_accumulator_reassembles_split_multibyte_characters() {
+        let text = "────────────";
+        let split = text.len() / 2;
+        let mut acc = Utf8Accumulator::default();
+
+        let first = acc.push(&text.as_bytes()[..split]);
+        assert!(first.ends_with('─'));
+        assert!(!first.contains('�'));
+
+        let second = acc.push(&text.as_bytes()[split..]);
+        assert_eq!(first.len() + second.len(), text.len());
+        assert_eq!(format!("{first}{second}"), text);
+        assert!(!format!("{first}{second}").contains('�'));
+    }
+
+    #[test]
+    fn utf8_accumulator_still_replaces_invalid_bytes() {
+        let mut acc = Utf8Accumulator::default();
+        let out = acc.push(b"ok\xFFnext");
+        assert_eq!(out, "ok\u{fffd}next");
+    }
 }
