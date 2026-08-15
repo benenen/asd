@@ -219,6 +219,50 @@
     term.onRender(updateImeCaret);
     updateImeCaret();
 
+    // ghostty-web already has wheel handling, but its write path force-scrolls
+    // the viewport back to the bottom whenever new PTY output arrives. Take
+    // wheel handling here so scrollback stays under asd's control, while
+    // alternate-screen applications still receive arrow-key input.
+    window.__asdUserScrolledBack = false;
+    term.attachCustomWheelEventHandler(function(e) {
+      if (e) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+
+      var lineHeight = 1;
+      if (term.renderer && typeof term.renderer.getMetrics === 'function') {
+        var metrics = term.renderer.getMetrics();
+        if (metrics && metrics.height) lineHeight = metrics.height;
+      }
+
+      var amount;
+      if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+        amount = e.deltaY;
+      } else if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+        amount = e.deltaY * term.rows;
+      } else {
+        amount = e.deltaY / lineHeight;
+      }
+
+      var alternate = term.wasmTerm && typeof term.wasmTerm.isAlternateScreen === 'function'
+        && term.wasmTerm.isAlternateScreen();
+      if (alternate) {
+        var key = amount > 0 ? '\x1b[B' : '\x1b[A';
+        var steps = Math.max(1, Math.min(Math.abs(Math.round(amount)), 5));
+        for (var i = 0; i < steps; i++) {
+          send({ type: 'input', data: key });
+        }
+        return true;
+      }
+
+      if (amount !== 0) {
+        term.scrollLines(amount);
+        window.__asdUserScrolledBack = term.getViewportY() > 0.01;
+      }
+      return true;
+    });
+
     // JS → Rust: keystrokes and size. Registered before the first fit() so
     // Rust learns the real grid before the first attach.
     term.onData(function(data) {
@@ -276,7 +320,22 @@
     window.__asdWrite = function(data) {
       if (!window.__asdTerm) return;
       try {
-        window.__asdTerm.write(data);
+        var t = window.__asdTerm;
+        var keepViewport = window.__asdUserScrolledBack && t.getViewportY() > 0
+          ? t.getViewportY()
+          : 0;
+        var scrollbackBefore = typeof t.getScrollbackLength === 'function'
+          ? t.getScrollbackLength()
+          : 0;
+        t.write(data);
+        if (keepViewport > 0) {
+          var scrollbackAfter = typeof t.getScrollbackLength === 'function'
+            ? t.getScrollbackLength()
+            : 0;
+          var added = Math.max(0, scrollbackAfter - scrollbackBefore);
+          var desired = Math.min(scrollbackAfter, keepViewport + added);
+          if (desired > 0) t.scrollToLine(desired);
+        }
         window.__asdWriteErrors = 0;
       } catch (e) {
         window.__asdWriteErrors = (window.__asdWriteErrors || 0) + 1;
@@ -289,6 +348,7 @@
     window.__asdReset = function() {
       if (!window.__asdTerm) return;
       try {
+        window.__asdUserScrolledBack = false;
         if (typeof window.__asdTerm.reset === 'function') {
           window.__asdTerm.reset();
         } else {
