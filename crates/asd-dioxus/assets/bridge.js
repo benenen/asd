@@ -156,35 +156,68 @@
     term.onRender(positionTextareaAtCursor);
     positionTextareaAtCursor();
 
-    // On macOS/Windows WebKit, composition events are sent to the focused
-    // editing host. ghostty-web keeps focus on the terminal container, whose
-    // caret sits at the pane origin, so the IME candidate window would open
-    // there even after the hidden textarea is moved. For IME keydowns, move
-    // focus to the positioned textarea just before composition starts and
-    // forward only the committed text back to Rust.
+    // Keep a zero-width, in-flow caret inside the contenteditable terminal
+    // element at the same cell as the ghostty cursor. WebKit positions the IME
+    // candidate window from this DOM selection, but composition still belongs
+    // to the terminal element itself, so the original ghostty-web input path
+    // is left untouched.
+    var imeCaretSpacer = null;
+    var imeCaretPad = null;
+    var imeCaretText = null;
+    var ensureImeCaret = function() {
+      if (!imeCaretSpacer || !imeCaretSpacer.isConnected) {
+        imeCaretSpacer = document.createElement('div');
+        imeCaretSpacer.style.cssText = 'height:0;width:0;font-size:0;line-height:0;opacity:0;pointer-events:none;';
+        term.element.appendChild(imeCaretSpacer);
+
+        imeCaretPad = document.createElement('span');
+        imeCaretPad.style.cssText = 'display:inline-block;width:0;height:1px;opacity:0;pointer-events:none;';
+        term.element.appendChild(imeCaretPad);
+
+        imeCaretText = document.createElement('span');
+        imeCaretText.style.cssText = 'opacity:0;pointer-events:none;white-space:pre;';
+        term.element.appendChild(imeCaretText);
+      }
+      if (imeCaretText && !imeCaretText.firstChild) {
+        imeCaretText.appendChild(document.createTextNode(String.fromCharCode(0x200B)));
+      }
+    };
+    var selectImeCaret = function() {
+      var textNode = imeCaretText.firstChild;
+      if (!textNode) return;
+      var range = document.createRange();
+      range.setStart(textNode, textNode.length);
+      range.collapse(true);
+      var selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    };
     var imeComposing = false;
-    term.element.addEventListener('keydown', function(e) {
-      var isImeKey = e.keyCode === 229 || e.isComposing || e.key === 'Process';
-      if (!isImeKey) return;
-      placeTextareaAtCursor();
-      var textarea = term.textarea;
-      if (!textarea) return;
-      textarea.value = '';
-      textarea.setSelectionRange(0, 0);
-      textarea.focus();
-      imeComposing = true;
-    }, true);
-    term.textarea.addEventListener('compositionstart', function() {
+    var updateImeCaret = function() {
+      if (!term.renderer) return;
+      var metrics = term.renderer.getMetrics();
+      if (!metrics || !metrics.width || !metrics.height) return;
+      ensureImeCaret();
+      var x = term.buffer.active.cursorX;
+      var y = term.buffer.active.cursorY;
+      imeCaretSpacer.style.height = (y * metrics.height) + 'px';
+      imeCaretPad.style.width = (x * metrics.width) + 'px';
+      imeCaretPad.style.height = metrics.height + 'px';
+      imeCaretText.style.fontSize = metrics.height + 'px';
+      imeCaretText.style.lineHeight = metrics.height + 'px';
+      if (!imeComposing) selectImeCaret();
+    };
+    term.element.addEventListener('compositionstart', function() {
       imeComposing = true;
     });
-    term.textarea.addEventListener('compositionend', function(e) {
-      if (!imeComposing) return;
+    term.element.addEventListener('compositionend', function() {
       imeComposing = false;
-      var data = e.data || '';
-      if (data) send({ type: 'input', data: data });
-      term.textarea.value = '';
-      if (term.element && typeof term.element.focus === 'function') term.element.focus();
+      updateImeCaret();
     });
+    term.element.style.caretColor = 'transparent';
+    term.onCursorMove(updateImeCaret);
+    term.onRender(updateImeCaret);
+    updateImeCaret();
 
     // JS → Rust: keystrokes and size. Registered before the first fit() so
     // Rust learns the real grid before the first attach.
