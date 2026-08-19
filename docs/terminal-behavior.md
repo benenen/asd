@@ -198,12 +198,15 @@ itself is producing output, so the TUI also tracks the physical footprint of
 `http`, `https`, `ftp`, and `file` URLs, including soft-wrapped continuations.
 
 When a URL moves or disappears after the host has had a quiet interval, the TUI
-uses one synchronized frame to switch out of and back into alternate screen,
-clears the same-size ratatui viewport, and performs a full repaint. Windows
-Terminal rebuilds the cached pattern tree during those buffer switches, so old
-coordinates are cleared even if later output stays busy. Avoid repeating the
-switch until another footprint transition requires it.
+clears the same-size ratatui viewport and performs a full repaint inside the
+current alternate screen. It deliberately does not switch out of and back into
+alternate screen: remote xterm-style hosts can expose that switch as a visible
+full-screen flash. The host may keep an old auto-detected click target until its
+own scanner catches up, but screen contents and explicit OSC 8 links remain
+correct. Avoid repeating the full repaint until another quiet footprint
+transition requires it.
 
-The tradeoff is deliberate: this reset can cancel a host-native Shift
-selection. The TUI's own selection state is unaffected. There is no VT sequence
-that directly commands Windows Terminal to refresh only its URL regex cache.
+The tradeoff is deliberate: preserving the host buffer avoids the flash and
+does not discard its alternate-screen state, while accepting that an
+auto-detected click target can lag. There is no VT sequence that directly
+commands Windows Terminal to refresh only its URL regex cache.

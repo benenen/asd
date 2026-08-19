@@ -81,21 +81,21 @@ struct HostLinkState {
 
 impl HostLinkState {
     /// Observe the next visible pane frame. Returns true exactly when a URL
-    /// footprint that the host may have scanned has moved or disappeared.
+    /// footprint that the host may have scanned should be fully repainted.
     fn before_frame(&mut self, snapshot: Option<&RenderSnapshot>, host_quiet: Duration) -> bool {
         if host_quiet >= HOST_URL_SCAN_DEBOUNCE && !self.footprint.is_empty() {
             self.may_be_cached = true;
         }
 
         let footprint = snapshot.map(host_url_footprint).unwrap_or_default();
-        let reset = self.may_be_cached && self.footprint != footprint;
+        let repaint = self.may_be_cached && self.footprint != footprint;
         self.footprint = footprint;
-        if reset {
-            // The synchronous host reset clears the pattern tree. Further
-            // movement during continuous output needs no additional reset.
+        if repaint {
+            // The full repaint gives the host a fresh set of cells. Further
+            // movement during continuous output needs no additional repaint.
             self.may_be_cached = false;
         }
-        reset
+        repaint
     }
 }
 
@@ -418,8 +418,8 @@ pub(crate) struct App {
     /// letting an older list sample override output observed locally afterward.
     running_activity: RunningActivity,
     /// URL coordinates in the pane that Windows Terminal may have auto-detected.
-    /// When a scanned footprint moves, the next frame recreates the host's
-    /// alternate buffer so stale click targets cannot point at replacement text.
+    /// When a scanned footprint moves, the next frame fully repaints the current
+    /// host buffer. Auto-detected click targets may lag until the host rescans.
     host_links: HostLinkState,
     /// The attached session's name.
     pub active: Option<String>,
@@ -555,15 +555,12 @@ impl FrameBuf {
         b.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
     }
 
-    /// Recreate the host alternate buffer before a full repaint. Windows
-    /// Terminal synchronously rebuilds URL detection on each buffer switch;
-    /// the newly created alternate buffer is blank, so stale coordinates are
-    /// gone before the current frame is painted. This remains inside the
-    /// synchronized-update envelope opened by [`Self::begin`].
-    fn reset_host_links(&self) {
-        self.0
-            .borrow_mut()
-            .extend_from_slice(b"\x1b[?1049l\x1b[?1049h");
+    /// Preserve the current host screen buffer before repainting moved links.
+    /// This deliberately emits no bytes: leaving and re-entering alternate
+    /// screen visibly flashes on remote xterm-style hosts. The caller still
+    /// forces a same-size full repaint.
+    fn preserve_host_screen(&self) {
+        let _ = self;
     }
 
     /// Close a frame with the cursor tail and hand it to the terminal as a
@@ -789,8 +786,9 @@ fn event_loop(
         );
         app.dirty |= timing.shimmer_due;
         if app.dirty {
-            let reset_host_links = app
-                .host_link_reset_needed(Instant::now().saturating_duration_since(last_frame_flush));
+            let repaint_host_links = app.host_link_repaint_needed(
+                Instant::now().saturating_duration_since(last_frame_flush),
+            );
             app.now_ms = wall_now_ms;
             // One frame = one write: `FrameBuf` wraps the cell diff in
             // `?2026h ?25l` … `<CUP><?25h|?25l> ?2026l` and flushes it in a
@@ -801,8 +799,8 @@ fn event_loop(
             // terminals without DEC-2026 render freely between writes). The
             // tail is `app.cursor_tail`, recomputed by `ui::draw`.
             frame.begin();
-            if reset_host_links {
-                frame.reset_host_links();
+            if repaint_host_links {
+                frame.preserve_host_screen();
                 terminal.resize(ratatui::layout::Rect::new(
                     0,
                     0,
@@ -856,7 +854,7 @@ fn event_loop(
 }
 
 impl App {
-    fn host_link_reset_needed(&mut self, host_quiet: Duration) -> bool {
+    fn host_link_repaint_needed(&mut self, host_quiet: Duration) -> bool {
         let snapshot = self.snapshot();
         self.host_links.before_frame(snapshot.as_ref(), host_quiet)
     }
@@ -2159,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    fn moved_url_resets_a_scanned_host_cache_once() {
+    fn moved_url_requests_a_full_repaint_once() {
         fn snapshot(lines: &[&str]) -> RenderSnapshot {
             let cols = lines.iter().map(|line| line.len()).max().unwrap_or(0) as u16;
             let cells = lines
@@ -2201,7 +2199,7 @@ mod tests {
         let moved_again = snapshot(&["more output", "http://example.test/task"]);
         assert!(
             !state.before_frame(Some(&moved_again), Duration::ZERO),
-            "the synchronous reset left no cached host coordinates to invalidate again"
+            "continuous movement needs no additional repaint before another quiet interval"
         );
 
         let mut wrapped_state = HostLinkState::default();
@@ -2297,17 +2295,17 @@ mod tests {
     }
 
     #[test]
-    fn host_link_reset_precedes_the_repaint_in_one_atomic_frame() {
+    fn host_link_repaint_stays_on_the_current_host_screen() {
         use std::io::Write;
         let frame = FrameBuf::default();
         frame.begin();
-        frame.reset_host_links();
+        frame.preserve_host_screen();
         let mut backend_handle = frame.clone();
         backend_handle.write_all(b"<full repaint>").unwrap();
 
         assert_eq!(
             frame.0.borrow().as_slice(),
-            b"\x1b[?2026h\x1b[?25l\x1b[?1049l\x1b[?1049h<full repaint>"
+            b"\x1b[?2026h\x1b[?25l<full repaint>"
         );
     }
 
