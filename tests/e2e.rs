@@ -2987,6 +2987,56 @@ fn attach_to_pty(mut cmd: Command, slave: std::fs::File) -> Command {
     cmd
 }
 
+/// A session's child is pointed at the daemon that hosts it. A daemon serving a
+/// non-default `--socket` hands that exact path down as `$ASD_SOCKET`, so an
+/// `asd` command run inside a session addresses its own daemon instead of
+/// resolving the default path and answering for a different one.
+#[tokio::test]
+async fn session_children_are_given_the_hosting_daemons_socket() {
+    let daemon = Daemon::start("sessionenv");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "envs"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // Ask the session's own shell. The marker is assembled by printf so the
+    // echoed input line cannot satisfy the wait — only the output can.
+    let probe = format!(
+        "[ \"$ASD_SOCKET\" = \"{}\" ] && printf 'ASD_SOCKET_%s\\n' MATCHES",
+        daemon.socket.display()
+    );
+    let out = daemon
+        .cli()
+        .args(["send", "envs", "--text", &probe, "--enter"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "send failed: {out:?}");
+
+    let out = daemon
+        .cli()
+        .args([
+            "wait",
+            "envs",
+            "--text",
+            "ASD_SOCKET_MATCHES",
+            "--timeout",
+            "10s",
+        ])
+        .output()
+        .unwrap();
+    let screen = daemon.cli().args(["peek", "envs"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "session did not see the daemon socket in $ASD_SOCKET; screen:\n{}",
+        String::from_utf8_lossy(&screen.stdout)
+    );
+}
+
 /// Poll `cond` until it holds, or fail with `what`.
 async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);

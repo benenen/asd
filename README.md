@@ -238,6 +238,19 @@ in plain text, the same trust model as `~/.ssh` on a single-user machine.
 → `/tmp/asd-$UID/asd.sock`; the GUI's `config.json`, the daemon log, and the
 session list below live in the data directory, `~/.local/share/asd/`.
 
+**Session environment.** Every session's program is started with two variables
+of its own, so a script or agent running *inside* a session can address the
+session it lives in:
+
+| | |
+|---|---|
+| `ASD_SESSION` | the session's name at spawn time (a later rename does not update it) |
+| `ASD_SOCKET` | the socket of the daemon hosting it — the exact one it serves, not the default the resolution order would pick |
+
+`ASD_SOCKET` is what makes `asd list` / `asd new` inside a session answer for
+that session's daemon even when it was started with `--socket`. Both follow the
+same precedence as everywhere else, so exporting your own value overrides them.
+
 ### Configuration
 
 The daemon's config file is optional, read-only, and never auto-created — a

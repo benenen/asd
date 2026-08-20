@@ -47,6 +47,7 @@ pub(super) async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
     let registry = Arc::new(Mutex::new(Registry::new(
         config.scrollback_lines,
         persist_path.clone(),
+        socket_path.clone(),
     )));
 
     // Restore the persisted session list on every startup (fresh boot, crash

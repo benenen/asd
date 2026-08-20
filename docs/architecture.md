@@ -157,6 +157,11 @@ use exactly the same contract.
   `\\.\pipe\asd-<USERNAME>`.
 - Unix data defaults to `~/.local/share/asd`; Windows data defaults to
   `%LOCALAPPDATA%\asd`.
+- Each session's child process is spawned with `ASD_SESSION` (its name at spawn
+  time) and `ASD_SOCKET` (the listener the hosting daemon actually serves, which
+  is not necessarily what `paths::socket_path` would resolve). The daemon owns
+  both; `spawn_session` receives the socket from the registry rather than
+  re-resolving it.
 - Unix config defaults to `~/.config/asd/config.toml`; Windows config defaults
   to `%APPDATA%\asd\config.toml`; `ASD_CONFIG` overrides both.
 

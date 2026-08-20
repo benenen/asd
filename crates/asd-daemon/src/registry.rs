@@ -24,6 +24,10 @@ pub struct Registry {
     scrollback_lines: usize,
     /// Where the live session list is persisted; rewritten on every mutation.
     persist_path: PathBuf,
+    /// The listener this daemon serves, handed to every session's child as
+    /// `$ASD_SOCKET` so an `asd` command run inside a session addresses the
+    /// daemon that hosts it.
+    socket_path: PathBuf,
     /// Once set (at shutdown), `persist` is a no-op — so the SIGHUP-driven
     /// session removals during shutdown don't wipe the file before restart.
     persist_frozen: bool,
@@ -34,13 +38,15 @@ pub struct Registry {
 
 impl Registry {
     /// Create an empty registry whose sessions each keep `scrollback_lines` lines
-    /// of scrollback and whose live set is persisted to `persist_path`.
-    pub fn new(scrollback_lines: usize, persist_path: PathBuf) -> Self {
+    /// of scrollback, whose live set is persisted to `persist_path`, and whose
+    /// children are pointed at `socket_path`.
+    pub fn new(scrollback_lines: usize, persist_path: PathBuf, socket_path: PathBuf) -> Self {
         Self {
             sessions: HashMap::new(),
             next_auto: 0,
             scrollback_lines,
             persist_path,
+            socket_path,
             persist_frozen: false,
             last_persisted: Vec::new(),
         }
@@ -81,6 +87,7 @@ impl Registry {
         };
 
         let scrollback = reg.scrollback_lines;
+        let socket = reg.socket_path.clone();
         let handle = spawn_session(
             name.clone(),
             cmd,
@@ -88,6 +95,7 @@ impl Registry {
             DEFAULT_SIZE.0,
             DEFAULT_SIZE.1,
             scrollback,
+            socket,
             Arc::clone(registry),
         )
         .map_err(|e| (code::INTERNAL, format!("failed to spawn session: {e}")))?;
