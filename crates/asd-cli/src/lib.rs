@@ -99,6 +99,30 @@ enum Cmd {
         #[arg(long)]
         stdin: bool,
     },
+    /// Type the same thing into every session at once. The session you are
+    /// running in is skipped unless --include-self
+    SendAll {
+        /// The text to type (sent literally)
+        #[arg(long, conflicts_with_all = ["key", "stdin"])]
+        text: Option<String>,
+        /// Named keys, comma-separated: Enter, Tab, Escape, Space, Backspace,
+        /// Up, Down, Left, Right, Home, End, C-a..C-z
+        #[arg(long, conflicts_with = "stdin")]
+        key: Option<String>,
+        /// Send Enter (carriage return) as a separate keypress after everything
+        /// else, exactly as `send --enter` does
+        #[arg(long)]
+        enter: bool,
+        /// Force reading the payload from stdin
+        #[arg(long)]
+        stdin: bool,
+        /// Include the session this command is running in ($ASD_SESSION)
+        #[arg(long)]
+        include_self: bool,
+        /// List the sessions that would receive it and send nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print the session's rendered screen (reconstructed from terminal state,
     /// not a raw byte log); safe to run while attached
     Peek {
@@ -487,6 +511,14 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             enter,
             stdin,
         } => control::send(&socket, name, text, key, enter, stdin).await?,
+        Cmd::SendAll {
+            text,
+            key,
+            enter,
+            stdin,
+            include_self,
+            dry_run,
+        } => control::send_all(&socket, text, key, enter, stdin, include_self, dry_run).await?,
         Cmd::Peek {
             name,
             scrollback,

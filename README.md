@@ -106,6 +106,9 @@ Scripting — drive and observe a session without attaching:
 ```bash
 asd send build --text 'make test' --enter   # type into a session
 asd send build --key C-c                     # named keys: Enter/Tab/Esc/arrows/C-a…C-z
+asd send-all --text '/compact' --enter        # … or type it into every session at once
+asd send-all --key C-c --dry-run             # (--dry-run lists the targets first; your own
+                                             #   session is skipped unless --include-self)
 echo 'make test' | asd send build --enter    # or pipe it in (--enter folds the shell's newline
                                              #   away, then sends Enter separately so a TUI submits)
 asd peek build                               # print the rendered screen (--json)

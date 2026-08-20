@@ -3096,6 +3096,82 @@ async fn the_daemon_reports_a_recognized_agents_screen_state() {
     assert!(out.status.success(), "wait --until blocked failed: {out:?}");
 }
 
+/// `send-all` types into every session, skips the one it is running in, and
+/// reports what it did.
+#[tokio::test]
+async fn send_all_types_into_every_session_but_its_own() {
+    let daemon = Daemon::start("sendall");
+    for name in ["one", "two", "three"] {
+        assert!(
+            daemon
+                .cli()
+                .args(["new", name])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    // --dry-run names the targets without writing: for a command that types
+    // into every live session at once, seeing the list first is the point.
+    let out = daemon
+        .cli()
+        .args(["send-all", "--text", "x", "--dry-run"])
+        .env("ASD_SESSION", "two")
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "dry run failed: {out:?}");
+    assert!(
+        listed.contains("one") && listed.contains("three"),
+        "{listed}"
+    );
+    assert!(
+        !listed.contains("\n  two"),
+        "the caller's own session was listed as a target:\n{listed}"
+    );
+
+    // The screens are untouched by a dry run.
+    let screen = daemon.cli().args(["peek", "one"]).output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&screen.stdout).contains("sendallmark"),
+        "dry run wrote to a session"
+    );
+
+    let out = daemon
+        .cli()
+        .args(["send-all", "--text", "echo sendallmark-$((6*7))", "--enter"])
+        .env("ASD_SESSION", "two")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "send-all failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("sent to 2/2"),
+        "unexpected summary: {out:?}"
+    );
+
+    for name in ["one", "three"] {
+        let out = daemon
+            .cli()
+            .args(["wait", name, "--text", "sendallmark-42", "--timeout", "10s"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{name} never got the payload: {out:?}"
+        );
+    }
+
+    // And the skipped session really was skipped, not merely absent from the
+    // summary.
+    let screen = daemon.cli().args(["peek", "two"]).output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&screen.stdout).contains("sendallmark"),
+        "the caller's own session was written to"
+    );
+}
+
 /// Poll `cond` until it holds, or fail with `what`.
 async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);

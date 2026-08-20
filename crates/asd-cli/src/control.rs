@@ -28,42 +28,7 @@ pub async fn send(
     enter: bool,
     stdin: bool,
 ) -> anyhow::Result<()> {
-    // clap enforces the --text/--key/--stdin exclusivity; build the payload.
-    let payload: Vec<u8> = if let Some(t) = text {
-        t.into_bytes()
-    } else if let Some(list) = key {
-        let mut out = Vec::new();
-        for key_name in list.split(',').filter(|k| !k.is_empty()) {
-            match named_key(key_name) {
-                Some(bytes) => out.extend_from_slice(&bytes),
-                None => bail!("send: unknown key '{key_name}'"),
-            }
-        }
-        out
-    } else {
-        let _ = stdin; // presence only forces this branch; reading is the default
-        // Reading a terminal blocks until Ctrl-D, and this happens before the
-        // daemon is even contacted — so without a word `asd send --stdin` at a
-        // prompt looks hung rather than waiting.
-        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            eprintln!(
-                "send: reading the payload from stdin — type it, then Ctrl-D (or pipe it in)"
-            );
-        }
-        let mut buf = Vec::new();
-        tokio::io::stdin().read_to_end(&mut buf).await?;
-        if buf.len() > MAX_FRAME_LEN - 1024 {
-            bail!("send: stdin too large (max ~4 MiB)");
-        }
-        buf
-    };
-    if payload.contains(&0) {
-        bail!("send: cannot send NUL bytes");
-    }
-    let (payload, enter) = prepare_send_payload(payload, enter);
-    if payload.is_empty() && !enter {
-        bail!("send: nothing to send");
-    }
+    let (payload, enter) = send_payload("send", text, key, enter, stdin).await?;
 
     let mut c = client::connect(socket, ClientKind::Cli).await?;
     c.writer
@@ -77,6 +42,139 @@ pub async fn send(
         Some(Frame::Ack) => Ok(()),
         Some(Frame::Error { code, msg }) => Err(exit::daemon("send", code, &msg)),
         other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+/// The bytes to type and whether to follow them with Enter, from whichever of
+/// `--text` / `--key` / stdin was given. `command` only names the caller in
+/// error messages, so `send` and `send-all` report their own name.
+///
+/// Split out of [`send`] because a broadcast has to build the payload once —
+/// stdin in particular can only be read once — before it knows how many
+/// sessions it is about to write it to.
+async fn send_payload(
+    command: &str,
+    text: Option<String>,
+    key: Option<String>,
+    enter: bool,
+    stdin: bool,
+) -> anyhow::Result<(Vec<u8>, bool)> {
+    // clap enforces the --text/--key/--stdin exclusivity; build the payload.
+    let payload: Vec<u8> = if let Some(t) = text {
+        t.into_bytes()
+    } else if let Some(list) = key {
+        let mut out = Vec::new();
+        for key_name in list.split(',').filter(|k| !k.is_empty()) {
+            match named_key(key_name) {
+                Some(bytes) => out.extend_from_slice(&bytes),
+                None => bail!("{command}: unknown key '{key_name}'"),
+            }
+        }
+        out
+    } else {
+        let _ = stdin; // presence only forces this branch; reading is the default
+        // Reading a terminal blocks until Ctrl-D, and this happens before the
+        // daemon is even contacted — so without a word `asd send --stdin` at a
+        // prompt looks hung rather than waiting.
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            eprintln!(
+                "{command}: reading the payload from stdin — type it, then Ctrl-D (or pipe it in)"
+            );
+        }
+        let mut buf = Vec::new();
+        tokio::io::stdin().read_to_end(&mut buf).await?;
+        if buf.len() > MAX_FRAME_LEN - 1024 {
+            bail!("{command}: stdin too large (max ~4 MiB)");
+        }
+        buf
+    };
+    if payload.contains(&0) {
+        bail!("{command}: cannot send NUL bytes");
+    }
+    let (payload, enter) = prepare_send_payload(payload, enter);
+    if payload.is_empty() && !enter {
+        bail!("{command}: nothing to send");
+    }
+    Ok((payload, enter))
+}
+
+/// `asd send-all`: type the same thing into every session.
+///
+/// Built on the same per-session `SendInput` the single-session `send` uses,
+/// one after another over one connection — there is no broadcast frame, and
+/// there should not be: each session's write is already atomic against that
+/// session's own thread, and a daemon-side fan-out would only add a second
+/// meaning of "all" that a client could not filter.
+///
+/// The session hosting the caller is skipped unless `include_self` says
+/// otherwise. Typing into your own terminal is rarely what "all" meant, and
+/// `--key C-c` into it is actively destructive; `$ASD_SESSION` names it.
+pub async fn send_all(
+    socket: &Path,
+    text: Option<String>,
+    key: Option<String>,
+    enter: bool,
+    stdin: bool,
+    include_self: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let (payload, enter) = send_payload("send-all", text, key, enter, stdin).await?;
+
+    let mut c = client::connect(socket, ClientKind::Cli).await?;
+    c.writer.write_frame(&Frame::ListSessions).await?;
+    let sessions = match c.reader.read_frame().await? {
+        Some(Frame::SessionList { sessions }) => sessions,
+        Some(Frame::Error { code, msg }) => return Err(exit::daemon("send-all", code, &msg)),
+        other => bail!("unexpected reply: {other:?}"),
+    };
+
+    let own = std::env::var("ASD_SESSION").ok().filter(|_| !include_self);
+    let (targets, skipped): (Vec<_>, Vec<_>) = sessions
+        .iter()
+        .map(|s| s.name.clone())
+        .partition(|name| own.as_deref() != Some(name.as_str()));
+    for name in &skipped {
+        eprintln!("send-all: skipping '{name}' (this session; --include-self to include it)");
+    }
+    if targets.is_empty() {
+        eprintln!("send-all: no sessions to send to");
+        return Ok(());
+    }
+    if dry_run {
+        println!("send-all would type into {} session(s):", targets.len());
+        for name in &targets {
+            println!("  {name}");
+        }
+        return Ok(());
+    }
+
+    // One failure must not silence the rest: a session that died between the
+    // listing and the write is exactly the case a broadcast has to survive.
+    let mut failed = Vec::new();
+    for name in &targets {
+        c.writer
+            .write_frame(&Frame::SendInput {
+                name: name.clone(),
+                bytes: payload.clone(),
+                enter,
+            })
+            .await?;
+        match c.reader.read_frame().await? {
+            Some(Frame::Ack) => {}
+            Some(Frame::Error { code, msg }) => {
+                eprintln!("send-all: {name}: {msg} (code {code})");
+                failed.push(name.clone());
+            }
+            other => bail!("unexpected reply: {other:?}"),
+        }
+    }
+
+    let sent = targets.len() - failed.len();
+    println!("send-all: sent to {sent}/{} session(s)", targets.len());
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        bail!("send-all: failed for {}", failed.join(", "))
     }
 }
 
