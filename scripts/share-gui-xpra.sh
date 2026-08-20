@@ -12,6 +12,7 @@
 #   SESSION=demo        asd session name shown in the GUI
 #   SOCKET=/tmp/asd-xpra.sock   daemon UDS (kept off $XDG_RUNTIME_DIR so the
 #                               daemon and the GUI child always agree on it)
+#   MIN_QUALITY=70      floor for xpra's lossy encoder (see the note below)
 #   ASD=<auto>          path to the asd binary (defaults to target/release then
 #                       target/debug under the repo)
 #
@@ -25,6 +26,7 @@ PORT="${PORT:-14711}"
 DISPLAY_NUM="${DISPLAY_NUM:-100}"
 SESSION="${SESSION:-demo}"
 SOCKET="${SOCKET:-/tmp/asd-xpra.sock}"
+MIN_QUALITY="${MIN_QUALITY:-70}"
 DISP=":${DISPLAY_NUM}"
 
 # Resolve the asd binary: prefer a release build, fall back to debug.
@@ -114,10 +116,16 @@ start() {
   # --start (not --start-child) so the server stays up even if the GUI exits.
   # --clipboard both directions so a copy inside the GUI (which writes the
   # server-side clipboard) reaches the viewing client's clipboard.
+  # --min-quality floors the lossy encoder. xpra's own default is 1, so when a
+  # viewer falls behind acknowledging damage it compresses the picture until
+  # the backlog clears — measured down to quality 4 against a 1.75s
+  # acknowledgement latency, which turns terminal text to mush. With a floor it
+  # sheds frame rate instead, and the text stays readable.
   xpra start "$DISP" \
     --start="$ASD gui $SESSION" \
     --bind-tcp="0.0.0.0:${PORT}" --html=on --daemon=yes --sharing=yes \
     --clipboard=yes --clipboard-direction=both \
+    --min-quality="${MIN_QUALITY}" \
     --env="ASD_SOCKET=${SOCKET}" \
     --env="WGPU_BACKEND=${WGPU_BACKEND}" \
     ${VK_ICD:+--env="VK_ICD_FILENAMES=${VK_ICD}"} \
