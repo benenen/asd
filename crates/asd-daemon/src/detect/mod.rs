@@ -11,6 +11,14 @@
 //! Rules live in TOML ([`manifest`]), embedded per agent and overridable from
 //! the user's config directory. Detection is pure — screen text in, state out —
 //! so it is testable against captured screens without a pty in sight.
+//!
+//! Prior art: herdr (<https://github.com/herdrdev/herdr>, Apache-2.0) reads
+//! agent state off the terminal the same way and keeps its rules in per-agent
+//! TOML. This module follows that design, and Claude's rule set in particular
+//! owes it the ranking it uses and several of the strings it keys on. What is
+//! here is not a port: the predicates are re-expressed without regex, the
+//! region vocabulary is smaller, and every shipped rule is justified by a
+//! capture checked into `fixtures/` rather than carried over on trust.
 
 mod manifest;
 
