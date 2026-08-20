@@ -32,6 +32,10 @@ mouse-mode mirroring for full-screen apps like `vim`/`htop`.
   native copy.
 - **Running/idle status** — each session reports whether its program is actively
   producing output; the TUI highlights running rows and `asd list` shows it.
+- **Agent state** — for a recognized coding agent the daemon also reads its
+  *screen*, so a session that stopped to ask you something reports `blocked`
+  rather than merely "not producing output". `asd wait --until blocked` returns
+  on it, and the TUI marks the row.
 
 ## Architecture
 
@@ -109,6 +113,7 @@ asd peek build --scrollback                  # … with all its history above it
 asd peek build --scrollback 200              # … or just the last 200 lines of it
 asd wait build --text PASS --timeout 2m      # block until the screen contains "PASS" …
 asd wait build --idle && asd peek build      # … or until output settles (2s), then read it
+asd wait agent --until blocked               # … or until a recognized agent stops to ask you something
 asd follow build                             # stream output live, return when it settles
 asd follow build --forever                   # … or keep streaming until the session ends
 asd follow build --json                      # … as JSONL: one event object per line
@@ -282,6 +287,58 @@ warning and serves with defaults rather than refusing to start.
 
 The file is read **once, at daemon startup**, so run `asd restart` to apply an
 edit. `config.example.toml` in the repository root is a ready-to-copy template.
+
+### Agent state
+
+Alongside `running` (is output arriving?), the daemon reports what the program
+on a session's screen is *doing*, where it recognizes one: `working`, `blocked`,
+`idle`, or `unknown`. The two answer different questions — an agent stopped at
+a permission prompt is not producing output, so activity alone calls it "idle",
+which is the one word that most misdescribes a session waiting on a person.
+
+Rules live in TOML, one file per agent, shipped inside the binary for `claude`,
+`codex`, `opencode`, and `pi`. To change one — an agent's UI moved, or you want
+a rule of your own — drop a file with the same `id` in:
+
+| | |
+|---|---|
+| Linux/macOS | `~/.config/asd/agents/<agent>.toml` |
+| Windows | `%APPDATA%\asd\agents\<agent>.toml` |
+
+A user file **replaces** the built-in rules for that agent rather than merging
+with them, so a rule that has started firing wrongly can be removed and not
+just outvoted. An unparsable file is skipped with a warning and the built-in
+rules stand; a file declaring a `min_engine_version` this daemon does not
+implement is skipped too.
+
+A rule names a region of the screen (`osc_title`, `bottom_non_empty_lines(N)`,
+or `whole_screen`), the conditions to look for there, and the state a match
+means. Highest `priority` wins.
+
+```toml
+id = "claude"
+min_engine_version = 1
+
+[[rules]]
+id = "title_spinner"
+state = "working"
+priority = 1100
+region = "osc_title"
+line = [{ first_char_in = ["2800-28ff", "25d0-25d3"] }]
+
+[[rules]]
+id = "permission_prompt"
+state = "blocked"
+priority = 980
+region = "bottom_non_empty_lines(16)"
+contains = ["do you want to proceed?"]
+```
+
+Each entry in `line` must be satisfied by a *single* line (`starts_with`,
+`first_char_in`, `contains`); `contains` at the rule level may match anywhere in
+the region; `any` and `not` nest. A rule with no conditions matches nothing, so
+a misspelled key cannot pin every session to one state. `RUST_LOG=debug` makes
+the daemon log which rule produced each state change.
 
 ### Session persistence
 

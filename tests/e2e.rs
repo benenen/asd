@@ -3037,6 +3037,65 @@ async fn session_children_are_given_the_hosting_daemons_socket() {
     );
 }
 
+/// The daemon reads the screen of a recognized agent and reports what it says,
+/// end to end: rules → session thread → `SessionInfo.state` → `asd list`.
+///
+/// The session runs a shell script rather than a real agent — the point under
+/// test is the daemon's plumbing, not any agent's UI, and the rules themselves
+/// are covered against captured screens in asd-daemon. It prints a screen that
+/// Claude Code's rules classify, and renames itself to `claude` so the
+/// foreground-command lookup resolves the manifest.
+#[tokio::test]
+async fn the_daemon_reports_a_recognized_agents_screen_state() {
+    let daemon = Daemon::start("agentstate");
+
+    // exec through a copy named `claude`, so /proc reports that as the pty's
+    // foreground command — which is how the daemon picks the rule set.
+    let fake = daemon.dir.join("claude");
+    std::fs::copy("/bin/sh", &fake).unwrap();
+    let script = format!(
+        "exec {} -c 'printf \"\\033]0;\\u2733 asd\\007\";          printf \"Do you want to proceed?\\r\\n\";          printf \"1. Yes\\r\\n2. No\\r\\n\"; sleep 60'",
+        fake.display()
+    );
+    let out = daemon
+        .cli()
+        .args(["new", "agent", "--cmd", &script])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "new failed: {out:?}");
+
+    // Detection runs on the session thread behind a throttle, so the state
+    // appears shortly after the screen does rather than with it.
+    let status = |daemon: &Daemon| -> String {
+        let out = daemon.cli().args(["inspect", "agent", "--json"]).output();
+        out.map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    };
+    wait_for(
+        || status(&daemon).contains(r#""status":"blocked""#),
+        "the daemon to report the agent as blocked",
+    )
+    .await;
+
+    // `list` renders the same reading in its STATUS column.
+    let out = daemon.cli().args(["list"]).output().unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        listing
+            .lines()
+            .any(|l| l.starts_with("agent") && l.contains("blocked")),
+        "list did not show the state:\n{listing}"
+    );
+
+    // And `wait --until` returns on it without polling from the script.
+    let out = daemon
+        .cli()
+        .args(["wait", "agent", "--until", "blocked", "--timeout", "10s"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "wait --until blocked failed: {out:?}");
+}
+
 /// Poll `cond` until it holds, or fail with `what`.
 async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);

@@ -38,6 +38,8 @@ const FIXTURES: &[(&str, &str)] = &[
     ),
     ("codex-working", include_str!("fixtures/codex-working.txt")),
     ("codex-idle", include_str!("fixtures/codex-idle.txt")),
+    ("pi-idle", include_str!("fixtures/pi-idle.txt")),
+    ("pi-working", include_str!("fixtures/pi-working.txt")),
     ("shell", include_str!("fixtures/shell.txt")),
 ];
 
@@ -66,10 +68,8 @@ fn detect(command: &str, name: &str) -> (AgentState, Option<String>) {
         lines: &lines,
     };
     let detector = Detector::load(None);
-    let rule = detector
-        .matching_rule(command, &screen)
-        .map(|r| r.id.clone());
-    (detector.detect(command, &screen), rule)
+    let (state, rule) = detector.detect(command, &screen);
+    (state, rule.map(|r| r.id.clone()))
 }
 
 #[test]
@@ -149,6 +149,22 @@ fn codex_is_recognized_by_its_own_manifest() {
             "node /root/.nvm/versions/node/v24.16.0/bin/codex",
             "codex-idle"
         ),
+        (AgentState::Idle, Some("composer_ready".to_string()))
+    );
+}
+
+#[test]
+fn pi_is_read_from_its_screen_because_its_title_never_moves() {
+    // pi rebuilds its title from the app name, session and cwd, so unlike
+    // Claude there is no spinner in it to read. Both states have to come off
+    // the screen, and the status line alone cannot tell them apart — it is on
+    // screen either way, which is what the idle rule's guard is for.
+    assert_eq!(
+        detect("pi", "pi-working"),
+        (AgentState::Working, Some("turn_in_progress".to_string()))
+    );
+    assert_eq!(
+        detect("pi", "pi-idle"),
         (AgentState::Idle, Some("composer_ready".to_string()))
     );
 }
@@ -243,7 +259,7 @@ fn a_rule_with_no_conditions_never_fires() {
         lines: &lines,
     };
 
-    assert_eq!(detector.detect("ghost", &screen), AgentState::Unknown);
+    assert_eq!(detector.detect("ghost", &screen).0, AgentState::Unknown);
 }
 
 #[test]
@@ -269,7 +285,7 @@ fn a_line_predicate_with_no_conditions_never_fires() {
         lines: &lines,
     };
 
-    assert_eq!(detector.detect("ghost", &screen), AgentState::Unknown);
+    assert_eq!(detector.detect("ghost", &screen).0, AgentState::Unknown);
 }
 
 #[test]
@@ -293,25 +309,29 @@ fn a_line_predicates_conditions_must_hold_on_one_line() {
 
     let split = vec!["· a bullet".to_string(), "elapsed… (9s)".to_string()];
     assert_eq!(
-        detector.detect(
-            "ghost",
-            &Screen {
-                title: "",
-                lines: &split
-            }
-        ),
+        detector
+            .detect(
+                "ghost",
+                &Screen {
+                    title: "",
+                    lines: &split
+                }
+            )
+            .0,
         AgentState::Unknown
     );
 
     let together = vec!["· Puttering… (9m 23s · ↓ 34.3k tokens)".to_string()];
     assert_eq!(
-        detector.detect(
-            "ghost",
-            &Screen {
-                title: "",
-                lines: &together
-            }
-        ),
+        detector
+            .detect(
+                "ghost",
+                &Screen {
+                    title: "",
+                    lines: &together
+                }
+            )
+            .0,
         AgentState::Working
     );
 }
@@ -368,7 +388,7 @@ fn a_user_manifest_replaces_the_embedded_one_of_the_same_id() {
 
     // Replaced, not merged: the built-in idle rule is gone, so the user's
     // reading of that same screen is the only one left.
-    assert_eq!(detector.detect("claude", &screen), AgentState::Blocked);
+    assert_eq!(detector.detect("claude", &screen).0, AgentState::Blocked);
     assert_eq!(
         detector
             .matching_rule("claude", &screen)
@@ -390,7 +410,7 @@ fn an_unparsable_user_manifest_leaves_the_built_in_alone() {
     };
 
     assert_eq!(
-        Detector::load(Some(&dir)).detect("claude", &screen),
+        Detector::load(Some(&dir)).detect("claude", &screen).0,
         AgentState::Idle
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -492,7 +512,7 @@ fn captured_screen() {
     println!(
         "{path}: agent={:?} state={:?} rule={:?}",
         agent_id(&command),
-        detector.detect(&command, &screen),
+        detector.detect(&command, &screen).0,
         detector.matching_rule(&command, &screen).map(|r| &r.id),
     );
 }

@@ -145,6 +145,30 @@ The session list belongs to the data directory, not to the socket name. Setting
 only `ASD_SOCKET` does not isolate an experimental daemon's persistence; set a
 separate data directory as well.
 
+## Agent state
+
+`SessionInfo.running` is byte activity. `SessionInfo.state` is a reading of the
+rendered screen, and the two are kept apart on purpose: an agent blocked on a
+permission prompt produces no output, and one thinking silently produces none
+either, so activity cannot separate them.
+
+The session thread owns the detection because it owns the terminal model. It
+re-reads the screen at most every 250 ms; a batch arriving inside that window
+marks a detection as owed, and the loop's own deadline services it. Without
+that, the last batch of a turn — the one drawing the finished screen — could be
+the one skipped, leaving a session reported as working after it stopped.
+
+The agent is resolved per detection from the pty's foreground command, not
+remembered, so a session whose occupant changes stops being read with the
+previous occupant's rules. Interpreter prefixes are looked past: Codex ships as
+`node .../bin/codex`.
+
+Rules are data (`crates/asd-daemon/src/detect/manifests/*.toml`), embedded per
+agent and replaced wholesale by a user file of the same id. They are matched
+against captured screens in `crates/asd-daemon/src/detect/fixtures/`; the
+ignored `captured_screen` test runs them against a screen captured from a live
+session, which is how a manifest gets widened.
+
 ## Paths and configuration
 
 All daemon/client endpoint resolution lives in `asd_proto::paths` so both ends
@@ -157,6 +181,8 @@ use exactly the same contract.
   `\\.\pipe\asd-<USERNAME>`.
 - Unix data defaults to `~/.local/share/asd`; Windows data defaults to
   `%LOCALAPPDATA%\asd`.
+- User agent-detection manifests live in `<config_dir>/agents/*.toml`, beside
+  but distinct from `config.toml`. Read once at daemon startup, like the config.
 - Each session's child process is spawned with `ASD_SESSION` (its name at spawn
   time) and `ASD_SOCKET` (the listener the hosting daemon actually serves, which
   is not necessarily what `paths::socket_path` would resolve). The daemon owns

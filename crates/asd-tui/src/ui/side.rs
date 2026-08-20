@@ -4,7 +4,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 
-use super::{ACCENT, DIM, MUTED, ROW_TEXT_X, RULE, SELECT_BG, TEXT, truncate};
+use super::{ACCENT, ALERT, DIM, MUTED, ROW_TEXT_X, RULE, SELECT_BG, TEXT, truncate};
 use crate::App;
 use crate::keymap::KeyAction;
 
@@ -57,6 +57,15 @@ fn draw_row(
     }
 }
 
+/// Whether this row should read as "waiting on you".
+///
+/// Checked before `running`, which it can coexist with: an agent that has just
+/// drawn a permission prompt produced output a moment ago, so activity still
+/// calls it running while the screen says it has stopped and is asking.
+fn blocked(session: &asd_proto::SessionInfo) -> bool {
+    session.state == asd_proto::AgentState::Blocked
+}
+
 fn draw_title(
     buf: &mut Buffer,
     area: Rect,
@@ -86,6 +95,8 @@ fn draw_title(
     buf.set_string(area.left() + 1, y, format!("{ordinal:<2}"), ordinal_style);
     let name_style = if is_self {
         row_bg.fg(DIM)
+    } else if blocked(session) {
+        row_bg.fg(ALERT).add_modifier(Modifier::BOLD)
     } else if session.running {
         row_bg.fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
@@ -114,8 +125,17 @@ fn draw_detail(buf: &mut Buffer, area: Rect, app: &App, session: &asd_proto::Ses
     } else {
         session.title.trim().to_string()
     };
+    // A marker as well as a colour: in a sidebar of twenty rows, colour alone
+    // is easy to miss, and it is gone entirely for a colour-blind reader.
+    let label = if blocked(session) {
+        format!("! {label}")
+    } else {
+        label
+    };
     let cmd = truncate(&label, cmd_w);
-    let cmd_fg = if session.running && !is_self {
+    let cmd_fg = if blocked(session) {
+        ALERT
+    } else if session.running && !is_self {
         ACCENT
     } else {
         MUTED
@@ -191,6 +211,37 @@ mod tests {
         assert!(text_end < age_start);
         assert!(shown.ends_with('…'));
         assert!(str_width(&shown) <= budget);
+    }
+
+    fn info(state: asd_proto::AgentState, running: bool) -> asd_proto::SessionInfo {
+        asd_proto::SessionInfo {
+            name: "web".into(),
+            command: "claude".into(),
+            title: "Refactor auth".into(),
+            created_ms: 0,
+            idle_ms: 0,
+            running,
+            state,
+            attached_clients: 0,
+            pid: 1,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    #[test]
+    fn blocked_outranks_running_on_a_row() {
+        use asd_proto::AgentState;
+
+        // The screen that draws a permission prompt is output like any other,
+        // so a session can be blocked and still count as running. The row has
+        // to say the part a person can act on.
+        assert!(blocked(&info(AgentState::Blocked, true)));
+        assert!(blocked(&info(AgentState::Blocked, false)));
+        assert!(!blocked(&info(AgentState::Working, true)));
+        assert!(!blocked(&info(AgentState::Idle, false)));
+        // An ordinary shell is never marked: nothing recognized it.
+        assert!(!blocked(&info(AgentState::Unknown, false)));
     }
 
     #[test]

@@ -12,19 +12,15 @@
 //! the user's config directory. Detection is pure — screen text in, state out —
 //! so it is testable against captured screens without a pty in sight.
 
-// Nothing in the daemon calls this yet: the engine and its rules land first,
-// verified against captured screens, and the session thread starts asking it
-// for a state in the step that adds `SessionInfo.state` (a protocol change).
-// Remove this the moment that call site exists.
-#![allow(dead_code)]
-
 mod manifest;
 
 use std::path::Path;
 
-use serde::Deserialize;
 use tracing::{info, warn};
 
+/// The state vocabulary is the protocol's: the daemon is the only thing that
+/// may set it, and every client reads the same enum off the wire.
+pub use asd_proto::AgentState;
 pub use manifest::{ENGINE_VERSION, Manifest, Region, RegionText, Rule};
 
 /// Rule sets shipped with the binary. A user file of the same `id` replaces
@@ -34,24 +30,9 @@ pub use manifest::{ENGINE_VERSION, Manifest, Region, RegionText, Rule};
 const EMBEDDED: &[&str] = &[
     include_str!("manifests/claude.toml"),
     include_str!("manifests/codex.toml"),
+    include_str!("manifests/opencode.toml"),
+    include_str!("manifests/pi.toml"),
 ];
-
-/// What the program in a session is doing, as read from its screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentState {
-    /// Busy on a turn of its own — a spinner, an "esc to interrupt" hint.
-    Working,
-    /// Stopped, waiting for a person: a permission prompt, a question, a
-    /// selection. The state a session list exists to surface.
-    Blocked,
-    /// Ready for input, with nothing pending.
-    Idle,
-    /// No agent recognized, or a screen the rules deliberately decline to
-    /// classify. Never a claim that something *is* finished.
-    #[default]
-    Unknown,
-}
 
 /// The screen a detection runs against.
 pub struct Screen<'a> {
@@ -144,18 +125,21 @@ impl Detector {
         Self { manifests }
     }
 
-    /// The state `command`'s screen says it is in. `command` is the session's
-    /// foreground command as `SessionInfo.command` reports it; an agent with no
-    /// manifest, or a screen no rule claims, is [`AgentState::Unknown`].
-    pub fn detect(&self, command: &str, screen: &Screen<'_>) -> AgentState {
-        self.matching_rule(command, screen)
-            .map(|rule| rule.state)
-            .unwrap_or_default()
+    /// The state `command`'s screen says it is in, and the rule that said so.
+    /// `command` is the session's foreground command as `SessionInfo.command`
+    /// reports it; an agent with no manifest, or a screen no rule claims, is
+    /// [`AgentState::Unknown`] with no rule.
+    ///
+    /// The rule comes back with the verdict because a state nobody expected is
+    /// only debuggable if the daemon can say what produced it.
+    pub(crate) fn detect(&self, command: &str, screen: &Screen<'_>) -> (AgentState, Option<&Rule>) {
+        let rule = self.matching_rule(command, screen);
+        (rule.map(|r| r.state).unwrap_or_default(), rule)
     }
 
-    /// The winning rule, for tests and tracing. Highest priority wins; ties go
-    /// to the earlier rule in the file.
-    fn matching_rule(&self, command: &str, screen: &Screen<'_>) -> Option<&Rule> {
+    /// The winning rule. Highest priority wins; ties go to the earlier rule in
+    /// the file.
+    pub(crate) fn matching_rule(&self, command: &str, screen: &Screen<'_>) -> Option<&Rule> {
         let id = agent_id(command)?;
         let manifest = self.manifests.iter().find(|m| m.matches_agent(&id))?;
 

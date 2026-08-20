@@ -327,6 +327,7 @@ mod tests {
             created_ms,
             idle_ms: 0,
             running: false,
+            state: asd_proto::AgentState::Unknown,
             attached_clients: clients,
             pid: 0,
             cols: 80,

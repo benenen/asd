@@ -8,7 +8,8 @@ use crate::session::kill_child;
 use asd_proto::{SessionInfo, code, paths};
 use tracing::info;
 
-use crate::session::{SessionHandle, SessionMsg, spawn_session};
+use crate::detect::Detector;
+use crate::session::{SessionContext, SessionHandle, SessionMsg, spawn_session};
 
 /// Default terminal size for a create without dimensions (immediately
 /// overridden by the client's size on attach).
@@ -24,10 +25,11 @@ pub struct Registry {
     scrollback_lines: usize,
     /// Where the live session list is persisted; rewritten on every mutation.
     persist_path: PathBuf,
-    /// The listener this daemon serves, handed to every session's child as
-    /// `$ASD_SOCKET` so an `asd` command run inside a session addresses the
-    /// daemon that hosts it.
-    socket_path: PathBuf,
+    /// What every session this registry spawns needs from the daemon: its
+    /// listener (handed to each child as `$ASD_SOCKET`, so an `asd` command run
+    /// inside a session addresses the daemon hosting it) and the shared
+    /// agent-detection rules.
+    context: SessionContext,
     /// Once set (at shutdown), `persist` is a no-op — so the SIGHUP-driven
     /// session removals during shutdown don't wipe the file before restart.
     persist_frozen: bool,
@@ -46,7 +48,13 @@ impl Registry {
             next_auto: 0,
             scrollback_lines,
             persist_path,
-            socket_path,
+            context: SessionContext {
+                socket: socket_path,
+                // Loaded once per daemon: the rules are the same for every
+                // session, and re-reading the config directory per spawn would
+                // let two sessions started minutes apart disagree.
+                detector: Arc::new(Detector::load(Some(&paths::agents_dir()))),
+            },
             persist_frozen: false,
             last_persisted: Vec::new(),
         }
@@ -87,7 +95,7 @@ impl Registry {
         };
 
         let scrollback = reg.scrollback_lines;
-        let socket = reg.socket_path.clone();
+        let context = reg.context.clone();
         let handle = spawn_session(
             name.clone(),
             cmd,
@@ -95,7 +103,7 @@ impl Registry {
             DEFAULT_SIZE.0,
             DEFAULT_SIZE.1,
             scrollback,
-            socket,
+            context,
             Arc::clone(registry),
         )
         .map_err(|e| (code::INTERNAL, format!("failed to spawn session: {e}")))?;

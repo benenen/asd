@@ -2,7 +2,7 @@
 //! truncated/oversized frame error paths.
 
 use asd_proto::{
-    ClientKind, Frame, FrameReader, FrameWriter, MAX_FRAME_LEN, ProtoError, Scrollback,
+    AgentState, ClientKind, Frame, FrameReader, FrameWriter, MAX_FRAME_LEN, ProtoError, Scrollback,
     SessionInfo, TerminalAppearance, TerminalColor, decode_frame, encode_frame,
 };
 
@@ -28,6 +28,7 @@ fn all_frames() -> Vec<Frame> {
                     created_ms: 1_752_450_000_000,
                     idle_ms: 1500,
                     running: true,
+                    state: AgentState::Blocked,
                     attached_clients: 2,
                     pid: 4242,
                     cols: 120,
@@ -40,6 +41,7 @@ fn all_frames() -> Vec<Frame> {
                     created_ms: 0,
                     idle_ms: 0,
                     running: false,
+                    state: AgentState::Idle,
                     attached_clients: 0,
                     pid: 4242,
                     cols: 80,
@@ -146,6 +148,7 @@ fn all_frames() -> Vec<Frame> {
                 created_ms: 1_752_450_000_000,
                 idle_ms: 42,
                 running: true,
+                state: AgentState::Working,
                 attached_clients: 1,
                 pid: 4242,
                 cols: 100,
@@ -164,10 +167,12 @@ fn all_frames() -> Vec<Frame> {
         Frame::Unfollow { name: "s0".into() },
         Frame::FollowStatus {
             running: true,
+            state: AgentState::Working,
             idle_ms: 12,
         },
         Frame::FollowStatus {
             running: false,
+            state: AgentState::Idle,
             idle_ms: 2500,
         },
         Frame::ViewRevoked {
@@ -187,8 +192,8 @@ fn all_frames() -> Vec<Frame> {
 }
 
 #[test]
-fn protocol_version_covers_exclusive_tui_viewers() {
-    assert_eq!(asd_proto::PROTO_VERSION, 13);
+fn protocol_version_covers_screen_derived_agent_state() {
+    assert_eq!(asd_proto::PROTO_VERSION, 14);
 }
 
 #[test]

@@ -165,7 +165,7 @@ enum Cmd {
     /// Block until the session's screen matches or its output settles, then
     /// exit 0 (4 on timeout, 3 if there is no such session). Replaces
     /// sleep-and-poll loops in scripts.
-    #[command(group(clap::ArgGroup::new("wait_cond").required(true).args(["text", "idle"])))]
+    #[command(group(clap::ArgGroup::new("wait_cond").required(true).args(["text", "idle", "until"])))]
     Wait {
         /// Session name
         name: String,
@@ -175,6 +175,11 @@ enum Cmd {
         /// Until the session has produced no output for 2 seconds
         #[arg(long)]
         idle: bool,
+        /// Until the recognized agent reaches this state: working, blocked,
+        /// idle, or unknown. Screen-derived, so `blocked` means it stopped to
+        /// ask you something — which `--idle` cannot tell from being finished.
+        #[arg(long, value_name = "STATE")]
+        until: Option<asd_proto::AgentState>,
         /// Give up and exit 4 after this long (500ms, 2s, 1m, 4h, 1d)
         #[arg(long, default_value = "30s")]
         timeout: String,
@@ -332,7 +337,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                                 "{:<16} {:>8} {:>8} {:>8} {:>12}  {}  {}",
                                 s.name,
                                 format!("{}x{}", s.cols, s.rows),
-                                if s.running { "running" } else { "idle" },
+                                control::status_label(s),
                                 s.attached_clients,
                                 format_age(s.created_ms),
                                 pad_cell(title, tw),
@@ -514,8 +519,9 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             name,
             text,
             idle,
+            until,
             timeout,
-        } => control::wait(&socket, name, text, idle, timeout).await?,
+        } => control::wait(&socket, name, text, idle, until, timeout).await?,
         Cmd::Restart => {
             let c = client::restart(&socket).await?;
             println!(

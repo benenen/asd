@@ -43,6 +43,14 @@ pub fn session_list_path() -> PathBuf {
     data_dir().join("sessions.tsv")
 }
 
+/// Directory of user agent-detection manifests: `<config_dir>/agents`. Each
+/// `*.toml` in it replaces the daemon's built-in rules for the agent id it
+/// declares. Read-only to the daemon and never auto-created — a missing
+/// directory just means "the built-in rules".
+pub fn agents_dir() -> PathBuf {
+    config_dir().join("agents")
+}
+
 /// Config file: `<config_dir>/config.toml`. `ASD_CONFIG` overrides it entirely
 /// (tests, multi-instance). The daemon reads it once at startup; it is never
 /// auto-created — a missing file just means "all defaults".

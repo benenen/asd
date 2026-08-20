@@ -13,7 +13,9 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Mutex, mpsc};
 
-use asd_proto::{Frame, IDLE_SETTLE_MS, TerminalAppearance, TerminalColor, code};
+use asd_proto::{AgentState, Frame, IDLE_SETTLE_MS, TerminalAppearance, TerminalColor, code};
+
+use crate::detect::Detector;
 use asd_vt::{ColorQueryFilter, GhosttyVt, Rgb, VtBackend};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tracing::{debug, info, warn};
@@ -233,6 +235,10 @@ pub struct SessionMeta {
     /// The terminal title (OSC 0/2), exported by the session thread after each
     /// output batch; the network side reads it for `SessionInfo`.
     pub title: Mutex<String>,
+    /// What the program on the screen is doing, as the detection rules read it.
+    /// Written by the session thread — the only owner of the terminal model —
+    /// and read by the network side for `SessionInfo`.
+    pub state: Mutex<AgentState>,
     /// Unix-epoch ms of the session's last pty output, stamped by the session
     /// thread each output batch. The network side derives `idle_ms` from it for
     /// `SessionInfo` (drives `asd wait --idle`). Initialized to `created_ms`.
@@ -275,6 +281,7 @@ impl SessionHandle {
             // "Running" = recently producing output; for an agent this tracks
             // working vs done (see `SessionInfo.running`).
             running: idle_ms < asd_proto::IDLE_SETTLE_MS,
+            state: self.meta.state.lock().map(|s| *s).unwrap_or_default(),
             attached_clients: self.meta.attached_clients.load(Ordering::Relaxed),
             cols: self.meta.cols.load(Ordering::Relaxed),
             rows: self.meta.rows.load(Ordering::Relaxed),
@@ -482,6 +489,16 @@ fn proc_command(_pid: libc::pid_t) -> Option<String> {
     None
 }
 
+/// What a session needs from the daemon that owns it. One value rather than a
+/// growing tail of parameters through `spawn_session` into the session thread.
+#[derive(Clone)]
+pub struct SessionContext {
+    /// The listener this daemon serves, exported to the child as `$ASD_SOCKET`.
+    pub socket: std::path::PathBuf,
+    /// Agent-detection rules, loaded once and shared by every session.
+    pub detector: Arc<Detector>,
+}
+
 /// The environment a session's child gets on top of the daemon's own: what it
 /// is running in, and which daemon owns it.
 ///
@@ -509,7 +526,7 @@ pub fn spawn_session(
     cols: u16,
     rows: u16,
     scrollback: usize,
-    socket: std::path::PathBuf,
+    context: SessionContext,
     registry: Arc<Mutex<Registry>>,
 ) -> anyhow::Result<SessionHandle> {
     let pty = native_pty_system();
@@ -535,7 +552,7 @@ pub fn spawn_session(
         }
         None => CommandBuilder::new_default_prog(), // $SHELL
     };
-    set_session_env(&mut builder, &name, &socket);
+    set_session_env(&mut builder, &name, &context.socket);
     // Working directory: the requested one (a restart workspace restore) when it
     // still exists, else the process default ($HOME). A stale/missing dir must
     // not fail the spawn — fall back rather than error.
@@ -569,6 +586,7 @@ pub fn spawn_session(
         alive: AtomicBool::new(true),
         pty_master_fd: AtomicI32::new(master_fd),
         title: Mutex::new(String::new()),
+        state: Mutex::new(AgentState::default()),
         last_output_ms: AtomicU64::new(created_ms),
         name: Mutex::new(name.clone()),
     });
@@ -606,7 +624,8 @@ pub fn spawn_session(
             .name(format!("session-{name}"))
             .spawn(move || {
                 session_thread(
-                    name, rx, master, pty_writer, child, cols, rows, scrollback, meta, registry,
+                    name, rx, master, pty_writer, child, cols, rows, scrollback, context, meta,
+                    registry,
                 );
             })?;
     }
@@ -630,6 +649,7 @@ fn session_thread(
     cols: u16,
     rows: u16,
     scrollback: usize,
+    context: SessionContext,
     meta: Arc<SessionMeta>,
     registry: Arc<Mutex<Registry>>,
 ) {
@@ -647,30 +667,51 @@ fn session_thread(
     let mut followers: Vec<ClientSink> = Vec::new();
     // Whether the followers have already been told this quiet spell began.
     let mut idle_announced = false;
+    // Detection throttle: when the last one ran, and whether output has arrived
+    // since that still needs one.
+    let mut last_detect_ms = 0u64;
+    let mut detect_pending = false;
     info!(session = %name, pid = meta.child_pid.load(Ordering::Relaxed), "session started");
 
     loop {
-        // Going quiet is the one thing a follower needs to hear about that
-        // arrives as *no message at all*, so the wait needs a deadline of its
-        // own — but only while somebody is waiting for that news. With no
-        // followers, or once the quiet spell has been announced, block exactly
-        // as before: nothing can change until the next message.
-        let msg = if followers.is_empty() || idle_announced {
-            match rx.recv() {
+        // Two things can become true with no message arriving: a quiet spell a
+        // follower is waiting to hear about, and a detection the throttle
+        // deferred. Each contributes a deadline, and the wait takes whichever
+        // comes first; with neither pending, block exactly as before, since
+        // nothing can change until the next message.
+        let until_idle = (!followers.is_empty() && !idle_announced).then(|| {
+            let idle_ms = now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed));
+            IDLE_SETTLE_MS.saturating_sub(idle_ms).max(1)
+        });
+        let until_detect = detect_pending.then(|| {
+            DETECT_INTERVAL_MS
+                .saturating_sub(now_ms().saturating_sub(last_detect_ms))
+                .max(1)
+        });
+        let deadline = match (until_idle, until_detect) {
+            (Some(idle), Some(detect)) => Some(idle.min(detect)),
+            (idle, detect) => idle.or(detect),
+        };
+        let msg = match deadline {
+            None => match rx.recv() {
                 Ok(msg) => msg,
                 Err(_) => break,
-            }
-        } else {
-            let idle_ms = now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed));
-            let until_idle = IDLE_SETTLE_MS.saturating_sub(idle_ms).max(1);
-            match rx.recv_timeout(std::time::Duration::from_millis(until_idle)) {
+            },
+            Some(ms) => match rx.recv_timeout(std::time::Duration::from_millis(ms)) {
                 Ok(msg) => msg,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    idle_announced = notify_followers(&mut followers, &meta);
+                    if detect_pending {
+                        update_agent_state(&context.detector, &mut vt, &meta);
+                        last_detect_ms = now_ms();
+                        detect_pending = false;
+                    }
+                    if !followers.is_empty() && !idle_announced {
+                        idle_announced = notify_followers(&mut followers, &meta);
+                    }
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+            },
         };
         match msg {
             SessionMsg::PtyOutput(bytes) => {
@@ -689,6 +730,16 @@ fn session_thread(
                     && *shared != title
                 {
                     *shared = title;
+                }
+                // Read what the new screen says the program is doing, at most
+                // every DETECT_INTERVAL_MS; anything sooner is owed until the
+                // loop's deadline comes round.
+                if now_ms().saturating_sub(last_detect_ms) >= DETECT_INTERVAL_MS {
+                    update_agent_state(&context.detector, &mut vt, &meta);
+                    last_detect_ms = now_ms();
+                    detect_pending = false;
+                } else {
+                    detect_pending = true;
                 }
                 // The terminal's replies to DA/DSR-style queries must be
                 // written back to the pty, otherwise capability probes in
@@ -1010,6 +1061,8 @@ fn session_thread(
     for f in followers.drain(..) {
         f.send(Frame::FollowStatus {
             running: false,
+            // The session is gone; nothing on a screen to read any more.
+            state: AgentState::Unknown,
             idle_ms: now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed)),
         });
         f.send(Frame::Error {
@@ -1132,6 +1185,57 @@ fn apply_resize(
     meta.rows.store(rows, Ordering::Relaxed);
 }
 
+/// Shortest gap between two detections. A redrawing agent produces output
+/// continuously, so detection is throttled rather than run per batch; a batch
+/// that arrives inside the window sets a pending flag instead, and the loop
+/// wakes to service it. Without that flag the *last* batch of a turn — the one
+/// that draws the finished screen — could be the one skipped, leaving a
+/// session reported as working after it stopped.
+const DETECT_INTERVAL_MS: u64 = 250;
+
+/// The visible screen as plain-text lines: the same screen-space path `peek`
+/// renders, without the scrollback above it.
+fn screen_lines(vt: &mut GhosttyVt, rows: u16) -> Vec<String> {
+    let start = vt.scrollback_rows() as u32;
+    vt.fetch_history(start, u32::from(rows))
+        .into_iter()
+        .map(|row| String::from_utf8_lossy(&row).into_owned())
+        .collect()
+}
+
+/// Re-read the screen and publish what the program on it is doing.
+///
+/// Runs on the session thread, which exclusively owns the terminal model, so
+/// the screen it reads is never a half-drawn frame observed from outside. The
+/// agent is resolved from the pty's foreground process each time rather than
+/// remembered: a session's occupant changes when a program is started or
+/// exits, and a stale agent id would keep applying one agent's rules to
+/// another's screen.
+fn update_agent_state(detector: &Detector, vt: &mut GhosttyVt, meta: &SessionMeta) {
+    let command =
+        foreground_command(meta.pty_master_fd.load(Ordering::Relaxed)).unwrap_or_default();
+    let title = vt.title();
+    let lines = screen_lines(vt, meta.rows.load(Ordering::Relaxed));
+    let screen = crate::detect::Screen {
+        title: &title,
+        lines: &lines,
+    };
+    // The rule, not just its verdict: a state nobody expected is only
+    // debuggable if the daemon can say which rule produced it.
+    let (state, matched) = detector.detect(&command, &screen);
+    if let Ok(mut shared) = meta.state.lock()
+        && *shared != state
+    {
+        debug!(
+            session = %meta.name.lock().map(|n| n.clone()).unwrap_or_default(),
+            %state,
+            rule = matched.map(|rule| rule.id.as_str()).unwrap_or("none"),
+            "agent state changed"
+        );
+        *shared = state;
+    }
+}
+
 /// Render the session's screen as a plain-text `PeekReply` (`asd peek`). The
 /// visible screen is the bottom `rows` of screen space; `scrollback` prepends
 /// history above it — all of it, or the last N lines. Rows come from the same
@@ -1180,7 +1284,15 @@ fn render_peek(vt: &mut GhosttyVt, scrollback: asd_proto::Scrollback) -> Frame {
 fn follow_status(meta: &SessionMeta) -> (Frame, bool) {
     let idle_ms = now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed));
     let running = idle_ms < IDLE_SETTLE_MS;
-    (Frame::FollowStatus { running, idle_ms }, running)
+    let state = meta.state.lock().map(|s| *s).unwrap_or_default();
+    (
+        Frame::FollowStatus {
+            running,
+            state,
+            idle_ms,
+        },
+        running,
+    )
 }
 
 /// Send the current status to every follower, dropping the ones that are gone.

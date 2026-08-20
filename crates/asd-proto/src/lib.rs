@@ -27,7 +27,10 @@
 //! a scripted payload plus Enter one atomic session-thread operation; v13
 //! identifies TUI clients and adds `ViewRevoked`/`ViewRenamed`, allowing one
 //! interactive TUI viewer per session while ordinary attach clients remain
-//! shared and external renames keep the owner tagged correctly.
+//! shared and external renames keep the owner tagged correctly; v14 adds
+//! `SessionInfo.state` and `FollowStatus.state`, the daemon's reading of what
+//! the program on the screen is doing — distinct from `running`, which only
+//! says whether bytes are arriving.
 
 mod codec;
 pub mod paths;
@@ -38,13 +41,70 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 13;
+pub const PROTO_VERSION: u32 = 14;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
 /// otherwise. Shared so `SessionInfo.running` (daemon) and `asd wait --idle`
 /// (client) agree on one definition.
 pub const IDLE_SETTLE_MS: u64 = 2000;
+
+/// What the program in a session is doing, as the daemon reads it off the
+/// rendered screen.
+///
+/// Deliberately not the same question as [`SessionInfo::running`], which is
+/// byte activity and cannot tell a busy-but-silent program from one that has
+/// stopped to ask the user something. Only the daemon may set this: it owns
+/// the session-side terminal model, so every client sees one answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentState {
+    /// Busy on a turn of its own.
+    Working,
+    /// Stopped, waiting for a person: a permission prompt, a question, a
+    /// selection.
+    Blocked,
+    /// Ready for input, with nothing pending.
+    Idle,
+    /// Nothing recognized, or a screen the daemon declines to classify. Never
+    /// a claim that something *is* finished.
+    #[default]
+    Unknown,
+}
+
+impl AgentState {
+    /// The lowercase name, for display and for `--until` arguments.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Idle => "idle",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for AgentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AgentState {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "working" => Ok(Self::Working),
+            "blocked" => Ok(Self::Blocked),
+            "idle" => Ok(Self::Idle),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!(
+                "unknown state {other:?} (want working, blocked, idle, or unknown)"
+            )),
+        }
+    }
+}
 
 /// Per-frame cap: 4 MiB (postcard payload, excluding the 4-byte length prefix).
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -103,6 +163,13 @@ pub struct SessionInfo {
     /// "working" vs "done / waiting for input"; the title only labels *what*
     /// it is, it does not flip with activity. Daemon-derived.
     pub running: bool,
+    /// What the program on the screen is doing, where the daemon recognizes it
+    /// — an agent working, blocked on a prompt, or ready. [`AgentState::Unknown`]
+    /// for everything else, including every ordinary shell. Screen-derived, so
+    /// it answers a different question than `running` above: an agent stopped
+    /// at a permission prompt is `Blocked` and not running, while one thinking
+    /// silently is `Working` and also not running.
+    pub state: AgentState,
     pub attached_clients: u32,
     /// The session child's process id, or 0 before it is known. Lets a caller
     /// reach the process (its `/proc` entry, say) straight from `list`, instead
@@ -321,6 +388,11 @@ pub enum Frame {
     /// three ways of asking "is it done?" cannot drift apart.
     FollowStatus {
         running: bool,
+        /// What the program on the screen is doing. Carried here as well as in
+        /// `SessionInfo` so a follower watching an agent work sees it stop —
+        /// and sees *why* it stopped — without polling `list` alongside the
+        /// stream it is already reading.
+        state: AgentState,
         idle_ms: u64,
     },
     /// daemon → TUI: another `asd ui` took this session's exclusive view.

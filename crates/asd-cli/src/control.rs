@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
-use asd_proto::{ClientKind, Frame, IDLE_SETTLE_MS, MAX_FRAME_LEN, Scrollback, code};
+use asd_proto::{AgentState, ClientKind, Frame, IDLE_SETTLE_MS, MAX_FRAME_LEN, Scrollback, code};
 use asd_vt::{GhosttyVt, VtBackend};
 use tokio::io::AsyncReadExt;
 
@@ -196,7 +196,7 @@ pub async fn inspect(socket: &Path, name: String, json: bool) -> anyhow::Result<
         unreachable!("matched InspectReply above")
     };
 
-    let status = if info.running { "running" } else { "idle" };
+    let status = status_label(&info);
     let screen = if alt_screen { "alternate" } else { "primary" };
     let mouse = if mouse_tracking {
         format!("on {mouse_modes:?}")
@@ -286,14 +286,29 @@ fn fmt_idle(ms: u64) -> String {
 /// `asd wait`: block until the session's screen contains `text`, or output has
 /// been idle for [`IDLE_SETTLE_MS`], then exit 0. On timeout, exit
 /// [`exit::TIMEOUT`]. One persistent connection is polled every [`POLL_MS`].
+/// The STATUS a session reports: what the program on its screen is doing where
+/// the daemon recognizes it, and the byte-activity reading otherwise.
+///
+/// The two cannot simply be concatenated. An agent stopped at a permission
+/// prompt is not producing output, so activity alone calls it "idle" — the one
+/// word that most misdescribes a session waiting on a person.
+pub(crate) fn status_label(info: &asd_proto::SessionInfo) -> &'static str {
+    match info.state {
+        AgentState::Unknown if info.running => "running",
+        AgentState::Unknown => "idle",
+        state => state.as_str(),
+    }
+}
+
 pub async fn wait(
     socket: &Path,
     name: String,
     text: Option<String>,
     idle: bool,
+    until: Option<AgentState>,
     timeout: String,
 ) -> anyhow::Result<()> {
-    let _ = idle; // clap guarantees exactly one of --text / --idle
+    let _ = idle; // clap guarantees exactly one of --text / --idle / --until
     let timeout_ms = parse_duration(&timeout).ok_or_else(|| {
         anyhow::anyhow!("wait: bad duration '{timeout}' (use 500ms, 2s, 1m, 4h, 1d)")
     })?;
@@ -322,7 +337,13 @@ pub async fn wait(
             match c.reader.read_frame().await? {
                 Some(Frame::SessionList { sessions }) => {
                     match sessions.iter().find(|s| s.name == name) {
-                        Some(s) if s.idle_ms >= IDLE_SETTLE_MS => return Ok(()),
+                        // `--until` watches the screen-derived state; plain
+                        // `--idle` watches output activity. They are different
+                        // questions, so one never stands in for the other.
+                        Some(s) if until.is_some_and(|want| s.state == want) => return Ok(()),
+                        Some(s) if until.is_none() && s.idle_ms >= IDLE_SETTLE_MS => {
+                            return Ok(());
+                        }
                         Some(_) => {}
                         // `ListSessions` cannot fail on a missing name — it just
                         // returns a list without it — so the absence is detected
@@ -357,8 +378,13 @@ pub async fn wait(
 pub(crate) enum FollowEvent<'a> {
     /// A batch of pty output, decoded to text.
     Output(&'a str),
-    /// The session's activity flipped (or the opening status on subscribe).
-    Status { running: bool, idle_ms: u64 },
+    /// The session's activity or agent state flipped (or the opening status on
+    /// subscribe).
+    Status {
+        running: bool,
+        state: AgentState,
+        idle_ms: u64,
+    },
     /// The live screen, as it stands where the stream pauses (settle, end,
     /// timeout). This is the part a repaint keeps rewriting, so it is reported
     /// once per pause instead of once per frame.
@@ -387,8 +413,14 @@ pub(crate) fn follow_event_json(ev: &FollowEvent<'_>, time_ms: u64) -> String {
             s.push_str(r#","text":"#);
             json_string(text, &mut s);
         }
-        FollowEvent::Status { running, idle_ms } => {
-            s.push_str(&format!(r#","running":{running},"idle_ms":{idle_ms}"#));
+        FollowEvent::Status {
+            running,
+            state,
+            idle_ms,
+        } => {
+            s.push_str(&format!(
+                r#","running":{running},"state":"{state}","idle_ms":{idle_ms}"#
+            ));
         }
         FollowEvent::Exit | FollowEvent::Timeout => {}
     }
@@ -657,7 +689,7 @@ pub async fn follow(
         .await?;
 
     let mut out = std::io::stdout();
-    let mut last_running: Option<bool> = None;
+    let mut last_status: Option<(bool, AgentState)> = None;
     // The live screen is reported at every pause, but only when it has changed
     // since the last report — settle-then-exit would otherwise print it twice.
     let mut last_screen = String::new();
@@ -714,7 +746,11 @@ pub async fn follow(
                     emit(&FollowEvent::Output(&text), &mut out)?;
                 }
             }
-            Some(Frame::FollowStatus { running, idle_ms }) => {
+            Some(Frame::FollowStatus {
+                running,
+                state,
+                idle_ms,
+            }) => {
                 // Going quiet is the moment the live screen is worth reporting:
                 // whatever was being repainted has stopped moving.
                 if !running
@@ -725,9 +761,16 @@ pub async fn follow(
                     emit(&FollowEvent::Screen(&screen), &mut out)?;
                     last_screen = screen;
                 }
-                if last_running != Some(running) {
-                    last_running = Some(running);
-                    emit(&FollowEvent::Status { running, idle_ms }, &mut out)?;
+                if last_status != Some((running, state)) {
+                    last_status = Some((running, state));
+                    emit(
+                        &FollowEvent::Status {
+                            running,
+                            state,
+                            idle_ms,
+                        },
+                        &mut out,
+                    )?;
                 }
                 if until_idle && !running {
                     return Ok(());
@@ -888,7 +931,7 @@ pub fn sessions_json(sessions: &[asd_proto::SessionInfo]) -> String {
         s.push_str(r#"{"session":"#);
         json_string(&info.name, &mut s);
         s.push_str(r#","status":"#);
-        json_string(if info.running { "running" } else { "idle" }, &mut s);
+        json_string(status_label(info), &mut s);
         s.push_str(r#","command":"#);
         json_string(&info.command, &mut s);
         s.push_str(r#","title":"#);
@@ -935,6 +978,7 @@ mod tests {
             name: name.to_string(),
             command: "bash".to_string(),
             title: String::new(),
+            state: AgentState::Unknown,
             created_ms: 1_700_000_000_000,
             idle_ms: 42,
             running,
@@ -1049,6 +1093,23 @@ mod tests {
     }
 
     #[test]
+    fn a_status_event_names_the_agent_state() {
+        // What a follower watching an agent is actually waiting for: the stream
+        // says it stopped *and* that it stopped to ask something.
+        assert_eq!(
+            follow_event_json(
+                &FollowEvent::Status {
+                    running: false,
+                    state: asd_proto::AgentState::Blocked,
+                    idle_ms: 2001
+                },
+                7
+            ),
+            r#"{"event":"status","time_ms":7,"running":false,"state":"blocked","idle_ms":2001}"#
+        );
+    }
+
+    #[test]
     fn follow_events_are_one_json_object_per_line() {
         // Escapes survive: the payload is the raw pty stream, so ESC and CR
         // are normal content here, not formatting.
@@ -1060,11 +1121,12 @@ mod tests {
             follow_event_json(
                 &FollowEvent::Status {
                     running: false,
+                    state: asd_proto::AgentState::Unknown,
                     idle_ms: 2001
                 },
                 7
             ),
-            r#"{"event":"status","time_ms":7,"running":false,"idle_ms":2001}"#
+            r#"{"event":"status","time_ms":7,"running":false,"state":"unknown","idle_ms":2001}"#
         );
         assert_eq!(
             follow_event_json(&FollowEvent::Exit, 7),

@@ -1,0 +1,37 @@
+# OpenCode.
+#
+# UNVERIFIED. Nothing here was checked against a screen or against the
+# package's own strings: opencode is not installed on the machine these rules
+# were written on, so there was nothing to capture and nothing to read.
+#
+# The rules are deliberately narrow, keyed on hint strings that are distinctive
+# where they appear. That choice picks the safe failure: a rule that is wrong
+# about opencode's wording simply never fires, and an unmatched screen answers
+# `unknown`, which claims nothing. A broad rule would instead claim `idle` or
+# `working` about a screen nobody has looked at.
+#
+# Replace this from a capture rather than editing it from memory — run the
+# session, capture each state, and keep the rule the capture justifies. See
+# `captured_screen` in ../tests.rs.
+
+id = "opencode"
+version = "2026.08.20.1"
+min_engine_version = 1
+
+[[rules]]
+id = "turn_in_progress"
+state = "working"
+priority = 970
+region = "bottom_non_empty_lines(12)"
+line = [{ contains = ["esc to interrupt"] }]
+
+[[rules]]
+id = "approval_prompt"
+state = "blocked"
+priority = 900
+region = "bottom_non_empty_lines(16)"
+contains = ["esc to cancel"]
+any = [
+  { contains = ["enter to confirm"] },
+  { contains = ["enter to select"] },
+]

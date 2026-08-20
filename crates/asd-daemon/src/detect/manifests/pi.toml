@@ -1,0 +1,38 @@
+# pi (@earendil-works/pi-coding-agent).
+#
+# No title rules here, unlike Claude. pi's title is
+# `π - <session> - <cwd>` and is rebuilt from those parts alone
+# (`updateTerminalTitle` in modes/interactive/interactive-mode.js), so it never
+# carries state — reading a spinner out of it would be inventing one.
+#
+# Working is source-verified: the status indicator is set to
+# `Working... (<key> to interrupt)`.
+# Idle is capture-verified: the composer sits between two horizontal rules,
+# above a cwd line and a token/context status line that begins with `↑`.
+# There is no blocked rule. The approval dialog's wording is not in the
+# package's strings and has not been captured, and an unmatched screen answers
+# `unknown` — which claims nothing — where a guessed rule would claim something
+# false. Add one from a capture; see `captured_screen` in ../tests.rs.
+
+id = "pi"
+version = "2026.08.20.1"
+min_engine_version = 1
+
+# `Working... (Esc to interrupt)`.
+[[rules]]
+id = "turn_in_progress"
+state = "working"
+priority = 970
+region = "bottom_non_empty_lines(12)"
+line = [{ contains = ["to interrupt"] }]
+
+# The status line under the composer: token counts and context percentages.
+# It is on screen whichever state pi is in, so it means "at rest" only with
+# the working hint ruled out — which is what the guard is for.
+[[rules]]
+id = "composer_ready"
+state = "idle"
+priority = 800
+region = "bottom_non_empty_lines(6)"
+line = [{ first_char_in = ["2191"], contains = ["%"] }]
+not = [{ line = [{ contains = ["to interrupt"] }] }]
