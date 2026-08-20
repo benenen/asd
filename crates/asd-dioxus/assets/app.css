@@ -61,6 +61,9 @@ button { font-family: inherit; }
 .session-dot.attached { background:#F3B24C; }
 .session-dot.remote { border-color:#54C7DA; }
 .session-dot.remote.attached { background:#54C7DA; }
+.session-row.blocked .session-name { color:#E5595E; }
+.session-row.blocked .session-cmd { color:#E5595E; opacity:0.85; }
+.session-state { flex:none; font-size:10px; font-weight:bold; line-height:1; color:#E5595E; border:1px solid #E5595E; border-radius:50%; width:14px; height:14px; display:flex; align-items:center; justify-content:center; cursor:help; }
 .session-name { font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
 .session-rename { font:inherit; font-weight:bold; background:var(--asd-terminal-background); border:1px solid #54C7DA; border-radius:4px; color:var(--asd-terminal-foreground); padding:0 4px; outline:none; width:120px; }
 .rename-error { color:#E5595E; font-weight:bold; cursor:help; }

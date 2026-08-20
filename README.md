@@ -35,7 +35,7 @@ mouse-mode mirroring for full-screen apps like `vim`/`htop`.
 - **Agent state** — for a recognized coding agent the daemon also reads its
   *screen*, so a session that stopped to ask you something reports `blocked`
   rather than merely "not producing output". `asd wait --until blocked` returns
-  on it, and the TUI marks the row.
+  on it, and both the TUI and the GUI mark the row.
 
 ## Architecture
 

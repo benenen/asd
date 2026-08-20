@@ -237,6 +237,28 @@ impl Model {
 /// basename (a shell reads as `bash`, not `/usr/bin/bash`); anything with
 /// arguments is kept whole, and everything is capped so a long command can't
 /// blow out the row width.
+/// Class of the badge drawn on a blocked row. Named here rather than written
+/// into the markup so the test below can hold it against the stylesheet: the
+/// two live in different files, and a rename on either side would silently
+/// stop marking the rows it exists to mark.
+pub const BLOCKED_BADGE_CLASS: &str = "session-state";
+
+/// The classes a sidebar row carries: whether it is the selected session, and
+/// whether the agent in it has stopped to ask for something.
+///
+/// `blocked` is independent of `active` and of `running`: the screen that draws
+/// a permission prompt is output like any other, so a session can be blocked
+/// and still count as producing output. What the row has to show is the part a
+/// person can act on.
+pub fn session_row_class(is_active: bool, state: asd_proto::AgentState) -> &'static str {
+    match (is_active, state == asd_proto::AgentState::Blocked) {
+        (true, true) => "session-row active blocked",
+        (true, false) => "session-row active",
+        (false, true) => "session-row blocked",
+        (false, false) => "session-row",
+    }
+}
+
 pub fn short_cmd(cmd: &str) -> String {
     let cmd = cmd.trim();
     if cmd.is_empty() {
@@ -347,6 +369,37 @@ mod tests {
             port,
             auth: SshAuth::default(),
             name: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_blocked_row_classes_are_the_ones_the_stylesheet_targets() {
+        let css = include_str!("../assets/app.css");
+
+        assert!(css.contains(".session-row.blocked"));
+        assert!(css.contains(&format!(".{BLOCKED_BADGE_CLASS} ")));
+    }
+
+    #[test]
+    fn a_blocked_row_is_marked_whether_or_not_it_is_selected() {
+        use asd_proto::AgentState;
+
+        assert_eq!(
+            session_row_class(false, AgentState::Blocked),
+            "session-row blocked"
+        );
+        assert_eq!(
+            session_row_class(true, AgentState::Blocked),
+            "session-row active blocked"
+        );
+        assert_eq!(
+            session_row_class(true, AgentState::Working),
+            "session-row active"
+        );
+        // Working, idle, and an unrecognized program all read the same here:
+        // there is nothing for a person to do about any of them.
+        for state in [AgentState::Working, AgentState::Idle, AgentState::Unknown] {
+            assert_eq!(session_row_class(false, state), "session-row");
         }
     }
 

@@ -653,7 +653,8 @@ fn host_group(
                         .as_ref()
                         .filter(|r| r.host == id && r.old == name)
                         .cloned();
-                    let row = if is_active { "session-row active" } else { "session-row" };
+                    let row = crate::model::session_row_class(is_active, s.state);
+                    let blocked = s.state == asd_proto::AgentState::Blocked;
                     let sdot = if attached { "session-dot attached" } else { "session-dot" };
                     let sdot = if remote { format!("{sdot} remote") } else { sdot.to_string() };
                     rsx! {
@@ -725,6 +726,16 @@ fn host_group(
                                         }));
                                     },
                                     "{name}"
+                                }
+                            }
+                            if blocked {
+                                // A glyph as well as the row's colour: colour
+                                // alone is missable in a long list and absent
+                                // for a colour-blind reader.
+                                span {
+                                    class: crate::model::BLOCKED_BADGE_CLASS,
+                                    title: "waiting for you — this agent asked something",
+                                    "!"
                                 }
                             }
                             span { class: "session-age", "{age}" }
