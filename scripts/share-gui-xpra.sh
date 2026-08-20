@@ -13,6 +13,8 @@
 #   SOCKET=/tmp/asd-xpra.sock   daemon UDS (kept off $XDG_RUNTIME_DIR so the
 #                               daemon and the GUI child always agree on it)
 #   MIN_QUALITY=70      floor for xpra's lossy encoder (see the note below)
+#   IME_ENGINE=libpinyin        ibus engine used for Chinese input
+#   IME_PACKAGE=ibus-libpinyin  package installed when that engine is missing
 #   ASD=<auto>          path to the asd binary (defaults to target/release then
 #                       target/debug under the repo)
 #
@@ -27,6 +29,8 @@ DISPLAY_NUM="${DISPLAY_NUM:-100}"
 SESSION="${SESSION:-demo}"
 SOCKET="${SOCKET:-/tmp/asd-xpra.sock}"
 MIN_QUALITY="${MIN_QUALITY:-70}"
+IME_ENGINE="${IME_ENGINE:-libpinyin}"
+IME_PACKAGE="${IME_PACKAGE:-ibus-libpinyin}"
 DISP=":${DISPLAY_NUM}"
 
 # Resolve the asd binary: prefer a release build, fall back to debug.
@@ -75,6 +79,76 @@ ensure_session() {
   fi
 }
 
+# Read the ibus environment for this display. xpra starts one ibus-daemon and
+# one dbus session per display, so the addresses have to come from that daemon
+# rather than from this shell.
+ibus_env() {
+  local pidfile="/run/xpra/${DISPLAY_NUM}/ibus-daemon.pid" pid
+  [ -r "$pidfile" ] || return 1
+  pid="$(cat "$pidfile")"
+  [ -r "/proc/$pid/environ" ] || return 1
+  tr '\0' '\n' < "/proc/$pid/environ" | grep -E '^DBUS_SESSION_BUS_ADDRESS=' | head -n1
+}
+
+# Make Chinese typing work on this display.
+#
+# xpra forwards key events, not composed text. A character composed by the
+# viewer's own input method has no keycode in this display's keymap: it arrives
+# as keycode 8 with NoSymbol and is dropped before any application sees it. So
+# composition has to happen on this side, in the ibus that xpra starts.
+ensure_ime() {
+  # ibus scans /usr/share/ibus/component at startup, so the engine has to be
+  # installed before the daemon that will serve it.
+  if [ ! -e "/usr/share/ibus/component/${IME_ENGINE}.xml" ]; then
+    echo "  installing ${IME_PACKAGE} (needed to type Chinese)"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$IME_PACKAGE" >/dev/null 2>&1; then
+      echo "  warning: could not install ${IME_PACKAGE}; Chinese input will not work" >&2
+      return 0
+    fi
+  fi
+
+  local dbus=""
+  for _ in $(seq 1 30); do
+    dbus="$(ibus_env || true)"
+    [ -n "$dbus" ] && break
+    sleep 0.5
+  done
+  if [ -z "$dbus" ]; then
+    echo "  warning: xpra's ibus never came up; Chinese input will not work" >&2
+    return 0
+  fi
+
+  export DISPLAY="$DISP"
+  export "${dbus?}"
+
+  # An engine installed after this daemon started is invisible until it rescans.
+  if ! ibus list-engine 2>/dev/null | grep -qE "^[[:space:]]+${IME_ENGINE} -"; then
+    ibus restart >/dev/null 2>&1 || true
+    sleep 3
+  fi
+
+  # Start in English. libpinyin otherwise boots in Chinese mode and swallows
+  # ordinary shell input -- a plain "ls " comes back as Chinese words. A single
+  # Shift tap switches to Chinese and back, which is the usual convention.
+  if [ "$IME_ENGINE" = "libpinyin" ]; then
+    gsettings set com.github.libpinyin.ibus-libpinyin.libpinyin init-chinese false 2>/dev/null || true
+  fi
+  gsettings set org.freedesktop.ibus.general preload-engines \
+    "['xkb:us::eng', '${IME_ENGINE}']" 2>/dev/null || true
+  ibus engine "$IME_ENGINE" >/dev/null 2>&1 || true
+
+  # xpra runs ibus with --panel=disable, which leaves nothing to draw the
+  # candidate list: the engine still composes, but blind. Run the stock panel so
+  # homophones can be picked. ibus's own switch hotkey stays unused because xpra
+  # does not forward Super.
+  local panel_pid="/run/xpra/${DISPLAY_NUM}/ibus-panel.pid"
+  if [ -r "$panel_pid" ] && kill -0 "$(cat "$panel_pid")" 2>/dev/null; then
+    return 0
+  fi
+  setsid /usr/libexec/ibus-ui-gtk3 >/dev/null 2>&1 &
+  echo $! > "$panel_pid"
+}
+
 print_access() {
   local ip; ip="$(lan_ip || true)"; ip="${ip:-<sandbox-ip>}"
   cat <<EOF
@@ -90,6 +164,10 @@ print_access() {
   B) Native xpra client (smoother; xpra tunnels over SSH itself):
        xpra attach ssh://<your-login>@${ip}/${DISPLAY_NUM}
 
+  Chinese input: tap Shift to switch the terminal between English and pinyin.
+                 Composition happens on this host, so the viewer's own input
+                 method should stay off.
+
   Stop sharing:  scripts/share-gui-xpra.sh stop
 EOF
 }
@@ -97,6 +175,7 @@ EOF
 start() {
   if xpra_running; then
     echo "xpra already sharing on ${DISP} (port ${PORT})."
+    ensure_ime
     print_access
     return 0
   fi
@@ -137,6 +216,8 @@ start() {
     sleep 0.5
   done
   if ss -ltn 2>/dev/null | grep -qE "[:.]${PORT}\b"; then
+    echo "setting up Chinese input..."
+    ensure_ime
     print_access
   else
     echo "error: xpra did not come up — see /run/xpra/${DISPLAY_NUM}/server.log" >&2
@@ -146,6 +227,11 @@ start() {
 
 stop() {
   echo "stopping xpra on ${DISP} (the asd daemon/session keep running)..."
+  local panel_pid="/run/xpra/${DISPLAY_NUM}/ibus-panel.pid"
+  if [ -r "$panel_pid" ]; then
+    kill "$(cat "$panel_pid")" 2>/dev/null || true
+    rm -f "$panel_pid"
+  fi
   xpra stop "$DISP" 2>/dev/null || echo "  (no xpra server on ${DISP})"
   echo "  to also drop the session: $ASD kill $SESSION"
 }
@@ -155,6 +241,14 @@ status() {
   xpra list 2>/dev/null | grep -E "${DISP}\b" || echo "  no xpra on ${DISP}"
   echo "=== port ${PORT} ==="
   ss -ltn 2>/dev/null | grep -E "[:.]${PORT}\b" || echo "  not listening"
+  echo "=== input method ==="
+  local dbus; dbus="$(ibus_env || true)"
+  if [ -z "$dbus" ]; then
+    echo "  no ibus on ${DISP}"
+  else
+    ( export DISPLAY="$DISP"; export "${dbus?}"
+      echo "  engine: $(ibus engine 2>/dev/null || echo '<none active>')" )
+  fi
   echo "=== asd sessions ($SOCKET) ==="
   "$ASD" list 2>&1 || true
 }
