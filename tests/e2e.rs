@@ -2978,6 +2978,10 @@ fn attach_to_pty(mut cmd: Command, slave: std::fs::File) -> Command {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // TIOCSCTTY and the ioctl request parameter do not share a type
+            // on every Unix. The conversion is load-bearing on macOS and an
+            // identity on Linux, where clippy would otherwise reject it.
+            #[allow(clippy::useless_conversion)]
             if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY.into(), 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
