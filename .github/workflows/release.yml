@@ -153,7 +153,7 @@ jobs:
   # Native Windows build — the full binary (CLI + daemon + TUI + GUI), same
   # deliverable as Linux and macOS. This used to ship GUI-only, back when the
   # terminal side was Unix-only; the Named Pipe transport and the platform/
-  # modules changed that, and windows-check.yml builds all three flavors on
+  # modules changed that, and windows-check.yml builds both flavors on
   # every push to prove it. russh → aws-lc-sys needs NASM to assemble its
   # crypto; asd-vt needs Zig for the vendored ghostty.
   windows:

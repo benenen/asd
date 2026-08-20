@@ -69,10 +69,7 @@ cargo build --release
 # → target/release/asd
 
 # Server / headless: CLI + daemon + TUI, no GUI (won't link WebKitGTK)
-cargo build --release --no-default-features --features local
-
-# Client-only: GUI, no PTY/daemon
-cargo build --release --no-default-features --features dioxus
+cargo build --release --no-default-features
 ```
 
 Prebuilt binaries are produced by CI (currently green) for:

@@ -32,7 +32,7 @@ rustup target add x86_64-pc-windows-gnu
 env -i PATH="$PATH" HOME="$HOME" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" \
   LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast \
   cargo check --target x86_64-pc-windows-gnu \
-    --no-default-features --features local
+    --no-default-features
 ```
 
 The clean `env -i` is required. A polluted shell environment or stdin can

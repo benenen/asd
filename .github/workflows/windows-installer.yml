@@ -15,8 +15,7 @@ on:
         default: full
         options:
           - full # CLI + embedded daemon + TUI + GUI (default features)
-          - local # CLI + embedded daemon + TUI, no GUI (no WebView2 needed)
-          - gui # GUI only — no PTY/process management at all
+          - headless # CLI + embedded daemon + TUI, no GUI (no WebView2 needed)
       profile:
         description: "Cargo profile"
         type: choice
@@ -43,9 +42,8 @@ jobs:
         run: |
           # Feature flags per flavor. "full" takes the crate's default features.
           $features = switch ("${{ inputs.flavor }}") {
-            "full"  { "" }
-            "local" { "--no-default-features --features local" }
-            "gui"   { "--no-default-features --features dioxus" }
+            "full"     { "" }
+            "headless" { "--no-default-features" }
           }
           $profileFlag = if ("${{ inputs.profile }}" -eq "release") { "--release" } else { "" }
           # debug builds land in target/<triple>/debug, release in .../release.
@@ -72,25 +70,24 @@ jobs:
         with:
           key: ${{ inputs.flavor }}-${{ inputs.profile }}
 
-      # Zig builds the vendored libghostty-vt (asd-vt). The GUI-only flavor
-      # renders in ghostty-web inside the WebView and never links asd-vt.
+      # Zig builds the vendored libghostty-vt (asd-vt), which every flavor
+      # links through asd-cli.
       - name: Install Zig (vendored libghostty-vt)
-        if: inputs.flavor != 'gui'
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
       # asd-dioxus's build.rs shells out to npm (esbuild vendor bundle), and its
       # russh dependency pulls aws-lc-sys, which assembles its crypto with NASM.
-      # Both are GUI-only, so the `local` flavor skips them.
+      # Both are GUI-only, so the `headless` flavor skips them.
       - name: Install Node (asd-dioxus build.rs runs npm)
-        if: inputs.flavor != 'local'
+        if: inputs.flavor != 'headless'
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install NASM (aws-lc-sys, pulled by russh)
-        if: inputs.flavor != 'local'
+        if: inputs.flavor != 'headless'
         uses: ilammy/setup-nasm@v1
 
       - name: Build
@@ -109,16 +106,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/$env:TARGET/${{ steps.cfg.outputs.out_dir }}/asd.exe" $stage
           Copy-Item LICENSE, README.md $stage
-          # Any flavor that links asd-vt imports ghostty-vt.dll (the vendored
-          # ghostty builds as a DLL, and the crate's "static" link resolves to
-          # its import library), so the DLL is part of the payload. The gui
-          # flavor renders in ghostty-web and never links asd-vt, hence no DLL.
-          if ("${{ inputs.flavor }}" -ne "gui") {
-            $dll = Get-ChildItem -Path "target/$env:TARGET/${{ steps.cfg.outputs.out_dir }}/build" `
-              -Recurse -Filter ghostty-vt.dll -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $dll) { throw "ghostty-vt.dll missing — asd.exe would not start" }
-            Copy-Item $dll.FullName $stage
-          }
+          # Every flavor links asd-vt and so imports ghostty-vt.dll (the
+          # vendored ghostty builds as a DLL, and the crate's "static" link
+          # resolves to its import library) — the DLL is part of the payload.
+          $dll = Get-ChildItem -Path "target/$env:TARGET/${{ steps.cfg.outputs.out_dir }}/build" `
+            -Recurse -Filter ghostty-vt.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) { throw "ghostty-vt.dll missing — asd.exe would not start" }
+          Copy-Item $dll.FullName $stage
           # Fail loudly rather than shipping an installer with no program in it.
           if (-not (Test-Path (Join-Path $stage "asd.exe"))) { throw "asd.exe missing from payload" }
           "dir=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append

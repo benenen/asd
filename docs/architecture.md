@@ -15,10 +15,11 @@ Distribution is intentionally a single executable. The workspace root is both
 `[workspace]` and `[package]`; `src/main.rs` combines library crates through
 features:
 
-- `local` brings in `asd-cli`, `asd-tui`, `asd-daemon`, and portable-pty.
+- `asd-cli`, `asd-tui`, `asd-daemon`, and portable-pty are unconditional.
 - `dioxus` brings in `asd-dioxus`, Dioxus Desktop, and ghostty-web.
 - `gui` is a compatibility alias for `dioxus`.
-- the default is `local` + `dioxus`.
+- `dioxus` is the default and the only feature; `--no-default-features`
+  yields the headless-server binary.
 
 The root package contains composition and dispatch, not duplicated business
 logic. The daemon is still launched as `asd daemon`, including self-healing

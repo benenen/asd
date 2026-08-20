@@ -60,16 +60,11 @@ jobs:
             zig: true # asd-vt
             node: true # asd-dioxus build.rs runs npm (esbuild bundle)
             nasm: true # aws-lc-sys, pulled by russh
-          - flavor: local # CLI + daemon + TUI, no GUI
-            features: "--no-default-features --features local"
+          - flavor: headless # CLI + daemon + TUI, no GUI
+            features: "--no-default-features"
             zig: true
             node: false
             nasm: false
-          - flavor: gui # GUI only; ghostty-web renders in the WebView, so no asd-vt
-            features: "--no-default-features --features dioxus"
-            zig: false
-            node: true
-            nasm: true
     steps:
       - uses: actions/checkout@v4
 

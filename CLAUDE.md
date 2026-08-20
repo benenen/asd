@@ -11,11 +11,10 @@ a symlink to it. Keep this file short: durable implementation details belong in
 shpool than tmux: one session owns exactly one PTY; there are no panes or
 windows inside a session.
 
-The repository intentionally ships one root-package `asd` executable. Feature
-`local` provides CLI/TUI/daemon/PTY support; `dioxus` provides the desktop GUI
-(`gui` is an alias); the default enables both. Bare `asd` opens the GUI. A
-headless server uses `--no-default-features --features local`; a GUI-only
-client uses `--no-default-features --features dioxus`.
+The repository intentionally ships one root-package `asd` executable. The
+CLI/TUI/daemon/PTY side is always built in; the only feature is `dioxus`
+(`gui` is an alias), which adds the desktop GUI and is on by default. Bare
+`asd` opens the GUI. A headless server uses `--no-default-features`.
 
 ## Non-negotiable rules
 

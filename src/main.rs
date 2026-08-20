@@ -1,12 +1,12 @@
-//! The single `asd` binary: the terminal-mux CLI + embedded daemon (`local`
-//! feature) and the GUI combined into one executable.
+//! The single `asd` binary: the terminal-mux CLI + embedded daemon and the GUI
+//! combined into one executable.
 //!
 //! Running `asd` with no subcommand opens the GUI; the terminal commands
-//! (`new` / `attach` / `list` / `kill` / `daemon` / `restart`) live under
-//! `local`. The GUI (`dioxus` feature: Dioxus Desktop + ghostty-web) stays a
+//! (`new` / `attach` / `list` / `kill` / `daemon` / `restart`) are always built
+//! in. The GUI (`dioxus` feature: Dioxus Desktop + ghostty-web) stays a
 //! separate library, as does `asd-cli` (which pulls portable-pty via the
 //! daemon) — only this binary combines them. Build with
-//! `--no-default-features --features dioxus` for a PTY-free, GUI-only client.
+//! `--no-default-features` for a GUI-free binary that links no WebView.
 
 fn main() {
     if let Err(e) = run() {
@@ -19,20 +19,14 @@ fn main() {
 }
 
 /// Exit status for a failed run. The CLI knows which failures a caller can act
-/// on; a GUI-only build has no such distinctions to draw.
-#[cfg(feature = "local")]
+/// on, so it owns the mapping.
 fn failure_status(err: &anyhow::Error) -> i32 {
     asd_cli::exit_status(err)
 }
 
-#[cfg(not(feature = "local"))]
-fn failure_status(_err: &anyhow::Error) -> i32 {
-    1
-}
-
-/// Full build: the CLI owns the command surface and calls back into the GUI
-/// launcher for a no-subcommand / `gui` invocation.
-#[cfg(feature = "local")]
+/// The CLI owns the command surface and calls back into the GUI launcher for a
+/// no-subcommand / `gui` invocation. Without the `dioxus` feature there is no
+/// launcher to hand it, and those invocations report that instead.
 fn run() -> anyhow::Result<()> {
     #[cfg(feature = "dioxus")]
     let gui: Option<asd_cli::GuiLauncher> = Some(launch_gui);
@@ -40,21 +34,6 @@ fn run() -> anyhow::Result<()> {
     let gui: Option<asd_cli::GuiLauncher> = None;
     asd_cli::run(gui)
 }
-
-/// GUI-only build: no CLI/daemon, so there is no command surface to parse —
-/// bare `asd`, or `asd [gui] <session>`, opens the window, and anything else
-/// on the command line is read as a session name. Every shipped binary is a
-/// full build; this is for a hand-built PTY-free client.
-#[cfg(all(not(feature = "local"), feature = "dioxus"))]
-fn run() -> anyhow::Result<()> {
-    let session = std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with('-') && a != "gui");
-    launch_gui(session)
-}
-
-#[cfg(not(any(feature = "local", feature = "dioxus")))]
-compile_error!("enable at least one of the `local` or `dioxus` features");
 
 #[cfg(feature = "dioxus")]
 fn launch_gui(session: Option<String>) -> anyhow::Result<()> {

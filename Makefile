@@ -11,10 +11,10 @@
 #   make clean
 #
 # Note on `make win`: cross-compiling from Linux is best-effort. The GUI links
-# wgpu, which does not cross-compile to Windows from Linux reliably (it targets
-# MSVC natively). For a dependable Windows build, run `cargo build --release`
-# on Windows, or build gui-only: `make win WIN_FEATURES="--no-default-features
-# --features gui"`. Both need `cross` + Docker + Zig in the container.
+# a system webview, which does not cross-compile to Windows from Linux reliably.
+# For a dependable Windows build, run `cargo build --release` on Windows, or
+# drop the GUI: `make win WIN_FEATURES="--no-default-features"`. Both need
+# `cross` + Docker + Zig in the container.
 #
 # Behind a proxy? Copy .env.example to .env and set your proxy there — `make`
 # loads it and forwards it into the cross container's Zig download.
@@ -41,7 +41,7 @@ VERSION := $(shell awk -F'"' '/^\[workspace\.package\]/{f=1} f&&/^version/{print
 # aarch64 Linux ships CLI-only: wgpu (the GUI) can't be cross-compiled cheaply.
 ARM_TARGET := aarch64-unknown-linux-gnu
 # Windows x64. Feature set is overridable, e.g.
-#   make win WIN_FEATURES="--no-default-features --features gui"
+#   make win WIN_FEATURES="--no-default-features"
 WIN_TARGET   := x86_64-pc-windows-gnu
 WIN_FEATURES ?=
 
@@ -62,7 +62,7 @@ build: ## Build the full asd binary (CLI + daemon + GUI) for the host
 	$(CARGO) build --release
 
 cli: ## Build the CLI/daemon-only binary (no GUI) for the host
-	$(CARGO) build --release --no-default-features --features local
+	$(CARGO) build --release --no-default-features
 
 install: build ## Install the binary to $(PREFIX)/bin, stripped (honors PREFIX, DESTDIR)
 	install -d "$(BINDIR)"
@@ -97,7 +97,7 @@ _cross-proxy:
 	fi
 
 cross-arm: _cross-proxy ## Cross-build + package the aarch64 CLI archive (needs `cross` + Zig)
-	env $(CROSS_DOCKER_ENV) cross build --release --no-default-features --features local --target $(ARM_TARGET)
+	env $(CROSS_DOCKER_ENV) cross build --release --no-default-features --target $(ARM_TARGET)
 	@$(MAKE) --no-print-directory archive BIN=target/$(ARM_TARGET)/release/asd NAME=asd-$(VERSION)-$(ARM_TARGET)-cli
 
 deb: build ## Build a Debian .deb (host arch, full binary; needs `cargo deb`)

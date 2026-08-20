@@ -26,19 +26,17 @@ assets = [
 ]
 
 [features]
-default = ["local", "dioxus"]
-# Terminal side: CLI subcommands + embedded daemon (pulls in portable-pty).
-local = ["dep:asd-cli"]
-# The GUI: Dioxus Desktop + ghostty-web in a webview. Build
-# `--no-default-features --features dioxus` (or `gui`) for a PTY-free,
-# GUI-only client (the basis of a viable Windows client).
+default = ["dioxus"]
+# The GUI: Dioxus Desktop + ghostty-web in a webview. Drop it with
+# `--no-default-features` for a headless-server binary — CLI + embedded daemon
+# + TUI, with no webview linked. The terminal side is not optional.
 dioxus = ["dep:asd-dioxus"]
 # Compat alias for older build scripts/CI: "the default GUI".
 gui = ["dioxus"]
 
 [dependencies]
 anyhow = { workspace = true }
-asd-cli = { workspace = true, optional = true }
+asd-cli = { workspace = true }
 asd-dioxus = { workspace = true, optional = true }
 
 [dev-dependencies]

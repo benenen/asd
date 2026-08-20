@@ -66,8 +66,8 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "{#PayloadDir}\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-; Every flavor that links asd-vt imports this; the gui flavor does not stage it,
-; hence skipifsourcedoesntexist rather than a hard requirement.
+; Every flavor links asd-vt and imports this, and the build stages it; the flag
+; only tolerates a hand-assembled payload that left it out.
 Source: "{#PayloadDir}\ghostty-vt.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#PayloadDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#PayloadDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist

@@ -84,7 +84,7 @@ cargo run -- gui demo              # preselect session "demo"
 cargo test -p asd-dioxus           # model + settings unit tests
 ```
 
-Linux needs WebKitGTK (`libwebkit2gtk-4.1-dev` to build, the runtime lib to run); macOS/Windows use the system webview. Servers that only need the daemon/CLI should build `--no-default-features --features local` — no GUI libraries linked.
+Linux needs WebKitGTK (`libwebkit2gtk-4.1-dev` to build, the runtime lib to run); macOS/Windows use the system webview. Servers that only need the daemon/CLI should build `--no-default-features` — no GUI libraries linked.
 
 [dioxus]: https://dioxuslabs.com
 [ghostty-web]: https://www.npmjs.com/package/ghostty-web
