@@ -1,0 +1,5 @@
+# The agent-detection fixtures reproduce a captured terminal screen verbatim,
+# so the spaces trailing a shell prompt are content rather than sloppiness.
+# Exempt them from git's whitespace checks; `git diff --check` flags them
+# otherwise.
+crates/asd-daemon/src/detect/fixtures/*.txt -whitespace
