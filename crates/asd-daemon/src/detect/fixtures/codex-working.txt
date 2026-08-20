@@ -1,0 +1,7 @@
+#title:
+▌ Working on the migration
+
+  • ran cargo check
+  • editing crates/asd-daemon/src/session.rs
+
+  Esc to interrupt

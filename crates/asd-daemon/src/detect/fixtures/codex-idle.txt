@@ -1,0 +1,7 @@
+#title: ins | 019fffc3-d981-7b50-8a66-0d
+⚠ Heads up, you have less than 10% of your weekly limit left.
+
+
+› Summarize recent commits
+
+  gpt-5.6-sol xhigh · ~/workspace/ins · Context 0% used · weekly 4% left

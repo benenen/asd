@@ -1,0 +1,5 @@
+#title: me@box: ~/workspace/asd
+$ cargo test --workspace
+   Compiling asd v0.1.12
+    Finished test profile
+$ 

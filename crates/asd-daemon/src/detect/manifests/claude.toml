@@ -1,0 +1,150 @@
+# Claude Code.
+#
+# Every rule here was checked against a screen captured from a running session
+# (`asd peek`), which is the only way to write one that holds: two assumptions
+# that read fine on paper did not survive the first capture —
+#
+#   * "? for shortcuts" is not dependable. A user statusline replaces that line.
+#   * "esc to interrupt" is not dependable either. It is absent in at least one
+#     current build/mode, where a running turn shows only its spinner line:
+#     `· Puttering… (9m 23s · ↓ 34.3k tokens)`.
+#
+# So the signals are ranked: the title first (the program sets it deliberately,
+# and it survives any repaint), then the spinner line, then the dialogs, and the
+# prompt line last. Rules are matched against lowercased text, so the strings
+# here are lowercase. Rule ids are referenced by ../tests.rs.
+
+id = "claude"
+version = "2026.08.20.1"
+aliases = ["claude-code"]
+min_engine_version = 1
+
+# --- working ---------------------------------------------------------------
+
+# The spinner in the terminal title: braille (<= 2.1.227) or the half-circles
+# the newer indicator cycles through. Verified against a live session, and
+# ranked highest because the title cannot be caught mid-draw the way a screen
+# can.
+[[rules]]
+id = "title_spinner"
+state = "working"
+priority = 1100
+region = "osc_title"
+line = [{ first_char_in = ["2800-28ff", "25d0-25d3"] }]
+
+# The hint under a running turn, where the build shows it.
+[[rules]]
+id = "turn_in_progress"
+state = "working"
+priority = 970
+region = "bottom_non_empty_lines(12)"
+line = [{ contains = ["esc to interrupt"] }]
+
+# The spinner line itself, for the builds that show no interrupt hint. The
+# glyph cycles, so it is matched as a class; the ellipsis and the opening
+# parenthesis of the elapsed time have to be on that same line, which is what
+# keeps ordinary bulleted prose from reading as a status line.
+[[rules]]
+id = "spinner_line"
+state = "working"
+priority = 960
+region = "bottom_non_empty_lines(12)"
+line = [
+  { first_char_in = ["002a", "00b7", "2722", "2733", "2736", "273b", "273d"], contains = ["… ("] },
+]
+
+# A turn that has handed off and is waiting on its own children still counts as
+# working — nobody has to do anything about it.
+[[rules]]
+id = "waiting_on_background_work"
+state = "working"
+priority = 955
+region = "bottom_non_empty_lines(6)"
+line = [{ contains = ["waiting for", "to finish"] }]
+
+# --- declined --------------------------------------------------------------
+
+# The transcript viewer replays an old screen, hints and all. Claim it so the
+# rules below cannot read a recorded dialog as a live one.
+[[rules]]
+id = "transcript_viewer"
+state = "unknown"
+priority = 1000
+region = "bottom_non_empty_lines(4)"
+contains = ["showing detailed transcript"]
+
+# --- blocked ---------------------------------------------------------------
+
+# The tool-permission dialog: a question plus a numbered choice list.
+[[rules]]
+id = "permission_prompt"
+state = "blocked"
+priority = 980
+region = "bottom_non_empty_lines(16)"
+contains = ["do you want to proceed?"]
+any = [
+  { line = [{ contains = ["1.", "yes"] }] },
+  { line = [{ contains = ["2.", "no"] }] },
+  { contains = ["don't ask again"] },
+]
+
+# Forms and pickers: the ones that say how to leave and how to commit.
+[[rules]]
+id = "confirmation_form"
+state = "blocked"
+priority = 975
+region = "bottom_non_empty_lines(16)"
+contains = ["esc to cancel"]
+any = [
+  { contains = ["enter to confirm"] },
+  { contains = ["enter to select"] },
+  { contains = ["to navigate"] },
+]
+
+# Anything else that asked and is sitting on a selection cursor. Last resort:
+# the phrasing is broad, so it is only trusted when the cursor proves a choice
+# is actually pending.
+[[rules]]
+id = "open_question"
+state = "blocked"
+priority = 850
+region = "bottom_non_empty_lines(16)"
+line = [{ starts_with = ["❯"] }]
+any = [
+  { contains = ["do you want to"] },
+  { contains = ["would you like to"] },
+  { contains = ["waiting for permission"] },
+]
+
+# --- idle ------------------------------------------------------------------
+
+# The prompt at rest. The cursor is the reliable half — the hint line beside it
+# is whatever the user's statusline says — and the guards are what separate
+# "ready" from "ready-looking but mid-dialog", since the prompt is drawn in
+# both. Every phrase a blocked rule keys on appears here.
+[[rules]]
+id = "prompt_box_ready"
+state = "idle"
+priority = 950
+region = "bottom_non_empty_lines(8)"
+any = [
+  { line = [{ starts_with = ["❯"] }] },
+  { contains = ["? for shortcuts"] },
+]
+not = [
+  { contains = ["esc to interrupt"] },
+  { contains = ["esc to cancel"] },
+  { contains = ["do you want to"] },
+  { contains = ["would you like to"] },
+  { contains = ["waiting for permission"] },
+]
+
+# The title's at-rest marker, for a screen the rules above did not recognize (a
+# full-screen diff, a plugin's own UI). Lowest priority: it says the program is
+# not mid-turn, not that the screen is a prompt.
+[[rules]]
+id = "title_at_rest"
+state = "idle"
+priority = 250
+region = "osc_title"
+line = [{ first_char_in = ["2733"] }]

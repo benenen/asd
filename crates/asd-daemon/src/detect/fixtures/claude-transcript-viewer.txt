@@ -1,0 +1,7 @@
+#title: ✳ asd
+● An earlier turn, replayed.
+
+  Do you want to proceed?
+  ❯ 1. Yes
+
+  Showing detailed transcript · Ctrl+O to toggle

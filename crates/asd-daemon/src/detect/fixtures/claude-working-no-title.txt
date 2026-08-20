@@ -1,0 +1,11 @@
+#title: Claude Code
+● I'll run the workspace test suite.
+
+· Puttering… (9m 23s · ↓ 34.3k tokens)
+  ⎿  Tip: Get pinged on your phone when long tasks finish
+
+────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────
+  cwd: ~/w/m/asd | Ctx Used: ▓▓▓░░░░░░░ 28.0% | ⎇ main | (+176,-100)
+  ⏵⏵ bypass permissions on · 1 shell · ← 2 agents

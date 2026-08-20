@@ -11,6 +11,7 @@
 
 mod config;
 mod conn;
+mod detect;
 mod platform;
 mod registry;
 mod server;

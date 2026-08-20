@@ -1,0 +1,14 @@
+#title: ✳ asd
+● I'll run the workspace test suite.
+
+╭──────────────────────────────────────────────────────────────────╮
+│ Bash command                                                     │
+│                                                                  │
+│   cargo test --workspace                                         │
+│   Run the workspace test suite                                   │
+│                                                                  │
+│ Do you want to proceed?                                          │
+│ ❯ 1. Yes                                                         │
+│   2. Yes, and don't ask again for cargo test commands            │
+│   3. No, and tell Claude what to do differently (esc)            │
+╰──────────────────────────────────────────────────────────────────╯

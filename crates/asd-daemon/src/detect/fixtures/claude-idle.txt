@@ -1,0 +1,9 @@
+#title: ✳ Claude Code
+● Done — the workspace build is green.
+
+────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────
+  cwd: ~/w/m/asd | Ctx Used: ▓▓▓░░░░░░░ 28.0% | ⎇ main | (+176,-100)
+  In: 452 | Out: 207.4k | Total: 35.6M | Cached: 35.4M
+  ⏵⏵ bypass permissions on · ← 2 agents
