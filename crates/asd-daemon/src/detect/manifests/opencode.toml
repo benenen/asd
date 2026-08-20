@@ -1,37 +1,53 @@
 # OpenCode.
 #
-# UNVERIFIED. Nothing here was checked against a screen or against the
-# package's own strings: opencode is not installed on the machine these rules
-# were written on, so there was nothing to capture and nothing to read.
+# Written from captures of opencode 1.18.18 taken on this machine: the start
+# screen, the prompt after a completed turn, a running turn, and a permission
+# dialog. Every rule below is justified by one of the fixtures in ../fixtures.
 #
-# The rules are deliberately narrow, keyed on hint strings that are distinctive
-# where they appear. That choice picks the safe failure: a rule that is wrong
-# about opencode's wording simply never fires, and an unmatched screen answers
-# `unknown`, which claims nothing. A broad rule would instead claim `idle` or
-# `working` about a screen nobody has looked at.
+# The terminal title is not usable for state here. It reads "OpenCode" until the
+# first turn names the session, then keeps that name -- so it says the same
+# thing whether the agent is working or waiting. Everything keys on the
+# statusline instead.
 #
-# Replace this from a capture rather than editing it from memory — run the
-# session, capture each state, and keep the rule the capture justifies. See
-# `captured_screen` in ../tests.rs.
+# To widen this: run the session, capture the state, and add the rule the
+# capture justifies -- see `captured_screen` in ../tests.rs.
 
 id = "opencode"
-version = "2026.08.20.1"
+version = "2026.08.20.2"
 min_engine_version = 1
 
+# A permission dialog takes over the prompt box. It outranks the running turn
+# for the same reason Claude's does: a dialog is exactly where "still busy" and
+# "needs a person" have to come apart. Verified against a capture.
+[[rules]]
+id = "permission_prompt"
+state = "blocked"
+priority = 980
+region = "bottom_non_empty_lines(16)"
+contains = ["permission required"]
+any = [
+  { contains = ["allow once"] },
+  { contains = ["allow always"] },
+]
+
+# The interrupt hint opens the statusline for the whole turn. It reads
+# "esc interrupt" -- no "to", unlike the other agents. Verified against a
+# capture.
 [[rules]]
 id = "turn_in_progress"
 state = "working"
 priority = 970
 region = "bottom_non_empty_lines(12)"
-line = [{ contains = ["esc to interrupt"] }]
+line = [{ contains = ["esc interrupt"] }]
 
+# The composer at rest. "ctrl+p commands" closes the statusline on every screen
+# that has one -- a running turn included -- so it identifies the TUI, not the
+# state; the absence of the interrupt hint is what makes this idle. Verified
+# against two captures: the start screen and the prompt after a turn.
 [[rules]]
-id = "approval_prompt"
-state = "blocked"
-priority = 900
-region = "bottom_non_empty_lines(16)"
-contains = ["esc to cancel"]
-any = [
-  { contains = ["enter to confirm"] },
-  { contains = ["enter to select"] },
-]
+id = "composer_ready"
+state = "idle"
+priority = 800
+region = "bottom_non_empty_lines(8)"
+contains = ["ctrl+p commands"]
+not = [{ contains = ["esc interrupt"] }]

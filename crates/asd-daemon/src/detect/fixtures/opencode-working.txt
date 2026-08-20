@@ -1,0 +1,24 @@
+#title: OC | Python FizzBuzz implementation and ex...
+     A red-black tree is a self-balancing binary search tree where each
+     node has a color attribute (red or black) that enforces constraints
+     keeping the tree approximately balanced.
+
+     Red-Black Properties (must hold after every operation)
+
+     1. Every node is red or black.
+     2. The root is black.
+     3. Every leaf (NIL sentinel) is black.
+     4. If a node is red, both children are black.
+     5. All paths from a node to its descendant leaves contain the same
+        number of black nodes.
+
+     Insertion Process                                                       ▄
+                                                                             █
+     ▣  Build · MiMo V2.5 Free                                               █
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · MiMo V2.5 Free OpenCode Zen
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                        19.8K (10%)  ctrl+p commands

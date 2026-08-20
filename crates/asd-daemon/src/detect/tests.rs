@@ -40,6 +40,19 @@ const FIXTURES: &[(&str, &str)] = &[
     ("codex-idle", include_str!("fixtures/codex-idle.txt")),
     ("pi-idle", include_str!("fixtures/pi-idle.txt")),
     ("pi-working", include_str!("fixtures/pi-working.txt")),
+    (
+        "opencode-idle-splash",
+        include_str!("fixtures/opencode-idle-splash.txt"),
+    ),
+    ("opencode-idle", include_str!("fixtures/opencode-idle.txt")),
+    (
+        "opencode-working",
+        include_str!("fixtures/opencode-working.txt"),
+    ),
+    (
+        "opencode-blocked-permission",
+        include_str!("fixtures/opencode-blocked-permission.txt"),
+    ),
     ("shell", include_str!("fixtures/shell.txt")),
 ];
 
@@ -165,6 +178,42 @@ fn pi_is_read_from_its_screen_because_its_title_never_moves() {
     );
     assert_eq!(
         detect("pi", "pi-idle"),
+        (AgentState::Idle, Some("composer_ready".to_string()))
+    );
+}
+
+#[test]
+fn opencode_is_read_from_its_statusline() {
+    // opencode names the session from the first turn and then keeps that title
+    // for good, so three of these four captures carry the same one. The title
+    // cannot separate the states; the statusline is all there is.
+    assert_eq!(
+        detect("opencode", "opencode-working"),
+        (AgentState::Working, Some("turn_in_progress".to_string()))
+    );
+    // Two idle screens with nothing in common but the statusline: the splash
+    // shown before any turn, and the prompt a finished turn leaves behind.
+    assert_eq!(
+        detect("opencode", "opencode-idle-splash"),
+        (AgentState::Idle, Some("composer_ready".to_string()))
+    );
+    assert_eq!(
+        detect("opencode", "opencode-idle"),
+        (AgentState::Idle, Some("composer_ready".to_string()))
+    );
+    // The dialog outranks the turn it interrupts: opencode drops the interrupt
+    // hint while it is up, but the state has to be `blocked` either way.
+    assert_eq!(
+        detect("opencode", "opencode-blocked-permission"),
+        (AgentState::Blocked, Some("permission_prompt".to_string()))
+    );
+    // It ships as `opencode.exe` even on Linux, so the `.exe` strip is what
+    // makes the manifest apply at all.
+    assert_eq!(
+        detect(
+            "/root/.nvm/versions/node/v24.16.0/lib/node_modules/opencode-ai/bin/opencode.exe",
+            "opencode-idle"
+        ),
         (AgentState::Idle, Some("composer_ready".to_string()))
     );
 }
