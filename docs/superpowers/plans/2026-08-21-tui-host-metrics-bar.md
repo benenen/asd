@@ -984,7 +984,10 @@ cargo clippy --offline --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 git diff --check
 cargo test --offline -p asd-proto
-cargo check --offline --workspace --target x86_64-pc-windows-gnu
+# The workspace-wide form pulls the GUI, whose aws-lc-sys needs a mingw
+# gcc this box does not have. Use the narrow command the repo documents
+# in docs/cross-platform-development.md, which covers asd-daemon:
+cargo check --offline --target x86_64-pc-windows-gnu --no-default-features
 ```
 
 Expected: all clean. Fix anything that is not before continuing.
