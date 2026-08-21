@@ -70,18 +70,34 @@ New module `crates/asd-daemon/src/metrics.rs`.
 
 A worker starts with the daemon and wakes on a fixed 1000 ms timer. It holds a
 `sysinfo::System` and a `sysinfo::Networks`, refreshes only what is used
-(`refresh_cpu_usage`, `refresh_memory`, `Networks::refresh`), and publishes the
-result into an `Arc<RwLock<Option<HostSample>>>`.
+(`refresh_cpu_usage`, `refresh_memory`, `Networks::refresh`), and stores the
+result on `Registry` (field `host_metrics`,
+`crates/asd-daemon/src/registry.rs`) rather than in a dedicated
+`Arc<RwLock<Option<HostSample>>>`. The registry is already an
+`Arc<Mutex<Registry>>` that flows to every connection handler in `conn.rs`, and
+the accept loop only ever passes that one registry along — a second `Arc` would
+have had to be threaded through that same platform-specific accept loop for no
+benefit, so the reading lives on the type that already makes the trip.
 
-The connection handler answers `HostMetrics` by taking a read lock and cloning.
-**It never samples.** That is the whole point of the worker: the sampling
-cadence belongs to the worker's own timer, so no number of clients and no
-fast-polling script can accelerate it. This is structural, and stronger than a
-cache with a TTL.
+The connection handler answers `HostMetrics` by locking the registry and
+cloning the stored reading (`Registry::host_metrics`). **It never samples.**
+That is the whole point of the worker: the sampling cadence belongs to the
+worker's own timer, so no number of clients and no fast-polling script can
+accelerate it. This is structural, and stronger than a cache with a TTL.
+Sampling itself — the `sysinfo` refreshes, which walk `/proc` — happens outside
+the registry lock; only the finished `HostSample` is written in under it, so
+session operations behind that same mutex never wait on a sample.
 
 CPU percentage needs two readings to difference. `sysinfo` does that internally
 between refreshes, but requires at least `MINIMUM_CPU_UPDATE_INTERVAL` between
-them; the fixed 1000 ms cadence satisfies it.
+them; the fixed 1000 ms cadence satisfies it. That differencing also needs a
+starting baseline, not just spacing: the worker calls
+`system.refresh_cpu_usage()` once before entering the loop to establish one.
+Without that priming call, sysinfo's first-ever `refresh_cpu_usage` reports the
+average usage since boot rather than a one-second delta, so the first sample
+after every daemon start would be a meaningless figure instead of a real
+reading. `Networks::new_with_refreshed_list` primes the network baseline the
+same way, at construction.
 
 Network rate divides the byte deltas `Networks::refresh` reports by the
 *measured* elapsed time, not by an assumed 1000 ms — a delayed thread would
@@ -102,8 +118,12 @@ tick also writes `Frame::HostMetrics`; `HostMetricsReply` becomes an
 `Ev::Metrics(Option<HostSample>)`. `App` gains `metrics: Option<HostSample>`,
 set from that event, marking the frame dirty. `bar.rs` renders it.
 
-Polling at 1500 ms against a 1000 ms sampler means the bar never shows a reading
-more than about a second old.
+Polling at 1500 ms against a 1000 ms sampler bounds `sampled_age_ms` on the
+*reply* to about a second, but that is not the same bound on what is on
+*screen*. The bar only replaces its value once per poll, so a reading that was
+a second old the moment it arrived can then sit displayed for another 1500 ms
+before the next poll overwrites it — up to about 2.5 s old in the worst case,
+not "about a second".
 
 ## Bar layout
 
