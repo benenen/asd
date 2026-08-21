@@ -200,7 +200,9 @@ generated from the same keymap registry so they stay in sync.
 - `r` — rename the selected session (input modal; `Enter` confirms, `Esc` cancels; empty and duplicate names are rejected)
 - `x` — kill the selected session (asks a `y`/`n` confirmation first)
 - `b` — hide/show the sidebar (the pane goes full-width when hidden; showing it restores the current width)
-- `s` — hide/show the bottom status bar
+- `s` — hide/show the bottom status bar, which besides the clock shows the
+  daemon host's CPU, memory, and network throughput (each behind its own icon,
+  dropping right to left as the terminal narrows)
 - `R` — reconnect · `q` — quit · `Ctrl+A Ctrl+A` — send a literal `Ctrl+A` to the session
 
 Mouse: click a sidebar row to switch (or its `x` to kill), drag in the pane to select (copied via OSC 52), and **drag the sidebar↔pane divider** to resize the sidebar (clamped to a sensible min/max). `Shift+PageUp`/`PageDown` page the scrollback.
