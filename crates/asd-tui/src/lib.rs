@@ -1232,6 +1232,10 @@ impl App {
                 self.view_revoked = None;
                 self.vt = None;
                 self.pane_cache = None;
+                // Otherwise the bar keeps showing the last CPU/memory/network
+                // reading, frozen, beside a clock that is local and keeps
+                // ticking -- a stale number that looks live.
+                self.metrics = None;
             }
             Ev::Sessions(list) => {
                 // A list reply can overtake the session thread's ViewRenamed
@@ -1837,6 +1841,9 @@ impl App {
         self.notice = None;
         self.active = None;
         self.vt = None;
+        // A stale reading from the old daemon must not survive the reconnect
+        // and be shown as if it were current.
+        self.metrics = None;
         self.dirty = true;
     }
 }
