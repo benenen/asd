@@ -776,17 +776,29 @@ Add to `mod tests` in `bar.rs`:
     }
 
     #[test]
-    fn without_a_sample_the_bar_looks_exactly_as_it_did_before() {
+    fn without_a_sample_only_the_clock_is_shown() {
+        // No reading yet: the clock is the whole left-hand group beyond the
+        // hint. It keeps its icon — the icon marks the segment, not the
+        // presence of data — so this line differs from the pre-feature bar by
+        // exactly that icon and nothing else.
         let line = rendered(160, None);
-        assert!(
-            line.starts_with(" Keybinds: Ctrl+A  2026-08-14 09:05:07"),
-            "bar: {line}"
-        );
+        assert!(line.contains("🕐"), "bar: {line}");
+        assert!(line.contains("2026-08-14 09:05:07"), "bar: {line}");
         assert!(!line.contains('%'), "bar: {line}");
+        assert!(!line.contains("💻"), "bar: {line}");
+        assert!(!line.contains("🌐"), "bar: {line}");
     }
 ```
 
-Then update the two existing tests, which call `draw_text` with the old six-argument signature: add `None` as the new last argument to both `bottom_bar_places_the_full_server_time_after_keybinds` and `narrow_bottom_bar_keeps_daemon_status_before_the_clock`. Their assertions are unchanged — with no sample, the bar must render exactly as it does today.
+Then update the two existing tests, which call `draw_text` with the old six-argument signature: add `None` as the new last argument to both `bottom_bar_places_the_full_server_time_after_keybinds` and `narrow_bottom_bar_keeps_daemon_status_before_the_clock`.
+
+`bottom_bar_places_the_full_server_time_after_keybinds` asserts an exact prefix that predates this feature. The clock now carries an icon, so that prefix genuinely changed and the assertion must move with it — it should expect the hint, the two-space gap, the clock icon, a space, then the timestamp. Build the expected string from those parts rather than pasting a guess.
+
+**A caution on this one.** Adjusting an assertion because the rendering deliberately changed is correct. Weakening one because it is inconvenient is not, and the two look alike from inside the task. The rule here: this test may gain the icon in its expected prefix and nothing else. If anything beyond the icon has to change for it to pass — a dropped `starts_with`, a shortened timestamp, a loosened `contains` — the rendering is wrong. Stop and report it instead.
+
+`narrow_bottom_bar_keeps_daemon_status_before_the_clock` asserts that at 42 columns the clock is dropped and the hint and status survive. That behaviour is unchanged, so its assertions stand as they are.
+
+One implementation detail you will meet: a double-width emoji occupies two cells, and ratatui leaves the second cell's symbol empty. A test that rebuilds the line by concatenating every cell's symbol therefore sees the emoji followed by nothing extra. Confirm what the buffer actually holds and write the expectation against that — but never reshape the rendering to produce a tidier string.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -933,7 +945,7 @@ fn draw_left(
 }
 ```
 
-Note the behaviour this preserves: with `metrics == None` the segment list holds only the clock, so the bar renders exactly as it does today, and the existing tests still pass unchanged.
+Note what this does and does not preserve: with `metrics == None` the segment list holds only the clock, so nothing metric-shaped appears — but the clock carries its icon either way, so the no-sample line is the pre-feature line plus that icon. That is the one deliberate change to how the bar looks when there is no reading.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
