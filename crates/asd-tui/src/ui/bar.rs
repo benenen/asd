@@ -2,9 +2,9 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 
-use super::{ACCENT, ALERT, DIM, OK, RULE, str_width, truncate};
+use super::{ACCENT, ALERT, DIM, MUTED, OK, RULE, str_width, truncate};
 use crate::App;
 use crate::keymap::{KeyAction, KeyHint};
 
@@ -102,6 +102,42 @@ fn session_status(count: usize, scroll: usize) -> String {
     }
 }
 
+/// Binary units the way `free -h` writes them: one decimal below ten, none
+/// above. The bar is short on columns, so nothing is padded.
+fn fmt_bytes(bytes: u64) -> String {
+    const UNITS: [(u64, char); 3] = [(1 << 30, 'G'), (1 << 20, 'M'), (1 << 10, 'K')];
+    for (scale, suffix) in UNITS {
+        if bytes >= scale {
+            let value = bytes as f64 / scale as f64;
+            return if value < 10.0 {
+                format!("{value:.1}{suffix}")
+            } else {
+                format!("{}{suffix}", value.round() as u64)
+            };
+        }
+    }
+    format!("{bytes}B")
+}
+
+/// A whole percent, clamped. The sampler already clamps; this is the second
+/// belt, because printing "103%" reads like a bug rather than a busy host.
+fn fmt_pct(pct: u8) -> String {
+    format!("{}%", pct.min(100))
+}
+
+/// Green until the host is working, amber while it is, red once it is out of
+/// room. Only CPU and memory get this: there is no throughput that is "bad",
+/// so colouring the network would raise an alarm that means nothing.
+fn load_color(pct: u8) -> Color {
+    if pct >= 90 {
+        ALERT
+    } else if pct >= 70 {
+        ACCENT
+    } else {
+        OK
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +198,38 @@ mod tests {
         assert!(line.contains("Keybinds: Ctrl+A"), "bar: {line}");
         assert!(line.contains("● 3 sessions"), "bar: {line}");
         assert!(!line.contains("2026-08-14"), "bar: {line}");
+    }
+
+    #[test]
+    fn bytes_read_the_way_free_h_writes_them() {
+        // One decimal below ten, none above, so a value never jitters between
+        // widths as it crosses a round number.
+        assert_eq!(fmt_bytes(6_549_123_456), "6.1G");
+        assert_eq!(fmt_bytes(33_285_996_544), "31G");
+        assert_eq!(fmt_bytes(1_258_291), "1.2M");
+        assert_eq!(fmt_bytes(348_160), "340K");
+        // Below a kibibyte there is no unit worth scaling to.
+        assert_eq!(fmt_bytes(512), "512B");
+        assert_eq!(fmt_bytes(0), "0B");
+    }
+
+    #[test]
+    fn a_percent_is_printed_whole_and_never_over_a_hundred() {
+        assert_eq!(fmt_pct(0), "0%");
+        assert_eq!(fmt_pct(12), "12%");
+        assert_eq!(fmt_pct(100), "100%");
+        // The sampler clamps, but a value that got past it should read as a
+        // busy host rather than a number that looks like a bug.
+        assert_eq!(fmt_pct(103), "100%");
+    }
+
+    #[test]
+    fn load_colour_escalates_at_the_documented_thresholds() {
+        assert_eq!(load_color(0), OK);
+        assert_eq!(load_color(69), OK);
+        assert_eq!(load_color(70), ACCENT);
+        assert_eq!(load_color(89), ACCENT);
+        assert_eq!(load_color(90), ALERT);
+        assert_eq!(load_color(100), ALERT);
     }
 }
