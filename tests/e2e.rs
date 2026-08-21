@@ -3204,7 +3204,11 @@ async fn host_metrics_are_served_from_the_daemon() {
         }
     };
     // u8 is unsigned, so only the upper bound is worth asserting.
-    assert!(sample.cpu_pct <= 100, "cpu out of range: {}", sample.cpu_pct);
+    assert!(
+        sample.cpu_pct <= 100,
+        "cpu out of range: {}",
+        sample.cpu_pct
+    );
     assert!(
         sample.mem_total_bytes > 0,
         "a host with no memory is not real"

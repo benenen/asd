@@ -168,8 +168,7 @@ fn draw_left(
         // not the stripe's `RULE`, which punches a hole in the bar. Re-apply
         // the stripe background across the icon's full width to close it.
         for col in 0..icon_width {
-            if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(x + col, area.top()))
-            {
+            if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(x + col, area.top())) {
                 cell.set_style(Style::new().bg(RULE));
             }
         }
@@ -379,8 +378,7 @@ mod tests {
             let cell = buf.cell(Position::new(x, 0)).expect("cell in bounds");
             if ["🕐", "💻", "🧠", "🌐"].contains(&cell.symbol()) {
                 assert_eq!(
-                    cell.bg,
-                    RULE,
+                    cell.bg, RULE,
                     "icon cell at {x} lost the stripe background: {cell:?}"
                 );
                 let notch = buf
