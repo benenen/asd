@@ -80,6 +80,9 @@ pub enum Ev {
     },
     /// A `Rename` completed (`Ok`) or was rejected by the daemon (`Err(msg)`).
     Renamed(Result<(), String>),
+    /// The daemon host's latest resource reading, or `None` while its sampler
+    /// is still priming.
+    Metrics(Option<asd_proto::HostSample>),
 }
 
 /// An actor event tagged with the connection generation that produced it.
@@ -177,6 +180,9 @@ async fn drive(
                 if writer.write_frame(&Frame::ListSessions).await.is_err() {
                     return Err("list write failed".to_string());
                 }
+                if writer.write_frame(&Frame::HostMetrics).await.is_err() {
+                    return Err("metrics write failed".to_string());
+                }
             }
             frame = reader.read_frame() => match frame {
                 Ok(Some(Frame::SessionList { sessions })) => {
@@ -187,6 +193,9 @@ async fn drive(
                     }
                     listed_sessions = sessions.clone();
                     let _ = ev_tx.send(Ev::Sessions(sessions));
+                }
+                Ok(Some(Frame::HostMetricsReply { sample })) => {
+                    let _ = ev_tx.send(Ev::Metrics(sample));
                 }
                 Ok(Some(Frame::Snapshot { vt: dump })) => {
                     if let Some(name) = at.on_snapshot() {

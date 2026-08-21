@@ -479,6 +479,9 @@ pub(crate) struct App {
     /// Declarative global/PREFIX bindings and their pending leader state.
     pub keymap: Keymap,
     pub now_ms: u64,
+    /// The daemon host's latest resource reading, for the bottom bar. `None`
+    /// before the first reply arrives.
+    pub metrics: Option<asd_proto::HostSample>,
 
     /// Session named on the command line, consumed by the first auto-select.
     preferred: Option<String>,
@@ -734,6 +737,7 @@ fn event_loop(
         modal: None,
         keymap: Keymap::default(),
         now_ms: now_ms(),
+        metrics: None,
         preferred,
         terminal_appearance: probe.appearance,
         startup_input: probe.input,
@@ -1289,6 +1293,10 @@ impl App {
                         self.select(name);
                     }
                 }
+            }
+            Ev::Metrics(sample) => {
+                self.metrics = sample;
+                self.dirty = true;
             }
             Ev::Created(name) => self.select(name),
             Ev::Bytes {
