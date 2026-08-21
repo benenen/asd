@@ -12,6 +12,7 @@
 mod config;
 mod conn;
 mod detect;
+mod metrics;
 mod platform;
 mod registry;
 mod server;

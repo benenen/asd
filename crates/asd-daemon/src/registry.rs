@@ -36,6 +36,9 @@ pub struct Registry {
     /// What was last written to `persist_path`, so the periodic cwd refresh can
     /// skip the write when nothing moved.
     last_persisted: Vec<crate::store::SessionState>,
+    /// The sampler's most recent reading and when it was taken. `None` until
+    /// its first tick.
+    host_metrics: Option<(asd_proto::HostSample, std::time::Instant)>,
 }
 
 impl Registry {
@@ -57,6 +60,7 @@ impl Registry {
             },
             persist_frozen: false,
             last_persisted: Vec::new(),
+            host_metrics: None,
         }
     }
 
@@ -265,5 +269,20 @@ impl Registry {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// Store a fresh reading from the sampler.
+    pub fn set_host_metrics(&mut self, sample: asd_proto::HostSample) {
+        self.host_metrics = Some((sample, std::time::Instant::now()));
+    }
+
+    /// The latest reading with its age filled in. The age is computed here, at
+    /// read time, so it measures how stale the reading is when it reaches a
+    /// client rather than when it was stored.
+    pub fn host_metrics(&self) -> Option<asd_proto::HostSample> {
+        self.host_metrics.map(|(sample, at)| asd_proto::HostSample {
+            sampled_age_ms: u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            ..sample
+        })
     }
 }

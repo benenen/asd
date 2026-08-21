@@ -66,6 +66,7 @@ pub(super) async fn serve(socket_path: PathBuf) -> anyhow::Result<()> {
     registry.lock().unwrap().persist();
 
     spawn_cwd_refresh(Arc::clone(&registry));
+    crate::metrics::spawn(Arc::clone(&registry));
 
     // Platform-specific listener + accept loop.
     crate::platform::serve_connections(socket_path, registry).await?;

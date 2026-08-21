@@ -12,6 +12,7 @@ asd-proto = { workspace = true }
 asd-vt = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true }
+sysinfo = { version = "0.38.4", default-features = false, features = ["system", "network"] }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
