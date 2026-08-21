@@ -25,7 +25,71 @@ pub(super) fn draw(buf: &mut Buffer, area: Rect, app: &App) {
         &server_time_at(app.now_ms),
         &status,
         status_style,
+        app.metrics,
     );
+}
+
+/// One run of the left-hand group: a dim icon and a coloured value. The icon
+/// carries no colour of its own so the eye lands on the number.
+struct Segment {
+    icon: &'static str,
+    value: String,
+    value_style: Style,
+}
+
+impl Segment {
+    fn width(&self) -> usize {
+        // The clock carries no icon, so it is the value alone; every metric
+        // segment is icon + one space + value.
+        if self.icon.is_empty() {
+            str_width(&self.value)
+        } else {
+            str_width(self.icon) + 1 + str_width(&self.value)
+        }
+    }
+}
+
+/// The metric segments in display order. Dropping from the end of this vector
+/// is what produces the documented narrow-terminal order: network, then
+/// memory, then CPU, then the clock.
+///
+/// The clock has no icon: it is the one segment shown whether or not a host
+/// sample exists, so it must render byte-for-byte the way it always has —
+/// only the new metric segments after it get an icon of their own.
+fn segments(server_time: &str, metrics: Option<asd_proto::HostSample>) -> Vec<Segment> {
+    let mut out = vec![Segment {
+        icon: "",
+        value: server_time.to_string(),
+        value_style: Style::new().fg(MUTED).bg(RULE),
+    }];
+    let Some(m) = metrics else {
+        return out;
+    };
+    out.push(Segment {
+        icon: "💻",
+        value: fmt_pct(m.cpu_pct),
+        value_style: Style::new().fg(load_color(m.cpu_pct)).bg(RULE),
+    });
+    let mem_pct = if m.mem_total_bytes == 0 {
+        0
+    } else {
+        ((m.mem_used_bytes as f64 / m.mem_total_bytes as f64) * 100.0).round() as u8
+    };
+    out.push(Segment {
+        icon: "🧠",
+        value: format!(
+            "{}/{}",
+            fmt_bytes(m.mem_used_bytes),
+            fmt_bytes(m.mem_total_bytes)
+        ),
+        value_style: Style::new().fg(load_color(mem_pct)).bg(RULE),
+    });
+    out.push(Segment {
+        icon: "🌐",
+        value: format!("↓{} ↑{}", fmt_bytes(m.net_rx_bps), fmt_bytes(m.net_tx_bps)),
+        value_style: Style::new().fg(MUTED).bg(RULE),
+    });
+    out
 }
 
 fn status(app: &App) -> (String, Style) {
@@ -60,27 +124,61 @@ fn draw_text(
     server_time: &str,
     status: &str,
     status_style: Style,
+    metrics: Option<asd_proto::HostSample>,
 ) {
     let status = truncate(status, (area.width / 2) as usize);
     let x = area.right().saturating_sub(str_width(&status) as u16 + 1);
     buf.set_string(x, area.top(), status, status_style);
     let left_width = x.saturating_sub(area.left() + 2) as usize;
-    draw_left(buf, area, hint, server_time, left_width);
+    draw_left(buf, area, hint, server_time, metrics, left_width);
 }
 
-fn draw_left(buf: &mut Buffer, area: Rect, hint: &KeyHint, server_time: &str, max_width: usize) {
-    let style = if hint.prefix_active {
+fn draw_left(
+    buf: &mut Buffer,
+    area: Rect,
+    hint: &KeyHint,
+    server_time: &str,
+    metrics: Option<asd_proto::HostSample>,
+    max_width: usize,
+) {
+    let hint_style = if hint.prefix_active {
         Style::new().fg(ACCENT).bg(RULE)
     } else {
         Style::new().fg(DIM).bg(RULE)
     };
-    let with_time = format!("{}  {server_time}", hint.text);
-    let line = if str_width(&with_time) <= max_width {
-        with_time
-    } else {
-        truncate(&hint.text, max_width)
-    };
-    buf.set_string(area.left() + 1, area.top(), &line, style);
+    let icon_style = Style::new().fg(DIM).bg(RULE);
+
+    // Two spaces separate the keybind hint from the first segment and each
+    // segment from the next, matching the gap the clock has always had.
+    const GAP: usize = 2;
+    let mut segs = segments(server_time, metrics);
+    let hint_width = str_width(&hint.text);
+    while !segs.is_empty()
+        && hint_width + segs.iter().map(|s| GAP + s.width()).sum::<usize>() > max_width
+    {
+        segs.pop();
+    }
+
+    let mut x = area.left() + 1;
+    if segs.is_empty() {
+        // Nothing else fits: the hint alone, truncated, as it has always been.
+        buf.set_string(x, area.top(), truncate(&hint.text, max_width), hint_style);
+        return;
+    }
+    buf.set_string(x, area.top(), &hint.text, hint_style);
+    x += hint_width as u16;
+    for seg in &segs {
+        x += GAP as u16;
+        // The clock's empty icon means no glyph and no separating space —
+        // the two-space GAP is the whole gap, matching the pre-existing
+        // "hint  time" spacing exactly.
+        if !seg.icon.is_empty() {
+            buf.set_string(x, area.top(), seg.icon, icon_style);
+            x += str_width(seg.icon) as u16 + 1;
+        }
+        buf.set_string(x, area.top(), &seg.value, seg.value_style);
+        x += str_width(&seg.value) as u16;
+    }
 }
 
 fn server_time_at(timestamp_ms: u64) -> String {
@@ -179,6 +277,7 @@ mod tests {
             &shown,
             "● 3 sessions",
             Style::default(),
+            None,
         );
         let line = (0..area.width)
             .map(|x| buf.cell(Position::new(x, 0)).unwrap().symbol())
@@ -201,6 +300,7 @@ mod tests {
             "2026-08-14 09:05:07",
             "● 3 sessions",
             Style::default(),
+            None,
         );
         let line = (0..area.width)
             .map(|x| buf.cell(Position::new(x, 0)).unwrap().symbol())
@@ -208,6 +308,99 @@ mod tests {
         assert!(line.contains("Keybinds: Ctrl+A"), "bar: {line}");
         assert!(line.contains("● 3 sessions"), "bar: {line}");
         assert!(!line.contains("2026-08-14"), "bar: {line}");
+    }
+
+    fn sample() -> asd_proto::HostSample {
+        asd_proto::HostSample {
+            cpu_pct: 12,
+            mem_used_bytes: 6_549_123_456,
+            mem_total_bytes: 33_285_996_544,
+            net_rx_bps: 1_258_291,
+            net_tx_bps: 348_160,
+            sampled_age_ms: 740,
+        }
+    }
+
+    fn rendered(width: u16, metrics: Option<asd_proto::HostSample>) -> String {
+        let area = Rect::new(0, 0, width, 1);
+        let mut buf = Buffer::empty(area);
+        draw_text(
+            &mut buf,
+            area,
+            &Keymap::default().current_hint(),
+            "2026-08-14 09:05:07",
+            "● 3 sessions",
+            Style::default(),
+            metrics,
+        );
+        (0..area.width)
+            .map(|x| buf.cell(Position::new(x, 0)).unwrap().symbol())
+            .collect()
+    }
+
+    #[test]
+    fn a_wide_bar_shows_every_segment() {
+        let line = rendered(160, Some(sample()));
+        assert!(line.contains("Keybinds: Ctrl+A"), "bar: {line}");
+        assert!(line.contains("2026-08-14 09:05:07"), "bar: {line}");
+        assert!(line.contains("12%"), "bar: {line}");
+        assert!(line.contains("6.1G/31G"), "bar: {line}");
+        assert!(line.contains("↓1.2M ↑340K"), "bar: {line}");
+        assert!(line.contains("● 3 sessions"), "bar: {line}");
+    }
+
+    #[test]
+    fn segments_drop_right_to_left_as_the_bar_narrows() {
+        // Network goes first, then memory, then CPU, then the clock. The
+        // keybind hint outlives them all because it is the only actionable
+        // thing on the bar, and the clock outlives the new segments so a narrow
+        // terminal keeps behaving the way it did before they existed.
+        let mut seen_without = Vec::new();
+        for width in [160u16, 120, 100, 84, 64, 42] {
+            let line = rendered(width, Some(sample()));
+            seen_without.push((
+                width,
+                line.contains("↓1.2M"),
+                line.contains("6.1G/31G"),
+                line.contains("12%"),
+                line.contains("2026-08-14"),
+                line.contains("Keybinds"),
+            ));
+        }
+        // Whatever the exact widths, a segment never comes back once dropped,
+        // and the keybind hint is present at every width.
+        let mut net = true;
+        let mut mem = true;
+        let mut cpu = true;
+        let mut clock = true;
+        for (width, has_net, has_mem, has_cpu, has_clock, has_keys) in seen_without {
+            assert!(has_keys, "keybinds vanished at {width}");
+            assert!(!has_net || net, "network came back at {width}");
+            assert!(!has_mem || mem, "memory came back at {width}");
+            assert!(!has_cpu || cpu, "cpu came back at {width}");
+            assert!(!has_clock || clock, "clock came back at {width}");
+            // Ordering: a segment cannot outlive one to its right.
+            assert!(
+                has_net <= has_mem,
+                "memory dropped before network at {width}"
+            );
+            assert!(has_mem <= has_cpu, "cpu dropped before memory at {width}");
+            assert!(has_cpu <= has_clock, "clock dropped before cpu at {width}");
+            net = has_net;
+            mem = has_mem;
+            cpu = has_cpu;
+            clock = has_clock;
+        }
+    }
+
+    #[test]
+    fn without_a_sample_the_bar_looks_exactly_as_it_did_before() {
+        let line = rendered(160, None);
+        assert!(
+            line.starts_with(" Keybinds: Ctrl+A  2026-08-14 09:05:07"),
+            "bar: {line}"
+        );
+        assert!(!line.contains('%'), "bar: {line}");
     }
 
     #[test]
