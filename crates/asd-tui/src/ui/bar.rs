@@ -161,7 +161,19 @@ fn draw_left(
     for seg in &segs {
         x += GAP as u16;
         buf.set_string(x, area.top(), seg.icon, icon_style);
-        x += str_width(seg.icon) as u16 + 1;
+        let icon_width = str_width(seg.icon) as u16;
+        // Most of these icons are double-width emoji. `set_string` writes the
+        // glyph into the first cell and calls `Cell::reset()` on the
+        // continuation cell(s); a reset cell's background is `Color::Reset`,
+        // not the stripe's `RULE`, which punches a hole in the bar. Re-apply
+        // the stripe background across the icon's full width to close it.
+        for col in 0..icon_width {
+            if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(x + col, area.top()))
+            {
+                cell.set_style(Style::new().bg(RULE));
+            }
+        }
+        x += icon_width + 1;
         buf.set_string(x, area.top(), &seg.value, seg.value_style);
         x += str_width(&seg.value) as u16;
     }
@@ -341,6 +353,49 @@ mod tests {
         assert!(line.contains("6.1G/31G"), "bar: {line}");
         assert!(line.contains("↓1.2M ↑340K"), "bar: {line}");
         assert!(line.contains("● 3 sessions"), "bar: {line}");
+    }
+
+    #[test]
+    fn every_icon_keeps_the_stripe_background_across_its_full_width() {
+        // Every segment icon here (🕐, 💻, 🧠, 🌐) is a two-column glyph.
+        // `Buffer::set_stringn` writes the glyph into the first cell and
+        // resets the continuation cell, and a reset cell's background is
+        // `Color::Reset`, not the stripe's `RULE`. Reading back `symbol()`
+        // cannot see this -- a reset cell's symbol reads as a plain space,
+        // same as an intentional gap -- so this asserts on style/bg instead.
+        let area = Rect::new(0, 0, 160, 1);
+        let mut buf = Buffer::empty(area);
+        draw_text(
+            &mut buf,
+            area,
+            &Keymap::default().current_hint(),
+            "2026-08-14 09:05:07",
+            "● 3 sessions",
+            Style::default(),
+            Some(sample()),
+        );
+        let mut checked = 0;
+        for x in 0..area.width {
+            let cell = buf.cell(Position::new(x, 0)).expect("cell in bounds");
+            if ["🕐", "💻", "🧠", "🌐"].contains(&cell.symbol()) {
+                assert_eq!(
+                    cell.bg,
+                    RULE,
+                    "icon cell at {x} lost the stripe background: {cell:?}"
+                );
+                let notch = buf
+                    .cell(Position::new(x + 1, 0))
+                    .expect("continuation cell in bounds");
+                assert_eq!(
+                    notch.bg,
+                    RULE,
+                    "reset continuation cell at {} notched the stripe: {notch:?}",
+                    x + 1
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 4, "expected all four segment icons on a wide bar");
     }
 
     #[test]
