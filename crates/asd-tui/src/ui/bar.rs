@@ -102,21 +102,31 @@ fn session_status(count: usize, scroll: usize) -> String {
     }
 }
 
-/// Binary units the way `free -h` writes them: one decimal below ten, none
-/// above. The bar is short on columns, so nothing is padded.
+/// Binary units the way `free -h` writes them: one decimal below ten, none at
+/// or above it. The bar is short on columns, so nothing is padded.
+///
+/// The unit is chosen from the value as it will be *rendered*, not from the
+/// raw ratio. Picking the unit first and rounding afterwards is what produces
+/// "1024K" for one byte under a mebibyte, and "10.0G" — a decimal at ten — for
+/// anything from 9.95 GiB up.
 fn fmt_bytes(bytes: u64) -> String {
-    const UNITS: [(u64, char); 3] = [(1 << 30, 'G'), (1 << 20, 'M'), (1 << 10, 'K')];
-    for (scale, suffix) in UNITS {
-        if bytes >= scale {
-            let value = bytes as f64 / scale as f64;
-            return if value < 10.0 {
-                format!("{value:.1}{suffix}")
-            } else {
-                format!("{}{suffix}", value.round() as u64)
-            };
-        }
+    const UNITS: [char; 3] = ['K', 'M', 'G'];
+    if bytes < 1024 {
+        return format!("{bytes}B");
     }
-    format!("{bytes}B")
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    // Promote while the whole-number form would read 1024 or more.
+    while unit + 1 < UNITS.len() && value >= 1023.5 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let suffix = UNITS[unit];
+    if value < 9.95 {
+        format!("{value:.1}{suffix}")
+    } else {
+        format!("{}{suffix}", value.round() as u64)
+    }
 }
 
 /// A whole percent, clamped. The sampler already clamps; this is the second
@@ -211,6 +221,28 @@ mod tests {
         // Below a kibibyte there is no unit worth scaling to.
         assert_eq!(fmt_bytes(512), "512B");
         assert_eq!(fmt_bytes(0), "0B");
+        assert_eq!(fmt_bytes(1023), "1023B");
+    }
+
+    #[test]
+    fn a_size_that_rounds_up_promotes_instead_of_reading_1024() {
+        // One byte under each boundary. Choosing the unit from the raw ratio
+        // and rounding afterwards renders these "1024K" and "1024M", which is
+        // not a unit anyone writes.
+        assert_eq!(fmt_bytes((1 << 20) - 1), "1.0M");
+        assert_eq!(fmt_bytes((1 << 30) - 1), "1.0G");
+        // Exactly on the boundary, for the other side of the same fence.
+        assert_eq!(fmt_bytes(1 << 20), "1.0M");
+        assert_eq!(fmt_bytes(1 << 30), "1.0G");
+    }
+
+    #[test]
+    fn a_size_that_rounds_up_to_ten_drops_its_decimal() {
+        // 9.95 GiB and up round to ten. Keeping the decimal there widens the
+        // field from "9.9G" to "10.0G", which is the jitter the one-decimal
+        // rule exists to avoid.
+        assert_eq!(fmt_bytes(10_684_795_973), "10G");
+        assert_eq!(fmt_bytes(10_630_000_000), "9.9G");
     }
 
     #[test]
