@@ -30,7 +30,7 @@
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `asd_proto::HostSample { cpu_pct: f32, mem_used_bytes: u64, mem_total_bytes: u64, net_rx_bps: u64, net_tx_bps: u64, sampled_age_ms: u64 }`, `Frame::HostMetrics`, `Frame::HostMetricsReply { sample: Option<HostSample> }`, `PROTO_VERSION == 15`.
+- Produces: `asd_proto::HostSample { cpu_pct: u8, mem_used_bytes: u64, mem_total_bytes: u64, net_rx_bps: u64, net_tx_bps: u64, sampled_age_ms: u64 }`, `Frame::HostMetrics`, `Frame::HostMetricsReply { sample: Option<HostSample> }`, `PROTO_VERSION == 15`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -40,7 +40,7 @@ In `crates/asd-proto/tests/codec.rs`, add the two frames to the vector returned 
         Frame::HostMetrics,
         Frame::HostMetricsReply {
             sample: Some(asd_proto::HostSample {
-                cpu_pct: 12.5,
+                cpu_pct: 12,
                 mem_used_bytes: 6_500_000_000,
                 mem_total_bytes: 33_000_000_000,
                 net_rx_bps: 1_258_291,
@@ -84,10 +84,15 @@ Add the struct next to the other shared types (above the `Frame` enum):
 ```rust
 /// One reading of the daemon host's resource use, taken by the daemon's own
 /// sampler rather than measured when a client asks. Rates are per second.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// Every field is an integer so that `Frame` keeps its `Eq`. CPU is the one
+/// value the host reports as a float, and the bar renders it as a whole
+/// percent anyway, so it is rounded at the sampler rather than carried at a
+/// precision nothing consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSample {
-    /// Whole-host utilisation, 0.0-100.0, averaged across cores.
-    pub cpu_pct: f32,
+    /// Whole-host utilisation, 0-100, averaged across cores.
+    pub cpu_pct: u8,
     pub mem_used_bytes: u64,
     pub mem_total_bytes: u64,
     /// Bytes per second, summed over every non-loopback interface.
@@ -100,7 +105,7 @@ pub struct HostSample {
 }
 ```
 
-Add the two variants to the `Frame` enum, after `InspectReply`:
+Add the two variants to the `Frame` enum, after `InspectReply`. Leave `Frame`'s existing derives alone — `HostSample` is all-integer precisely so that `Eq` still holds:
 
 ```rust
     /// client → daemon: what is the daemon host's resource use right now.
@@ -291,7 +296,10 @@ pub(crate) fn spawn(registry: Arc<Mutex<Registry>>) {
                 });
 
             let sample = HostSample {
-                cpu_pct: system.global_cpu_usage(),
+                // Rounded and clamped here, at the one place that sees the raw
+                // reading. Cores are summed and averaged, which can land a
+                // hair over 100.
+                cpu_pct: system.global_cpu_usage().round().clamp(0.0, 100.0) as u8,
                 mem_used_bytes: system.used_memory(),
                 mem_total_bytes: system.total_memory(),
                 net_rx_bps: rate_bps(rx, elapsed),
@@ -557,24 +565,23 @@ Add to the existing `mod tests` in `crates/asd-tui/src/ui/bar.rs`:
     }
 
     #[test]
-    fn cpu_is_a_whole_percent() {
-        assert_eq!(fmt_pct(0.0), "0%");
-        assert_eq!(fmt_pct(12.4), "12%");
-        assert_eq!(fmt_pct(12.6), "13%");
-        assert_eq!(fmt_pct(100.0), "100%");
-        // A host can briefly report slightly over 100 while cores are summed;
-        // clamp rather than print a number that reads like a bug.
-        assert_eq!(fmt_pct(103.2), "100%");
+    fn a_percent_is_printed_whole_and_never_over_a_hundred() {
+        assert_eq!(fmt_pct(0), "0%");
+        assert_eq!(fmt_pct(12), "12%");
+        assert_eq!(fmt_pct(100), "100%");
+        // The sampler clamps, but a value that got past it should read as a
+        // busy host rather than a number that looks like a bug.
+        assert_eq!(fmt_pct(103), "100%");
     }
 
     #[test]
     fn load_colour_escalates_at_the_documented_thresholds() {
-        assert_eq!(load_color(0.0), OK);
-        assert_eq!(load_color(69.9), OK);
-        assert_eq!(load_color(70.0), ACCENT);
-        assert_eq!(load_color(89.9), ACCENT);
-        assert_eq!(load_color(90.0), ALERT);
-        assert_eq!(load_color(100.0), ALERT);
+        assert_eq!(load_color(0), OK);
+        assert_eq!(load_color(69), OK);
+        assert_eq!(load_color(70), ACCENT);
+        assert_eq!(load_color(89), ACCENT);
+        assert_eq!(load_color(90), ALERT);
+        assert_eq!(load_color(100), ALERT);
     }
 ```
 
@@ -605,19 +612,19 @@ fn fmt_bytes(bytes: u64) -> String {
     format!("{bytes}B")
 }
 
-/// A whole percent, clamped. Cores are summed and averaged, which can land a
-/// hair over 100; printing "103%" reads like a bug rather than a busy host.
-fn fmt_pct(pct: f32) -> String {
-    format!("{}%", pct.clamp(0.0, 100.0).round() as u32)
+/// A whole percent, clamped. The sampler already clamps; this is the second
+/// belt, because printing "103%" reads like a bug rather than a busy host.
+fn fmt_pct(pct: u8) -> String {
+    format!("{}%", pct.min(100))
 }
 
 /// Green until the host is working, amber while it is, red once it is out of
 /// room. Only CPU and memory get this: there is no throughput that is "bad",
 /// so colouring the network would raise an alarm that means nothing.
-fn load_color(pct: f32) -> Color {
-    if pct >= 90.0 {
+fn load_color(pct: u8) -> Color {
+    if pct >= 90 {
         ALERT
-    } else if pct >= 70.0 {
+    } else if pct >= 70 {
         ACCENT
     } else {
         OK
@@ -655,7 +662,7 @@ Add to `mod tests` in `bar.rs`:
 ```rust
     fn sample() -> asd_proto::HostSample {
         asd_proto::HostSample {
-            cpu_pct: 12.0,
+            cpu_pct: 12,
             mem_used_bytes: 6_549_123_456,
             mem_total_bytes: 33_285_996_544,
             net_rx_bps: 1_258_291,
@@ -810,9 +817,9 @@ fn segments(server_time: &str, metrics: Option<asd_proto::HostSample>) -> Vec<Se
         value_style: Style::new().fg(load_color(m.cpu_pct)).bg(RULE),
     });
     let mem_pct = if m.mem_total_bytes == 0 {
-        0.0
+        0
     } else {
-        m.mem_used_bytes as f32 / m.mem_total_bytes as f32 * 100.0
+        ((m.mem_used_bytes as f64 / m.mem_total_bytes as f64) * 100.0).round() as u8
     };
     out.push(Segment {
         icon: "🧠",

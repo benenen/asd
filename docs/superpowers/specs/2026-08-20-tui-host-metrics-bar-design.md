@@ -34,8 +34,10 @@ Frame::HostMetricsReply { sample: Option<HostSample> } // daemon answers
 
 ```rust
 pub struct HostSample {
-    /// Whole-host utilisation, 0.0-100.0, averaged across cores.
-    pub cpu_pct: f32,
+    /// Whole-host utilisation, 0-100, averaged across cores. An integer
+    /// because the bar renders a whole percent anyway, and because a float
+    /// field would cost `Frame` its `Eq`.
+    pub cpu_pct: u8,
     pub mem_used_bytes: u64,
     pub mem_total_bytes: u64,
     /// Bytes per second, summed over every non-loopback interface.
