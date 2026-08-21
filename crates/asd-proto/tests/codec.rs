@@ -188,12 +188,24 @@ fn all_frames() -> Vec<Frame> {
             code: asd_proto::code::VERSION_MISMATCH,
             msg: "proto version mismatch".into(),
         },
+        Frame::HostMetrics,
+        Frame::HostMetricsReply {
+            sample: Some(asd_proto::HostSample {
+                cpu_pct: 12.5,
+                mem_used_bytes: 6_500_000_000,
+                mem_total_bytes: 33_000_000_000,
+                net_rx_bps: 1_258_291,
+                net_tx_bps: 348_160,
+                sampled_age_ms: 740,
+            }),
+        },
+        Frame::HostMetricsReply { sample: None },
     ]
 }
 
 #[test]
 fn protocol_version_covers_screen_derived_agent_state() {
-    assert_eq!(asd_proto::PROTO_VERSION, 14);
+    assert_eq!(asd_proto::PROTO_VERSION, 15);
 }
 
 #[test]

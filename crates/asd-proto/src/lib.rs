@@ -30,7 +30,10 @@
 //! shared and external renames keep the owner tagged correctly; v14 adds
 //! `SessionInfo.state` and `FollowStatus.state`, the daemon's reading of what
 //! the program on the screen is doing — distinct from `running`, which only
-//! says whether bytes are arriving.
+//! says whether bytes are arriving.; v15 adds `HostMetrics`/`HostMetricsReply`, letting a client read the
+//! daemon host's CPU, memory and network rates. The daemon samples them on its
+//! own timer and answers from that reading, so the request never measures
+//! anything and no client can drive the sampling rate.
 
 mod codec;
 pub mod paths;
@@ -41,7 +44,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 14;
+pub const PROTO_VERSION: u32 = 15;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -213,6 +216,23 @@ pub struct TerminalAppearance {
     pub background: Option<TerminalColor>,
 }
 
+/// One reading of the daemon host's resource use, taken by the daemon's own
+/// sampler rather than measured when a client asks. Rates are per second.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HostSample {
+    /// Whole-host utilisation, 0.0-100.0, averaged across cores.
+    pub cpu_pct: f32,
+    pub mem_used_bytes: u64,
+    pub mem_total_bytes: u64,
+    /// Bytes per second, summed over every non-loopback interface.
+    pub net_rx_bps: u64,
+    pub net_tx_bps: u64,
+    /// How old this reading is, in milliseconds. Deliberately an age and not a
+    /// timestamp: two hosts need not agree on the wall clock, so an absolute
+    /// time could not be compared against the client's.
+    pub sampled_age_ms: u64,
+}
+
 /// All frames in the current protocol.
 ///
 /// Handshake: each side sends once after connecting; the client sends
@@ -220,7 +240,7 @@ pub struct TerminalAppearance {
 /// Attach sequence: `Attach` → daemon replies `Snapshot` → subsequent
 /// `Output` stream; the client must finish feeding the Snapshot before
 /// consuming Output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Frame {
     // Handshake
     Hello {
@@ -366,6 +386,15 @@ pub enum Frame {
         cursor_col: u16,
         cursor_row: u16,
         cursor_visible: bool,
+    },
+    /// client → daemon: what is the daemon host's resource use right now.
+    HostMetrics,
+    /// daemon → client: the sampler's most recent reading. `None` means the
+    /// sampler has not produced one yet, which is true for the first second of
+    /// a daemon's life. It is `None` rather than zeroes because zeroes would
+    /// claim the host is idle.
+    HostMetricsReply {
+        sample: Option<HostSample>,
     },
     // Following (v9). Like `send`/`peek`, name-addressed and attach-free — but
     // a subscription rather than a one-shot: the follower joins the Output
