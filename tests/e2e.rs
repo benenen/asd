@@ -3177,24 +3177,39 @@ async fn send_all_types_into_every_session_but_its_own() {
 }
 
 /// The daemon answers a metrics request out of its sampler's stored reading.
-/// `None` is a real answer, not a failure -- the sampler primes for a second
-/// after start-up. What must not happen is an error, a wrong frame, or a hang.
+/// `sample: None` is a real answer only for the sampler's first second after
+/// start-up -- past that, it must turn into `Some`, or the sampler never ran
+/// at all (e.g. `server::serve` forgot to spawn it) and the bar would show
+/// nothing forever. So this polls for `Some`, with a bounded timeout, rather
+/// than accepting `None` as a pass. What must not happen otherwise is an
+/// error, a wrong frame, or a hang.
 #[tokio::test]
 async fn host_metrics_are_served_from_the_daemon() {
     let daemon = Daemon::start("host-metrics");
     let mut c = ProtoClient::connect(&daemon.socket).await;
 
-    c.send(Frame::HostMetrics).await;
-    match c.recv().await {
-        Frame::HostMetricsReply { sample: None } => {}
-        Frame::HostMetricsReply { sample: Some(s) } => {
-            // u8 is unsigned, so only the upper bound is worth asserting.
-            assert!(s.cpu_pct <= 100, "cpu out of range: {}", s.cpu_pct);
-            assert!(s.mem_total_bytes > 0, "a host with no memory is not real");
-            assert!(s.mem_used_bytes <= s.mem_total_bytes);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let sample = loop {
+        c.send(Frame::HostMetrics).await;
+        match c.recv().await {
+            Frame::HostMetricsReply { sample: Some(s) } => break s,
+            Frame::HostMetricsReply { sample: None } => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for the sampler to store a reading"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => panic!("expected HostMetricsReply, got {other:?}"),
         }
-        other => panic!("expected HostMetricsReply, got {other:?}"),
-    }
+    };
+    // u8 is unsigned, so only the upper bound is worth asserting.
+    assert!(sample.cpu_pct <= 100, "cpu out of range: {}", sample.cpu_pct);
+    assert!(
+        sample.mem_total_bytes > 0,
+        "a host with no memory is not real"
+    );
+    assert!(sample.mem_used_bytes <= sample.mem_total_bytes);
 }
 
 /// Poll `cond` until it holds, or fail with `what`.
