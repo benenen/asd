@@ -1,7 +1,7 @@
 # Host metrics in the `asd ui` bottom bar
 
 Date: 2026-08-20
-Status: approved, not yet implemented
+Status: implemented
 
 ## Goal
 
