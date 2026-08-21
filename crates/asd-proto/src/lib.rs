@@ -30,10 +30,10 @@
 //! shared and external renames keep the owner tagged correctly; v14 adds
 //! `SessionInfo.state` and `FollowStatus.state`, the daemon's reading of what
 //! the program on the screen is doing — distinct from `running`, which only
-//! says whether bytes are arriving.; v15 adds `HostMetrics`/`HostMetricsReply`, letting a client read the
-//! daemon host's CPU, memory and network rates. The daemon samples them on its
-//! own timer and answers from that reading, so the request never measures
-//! anything and no client can drive the sampling rate.
+//! says whether bytes are arriving; v15 adds `HostMetrics`/`HostMetricsReply`,
+//! letting a client read the daemon host's CPU, memory and network rates. The
+//! daemon samples them on its own timer and answers from that reading, so the
+//! request never measures anything and no client can drive the sampling rate.
 
 mod codec;
 pub mod paths;

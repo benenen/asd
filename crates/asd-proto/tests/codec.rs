@@ -204,7 +204,7 @@ fn all_frames() -> Vec<Frame> {
 }
 
 #[test]
-fn protocol_version_covers_screen_derived_agent_state() {
+fn protocol_version_covers_host_metrics() {
     assert_eq!(asd_proto::PROTO_VERSION, 15);
 }
 
