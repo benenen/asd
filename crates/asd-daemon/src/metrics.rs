@@ -43,11 +43,19 @@ fn is_loopback(interface: &str) -> bool {
 pub(crate) fn spawn(registry: Arc<Mutex<Registry>>) {
     tokio::spawn(async move {
         let mut system = System::new();
+        // Establish the CPU baseline the same way `Networks::new_with_refreshed_list`
+        // already establishes the network one. Without this, sysinfo's first-ever
+        // `refresh_cpu_usage` reports cumulative busy time since boot rather than a
+        // delta over the last interval, which would make the first stored sample's
+        // `cpu_pct` meaningless.
+        system.refresh_cpu_usage();
         let mut networks = Networks::new_with_refreshed_list();
         let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first tick fires immediately and its rates would divide a full
-        // counter by a near-zero interval, so let it prime the deltas only.
+        // The first tick fires immediately. CPU and network baselines are already
+        // primed above and at construction respectively, so this tick only primes
+        // the elapsed-time baseline the network rate is divided by; computing a
+        // rate from it would divide a full counter by a near-zero interval.
         ticker.tick().await;
         let mut last = Instant::now();
         loop {
