@@ -1300,7 +1300,17 @@ impl App {
             }
             Ev::Metrics(sample) => {
                 self.metrics = sample;
-                self.dirty = true;
+                // Only dirty the frame when the bar is visible. Comparing
+                // `self.metrics != sample` instead would not work: every
+                // reply carries a freshly recomputed `sampled_age_ms`, so
+                // equality never holds and this event would always dirty
+                // the frame regardless. Gating on visibility matches
+                // `wall_clock_tick_due`'s own `visible` gate and keeps a
+                // hidden bar as quiet under this event as it already is
+                // under `Ev::Sessions`, which arrives on the same tick.
+                if !self.status_hidden {
+                    self.dirty = true;
+                }
             }
             Ev::Created(name) => self.select(name),
             Ev::Bytes {
