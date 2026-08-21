@@ -70,13 +70,19 @@ In `crates/asd-proto/src/lib.rs`, bump the version at line 44:
 pub const PROTO_VERSION: u32 = 15;
 ```
 
-Append to the end of the history block (the paragraph that currently ends `...says whether bytes are arriving.`):
+Continue the history block. Every entry in it is a clause of one running sentence, so replace the final line
 
 ```rust
-//! ; v15 adds `HostMetrics`/`HostMetricsReply`, letting a client read the
-//! daemon host's CPU, memory and network rates. The daemon samples them on its
-//! own timer and answers from that reading, so the request never measures
-//! anything and no client can drive the sampling rate.
+//! says whether bytes are arriving.
+```
+
+with
+
+```rust
+//! says whether bytes are arriving; v15 adds `HostMetrics`/`HostMetricsReply`,
+//! letting a client read the daemon host's CPU, memory and network rates. The
+//! daemon samples them on its own timer and answers from that reading, so the
+//! request never measures anything and no client can drive the sampling rate.
 ```
 
 Add the struct next to the other shared types (above the `Frame` enum):
@@ -406,11 +412,8 @@ async fn host_metrics_are_served_from_the_daemon() {
     match c.recv().await {
         Frame::HostMetricsReply { sample: None } => {}
         Frame::HostMetricsReply { sample: Some(s) } => {
-            assert!(
-                (0.0..=100.0).contains(&s.cpu_pct),
-                "cpu out of range: {}",
-                s.cpu_pct
-            );
+            // u8 is unsigned, so only the upper bound is worth asserting.
+            assert!(s.cpu_pct <= 100, "cpu out of range: {}", s.cpu_pct);
             assert!(s.mem_total_bytes > 0, "a host with no memory is not real");
             assert!(s.mem_used_bytes <= s.mem_total_bytes);
         }
@@ -544,7 +547,7 @@ already refreshes on."
 
 **Interfaces:**
 - Consumes: the palette `OK`, `ACCENT`, `ALERT`, `MUTED`, `DIM`, `RULE` from `super` (already imported for `DIM`, `ACCENT`, `ALERT`, `OK`, `RULE`; add `MUTED`).
-- Produces: `fmt_bytes(bytes: u64) -> String`, `fmt_pct(pct: f32) -> String`, `load_color(pct: f32) -> Color`, all private to `bar.rs` and used by Task 6.
+- Produces: `fmt_bytes(bytes: u64) -> String`, `fmt_pct(pct: u8) -> String`, `load_color(pct: u8) -> Color`, all private to `bar.rs` and used by Task 6.
 
 - [ ] **Step 1: Write the failing tests**
 
