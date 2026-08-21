@@ -126,6 +126,13 @@ pub async fn handle_conn(
                     sessions: registry.lock().unwrap().list(),
                 });
             }
+            Frame::HostMetrics => {
+                // Read the sampler's stored reading. Nothing is measured here:
+                // see `crate::metrics`.
+                reply(Frame::HostMetricsReply {
+                    sample: registry.lock().unwrap().host_metrics(),
+                });
+            }
             Frame::Create { name, cmd, cwd } => {
                 let cwd = cwd.map(std::path::PathBuf::from);
                 match Registry::create(&registry, name, cmd, cwd) {

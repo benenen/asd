@@ -3176,6 +3176,27 @@ async fn send_all_types_into_every_session_but_its_own() {
     );
 }
 
+/// The daemon answers a metrics request out of its sampler's stored reading.
+/// `None` is a real answer, not a failure -- the sampler primes for a second
+/// after start-up. What must not happen is an error, a wrong frame, or a hang.
+#[tokio::test]
+async fn host_metrics_are_served_from_the_daemon() {
+    let daemon = Daemon::start("host-metrics");
+    let mut c = ProtoClient::connect(&daemon.socket).await;
+
+    c.send(Frame::HostMetrics).await;
+    match c.recv().await {
+        Frame::HostMetricsReply { sample: None } => {}
+        Frame::HostMetricsReply { sample: Some(s) } => {
+            // u8 is unsigned, so only the upper bound is worth asserting.
+            assert!(s.cpu_pct <= 100, "cpu out of range: {}", s.cpu_pct);
+            assert!(s.mem_total_bytes > 0, "a host with no memory is not real");
+            assert!(s.mem_used_bytes <= s.mem_total_bytes);
+        }
+        other => panic!("expected HostMetricsReply, got {other:?}"),
+    }
+}
+
 /// Poll `cond` until it holds, or fail with `what`.
 async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
