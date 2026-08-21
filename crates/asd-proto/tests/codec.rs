@@ -191,7 +191,7 @@ fn all_frames() -> Vec<Frame> {
         Frame::HostMetrics,
         Frame::HostMetricsReply {
             sample: Some(asd_proto::HostSample {
-                cpu_pct: 12.5,
+                cpu_pct: 12,
                 mem_used_bytes: 6_500_000_000,
                 mem_total_bytes: 33_000_000_000,
                 net_rx_bps: 1_258_291,

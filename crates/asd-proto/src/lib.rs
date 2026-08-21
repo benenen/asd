@@ -218,10 +218,15 @@ pub struct TerminalAppearance {
 
 /// One reading of the daemon host's resource use, taken by the daemon's own
 /// sampler rather than measured when a client asks. Rates are per second.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// Every field is an integer so that `Frame` keeps its `Eq`. CPU is the one
+/// value the host reports as a float, and the bar renders it as a whole
+/// percent anyway, so it is rounded at the sampler rather than carried at a
+/// precision nothing consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSample {
-    /// Whole-host utilisation, 0.0-100.0, averaged across cores.
-    pub cpu_pct: f32,
+    /// Whole-host utilisation, 0-100, averaged across cores.
+    pub cpu_pct: u8,
     pub mem_used_bytes: u64,
     pub mem_total_bytes: u64,
     /// Bytes per second, summed over every non-loopback interface.
@@ -240,7 +245,7 @@ pub struct HostSample {
 /// Attach sequence: `Attach` → daemon replies `Snapshot` → subsequent
 /// `Output` stream; the client must finish feeding the Snapshot before
 /// consuming Output.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Frame {
     // Handshake
     Hello {
