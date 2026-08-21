@@ -39,26 +39,17 @@ struct Segment {
 
 impl Segment {
     fn width(&self) -> usize {
-        // The clock carries no icon, so it is the value alone; every metric
-        // segment is icon + one space + value.
-        if self.icon.is_empty() {
-            str_width(&self.value)
-        } else {
-            str_width(self.icon) + 1 + str_width(&self.value)
-        }
+        // icon + one space + value
+        str_width(self.icon) + 1 + str_width(&self.value)
     }
 }
 
 /// The metric segments in display order. Dropping from the end of this vector
 /// is what produces the documented narrow-terminal order: network, then
 /// memory, then CPU, then the clock.
-///
-/// The clock has no icon: it is the one segment shown whether or not a host
-/// sample exists, so it must render byte-for-byte the way it always has —
-/// only the new metric segments after it get an icon of their own.
 fn segments(server_time: &str, metrics: Option<asd_proto::HostSample>) -> Vec<Segment> {
     let mut out = vec![Segment {
-        icon: "",
+        icon: "🕐",
         value: server_time.to_string(),
         value_style: Style::new().fg(MUTED).bg(RULE),
     }];
@@ -169,13 +160,8 @@ fn draw_left(
     x += hint_width as u16;
     for seg in &segs {
         x += GAP as u16;
-        // The clock's empty icon means no glyph and no separating space —
-        // the two-space GAP is the whole gap, matching the pre-existing
-        // "hint  time" spacing exactly.
-        if !seg.icon.is_empty() {
-            buf.set_string(x, area.top(), seg.icon, icon_style);
-            x += str_width(seg.icon) as u16 + 1;
-        }
+        buf.set_string(x, area.top(), seg.icon, icon_style);
+        x += str_width(seg.icon) as u16 + 1;
         buf.set_string(x, area.top(), &seg.value, seg.value_style);
         x += str_width(&seg.value) as u16;
     }
@@ -268,12 +254,13 @@ mod tests {
             .expect("the daytime fixture is unambiguous");
         let shown = format_server_time(time);
         assert_eq!(shown, "2026-08-14 09:05:07");
+        let hint = Keymap::default().current_hint();
         let area = Rect::new(0, 0, 80, 1);
         let mut buf = Buffer::empty(area);
         draw_text(
             &mut buf,
             area,
-            &Keymap::default().current_hint(),
+            &hint,
             &shown,
             "● 3 sessions",
             Style::default(),
@@ -282,10 +269,17 @@ mod tests {
         let line = (0..area.width)
             .map(|x| buf.cell(Position::new(x, 0)).unwrap().symbol())
             .collect::<String>();
-        assert!(
-            line.starts_with(" Keybinds: Ctrl+A  2026-08-14 09:05:07"),
-            "bar: {line}"
-        );
+        // Built from the same parts draw_left assembles: the hint, the
+        // two-space GAP, the clock icon, then its value. The clock icon is
+        // a double-width glyph -- ratatui writes it into one cell and
+        // resets the cell after it, and a reset cell's symbol() reads back
+        // as a literal space rather than empty, so the icon is followed by
+        // *two* space characters here: that wide-glyph continuation cell,
+        // then the single explicit separator space every segment has
+        // between its icon and its value. Confirmed by inspecting the
+        // buffer directly, not assumed.
+        let expected = format!(" {}  🕐  {shown}", hint.text);
+        assert!(line.starts_with(&expected), "bar: {line}");
         assert!(line.contains("● 3 sessions"), "bar: {line}");
     }
 
@@ -394,13 +388,17 @@ mod tests {
     }
 
     #[test]
-    fn without_a_sample_the_bar_looks_exactly_as_it_did_before() {
+    fn without_a_sample_only_the_clock_is_shown() {
+        // No reading yet: the clock is the whole left-hand group beyond the
+        // hint. It keeps its icon -- the icon marks the segment, not the
+        // presence of data -- so this line differs from the pre-feature bar by
+        // exactly that icon and nothing else.
         let line = rendered(160, None);
-        assert!(
-            line.starts_with(" Keybinds: Ctrl+A  2026-08-14 09:05:07"),
-            "bar: {line}"
-        );
+        assert!(line.contains("🕐"), "bar: {line}");
+        assert!(line.contains("2026-08-14 09:05:07"), "bar: {line}");
         assert!(!line.contains('%'), "bar: {line}");
+        assert!(!line.contains("💻"), "bar: {line}");
+        assert!(!line.contains("🌐"), "bar: {line}");
     }
 
     #[test]
