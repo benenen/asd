@@ -13,6 +13,8 @@
 //! - [`prepare_socket_dir`] / [`remove_stale_socket`] — make the listener's
 //!   location usable before binding (no-ops where the OS has nothing to clean).
 //! - [`kill_child`] — end a session's child process, gracefully or forcibly.
+//! - [`watch_child_exit`] — report a child's exit to its session thread, where
+//!   the pty does not go to EOF with it (a no-op where it does).
 //! - [`read_cwd`] — the current working directory of a live process, for the
 //!   persisted session list.
 //! - [`pty_master_fd`] — the pty master's raw fd, for foreground-process
@@ -26,5 +28,6 @@ mod imp;
 mod imp;
 
 pub(crate) use imp::{
-    kill_child, prepare_socket_dir, pty_master_fd, read_cwd, remove_stale_socket, serve_connections,
+    kill_child, prepare_socket_dir, pty_master_fd, read_cwd, remove_stale_socket,
+    serve_connections, watch_child_exit,
 };

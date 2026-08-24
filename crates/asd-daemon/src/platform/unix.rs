@@ -3,6 +3,7 @@
 //! there for the shared surface.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -11,6 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::conn;
 use crate::registry::Registry;
+use crate::session::SessionMsg;
 
 // ---- Listener ---------------------------------------------------------------
 
@@ -132,6 +134,12 @@ pub(crate) fn kill_child(pid: u32, force: bool) {
     };
     let _ = kill(Pid::from_raw(pid as i32), sig);
 }
+
+/// Watch for the child's exit. Nothing to do here: the child's exit closes the
+/// last slave fd, the master read returns EOF, and the pty reader reports the
+/// ending already. A watcher would also make a second party interested in the
+/// pid, which only `Child::wait` on the session thread may reap.
+pub(crate) fn watch_child_exit(_pid: u32, _name: &str, _tx: mpsc::Sender<SessionMsg>) {}
 
 /// The cwd of a live process, read from `/proc/<pid>/cwd`. `None` on any error —
 /// the session then recreates in the daemon's default directory rather than

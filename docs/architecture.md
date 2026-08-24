@@ -122,11 +122,15 @@ definitions of running.
 
 ## Session lifecycle and persistence
 
-Connection loss implicitly detaches its membership. PTY EOF is the session
-terminal condition: reap the child, remove the registry entry, and notify
-attached clients that the session exited. `Kill` sends SIGHUP and uses SIGKILL
-after two seconds if needed. Daemon shutdown applies the same graceful-then-hard
-sequence before removing its endpoint.
+Connection loss implicitly detaches its membership. The session's terminal
+condition is its child being gone: reap the child, remove the registry entry,
+and notify attached clients that the session exited. On Unix that arrives as PTY
+EOF, because the child's exit closes the last slave descriptor. A ConPTY master
+stays readable for as long as the pseudoconsole exists, which is until the
+daemon drops it, so EOF cannot report anything there — on Windows the child's
+exit is watched directly and reported to the session thread instead. `Kill`
+sends SIGHUP and uses SIGKILL after two seconds if needed. Daemon shutdown
+applies the same graceful-then-hard sequence before removing its endpoint.
 
 Live processes, terminal cells, and scrollback are not persisted. Session name
 and working directory are. Registry create, rename, and removal rewrite

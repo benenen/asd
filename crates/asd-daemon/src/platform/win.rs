@@ -2,6 +2,7 @@
 //! control. Selected by [`super`]; see there for the shared surface.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -10,6 +11,7 @@ use tracing::{error, info, warn};
 
 use crate::conn;
 use crate::registry::Registry;
+use crate::session::SessionMsg;
 
 // ---- Listener ---------------------------------------------------------------
 
@@ -129,6 +131,11 @@ pub(crate) fn remove_stale_socket(_socket_path: &Path) -> anyhow::Result<()> {
 
 // ---- Process control --------------------------------------------------------
 
+/// How long [`watch_child_exit`] lets the pty reader drain before it ends the
+/// session. Output the child wrote just before exiting can still be sitting in
+/// the ConPTY's buffer, and after the ending nothing reads it again.
+const CHILD_EXIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Minimal kernel32 process control (no extra crate).
 mod win32 {
     unsafe extern "system" {
@@ -136,9 +143,12 @@ mod win32 {
         fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
         fn CloseHandle(hObject: isize) -> i32;
         fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) -> i32;
+        fn WaitForSingleObject(hHandle: isize, dwMilliseconds: u32) -> u32;
     }
 
     const PROCESS_TERMINATE: u32 = 0x0001;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const INFINITE: u32 = 0xFFFF_FFFF;
     const CTRL_BREAK_EVENT: u32 = 1;
     const INVALID_HANDLE_VALUE: isize = -1;
 
@@ -150,6 +160,21 @@ mod win32 {
                 TerminateProcess(handle, 1);
                 CloseHandle(handle);
             }
+        }
+    }
+
+    /// Block until the process exits. Returns at once when the pid cannot be
+    /// opened, which for a child of this daemon means it is already gone: the
+    /// handle is taken while the process is known to be alive, so nothing else
+    /// can have claimed the number in between.
+    pub fn wait_for_exit(pid: u32) {
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+            return;
+        }
+        unsafe {
+            WaitForSingleObject(handle, INFINITE);
+            CloseHandle(handle);
         }
     }
 
@@ -176,6 +201,34 @@ mod win32 {
 pub(crate) fn kill_child(pid: u32, force: bool) {
     if force || !win32::graceful_kill(pid) {
         win32::force_kill(pid);
+    }
+}
+
+/// Watch for the child's exit and report it to the session thread, because the
+/// pty will not: a ConPTY master stays readable for as long as the pseudoconsole
+/// exists, and the daemon owns that until the session ends. Waiting for EOF is
+/// therefore circular — the session would sit listed forever, still holding the
+/// `OpenConsole.exe` whose exit it is waiting for, however its child died.
+///
+/// The wait runs on its own thread; it ends with the child, or with the session
+/// if that goes first (the send then finds a dropped receiver, which is fine).
+pub(crate) fn watch_child_exit(pid: u32, name: &str, tx: mpsc::Sender<SessionMsg>) {
+    if pid == 0 {
+        return;
+    }
+    let thread_name = format!("child-wait-{name}");
+    let spawned = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            win32::wait_for_exit(pid);
+            // The pty reader feeds the same channel, so everything it has
+            // already taken is ordered ahead of this ending. The settle covers
+            // what the child wrote last and the reader has not picked up yet.
+            std::thread::sleep(CHILD_EXIT_SETTLE);
+            let _ = tx.send(SessionMsg::Ended("child exited"));
+        });
+    if let Err(error) = spawned {
+        warn!(session = %name, error = %error, "child-exit watch not started; the session will outlive its child");
     }
 }
 

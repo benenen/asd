@@ -122,8 +122,11 @@ fn attach_view_rename(
 pub enum SessionMsg {
     /// Raw output fed in by the pty read thread.
     PtyOutput(Vec<u8>),
-    /// The pty read hit EOF/error — the end of the session's lifetime.
-    PtyEof,
+    /// The session's terminal condition, with what reported it (for the log).
+    /// The pty read hitting EOF/error is one; where the pty outlives its child
+    /// — a ConPTY does — [`crate::platform::watch_child_exit`] reports the
+    /// child's exit as the other.
+    Ended(&'static str),
     /// Client input (already-encoded bytes), written only while that client is
     /// still attached. Revocation takes effect at this membership check.
     Input {
@@ -603,7 +606,7 @@ pub fn spawn_session(
                 loop {
                     match std::io::Read::read(&mut reader, &mut buf) {
                         Ok(0) | Err(_) => {
-                            let _ = tx.send(SessionMsg::PtyEof);
+                            let _ = tx.send(SessionMsg::Ended("pty eof"));
                             break;
                         }
                         Ok(n) => {
@@ -615,6 +618,10 @@ pub fn spawn_session(
                 }
             })?;
     }
+
+    // Child-exit watch: where the pty outlives its child, this is the only
+    // ending the session gets (a no-op where the pty reports EOF by itself).
+    crate::platform::watch_child_exit(child_pid, &name, tx.clone());
 
     // Session thread: exclusive owner of the Terminal and the pty master
     {
@@ -1018,14 +1025,16 @@ fn session_thread(
                 info!(session = %name, "kill requested");
                 request_child_shutdown(&meta);
             }
-            SessionMsg::PtyEof => {
+            SessionMsg::Ended(reason) => {
+                // The filter's lookahead can be sitting on the child's last
+                // bytes, and after the break nothing else will push them out.
                 let tail = client_output_filter.finish();
                 if !tail.is_empty() {
                     let output = Frame::Output { bytes: tail };
                     broadcast(&mut clients, &meta, output.clone());
                     followers.retain(|f| f.send(output.clone()));
                 }
-                info!(session = %name, "pty eof, session ending");
+                info!(session = %name, reason, "session ending");
                 break;
             }
         }
