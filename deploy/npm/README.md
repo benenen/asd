@@ -29,11 +29,13 @@ taken on the registry), but the exposed command is still just `asd`.
 | macOS         | —   | ✅    |
 | Windows (msvc)| ✅  | —     |
 
-These mirror the assets built by the release CI. macOS ships **Apple Silicon
-(arm64) only** — the Intel leg was dropped because GitHub's Intel runners are
-frequently unavailable. On Windows the binary is the GUI client (the daemon/CLI
-side is Unix-only). Any other platform/arch has no prebuilt asset — the installer
-fails with a clear message and you can build from source instead.
+These mirror the assets built by the release CI, which publishes the full
+binary — CLI, embedded daemon, TUI, and GUI — for every supported platform.
+macOS ships **Apple Silicon (arm64) only** — the Intel leg was dropped because
+GitHub's Intel runners are frequently unavailable. The Windows archive also
+contains `ghostty-vt.dll`, which the installer places beside `asd.exe`. Any
+other platform/arch has no prebuilt asset — the installer fails with a clear
+message and you can build from source instead.
 
 ## How it works
 
@@ -50,7 +52,8 @@ fails with a clear message and you can build from source instead.
    `https://github.com/benenen/asd/releases/download/v<version>/…`
    (the tag is `v` + this package's `version`, following redirects).
 3. Unpacks it (`tar` on Unix, `Expand-Archive` on Windows), copies the binary to
-   `lib/asd[.exe]` and sets the execute bit.
+   `lib/asd[.exe]`, copies `ghostty-vt.dll` beside it on Windows, and sets the
+   execute bit on Unix.
 
 The `asd` command is a tiny Node launcher ([`bin/asd.js`](bin/asd.js)) that execs
 that binary, forwarding argv, the tty (asd is a TUI), and the exit code.

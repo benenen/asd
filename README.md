@@ -63,30 +63,74 @@ are indexed in [`docs/`](docs/README.md).
 
 ## Install / build
 
-Requires a recent Rust (edition 2024), **Zig 0.15.x** on `PATH` (it builds the
-vendored `libghostty-vt-sys`), and — only for the GUI — **Node/npm** (bundles
-the webview assets).
+### Install a prebuilt release
+
+The npm installer downloads the matching binary from
+[GitHub Releases](https://github.com/benenen/asd/releases/latest) and exposes it
+as `asd` (Node.js 16 or newer is required for the installer):
 
 ```bash
-# Full build: CLI + daemon + TUI + GUI
-cargo build --release
-# → target/release/asd
+npm install -g @shibenenen/asd
+asd --version
 
-# Server / headless: CLI + daemon + TUI, no GUI (won't link WebKitGTK)
-cargo build --release --no-default-features
+# Or run it once without installing it globally
+npx @shibenenen/asd
 ```
 
-Prebuilt binaries are produced by CI (currently green) for:
+You can also download and unpack a release archive directly. Prebuilt full
+binaries (CLI + daemon + TUI + GUI) are published for:
 
-- Linux `x86_64` / `aarch64` — full
-- Windows `x86_64-msvc` — full
-- macOS `aarch64` — full
+| Platform | Release target |
+|---|---|
+| Linux x64 | `x86_64-unknown-linux-gnu` |
+| Linux arm64 | `aarch64-unknown-linux-gnu` |
+| Windows x64 | `x86_64-pc-windows-msvc` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
 
 The Windows zip holds **two** files that belong together: `asd.exe` and
 `ghostty-vt.dll`. Keep them in the same directory — the exe imports the DLL and
-Windows will refuse to start it otherwise. (The vendored ghostty builds as a
-DLL, and libghostty-vt-sys's "static" link resolves to that DLL's import
-library, so the dependency exists even though nothing asked for a dynamic link.)
+Windows will refuse to start it otherwise. Linux release binaries require the
+WebKitGTK 4.1 runtime; use the headless source build below on servers where GUI
+libraries are unavailable.
+
+Upgrading the executable does not replace a daemon that is already running.
+`asd restart` starts the new daemon, but recreates saved sessions as fresh
+shells; their current processes and screens do not survive the restart.
+
+### Build from source
+
+All builds require a Rust toolchain with edition 2024 support and **Zig 0.15.x**
+on `PATH` for the vendored `libghostty-vt`. The default full build also requires
+**Node/npm**; on Linux it needs the WebKitGTK development libraries, and on
+Windows it needs NASM. For Debian/Ubuntu:
+
+```bash
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev
+```
+
+Build the default full binary:
+
+```bash
+cargo build --locked --release
+# -> target/release/asd (target/release/asd.exe on Windows)
+```
+
+A Windows source build also leaves `ghostty-vt.dll` under Cargo's build output;
+copy it beside `target\release\asd.exe` before running the program. The release
+zip and npm installer stage this DLL automatically.
+
+For a server/headless binary with the CLI, embedded daemon, and TUI but no GUI
+or WebKitGTK dependency:
+
+```bash
+cargo build --locked --release --no-default-features
+```
+
+On Unix, install either completed build on `PATH` with:
+
+```bash
+sudo install -m 0755 target/release/asd /usr/local/bin/asd
+```
 
 ## Usage
 
