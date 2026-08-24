@@ -809,10 +809,11 @@ pub async fn follow(
                 let left = d.saturating_duration_since(Instant::now());
                 match tokio::time::timeout(left, c.reader.read_frame()).await {
                     Ok(frame) => frame?,
-                    // Abandoning a half-read frame is safe here and only here:
-                    // the process ends on the next line, so the reader is never
-                    // used again. (`read_frame` is not cancel-safe, which is
-                    // why it is never put in a `select!`.)
+                    // The half-read frame is simply abandoned: the process
+                    // ends on the next line, so the reader is never used again.
+                    // (`read_frame` is cancel-safe and would resume it — the
+                    // clients that `select!` on it depend on that — but nothing
+                    // here needs the resumption.)
                     Err(_) => {
                         let t = timeout.as_deref().unwrap_or_default();
                         let tail = decoder.flush();

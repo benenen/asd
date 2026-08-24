@@ -28,16 +28,34 @@ pub fn decode_frame(payload: &[u8]) -> Result<Frame, ProtoError> {
 }
 
 /// Frame reading end over any `AsyncRead`.
+///
+/// The half-read frame lives here rather than in [`FrameReader::read_frame`]'s
+/// future, which is what makes that future safe to cancel — see its docs.
 #[derive(Debug)]
 pub struct FrameReader<R> {
     inner: R,
+    /// The length prefix, filled across as many reads as it takes.
+    len_buf: [u8; 4],
+    len_filled: usize,
+    /// The payload buffer, sized once the prefix is complete, then filled the
+    /// same way. `None` while the prefix is still arriving.
+    payload: Option<Vec<u8>>,
+    payload_filled: usize,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub fn new(inner: R) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            len_buf: [0u8; 4],
+            len_filled: 0,
+            payload: None,
+            payload_filled: 0,
+        }
     }
 
+    /// Take the transport back. Any partially read frame is discarded with the
+    /// reader, so only do this at a frame boundary.
     pub fn into_inner(self) -> R {
         self.inner
     }
@@ -48,28 +66,56 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// - EOF mid-frame returns `Err(Io(UnexpectedEof))`;
     /// - a length prefix over 4 MiB returns [`ProtoError::FrameTooLarge`];
     ///   the caller should disconnect.
+    ///
+    /// Cancellation-safe: every byte taken from the transport is recorded in
+    /// the reader before the next await, so dropping this future loses nothing
+    /// and the next call resumes the same frame. Clients drive their connection
+    /// with `tokio::select!`, which drops this future every time a heartbeat or
+    /// a keystroke wins the race; a future that owned the partial frame would
+    /// take those bytes with it and leave the stream resuming mid-payload —
+    /// read as a length prefix, that ends the connection on a nonsense length.
     pub async fn read_frame(&mut self) -> Result<Option<Frame>, ProtoError> {
-        // Read the length prefix with a manual loop: EOF at 0 bytes is a clean
+        // The length prefix, read with a manual loop: EOF at 0 bytes is a clean
         // close, EOF partway through is a truncation error (read_exact cannot
         // distinguish the two).
-        let mut len_buf = [0u8; 4];
-        let mut filled = 0;
-        while filled < len_buf.len() {
-            let n = self.inner.read(&mut len_buf[filled..]).await?;
+        while self.len_filled < self.len_buf.len() {
+            let n = self
+                .inner
+                .read(&mut self.len_buf[self.len_filled..])
+                .await?;
             if n == 0 {
-                if filled == 0 {
+                if self.len_filled == 0 {
                     return Ok(None);
                 }
                 return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
             }
-            filled += n;
+            self.len_filled += n;
         }
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len > MAX_FRAME_LEN {
-            return Err(ProtoError::FrameTooLarge(len));
+
+        // Size the payload the first time the prefix completes; a resumed read
+        // finds it already there.
+        if self.payload.is_none() {
+            let len = u32::from_le_bytes(self.len_buf) as usize;
+            if len > MAX_FRAME_LEN {
+                return Err(ProtoError::FrameTooLarge(len));
+            }
+            self.payload = Some(vec![0u8; len]);
+            self.payload_filled = 0;
         }
-        let mut payload = vec![0u8; len];
-        self.inner.read_exact(&mut payload).await?;
+        let payload = self.payload.as_mut().expect("payload was just sized");
+        while self.payload_filled < payload.len() {
+            let n = self.inner.read(&mut payload[self.payload_filled..]).await?;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            self.payload_filled += n;
+        }
+
+        // Whole frame in hand: clear the state before decoding, so a frame the
+        // codec rejects does not leave its bytes behind for the next call.
+        let payload = self.payload.take().expect("payload was just filled");
+        self.len_filled = 0;
+        self.payload_filled = 0;
         Ok(Some(decode_frame(&payload)?))
     }
 }

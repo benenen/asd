@@ -67,10 +67,13 @@ but their generated application replies are drained and discarded.
 ## Connection data path and flow control
 
 `crates/asd-daemon/src/conn.rs` splits each connection into an inbound reader
-and outbound writer task. `FrameReader::read_frame` is not cancellation-safe,
-so it must not be placed directly in a `tokio::select!`. Control replies and
-session broadcasts share one outbound queue, preserving their per-connection
-order.
+and outbound writer task. `FrameReader::read_frame` is cancellation-safe: the
+partially read frame is held by the reader, not by the future, so a client may
+place it directly in a `tokio::select!` — which every client does, and which
+drops that future on each heartbeat tick and keystroke. `FrameWriter` has no
+such guarantee, so a write must complete inside a branch body rather than race
+as a branch of its own. Control replies and session broadcasts share one
+outbound queue, preserving their per-connection order.
 
 Outbound Snapshot and Output payloads consume the `ClientSink` quota. The
 accounting helper also recognizes Input defensively, but Input is inbound and

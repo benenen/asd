@@ -303,3 +303,40 @@ async fn garbage_payload_is_codec_error() {
         other => panic!("expected Codec error, got {other:?}"),
     }
 }
+
+/// A read cancelled mid-frame must not eat the bytes it already took.
+///
+/// Every client drives its connection with `tokio::select!`, which drops the
+/// losing branch's future — the frame read — on every heartbeat tick and every
+/// keystroke. If the partially read frame lived in that future, those bytes
+/// would be gone and the stream would resume at a payload byte, reading it as a
+/// length prefix: the connection dies with a bogus length or a codec error,
+/// which is what a user sees as the daemon "going down" mid-session.
+#[tokio::test]
+async fn a_cancelled_read_resumes_the_same_frame() {
+    use tokio::io::AsyncWriteExt;
+
+    let frame = Frame::Output {
+        bytes: vec![7u8; 64],
+    };
+    let wire = encode_frame(&frame).unwrap();
+    let (mut peer, stream) = tokio::io::duplex(1024);
+    let mut reader = FrameReader::new(stream);
+
+    // Enough for the length prefix and a slice of the payload — not the frame.
+    peer.write_all(&wire[..6]).await.unwrap();
+
+    // Poll once (which consumes those bytes), then drop the future, exactly as
+    // `select!` does to the branch that loses the race.
+    {
+        let mut read = std::pin::pin!(reader.read_frame());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(read.as_mut(), &mut cx).is_pending(),
+            "the frame is incomplete, so the read must be pending"
+        );
+    }
+
+    peer.write_all(&wire[6..]).await.unwrap();
+    assert_eq!(reader.read_frame().await.unwrap(), Some(frame));
+}
