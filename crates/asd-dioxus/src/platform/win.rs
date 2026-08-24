@@ -3,14 +3,17 @@
 
 use crate::conn::{BoxRead, BoxWrite};
 
-/// No local connection yet: the GUI reaches sessions through SSH remotes here.
-///
-/// This predates the Windows daemon and is now merely unimplemented rather than
-/// impossible — the daemon does listen on `\\.\pipe\asd-<user>`, and a
-/// `ClientOptions::open` here would be the whole change. Wiring it up is a
-/// behaviour change, not a move, so it is left for its own commit; note that
-/// the transport must stay a plain named-pipe client, since this crate must
-/// never gain portable-pty or any process management.
+/// Connect to the local daemon's named pipe and split it for the framed codec.
 pub(crate) async fn connect_local() -> anyhow::Result<(BoxRead, BoxWrite)> {
-    anyhow::bail!("no local daemon connection on this platform yet — connect an SSH remote instead")
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let socket = asd_proto::paths::socket_path();
+    let name = socket
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("pipe path is not valid UTF-8"))?;
+    let stream = ClientOptions::new()
+        .open(name)
+        .map_err(|e| anyhow::anyhow!("connect {name}: {e}"))?;
+    let (r, w) = tokio::io::split(stream);
+    Ok((Box::new(r), Box::new(w)))
 }
