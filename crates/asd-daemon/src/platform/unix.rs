@@ -135,6 +135,11 @@ pub(crate) fn kill_child(pid: u32, force: bool) {
     let _ = kill(Pid::from_raw(pid as i32), sig);
 }
 
+/// Constrain the library search path. Nothing to do here: nothing this daemon
+/// loads is resolved by bare name at runtime, and `ld.so` takes its search path
+/// from the binary rather than from the working directory.
+pub(crate) fn harden_dll_search() {}
+
 /// Watch for the child's exit. Nothing to do here: the child's exit closes the
 /// last slave fd, the master read returns EOF, and the pty reader reports the
 /// ending already. A watcher would also make a second party interested in the

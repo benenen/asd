@@ -129,6 +129,29 @@ pub(crate) fn remove_stale_socket(_socket_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---- Library loading --------------------------------------------------------
+
+/// Constrain library loading to System32 before the first pty is created.
+///
+/// `portable-pty` opens the ConPTY entry points by probing a bare `conpty.dll`
+/// (`win/psuedocon.rs`), meaning the default search order — application
+/// directory first, then System32, then `PATH` — decides what gets loaded. A
+/// `conpty.dll` dropped next to the executable, in the install directory or
+/// anywhere on `PATH` would therefore be loaded into the daemon, which owns
+/// every session's pty. Nothing here needs an application-local library at
+/// runtime (`ghostty-vt.dll` is bound by the import table before `main`), so
+/// the whole class goes away by resolving later loads against System32 only:
+/// the sideload probe simply finds nothing and `portable-pty` falls back to
+/// the ConPTY exports in the already-loaded `kernel32.dll`.
+///
+/// Do not add a dynamic, application-local library to the daemon without
+/// revisiting this.
+pub(crate) fn harden_dll_search() {
+    if !win32::search_system32_only() {
+        warn!("could not restrict the dll search path; a planted conpty.dll could be loaded");
+    }
+}
+
 // ---- Process control --------------------------------------------------------
 
 /// How long [`watch_child_exit`] lets the pty reader drain before it ends the
@@ -139,6 +162,7 @@ const CHILD_EXIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(
 /// Minimal kernel32 process control (no extra crate).
 mod win32 {
     unsafe extern "system" {
+        fn SetDefaultDllDirectories(DirectoryFlags: u32) -> i32;
         fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
         fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
         fn CloseHandle(hObject: isize) -> i32;
@@ -146,6 +170,8 @@ mod win32 {
         fn WaitForSingleObject(hHandle: isize, dwMilliseconds: u32) -> u32;
     }
 
+    /// Resolve bare library names against System32 only.
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
     const PROCESS_TERMINATE: u32 = 0x0001;
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const INFINITE: u32 = 0xFFFF_FFFF;
@@ -161,6 +187,12 @@ mod win32 {
                 CloseHandle(handle);
             }
         }
+    }
+
+    /// Point the loader at System32 for every later load-by-name. Returns
+    /// whether the policy took effect.
+    pub fn search_system32_only() -> bool {
+        unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) != 0 }
     }
 
     /// Block until the process exits. Returns at once when the pid cannot be

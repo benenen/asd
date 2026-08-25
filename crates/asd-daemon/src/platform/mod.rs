@@ -12,6 +12,9 @@
 //!   termination signal, then shut the registry down.
 //! - [`prepare_socket_dir`] / [`remove_stale_socket`] — make the listener's
 //!   location usable before binding (no-ops where the OS has nothing to clean).
+//! - [`harden_dll_search`] — constrain where the process may load libraries
+//!   from, before anything gets the chance to (a no-op where the loader has no
+//!   such search path).
 //! - [`kill_child`] — end a session's child process, gracefully or forcibly.
 //! - [`watch_child_exit`] — report a child's exit to its session thread, where
 //!   the pty does not go to EOF with it (a no-op where it does).
@@ -28,6 +31,6 @@ mod imp;
 mod imp;
 
 pub(crate) use imp::{
-    kill_child, prepare_socket_dir, pty_master_fd, read_cwd, remove_stale_socket,
-    serve_connections, watch_child_exit,
+    harden_dll_search, kill_child, prepare_socket_dir, pty_master_fd, read_cwd,
+    remove_stale_socket, serve_connections, watch_child_exit,
 };

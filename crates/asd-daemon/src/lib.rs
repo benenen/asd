@@ -39,6 +39,10 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .try_init();
 
+    // Before anything can load a library by name — the first pty is what
+    // triggers it — decide where libraries may come from.
+    platform::harden_dll_search();
+
     let socket_path = socket.unwrap_or_else(paths::socket_path);
 
     // Data directory (the spawner redirects logs here; session metadata uses
