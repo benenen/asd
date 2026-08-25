@@ -699,3 +699,39 @@ fn an_oversized_cluster_renders_instead_of_crashing() {
     let snap = vt.render_snapshot();
     assert_eq!(snap.cells[0][0].grapheme, long);
 }
+
+/// A flag is two regional indicators; the terminal keeps them in the one cell
+/// the program drew, rather than splitting them into two half-flags.
+#[test]
+fn a_flag_stays_in_one_cell() {
+    let mut vt = term(20, 3);
+    vt.feed("\u{1F1E8}\u{1F1F3}x".as_bytes());
+    let snap = vt.render_snapshot();
+    assert_eq!(snap.cells[0][0].grapheme, "\u{1F1E8}\u{1F1F3}");
+    assert_eq!(snap.cells[0][0].width, CellWidth::Wide);
+    assert_eq!(snap.cells[0][1].width, CellWidth::SpacerTail);
+    assert_eq!(snap.cells[0][2].grapheme, "x");
+}
+
+/// The same for a ZWJ sequence, where the split is most visible: the pieces are
+/// themselves emoji, so a broken cluster renders as three separate people.
+#[test]
+fn a_zwj_sequence_stays_in_one_cell() {
+    let mut vt = term(20, 3);
+    vt.feed("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}".as_bytes());
+    let snap = vt.render_snapshot();
+    assert_eq!(
+        snap.cells[0][0].grapheme,
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}"
+    );
+}
+
+/// A program that sets the mode itself finds it already on, and keeps working.
+#[test]
+fn an_explicit_mode_2027_is_harmless() {
+    let mut vt = term(20, 3);
+    vt.feed(b"\x1b[?2027h");
+    vt.feed("\u{1F1E8}\u{1F1F3}".as_bytes());
+    let snap = vt.render_snapshot();
+    assert_eq!(snap.cells[0][0].grapheme, "\u{1F1E8}\u{1F1F3}");
+}

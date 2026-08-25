@@ -16,7 +16,7 @@ use libghostty_vt::{
     screen::{CellWide, Screen},
     selection::{FormatOptions as SelFormatOptions, Selection},
     style::{RgbColor, Underline},
-    terminal::{Point, PointCoordinate, ScrollViewport},
+    terminal::{Mode, Point, PointCoordinate, ScrollViewport},
 };
 
 use crate::{
@@ -71,6 +71,17 @@ impl VtBackend for GhosttyVt {
             max_scrollback: scrollback,
         })
         .expect("libghostty terminal allocation failed");
+
+        // Grapheme clustering (DEC mode 2027): store a flag, a ZWJ sequence or a
+        // combining mark run in the one cell the program drew it in. Without it
+        // the pieces land in separate cells, and every reader of this terminal —
+        // the attach snapshot, `asd peek`, the TUI — shows the split version.
+        // Applications may also turn the mode on themselves; a program that
+        // resets the terminal (RIS) turns it back off, since libghostty has no
+        // C API for the reset default.
+        terminal
+            .set_mode(Mode::GRAPHEME_CLUSTER, true)
+            .expect("enabling grapheme clustering failed");
 
         let pty_responses = Rc::new(RefCell::new(Vec::new()));
         terminal
