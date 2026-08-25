@@ -265,7 +265,13 @@ async fn drive(
                     }
                 }
                 Ok(Some(_)) => {}
-                Ok(None) | Err(_) => return Err("connection closed".to_string()),
+                // Told apart on purpose: the bottom bar shows this text, and a
+                // daemon that hung up is a different problem from a stream that
+                // stopped making sense. The latter used to mean a frame read
+                // cancelled by this very `select!` (see `FrameReader`), so if
+                // it shows up again the transport itself is at fault.
+                Ok(None) => return Err("daemon closed the connection".to_string()),
+                Err(e) => return Err(format!("connection error: {e}")),
             },
             cmd = cmd_rx.recv() => match cmd {
                 Some(Cmd::Attach {

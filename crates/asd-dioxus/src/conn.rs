@@ -214,7 +214,10 @@ async fn drive(
                     }
                 }
                 Ok(Some(_)) => {}
-                Ok(None) | Err(_) => return Err("connection closed".to_string()),
+                // Same split as the TUI: a hangup and a broken stream are
+                // different faults and the host row shows whichever it was.
+                Ok(None) => return Err("daemon closed the connection".to_string()),
+                Err(e) => return Err(format!("connection error: {e}")),
             },
             cmd = cmd_rx.recv() => match cmd {
                 Some(HostCmd::Attach { name, cols, rows }) => {
