@@ -13,7 +13,9 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Mutex, mpsc};
 
-use asd_proto::{AgentState, Frame, IDLE_SETTLE_MS, TerminalAppearance, TerminalColor, code};
+use asd_proto::{
+    AgentState, Frame, IDLE_SETTLE_MS, SessionExit, TerminalAppearance, TerminalColor, code,
+};
 
 use crate::detect::Detector;
 use asd_vt::{ColorQueryFilter, GhosttyVt, Rgb, VtBackend};
@@ -1076,7 +1078,14 @@ fn session_thread(
 
     // Endpoint: reap the child, deregister, broadcast the exit, and
     // disconnect all clients
-    let _ = child.wait();
+    let exit = child.wait().map(session_exit).unwrap_or_else(|error| {
+        warn!(session = %name, %error, "reaping the child failed");
+        // Nothing to report but the fact that it is over.
+        SessionExit {
+            code: 1,
+            signal: None,
+        }
+    });
     meta.alive.store(false, Ordering::Relaxed);
     meta.child_pid.store(0, Ordering::Relaxed);
     // Remove by the current name — a rename may have changed the map key since
@@ -1090,7 +1099,7 @@ fn session_thread(
     for c in clients.drain(..) {
         c.send(Frame::Error {
             code: code::SESSION_EXITED,
-            msg: format!("session '{name}' exited"),
+            msg: format!("session '{name}' exited ({exit})"),
         });
         // The sink is dropped by the drain; the connection side sees the
         // channel close after writing out the tail of its queue
@@ -1107,14 +1116,15 @@ fn session_thread(
             // The session is gone; nothing on a screen to read any more.
             state: AgentState::Unknown,
             idle_ms: now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed)),
+            exit: Some(exit.clone()),
         });
         f.send(Frame::Error {
             code: code::SESSION_EXITED,
-            msg: format!("session '{name}' exited"),
+            msg: format!("session '{name}' exited ({exit})"),
         });
     }
     meta.attached_clients.store(0, Ordering::Relaxed);
-    info!(session = %name, "session ended");
+    info!(session = %name, %exit, "session ended");
 }
 
 fn merge_terminal_appearance(
@@ -1333,6 +1343,8 @@ fn follow_status(meta: &SessionMeta) -> (Frame, bool) {
             running,
             state,
             idle_ms,
+            // Mid-stream: the session is still there to have a status at all.
+            exit: None,
         },
         running,
     )
@@ -1371,6 +1383,17 @@ fn remove_client_membership(
         *tui_owner = None;
     }
     clients.len() != before
+}
+
+/// The wire form of what `Child::wait` reported. `portable-pty` gives a code
+/// and, on unix, the signal name when one ended the child; both go across as
+/// they are, because "exited 0" and "killed by SIGKILL" are different answers
+/// to why a session is gone.
+fn session_exit(status: portable_pty::ExitStatus) -> SessionExit {
+    SessionExit {
+        code: status.exit_code(),
+        signal: status.signal().map(str::to_string),
+    }
 }
 
 fn broadcast(clients: &mut Vec<ClientSink>, meta: &SessionMeta, frame: Frame) -> usize {

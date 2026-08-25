@@ -65,6 +65,14 @@ Session exit sends both `FollowStatus { running: false }` and the session-exited
 error. Default follow may stop on the status transition; `--forever` ignores
 idle and needs the exit error as its terminal event.
 
+That last status is also the only one carrying `exit`: the child's code, and the
+platform's name for the signal when one ended it. It has to ride there rather
+than on `SessionInfo`, because by the time the status is known the session has
+left the registry and no `list` can report it. `follow --json` puts it on the
+terminal `exit` event as `code` and `signal`; the session-exited error names it
+in prose for whoever is only reading messages, `asd attach` included. A signal
+name is the platform's wording (`Hangup`, `Killed`), not a `SIG*` constant.
+
 ## Modelled follow output
 
 Normal `follow` output is passed through a client-side `GhosttyVt`; `--raw`

@@ -3493,3 +3493,86 @@ async fn a_read_only_client_does_not_resize_the_session() {
         "a read-only client resized the session: {list}"
     );
 }
+
+/// `follow --json` ends with how the child ended, not just that it did. A
+/// session that exits 7 and one that is killed are different outcomes, and
+/// until now both arrived as a bare `exit` event.
+#[tokio::test]
+async fn follow_reports_how_the_session_ended() {
+    let daemon = Daemon::start("exitcode");
+
+    // The signal's *name* is the platform's own wording (`Killed`, not
+    // `SIGKILL`), so assert on the shape rather than on glibc's vocabulary.
+    for (name, command, expected) in [
+        ("bycode", "sleep 1; exit 7", r#""code":7,"signal":null"#),
+        ("bysignal", "sleep 1; kill -9 $$", r#""code":1,"signal":""#),
+    ] {
+        assert!(daemon.cli().args(["new", name]).status().unwrap().success());
+        // The leading sleep is what lets `follow` subscribe before the session
+        // ends, the same trick the other follow tests use.
+        assert!(
+            daemon
+                .cli()
+                .args(["send", name, "--text", command, "--enter"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let out = daemon
+            .cli()
+            .args(["follow", name, "--forever", "--json", "--timeout", "20s"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "follow failed: {out:?}");
+        let streamed = String::from_utf8_lossy(&out.stdout);
+        let exit_line = streamed
+            .lines()
+            .find(|l| l.contains(r#""event":"exit""#))
+            .unwrap_or_else(|| panic!("no exit event for {name}: {streamed}"));
+        assert!(
+            exit_line.contains(expected),
+            "{name}: expected {expected} in {exit_line}"
+        );
+    }
+}
+
+/// The same fact reaches an attached client, which has only the message to go
+/// on: it now names the status or the signal instead of saying only "exited".
+#[tokio::test]
+async fn an_attached_client_is_told_how_the_session_ended() {
+    let daemon = Daemon::start("exitmsg");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "doomed"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let mut c = ProtoClient::connect(&daemon.socket).await;
+    c.attach("doomed").await;
+
+    // `asd kill` is SIGHUP, and a shell dies by it.
+    assert!(
+        daemon
+            .cli()
+            .args(["kill", "doomed"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let ended = loop {
+        match c.recv().await {
+            Frame::Error { code, msg } if code == asd_proto::code::SESSION_EXITED => break msg,
+            Frame::Output { .. } | Frame::FollowStatus { .. } => {}
+            other => panic!("unexpected frame while waiting for the ending: {other:?}"),
+        }
+    };
+    assert!(
+        ended.contains("(signal ") || ended.contains("(status "),
+        "the ending should say how it ended, got: {ended}"
+    );
+}

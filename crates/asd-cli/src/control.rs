@@ -6,7 +6,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
-use asd_proto::{AgentState, ClientKind, Frame, IDLE_SETTLE_MS, MAX_FRAME_LEN, Scrollback, code};
+use asd_proto::{
+    AgentState, ClientKind, Frame, IDLE_SETTLE_MS, MAX_FRAME_LEN, Scrollback, SessionExit, code,
+};
 use asd_vt::{GhosttyVt, VtBackend};
 use tokio::io::AsyncReadExt;
 
@@ -487,8 +489,10 @@ pub(crate) enum FollowEvent<'a> {
     /// timeout). This is the part a repaint keeps rewriting, so it is reported
     /// once per pause instead of once per frame.
     Screen(&'a str),
-    /// The session ended, or the daemon hung up: end of stream.
-    Exit,
+    /// The session ended, or the daemon hung up: end of stream. `status` says
+    /// how the child ended, when the daemon got as far as saying — a daemon
+    /// that hung up on us never told anyone.
+    Exit { status: Option<SessionExit> },
     /// `--timeout` expired with the stream still open.
     Timeout,
 }
@@ -502,7 +506,7 @@ pub(crate) fn follow_event_json(ev: &FollowEvent<'_>, time_ms: u64) -> String {
         FollowEvent::Output(_) => s.push_str("output"),
         FollowEvent::Status { .. } => s.push_str("status"),
         FollowEvent::Screen(_) => s.push_str("screen"),
-        FollowEvent::Exit => s.push_str("exit"),
+        FollowEvent::Exit { .. } => s.push_str("exit"),
         FollowEvent::Timeout => s.push_str("timeout"),
     }
     s.push_str(&format!(r#"","time_ms":{time_ms}"#));
@@ -520,7 +524,16 @@ pub(crate) fn follow_event_json(ev: &FollowEvent<'_>, time_ms: u64) -> String {
                 r#","running":{running},"state":"{state}","idle_ms":{idle_ms}"#
             ));
         }
-        FollowEvent::Exit | FollowEvent::Timeout => {}
+        FollowEvent::Exit { status } => {
+            if let Some(status) = status {
+                s.push_str(&format!(r#","code":{}"#, status.code));
+                match &status.signal {
+                    Some(signal) => s.push_str(&format!(r#","signal":"{signal}""#)),
+                    None => s.push_str(r#","signal":null"#),
+                }
+            }
+        }
+        FollowEvent::Timeout => {}
     }
     s.push('}');
     s
@@ -788,6 +801,10 @@ pub async fn follow(
 
     let mut out = std::io::stdout();
     let mut last_status: Option<(bool, AgentState)> = None;
+    // The daemon sets `FollowStatus.exit` only on a session's last status, so
+    // holding it here carries the answer to "how did it end" across to the
+    // `SESSION_EXITED` that follows.
+    let mut last_exit: Option<SessionExit> = None;
     // The live screen is reported at every pause, but only when it has changed
     // since the last report — settle-then-exit would otherwise print it twice.
     let mut last_screen = String::new();
@@ -849,7 +866,11 @@ pub async fn follow(
                 running,
                 state,
                 idle_ms,
+                exit,
             }) => {
+                if exit.is_some() {
+                    last_exit = exit;
+                }
                 // Going quiet is the moment the live screen is worth reporting:
                 // whatever was being repainted has stopped moving.
                 if !running
@@ -888,7 +909,12 @@ pub async fn follow(
                 {
                     emit(&FollowEvent::Screen(&screen), &mut out)?;
                 }
-                emit(&FollowEvent::Exit, &mut out)?;
+                emit(
+                    &FollowEvent::Exit {
+                        status: last_exit.clone(),
+                    },
+                    &mut out,
+                )?;
                 return Ok(());
             }
             Some(Frame::Error { code, msg }) => return Err(exit::daemon("follow", code, &msg)),
@@ -904,7 +930,7 @@ pub async fn follow(
                 {
                     emit(&FollowEvent::Screen(&screen), &mut out)?;
                 }
-                emit(&FollowEvent::Exit, &mut out)?;
+                emit(&FollowEvent::Exit { status: None }, &mut out)?;
                 return Ok(());
             }
             other => bail!("unexpected reply: {other:?}"),
@@ -1228,8 +1254,32 @@ mod tests {
             r#"{"event":"status","time_ms":7,"running":false,"state":"unknown","idle_ms":2001}"#
         );
         assert_eq!(
-            follow_event_json(&FollowEvent::Exit, 7),
+            follow_event_json(&FollowEvent::Exit { status: None }, 7),
             r#"{"event":"exit","time_ms":7}"#
+        );
+        assert_eq!(
+            follow_event_json(
+                &FollowEvent::Exit {
+                    status: Some(SessionExit {
+                        code: 3,
+                        signal: None,
+                    })
+                },
+                7
+            ),
+            r#"{"event":"exit","time_ms":7,"code":3,"signal":null}"#
+        );
+        assert_eq!(
+            follow_event_json(
+                &FollowEvent::Exit {
+                    status: Some(SessionExit {
+                        code: 1,
+                        signal: Some("SIGKILL".into()),
+                    })
+                },
+                7
+            ),
+            r#"{"event":"exit","time_ms":7,"code":1,"signal":"SIGKILL"}"#
         );
         assert_eq!(
             follow_event_json(&FollowEvent::Timeout, 7),

@@ -36,7 +36,10 @@
 //! request never measures anything and no client can drive the sampling rate;
 //! v16 adds `Attach.read_only`, a viewer that receives the Snapshot and every
 //! Output while the daemon drops its input and keeps it out of the pty's size
-//! negotiation.
+//! negotiation; v17 adds `FollowStatus.exit`, the exit code or signal that
+//! ended a session's child — reported on the last status a session sends,
+//! because by then the session has left the registry and no `SessionList` can
+//! carry it.
 
 mod codec;
 pub mod paths;
@@ -47,7 +50,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 16;
+pub const PROTO_VERSION: u32 = 17;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -144,6 +147,42 @@ pub enum ClientKind {
     Proxy,
     /// Ratatui `asd ui`; only one TUI may hold a session's interactive view.
     Tui,
+}
+
+/// How a session's child ended, as the platform reported it.
+///
+/// Reported once, on the last `FollowStatus` a session ever sends. It is not on
+/// [`SessionInfo`], and cannot be: by the time the status is known the session
+/// is out of the registry, so no `list` will ever carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExit {
+    /// Exit code as the platform reported it. A child ended by a signal reports
+    /// `1` here and names the signal below.
+    pub code: u32,
+    /// The signal that ended the child, when one did. This is the platform's
+    /// own description rather than the `SIG*` constant — `Hangup`, `Killed` —
+    /// because that is what the pty layer hands over, and inventing a mapping
+    /// back would mean guessing at a number nobody passed us. Always `None` on
+    /// Windows, which has no signals.
+    pub signal: Option<String>,
+}
+
+impl SessionExit {
+    /// Whether the child ended of its own accord, successfully.
+    pub fn success(&self) -> bool {
+        self.signal.is_none() && self.code == 0
+    }
+}
+
+impl std::fmt::Display for SessionExit {
+    /// Short enough to read inside another sentence: `status 0`, `status 3`,
+    /// `signal SIGKILL`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.signal {
+            Some(signal) => write!(f, "signal {signal}"),
+            None => write!(f, "status {}", self.code),
+        }
+    }
 }
 
 /// Metadata for a single session in `SessionList`.
@@ -440,6 +479,10 @@ pub enum Frame {
         /// stream it is already reading.
         state: AgentState,
         idle_ms: u64,
+        /// Set only on the status that reports the session's end, where it says
+        /// how the child ended. `running: false` alone cannot: it is also how a
+        /// quiet spell is reported mid-stream.
+        exit: Option<SessionExit>,
     },
     /// daemon → TUI: another `asd ui` took this session's exclusive view.
     /// The connection stays open so the displaced UI can keep listing sessions

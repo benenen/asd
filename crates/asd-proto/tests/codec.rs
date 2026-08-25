@@ -3,7 +3,7 @@
 
 use asd_proto::{
     AgentState, ClientKind, Frame, FrameReader, FrameWriter, MAX_FRAME_LEN, ProtoError, Scrollback,
-    SessionInfo, TerminalAppearance, TerminalColor, decode_frame, encode_frame,
+    SessionExit, SessionInfo, TerminalAppearance, TerminalColor, decode_frame, encode_frame,
 };
 
 /// Covers every frame kind in the current protocol. Add new frames here in
@@ -179,11 +179,32 @@ fn all_frames() -> Vec<Frame> {
             running: true,
             state: AgentState::Working,
             idle_ms: 12,
+            exit: None,
         },
         Frame::FollowStatus {
             running: false,
             state: AgentState::Idle,
             idle_ms: 2500,
+            exit: None,
+        },
+        // The last status a session sends: how its child ended, both ways.
+        Frame::FollowStatus {
+            running: false,
+            state: AgentState::Unknown,
+            idle_ms: 40,
+            exit: Some(SessionExit {
+                code: 3,
+                signal: None,
+            }),
+        },
+        Frame::FollowStatus {
+            running: false,
+            state: AgentState::Unknown,
+            idle_ms: 40,
+            exit: Some(SessionExit {
+                code: 1,
+                signal: Some("SIGHUP".into()),
+            }),
         },
         Frame::ViewRevoked {
             name: "build".into(),
@@ -215,7 +236,7 @@ fn all_frames() -> Vec<Frame> {
 
 #[test]
 fn protocol_version_covers_host_metrics() {
-    assert_eq!(asd_proto::PROTO_VERSION, 16);
+    assert_eq!(asd_proto::PROTO_VERSION, 17);
 }
 
 #[test]
