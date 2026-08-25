@@ -682,11 +682,12 @@ fn synchronized_output_tracks_mode_2026() {
     assert!(!vt.synchronized_output(), "?2026l closes the update");
 }
 
-/// Rendering a cluster far larger than any fixed buffer must not take
-/// libghostty's short-buffer path, which crashes there instead of reporting the
-/// size it needs (0.2.0). Any program can turn clustering on and print one, and
-/// the daemon renders whatever a session prints, so this is reachable from
-/// session output alone.
+/// A cluster far larger than the read buffer must come back whole. Reading one
+/// crashed libghostty 0.2.0 outright — it took the short-buffer path instead of
+/// reporting the size it needed — which any program could trigger by turning
+/// clustering on and printing one, since the daemon renders whatever a session
+/// prints. Fixed upstream in 0.2.1, the floor this workspace requires; this
+/// test is what notices if that ever comes back.
 #[test]
 fn an_oversized_cluster_renders_instead_of_crashing() {
     let mut vt = term(20, 3);

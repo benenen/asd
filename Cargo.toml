@@ -67,7 +67,9 @@ anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
-libghostty-vt = "0.2"
+# 0.2.1 is the floor: 0.2.0 crashes reading a multi-codepoint grapheme cluster
+# out of a cell (see crates/asd-vt/tests/vt.rs).
+libghostty-vt = "0.2.1"
 nix = { version = "0.30", features = ["signal", "process", "term", "fs"] }
 # Must match the crossterm ratatui 0.30 pulls in: asd-cli and asd-tui drive the
 # same terminal in one binary, and crossterm keeps process-global mode state, so
