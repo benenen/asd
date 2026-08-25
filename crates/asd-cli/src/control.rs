@@ -404,6 +404,151 @@ pub(crate) fn status_label(info: &asd_proto::SessionInfo) -> &'static str {
     }
 }
 
+/// How long `ask` gives a session to show any sign of having received the
+/// prompt — a state change, or output. Past this it reports a stall rather
+/// than sitting out the whole timeout, because the usual cause is a foreground
+/// program that does not read its input at all.
+const ASK_STALL_MS: u64 = 5_000;
+
+/// Whether a prompt can be said to have landed: the agent is ready for more
+/// (`Idle`), or it stopped to ask something of its own (`Blocked`).
+///
+/// `Unknown` is the interesting case, and the reason this takes the whole
+/// `SessionInfo`. It means the daemon declined to classify the screen — which
+/// is what happens for a plain shell, or any program without detection rules,
+/// whether it is busy or sitting at a prompt. State alone cannot tell those
+/// apart, so fall back to the same activity rule `list` uses to print "idle":
+/// no bytes for the settle interval.
+///
+/// `--until` asks for one state exactly, and is taken literally.
+pub(crate) fn ask_settled(info: &asd_proto::SessionInfo, until: Option<AgentState>) -> bool {
+    match until {
+        Some(want) => info.state == want,
+        None => match info.state {
+            AgentState::Idle | AgentState::Blocked => true,
+            AgentState::Unknown => info.idle_ms >= IDLE_SETTLE_MS,
+            AgentState::Working => false,
+        },
+    }
+}
+
+/// Prompt a session and wait for it to settle.
+///
+/// Three things this does that `send` followed by `wait` does not:
+///
+/// - it refuses to type into a session that is already waiting for an answer,
+///   where the text would answer *that* question rather than ask a new one;
+/// - it treats "nothing happened at all" as a failure of its own, instead of
+///   spending the whole timeout on a session that never read the input;
+/// - it prints the state it settled in, so a caller can branch on `blocked`
+///   without asking again.
+pub async fn ask(
+    socket: &Path,
+    name: String,
+    text: String,
+    until: Option<AgentState>,
+    timeout: String,
+) -> anyhow::Result<()> {
+    let timeout_ms = parse_duration(&timeout).ok_or_else(|| {
+        anyhow::anyhow!("ask: bad duration '{timeout}' (use 500ms, 2s, 1m, 4h, 1d)")
+    })?;
+    let mut c = client::connect(socket, ClientKind::Cli).await?;
+
+    let before = session_state(&mut c, &name).await?;
+    if before == AgentState::Blocked {
+        eprintln!(
+            "ask: '{name}' is waiting for an answer of its own — \
+             read it first (asd peek {name}), then answer with `asd send`"
+        );
+        std::process::exit(exit::BLOCKED);
+    }
+
+    c.writer
+        .write_frame(&Frame::SendInput {
+            name: name.clone(),
+            bytes: text.into_bytes(),
+            enter: true,
+        })
+        .await?;
+    match c.reader.read_frame().await? {
+        Some(Frame::Ack) => {}
+        Some(Frame::Error { code, msg }) => return Err(exit::daemon("ask", code, &msg)),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(timeout_ms);
+    let mut stirred = false;
+    loop {
+        tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
+        c.writer.write_frame(&Frame::ListSessions).await?;
+        let info = match c.reader.read_frame().await? {
+            Some(Frame::SessionList { sessions }) => {
+                match sessions.into_iter().find(|s| s.name == name) {
+                    Some(info) => info,
+                    // The session ended while we waited. Whatever was asked is
+                    // moot, and saying so beats waiting out the timeout.
+                    None => {
+                        return Err(exit::daemon(
+                            "ask",
+                            code::NO_SUCH_SESSION,
+                            &format!("session '{name}' ended while waiting for it to settle"),
+                        ));
+                    }
+                }
+            }
+            Some(Frame::Error { code, msg }) => return Err(exit::daemon("ask", code, &msg)),
+            other => bail!("unexpected reply: {other:?}"),
+        };
+
+        // Any sign of life clears the stall guard: a state change, or output
+        // that arrived *after* the prompt did. Output matters as well as state,
+        // because an agent that answers instantly can be back where it started
+        // before the first poll — and `running` alone would not do, because a
+        // session that printed something a second before the prompt is
+        // "running" without having received anything.
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if info.state != before || info.idle_ms < elapsed_ms {
+            stirred = true;
+        }
+        if stirred && ask_settled(&info, until) {
+            println!("{}", status_label(&info));
+            return Ok(());
+        }
+        if !stirred && started.elapsed() >= Duration::from_millis(ASK_STALL_MS) {
+            eprintln!(
+                "ask: '{name}' showed no sign of receiving the prompt after \
+                 {}s — is anything in it reading input?",
+                ASK_STALL_MS / 1000
+            );
+            std::process::exit(exit::TIMEOUT);
+        }
+        if Instant::now() >= deadline {
+            eprintln!("ask: '{name}' did not settle within {timeout}");
+            std::process::exit(exit::TIMEOUT);
+        }
+    }
+}
+
+/// One session's screen-derived state, or the daemon's own "no such session".
+async fn session_state(c: &mut client::Client, name: &str) -> anyhow::Result<AgentState> {
+    c.writer.write_frame(&Frame::ListSessions).await?;
+    match c.reader.read_frame().await? {
+        Some(Frame::SessionList { sessions }) => {
+            match sessions.iter().find(|info| info.name == name) {
+                Some(info) => Ok(info.state),
+                None => Err(exit::daemon(
+                    "ask",
+                    code::NO_SUCH_SESSION,
+                    &format!("no such session '{name}'"),
+                )),
+            }
+        }
+        Some(Frame::Error { code, msg }) => Err(exit::daemon("ask", code, &msg)),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
 pub async fn wait(
     socket: &Path,
     name: String,
@@ -1144,6 +1289,40 @@ pub(crate) fn json_string(value: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_settles_on_ready_or_asked_but_not_on_working() {
+        let with = |state: AgentState, idle_ms: u64| {
+            let mut i = info("s0", false);
+            i.state = state;
+            i.idle_ms = idle_ms;
+            i
+        };
+        // Either place a prompt can be said to have landed.
+        assert!(ask_settled(&with(AgentState::Idle, 0), None));
+        assert!(ask_settled(&with(AgentState::Blocked, 0), None));
+        assert!(!ask_settled(&with(AgentState::Working, 9_000), None));
+        // Unclassified: a plain shell that has gone quiet has settled, one that
+        // is still printing has not.
+        assert!(ask_settled(
+            &with(AgentState::Unknown, IDLE_SETTLE_MS),
+            None
+        ));
+        assert!(!ask_settled(&with(AgentState::Unknown, 10), None));
+        // `--until` is taken literally, activity rule and all.
+        assert!(ask_settled(
+            &with(AgentState::Blocked, 0),
+            Some(AgentState::Blocked)
+        ));
+        assert!(!ask_settled(
+            &with(AgentState::Idle, 0),
+            Some(AgentState::Blocked)
+        ));
+        assert!(ask_settled(
+            &with(AgentState::Unknown, 0),
+            Some(AgentState::Unknown)
+        ));
+    }
 
     fn info(name: &str, running: bool) -> asd_proto::SessionInfo {
         asd_proto::SessionInfo {

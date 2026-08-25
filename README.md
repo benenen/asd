@@ -150,6 +150,7 @@ asd kill <name>              # end a session (SIGHUP, then SIGKILL after 2s)
 Scripting — drive and observe a session without attaching:
 
 ```bash
+asd ask build 'make test'                   # type, then wait for it to settle
 asd send build --text 'make test' --enter   # type into a session
 asd send build --key C-c                     # named keys: Enter/Tab/Esc/arrows/C-a…C-z
 asd send-all --text '/compact' --enter        # … or type it into every session at once

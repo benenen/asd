@@ -154,3 +154,28 @@ The daemon keeps the first 512 bytes and drops the rest: every `list` carries
 this to every client, and the TUI polls the list every 1.5s. It is not
 persisted either — a restored session is a new process, which can say what it
 is doing when it knows.
+
+## Prompting another session
+
+`asd ask <name> "<text>"` is `send` and `wait` as one operation, plus three
+things the pair cannot do on its own:
+
+- **It refuses to type into a session that is already blocked.** A session
+  parked on `Do you want to proceed? (y/n)` will take whatever arrives as the
+  answer to *that* question. `ask` reads the state first and exits 5 rather than
+  answering someone else's dialog by accident. Answering one deliberately is
+  what `send` is for.
+- **It gives up early when nothing received the prompt.** A foreground program
+  that never reads its input (a `sleep`, a paused build) swallows the text
+  silently, and waiting the full timeout for a settle that cannot come is a
+  waste. Any state change, or any output that arrives *after* the prompt, counts
+  as having received it; five seconds of neither is reported as a stall. The
+  guard tests output timing rather than the `running` flag, because a session
+  that printed something just before the prompt would otherwise look alive.
+- **It says where it settled**, so a caller can branch on `blocked` without
+  asking again.
+
+Settling means `Idle` or `Blocked`. `Unknown` — a plain shell, or any program
+without detection rules — falls back to the activity rule `list` uses to print
+"idle": no bytes for the settle interval. `--until` overrides the whole thing
+and waits for exactly one state.

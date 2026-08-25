@@ -68,6 +68,23 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Prompt a session and wait for it to settle. Unlike `send`, this refuses
+    /// to type into a session that is already waiting for an answer of its own,
+    /// gives up early if nothing in it reads the input, and prints the state it
+    /// settled in (`idle` or `blocked`) so a caller can branch on it
+    Ask {
+        /// Session name
+        name: String,
+        /// What to say. Enter is sent for you
+        text: String,
+        /// Settle on this state only; by default the first of idle or blocked
+        #[arg(long, value_name = "STATE")]
+        until: Option<asd_proto::AgentState>,
+        /// Give up and exit 4 after this long (500ms, 2s, 1m, 4h, 1d). An
+        /// agent's turn often outlasts the default
+        #[arg(long, default_value = "30s")]
+        timeout: String,
+    },
     /// Set or read what a session says it is doing: one line, shown in `list`
     /// and the TUI. Meant to be run from inside the session it describes —
     /// with no NAME it uses `$ASD_SESSION`, which every session's child has
@@ -536,6 +553,12 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
 
             attach::run(c, &name, read_only).await?;
         }
+        Cmd::Ask {
+            name,
+            text,
+            until,
+            timeout,
+        } => control::ask(&socket, name, text, until, timeout).await?,
         Cmd::Status { name, text, clear } => {
             // The common caller is a program inside the session describing
             // itself, which knows its name only through the environment.

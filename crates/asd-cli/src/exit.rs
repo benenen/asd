@@ -15,7 +15,8 @@
 //! | 0 | success |
 //! | 1 | anything else that failed |
 //! | 3 | the named session does not exist (`asd`'s predecessor boo used 3 too) |
-//! | 4 | `wait` timed out |
+//! | 4 | `wait` timed out, or `ask` gave up waiting |
+//! | 5 | `ask` refused: the session is waiting for an answer of its own |
 //!
 //! 2 is deliberately unused: the shell convention for "wrong usage" is close
 //! enough to clap's own exit that claiming it would be confusing.
@@ -26,6 +27,9 @@ use asd_proto::code;
 pub(crate) const TIMEOUT: i32 = 4;
 /// The session named on the command line does not exist.
 pub(crate) const NO_SESSION: i32 = 3;
+/// `ask` would have typed into a session that is waiting for an answer, where
+/// the text would have answered *that* question instead of asking a new one.
+pub(crate) const BLOCKED: i32 = 5;
 
 /// A daemon `Error` frame on its way out of the process, keeping the protocol
 /// code next to the message built for the user.

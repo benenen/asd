@@ -3649,3 +3649,72 @@ async fn a_session_can_say_what_it_is_doing_from_inside_itself() {
         "clear left something behind"
     );
 }
+
+/// `asd ask` is send-and-wait as one operation: it types, waits for the session
+/// to settle, and says where it settled. On a shell that means the command runs
+/// and the prompt comes back.
+#[tokio::test]
+async fn ask_sends_and_waits_for_the_session_to_settle() {
+    let daemon = Daemon::start("ask");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "peer"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = daemon
+        .cli()
+        .args(["ask", "peer", "echo ASKED-AND-ANSWERED", "--timeout", "20s"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ask failed: {out:?}");
+    // It reports where it settled, so a caller can branch without asking again.
+    // A plain shell is never classified as an agent, so this is the activity
+    // reading — the same word `list` prints.
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "idle");
+
+    // And the text really went in.
+    let peek = daemon.cli().args(["peek", "peer"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&peek.stdout).contains("ASKED-AND-ANSWERED"),
+        "the prompt never reached the session"
+    );
+}
+
+/// A session whose foreground program never reads its input would otherwise
+/// absorb the prompt and leave `ask` waiting out the whole timeout. It gives up
+/// as soon as it is clear nothing received it — well before the 20s asked for.
+#[tokio::test]
+async fn ask_gives_up_early_when_nothing_reads_the_prompt() {
+    let daemon = Daemon::start("askstall");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "deaf", "--cmd", "sleep 300"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let started = std::time::Instant::now();
+    let out = daemon
+        .cli()
+        .args(["ask", "deaf", "anyone there?", "--timeout", "20s"])
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+
+    assert!(!out.status.success(), "ask should have failed: {out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no sign of receiving"),
+        "expected a stall report, got: {err}"
+    );
+    assert!(
+        took < Duration::from_secs(15),
+        "gave up after {took:?}, which is the timeout rather than the stall guard"
+    );
+}
