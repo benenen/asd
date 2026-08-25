@@ -346,6 +346,7 @@ mod tests {
             name: name.to_string(),
             command: "sh".into(),
             title: String::new(),
+            status_line: String::new(),
             created_ms,
             idle_ms: 0,
             running: false,

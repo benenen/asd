@@ -25,6 +25,7 @@ fn all_frames() -> Vec<Frame> {
                     name: "s0".into(),
                     command: "/bin/bash".into(),
                     title: "user@host: ~".into(),
+                    status_line: String::new(),
                     created_ms: 1_752_450_000_000,
                     idle_ms: 1500,
                     running: true,
@@ -38,6 +39,7 @@ fn all_frames() -> Vec<Frame> {
                     name: "work".into(),
                     command: "htop".into(),
                     title: String::new(),
+                    status_line: String::new(),
                     created_ms: 0,
                     idle_ms: 0,
                     running: false,
@@ -100,6 +102,15 @@ fn all_frames() -> Vec<Frame> {
             appearance: TerminalAppearance::default(),
             read_only: true,
         },
+        Frame::SetStatusLine {
+            name: "build".into(),
+            line: "step 3/7: running tests".into(),
+        },
+        // Clearing is the same frame with nothing in it.
+        Frame::SetStatusLine {
+            name: "build".into(),
+            line: String::new(),
+        },
         Frame::Snapshot {
             vt: b"\x1b[2J\x1b[Hhello".to_vec(),
         },
@@ -155,6 +166,7 @@ fn all_frames() -> Vec<Frame> {
                 name: "work".into(),
                 command: "vim file".into(),
                 title: "vim".into(),
+                status_line: String::new(),
                 created_ms: 1_752_450_000_000,
                 idle_ms: 42,
                 running: true,
@@ -236,7 +248,7 @@ fn all_frames() -> Vec<Frame> {
 
 #[test]
 fn protocol_version_covers_host_metrics() {
-    assert_eq!(asd_proto::PROTO_VERSION, 17);
+    assert_eq!(asd_proto::PROTO_VERSION, 18);
 }
 
 #[test]

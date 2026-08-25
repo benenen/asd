@@ -39,7 +39,9 @@
 //! negotiation; v17 adds `FollowStatus.exit`, the exit code or signal that
 //! ended a session's child — reported on the last status a session sends,
 //! because by then the session has left the registry and no `SessionList` can
-//! carry it.
+//! carry it; v18 adds `SetStatusLine` and `SessionInfo.status_line`, one line a
+//! session sets about itself from the inside — the only progress channel that
+//! does not go through reading the screen.
 
 mod codec;
 pub mod paths;
@@ -50,7 +52,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 17;
+pub const PROTO_VERSION: u32 = 18;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -198,6 +200,15 @@ pub struct SessionInfo {
     /// `user@host: dir` or an app's own status line. Empty when never set.
     /// Display-only.
     pub title: String,
+    /// What the session says it is doing, set from inside it with `asd status`.
+    /// Empty when nothing set it.
+    ///
+    /// Distinct from `title` and from `state`: the title is whatever the
+    /// program happened to put in the terminal's title bar, and the state is
+    /// the daemon's reading of the screen. This is the one channel where the
+    /// program speaks for itself, so it can say "step 3/7" — something no
+    /// amount of screen-scraping can work out.
+    pub status_line: String,
     /// Creation time, Unix epoch milliseconds.
     pub created_ms: u64,
     /// Milliseconds since the session last produced pty output; 0 while it is
@@ -483,6 +494,15 @@ pub enum Frame {
         /// how the child ended. `running: false` alone cannot: it is also how a
         /// quiet spell is reported mid-stream.
         exit: Option<SessionExit>,
+    },
+    /// client → daemon: set (or clear, with an empty `line`) what a session
+    /// says it is doing. Name-addressed and attach-free, like the other
+    /// scripting frames, because the caller is usually the program *inside*
+    /// that session using `$ASD_SESSION`. Replies `Ack`, or `Error` when there
+    /// is no such session.
+    SetStatusLine {
+        name: String,
+        line: String,
     },
     /// daemon → TUI: another `asd ui` took this session's exclusive view.
     /// The connection stays open so the displaced UI can keep listing sessions

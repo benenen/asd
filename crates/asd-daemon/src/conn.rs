@@ -23,6 +23,24 @@ struct Attached {
     client_id: u64,
 }
 
+/// Longest status line a session may set, in bytes. Long enough for a sentence
+/// about what a program is doing, short enough that it costs nothing to carry
+/// in every session list.
+const MAX_STATUS_LINE: usize = 512;
+
+/// Cut `s` to at most `max` bytes without splitting a character.
+fn truncate_on_char_boundary(mut s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s
+}
+
 pub async fn handle_conn(
     r: impl AsyncRead + Unpin + Send + 'static,
     w: impl AsyncWrite + Unpin + Send + 'static,
@@ -143,6 +161,28 @@ pub async fn handle_conn(
             Frame::Kill { name } => {
                 if let Err((code, msg)) = registry.lock().unwrap().kill(&name) {
                     reply(Frame::Error { code, msg });
+                }
+            }
+            // Set from inside the session it names, in the normal case: the
+            // child has `$ASD_SESSION` and `$ASD_SOCKET`, so `asd status` finds
+            // its own session and this daemon without being told either.
+            Frame::SetStatusLine { name, line } => {
+                // Every `list` carries this to every client, and the TUI polls
+                // the list every 1.5s, so an unbounded line would be a way for
+                // one session to tax the whole daemon. Keep the first
+                // `MAX_STATUS_LINE` bytes and drop the rest.
+                let line = truncate_on_char_boundary(line, MAX_STATUS_LINE);
+                match registry.lock().unwrap().get(&name) {
+                    Some(handle) => {
+                        if let Ok(mut current) = handle.meta.status_line.lock() {
+                            *current = line;
+                        }
+                        reply(Frame::Ack);
+                    }
+                    None => reply(Frame::Error {
+                        code: code::NO_SUCH_SESSION,
+                        msg: format!("no such session '{name}'"),
+                    }),
                 }
             }
             Frame::Rename { name, new_name } => {
@@ -382,4 +422,18 @@ pub async fn handle_conn(
     }
     let _ = out_tx.send(ConnItem::Close);
     let _ = write_task.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_status_line_is_cut_without_splitting_a_character() {
+        assert_eq!(truncate_on_char_boundary("abc".into(), 512), "abc");
+        assert_eq!(truncate_on_char_boundary("abcdef".into(), 3), "abc");
+        // Three bytes each: cutting at 4 must not leave half a character.
+        assert_eq!(truncate_on_char_boundary("中文标题".into(), 4), "中");
+        assert_eq!(truncate_on_char_boundary("中文标题".into(), 6), "中文");
+    }
 }

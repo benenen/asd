@@ -314,6 +314,10 @@ pub async fn inspect(socket: &Path, name: String, json: bool) -> anyhow::Result<
         json_string(&info.command, &mut s);
         s.push_str(r#","title":"#);
         json_string(&info.title, &mut s);
+        // What the session said about itself, if anything. Kept apart from
+        // "status", which is the daemon's reading of activity.
+        s.push_str(r#","says":"#);
+        json_string(&info.status_line, &mut s);
         let modes = mouse_modes
             .iter()
             .map(u16::to_string)
@@ -1047,6 +1051,45 @@ fn parse_duration(s: &str) -> Option<u64> {
 /// either without special-casing. The fields `inspect` adds beyond this are the
 /// ones only a session thread can answer (pid, alt-screen, cursor, …); they are
 /// absent here rather than null, because `list` never asks for them.
+/// Set (or, with an empty `line`, clear) what a session says it is doing.
+pub async fn set_status_line(
+    c: &mut client::Client,
+    name: &str,
+    line: String,
+) -> anyhow::Result<()> {
+    c.writer
+        .write_frame(&Frame::SetStatusLine {
+            name: name.to_string(),
+            line,
+        })
+        .await?;
+    match c.reader.read_frame().await? {
+        Some(Frame::Ack) => Ok(()),
+        Some(Frame::Error { code, msg }) => Err(exit::daemon("status", code, &msg)),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+/// Read back what a session says it is doing. `None` when it never said
+/// anything; the session not existing is an error, not silence.
+pub async fn status_line_of(c: &mut client::Client, name: &str) -> anyhow::Result<Option<String>> {
+    c.writer.write_frame(&Frame::ListSessions).await?;
+    match c.reader.read_frame().await? {
+        Some(Frame::SessionList { sessions }) => {
+            match sessions.iter().find(|info| info.name == name) {
+                Some(info) => Ok((!info.status_line.is_empty()).then(|| info.status_line.clone())),
+                None => Err(exit::daemon(
+                    "status",
+                    asd_proto::code::NO_SUCH_SESSION,
+                    &format!("no such session '{name}'"),
+                )),
+            }
+        }
+        Some(Frame::Error { code, msg }) => Err(exit::daemon("status", code, &msg)),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
 pub fn sessions_json(sessions: &[asd_proto::SessionInfo]) -> String {
     let mut s = String::from("[");
     for (i, info) in sessions.iter().enumerate() {
@@ -1061,6 +1104,10 @@ pub fn sessions_json(sessions: &[asd_proto::SessionInfo]) -> String {
         json_string(&info.command, &mut s);
         s.push_str(r#","title":"#);
         json_string(&info.title, &mut s);
+        // What the session said about itself, if anything. Kept apart from
+        // "status", which is the daemon's reading of activity.
+        s.push_str(r#","says":"#);
+        json_string(&info.status_line, &mut s);
         s.push_str(&format!(
             r#","pid":{pid},"cols":{cols},"rows":{rows},"created_ms":{created},"idle_ms":{idle},"running":{running},"attached_clients":{clients}}}"#,
             pid = info.pid,
@@ -1103,6 +1150,7 @@ mod tests {
             name: name.to_string(),
             command: "bash".to_string(),
             title: String::new(),
+            status_line: String::new(),
             state: AgentState::Unknown,
             created_ms: 1_700_000_000_000,
             idle_ms: 42,

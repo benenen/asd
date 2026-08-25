@@ -120,7 +120,11 @@ fn draw_detail(buf: &mut Buffer, area: Rect, app: &App, session: &asd_proto::Ses
     let age = short_age(session.created_ms, app.now_ms);
     let cmd_w = (area.width - 1) as usize;
     let cmd_w = cmd_w.saturating_sub(ROW_TEXT_X as usize + age.len() + 2);
-    let label = if session.title.trim().is_empty() {
+    // Most deliberate first: what the session said about itself with `asd
+    // status`, then the title its program set, then the command it is running.
+    let label = if !session.status_line.trim().is_empty() {
+        session.status_line.trim().to_string()
+    } else if session.title.trim().is_empty() {
         short_cmd(&session.command)
     } else {
         session.title.trim().to_string()
@@ -218,6 +222,7 @@ mod tests {
             name: "web".into(),
             command: "claude".into(),
             title: "Refactor auth".into(),
+            status_line: String::new(),
             created_ms: 0,
             idle_ms: 0,
             running,

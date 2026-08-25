@@ -134,3 +134,23 @@ canonical path must remain inside the canonical session directory.
 This is a guardrail against an agent wandering outside the project, not a
 security boundary: the user running `asd card` already has ordinary filesystem
 permissions to read those paths.
+
+## What a session says about itself
+
+`asd status --text "step 3/7: running tests"` sets one line on a session;
+`asd list`, `list --json` (as `says`), `inspect` and the TUI sidebar show it.
+With no name it uses `$ASD_SESSION`, so the program inside a session describes
+itself without knowing its own name or where its daemon is — both are already
+in its environment.
+
+This is the only progress channel that does not go through reading the screen.
+Detection can tell working from blocked because those look different; it cannot
+tell step three from step four, because they look the same. So the two coexist
+and neither overrides the other: `state` stays the daemon's reading, `says` is
+the session's own claim, and a display prefers the deliberate one — the status
+line, then the terminal title, then the command.
+
+The daemon keeps the first 512 bytes and drops the rest: every `list` carries
+this to every client, and the TUI polls the list every 1.5s. It is not
+persisted either — a restored session is a new process, which can say what it
+is doing when it knows.

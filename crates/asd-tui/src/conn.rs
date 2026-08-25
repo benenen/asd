@@ -362,6 +362,7 @@ mod tests {
             name: name.to_string(),
             command: "shell".to_string(),
             title: String::new(),
+            status_line: String::new(),
             created_ms,
             idle_ms: 0,
             running: true,

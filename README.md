@@ -142,6 +142,7 @@ asd new [name] [--cmd CMD]   # create a session (auto-named s0, s1, …); defaul
 asd attach <name>            # attach a VT-rendering client (detach: Ctrl-\)
 asd attach -A <name>         # attach, creating the session first if absent
 asd attach -r <name>         # watch read-only: keys go nowhere, size unaffected
+asd status [name] --text …   # say what this session is doing (from inside it)
 asd list                     # list sessions: name, size, status, clients, command
 asd kill <name>              # end a session (SIGHUP, then SIGKILL after 2s)
 ```

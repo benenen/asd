@@ -3576,3 +3576,76 @@ async fn an_attached_client_is_told_how_the_session_ended() {
         "the ending should say how it ended, got: {ended}"
     );
 }
+
+/// The point of `asd status` is that the program inside a session sets it: the
+/// child has `$ASD_SESSION` and `$ASD_SOCKET`, so it can describe itself
+/// without being told its own name or where its daemon is. Anything the daemon
+/// reads off the screen can say a session is busy; only the session can say it
+/// is on step three.
+#[tokio::test]
+async fn a_session_can_say_what_it_is_doing_from_inside_itself() {
+    let daemon = Daemon::start("saysit");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "worker"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Typed into the session, exactly as an agent would run it.
+    assert!(
+        daemon
+            .cli()
+            .args([
+                "send",
+                "worker",
+                "--text",
+                &format!("{} status --text 'step 3/7: running tests'", cli_exe()),
+                "--enter",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    wait_for(
+        || {
+            let out = daemon.cli().args(["list"]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).contains("step 3/7")
+        },
+        "the session's own status line to reach `list`",
+    )
+    .await;
+
+    // ...and it is a field of its own in JSON, not the activity status.
+    let out = daemon.cli().args(["list", "--json"]).output().unwrap();
+    let json = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        json.contains(r#""says":"step 3/7: running tests""#),
+        "says missing from: {json}"
+    );
+
+    // Reading it back needs no name from inside; from outside it takes one.
+    let out = daemon.cli().args(["status", "worker"]).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "step 3/7: running tests"
+    );
+
+    // Clearing hands the column back to the terminal title.
+    assert!(
+        daemon
+            .cli()
+            .args(["status", "worker", "--clear"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = daemon.cli().args(["list", "--json"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(r#""says":"""#),
+        "clear left something behind"
+    );
+}

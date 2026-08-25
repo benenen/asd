@@ -249,6 +249,10 @@ pub struct SessionMeta {
     /// The terminal title (OSC 0/2), exported by the session thread after each
     /// output batch; the network side reads it for `SessionInfo`.
     pub title: Mutex<String>,
+    /// What the session says it is doing (`asd status`). Written by the network
+    /// side rather than the session thread — it is metadata about the session,
+    /// not terminal state, so it never touches the VT the session thread owns.
+    pub status_line: Mutex<String>,
     /// What the program on the screen is doing, as the detection rules read it.
     /// Written by the session thread — the only owner of the terminal model —
     /// and read by the network side for `SessionInfo`.
@@ -277,6 +281,12 @@ impl SessionHandle {
             .lock()
             .map(|t| t.clone())
             .unwrap_or_default();
+        let status_line = self
+            .meta
+            .status_line
+            .lock()
+            .map(|t| t.clone())
+            .unwrap_or_default();
         let idle_ms = now_ms().saturating_sub(self.meta.last_output_ms.load(Ordering::Relaxed));
         // The current name lives in `meta` so a rename is reflected here.
         let name = self
@@ -288,6 +298,7 @@ impl SessionHandle {
         asd_proto::SessionInfo {
             name,
             command,
+            status_line,
             title,
             pid: self.meta.child_pid.load(Ordering::Relaxed),
             created_ms: self.created_ms,
@@ -600,6 +611,7 @@ pub fn spawn_session(
         alive: AtomicBool::new(true),
         pty_master_fd: AtomicI32::new(master_fd),
         title: Mutex::new(String::new()),
+        status_line: Mutex::new(String::new()),
         state: Mutex::new(AgentState::default()),
         last_output_ms: AtomicU64::new(created_ms),
         name: Mutex::new(name.clone()),

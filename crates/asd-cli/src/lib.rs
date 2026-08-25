@@ -68,6 +68,20 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Set or read what a session says it is doing: one line, shown in `list`
+    /// and the TUI. Meant to be run from inside the session it describes —
+    /// with no NAME it uses `$ASD_SESSION`, which every session's child has
+    Status {
+        /// Session name; defaults to $ASD_SESSION
+        name: Option<String>,
+        /// The line to set. Without it (and without --clear), print the
+        /// current one
+        #[arg(long, conflicts_with = "clear")]
+        text: Option<String>,
+        /// Clear the line, leaving the terminal title to speak for the session
+        #[arg(long)]
+        clear: bool,
+    },
     /// Rename a session. The running program and its screen are untouched — only
     /// the name changes, so a session created with an auto-generated or prefixed
     /// name can be corrected without losing what is running in it
@@ -352,13 +366,14 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                     } else if sessions.is_empty() {
                         println!("no sessions");
                     } else {
-                        // TITLE holds the session's own terminal title (OSC
-                        // 0/2) — what a TUI says it *is*, where COMMAND only
-                        // names the foreground binary. The column is sized to
-                        // the widest title on screen so short titles don't
-                        // push COMMAND off the terminal.
-                        let titles: Vec<String> =
-                            sessions.iter().map(|s| clean_title(&s.title)).collect();
+                        // SAYS holds what the session says about itself: the
+                        // line it set with `asd status` if it set one, else its
+                        // terminal title (OSC 0/2). Either way it is the
+                        // session's own words, where COMMAND only names the
+                        // foreground binary. The column is sized to the widest
+                        // entry on screen so short ones don't push COMMAND off
+                        // the terminal.
+                        let titles: Vec<String> = sessions.iter().map(session_says).collect();
                         let tw = title_col_width(&titles);
                         println!(
                             "{:<16} {:>8} {:>8} {:>8} {:>12}  {}  COMMAND",
@@ -367,7 +382,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                             "STATUS",
                             "CLIENTS",
                             "CREATED",
-                            pad_cell("TITLE", tw),
+                            pad_cell(SAYS_HEADER, tw),
                         );
                         for (s, title) in sessions.iter().zip(&titles) {
                             println!(
@@ -521,6 +536,32 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
 
             attach::run(c, &name, read_only).await?;
         }
+        Cmd::Status { name, text, clear } => {
+            // The common caller is a program inside the session describing
+            // itself, which knows its name only through the environment.
+            let name = match name.or_else(|| {
+                std::env::var("ASD_SESSION")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            }) {
+                Some(name) => name,
+                None => bail!(
+                    "no session named and $ASD_SESSION is unset — \
+                     pass a name, or run this inside a session"
+                ),
+            };
+            let mut c = client::connect(&socket, ClientKind::Cli).await?;
+            match (text, clear) {
+                (None, false) => {
+                    if let Some(line) = control::status_line_of(&mut c, &name).await? {
+                        println!("{line}");
+                    }
+                }
+                (text, _) => {
+                    control::set_status_line(&mut c, &name, text.unwrap_or_default()).await?;
+                }
+            }
+        }
         Cmd::Rename { name, new_name } => control::rename(&socket, name, new_name).await?,
         Cmd::Send {
             name,
@@ -596,13 +637,28 @@ async fn session_exists(c: &mut client::Client, name: &str) -> anyhow::Result<bo
     }
 }
 
-/// Widest the TITLE column may grow, in display columns. NAME..CREATED
+/// Header of the column that shows what a session says about itself.
+pub(crate) const SAYS_HEADER: &str = "SAYS";
+/// Widest the SAYS column may grow, in display columns. NAME..CREATED
 /// already take 58, so this keeps a titled table inside ~100 columns.
 const TITLE_COL_MAX: usize = 32;
 
 /// A session's terminal title as table text: control characters dropped (a
 /// rogue OSC title must not break the table or move the caller's cursor) and
 /// surrounding whitespace trimmed.
+/// What a session says about itself, most deliberate first: the line it set
+/// with `asd status`, else the terminal title its program happened to set.
+/// Both are arbitrary text from inside the session, so both are cleaned before
+/// they reach a terminal that would otherwise obey them.
+pub(crate) fn session_says(info: &asd_proto::SessionInfo) -> String {
+    let line = clean_title(&info.status_line);
+    if line.is_empty() {
+        clean_title(&info.title)
+    } else {
+        line
+    }
+}
+
 pub(crate) fn clean_title(title: &str) -> String {
     title
         .chars()
@@ -620,7 +676,7 @@ pub(crate) fn title_col_width(titles: &[String]) -> usize {
         .map(|t| str_width(t))
         .max()
         .unwrap_or(0)
-        .clamp("TITLE".len(), TITLE_COL_MAX)
+        .clamp(SAYS_HEADER.len(), TITLE_COL_MAX)
 }
 
 /// Fit `s` into exactly `width` display columns: truncated with an ellipsis
@@ -672,7 +728,10 @@ pub(crate) fn format_age(created_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, Cmd, TITLE_COL_MAX, clean_title, pad_cell, str_width, title_col_width};
+    use super::{
+        Args, Cmd, SAYS_HEADER, TITLE_COL_MAX, clean_title, pad_cell, session_says, str_width,
+        title_col_width,
+    };
     use clap::Parser;
 
     #[test]
@@ -696,6 +755,36 @@ mod tests {
     }
 
     #[test]
+    fn what_a_session_says_prefers_its_own_words() {
+        let mut info = asd_proto::SessionInfo {
+            name: "s0".into(),
+            command: "sh".into(),
+            title: "user@host: ~".into(),
+            status_line: String::new(),
+            state: asd_proto::AgentState::Unknown,
+            created_ms: 0,
+            idle_ms: 0,
+            running: false,
+            attached_clients: 0,
+            pid: 0,
+            cols: 80,
+            rows: 24,
+        };
+        // Nothing set: the terminal title speaks for the session.
+        assert_eq!(session_says(&info), "user@host: ~");
+        // Something set: that wins, because it was deliberate.
+        info.status_line = "step 3/7: running tests".into();
+        assert_eq!(session_says(&info), "step 3/7: running tests");
+        // Whitespace only is nothing said at all.
+        info.status_line = "   ".into();
+        assert_eq!(session_says(&info), "user@host: ~");
+        // It is arbitrary text from inside a session: it must not be able to
+        // repaint the terminal of whoever runs `asd list`.
+        info.status_line = "step 3\x1b[2J\x07".into();
+        assert_eq!(session_says(&info), "step 3[2J");
+    }
+
+    #[test]
     fn clean_title_trims_and_strips_control_characters() {
         assert_eq!(clean_title("  Claude Code  "), "Claude Code");
         assert_eq!(clean_title(""), "");
@@ -708,9 +797,9 @@ mod tests {
 
     #[test]
     fn title_col_width_fits_the_titles_within_bounds() {
-        // Never narrower than the header, even with no titles at all.
-        assert_eq!(title_col_width(&[]), 5);
-        assert_eq!(title_col_width(&["ab".to_string()]), 5);
+        // Never narrower than the header, even with nothing to show at all.
+        assert_eq!(title_col_width(&[]), SAYS_HEADER.len());
+        assert_eq!(title_col_width(&["ab".to_string()]), SAYS_HEADER.len());
         // Sized to the widest title present...
         assert_eq!(
             title_col_width(&["short".to_string(), "a longer title".to_string()]),
