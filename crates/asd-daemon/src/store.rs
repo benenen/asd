@@ -4,8 +4,6 @@
 //! back as a fresh shell `cd`'d to its saved directory, with the command it was
 //! created with waiting at that shell's prompt. Neither the live process nor the
 //! screen is restored, and the command is not re-run on its own.
-//!
-//! Spec: docs/superpowers/specs/2026-07-21-persistent-session-list-design.md
 
 use std::path::{Path, PathBuf};
 

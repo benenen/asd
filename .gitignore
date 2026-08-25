@@ -39,3 +39,8 @@ node_modules
 crates/asd-dioxus/dist
 
 .playwright-cli
+# Superpowers workflow byproducts: specs, plans, and research written while
+# working on a change. Kept on disk for whoever is working, out of the repo —
+# the durable contracts live in docs/ proper.
+/.superpowers/
+/docs/superpowers/
