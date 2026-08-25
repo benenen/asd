@@ -135,12 +135,22 @@ exit is watched directly and reported to the session thread instead. `Kill`
 sends SIGHUP and uses SIGKILL after two seconds if needed. Daemon shutdown
 applies the same graceful-then-hard sequence before removing its endpoint.
 
-Live processes, terminal cells, and scrollback are not persisted. Session name
-and working directory are. Registry create, rename, and removal rewrite
-`sessions.tsv` atomically through a temporary file plus rename. Daemon startup
-recreates each saved entry as a fresh default shell in its recorded directory.
-An ordinary kill or shell exit removes the saved entry; a daemon restart or
-crash restores it.
+Live processes, terminal cells, and scrollback are not persisted. Session name,
+working directory, and the command the session was created with are. Registry
+create, rename, and removal rewrite `sessions.tsv` atomically through a
+temporary file plus rename. An ordinary kill or shell exit removes the saved
+entry; a daemon restart or crash restores it.
+
+Daemon startup recreates each saved entry as a fresh default shell in its
+recorded directory. A recorded command is **staged, not run**: the daemon types
+it at that shell's prompt without the newline, so the session comes back with
+the command waiting to be confirmed, edited, or discarded. Re-running it is a
+decision only a person can make — the command may be a deploy or a migration
+whose second run is not free — so it is deliberately not automatic. A daemon
+started with `--run-restored-commands`, or one whose config sets
+`session.run_restored_commands`, sends the newline too. The staging write is
+the ordinary scripted-input path (`SessionMsg::ScriptInput`), delayed briefly so
+the shell has drawn its prompt before the command lands on it.
 
 Before intentional daemon shutdown, `freeze_and_persist` captures live working
 directories and freezes persistence. Otherwise the subsequent SIGHUP-driven

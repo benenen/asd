@@ -65,11 +65,43 @@ impl Registry {
     }
 
     /// Create a session. `name` defaults to auto-assignment; `cmd` defaults
-    /// to `$SHELL`.
+    /// to `$SHELL`, and is both what the child runs and what is persisted.
     pub fn create(
         registry: &Arc<Mutex<Self>>,
         name: Option<String>,
         cmd: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<String, (u32, String)> {
+        Self::spawn(registry, name, cmd.clone(), cmd, cwd)
+    }
+
+    /// Recreate a session the persisted list remembers, with its recorded
+    /// `command` *staged rather than run*: the child is a plain shell in `cwd`,
+    /// and the command is only what the daemon writes at that shell's prompt
+    /// afterwards (see `server::stage_restored_command`).
+    ///
+    /// A restart must not re-run an arbitrary command on its own — the recorded
+    /// command could be a migration, a deploy, or anything else whose second
+    /// run is not free. The session still carries the command forward, so it
+    /// survives the *next* restart too.
+    pub fn restore(
+        registry: &Arc<Mutex<Self>>,
+        name: String,
+        command: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<String, (u32, String)> {
+        Self::spawn(registry, Some(name), None, command, cwd)
+    }
+
+    /// The one spawn path. `run` is what the child executes (`None` = the
+    /// default shell); `record` is what the persisted list remembers, which is
+    /// the same thing for an ordinary create and the staged command for a
+    /// restore.
+    fn spawn(
+        registry: &Arc<Mutex<Self>>,
+        name: Option<String>,
+        run: Option<String>,
+        record: Option<String>,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<String, (u32, String)> {
         let mut reg = registry.lock().unwrap();
@@ -100,9 +132,9 @@ impl Registry {
 
         let scrollback = reg.scrollback_lines;
         let context = reg.context.clone();
-        let handle = spawn_session(
+        let mut handle = spawn_session(
             name.clone(),
-            cmd,
+            run,
             cwd,
             DEFAULT_SIZE.0,
             DEFAULT_SIZE.1,
@@ -111,14 +143,16 @@ impl Registry {
             Arc::clone(registry),
         )
         .map_err(|e| (code::INTERNAL, format!("failed to spawn session: {e}")))?;
+        handle.spawn_command = record;
         reg.sessions.insert(name.clone(), handle);
         reg.persist();
         info!(session = %name, "session created");
         Ok(name)
     }
 
-    /// Snapshot each live session's name + cwd for persistence/restore. Reads
-    /// `/proc/<pid>/cwd` under the lock — a cheap readlink.
+    /// Snapshot each live session's name, cwd, and recorded command for
+    /// persistence/restore. Reads `/proc/<pid>/cwd` under the lock — a cheap
+    /// readlink.
     pub fn snapshot(&self) -> Vec<crate::store::SessionState> {
         self.sessions
             .values()
@@ -133,6 +167,7 @@ impl Registry {
                 crate::store::SessionState {
                     name,
                     cwd: crate::store::read_cwd(pid),
+                    command: h.spawn_command.clone(),
                 }
             })
             .collect()

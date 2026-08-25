@@ -327,9 +327,15 @@ live in the data directory.)
 # scroll back, and how much `asd peek --scrollback` can return. Default 10000;
 # 0 disables scrollback. Memory grows only with the lines actually produced.
 scrollback_lines = 10000
+
+# Whether a restored session's recorded command runs by itself. Default false:
+# a restart types the command at the restored shell's prompt and waits for you
+# to press Enter. `asd daemon --run-restored-commands` forces it on for one
+# daemon.
+run_restored_commands = false
 ```
 
-That is the only knob today. Every key is optional and unknown keys are
+Every key is optional and unknown keys are
 ignored, so a partial file merges onto the defaults and an older daemon
 tolerates a newer file. A malformed one is not fatal either — the daemon logs a
 warning and serves with defaults rather than refusing to start.
@@ -391,8 +397,8 @@ the daemon log which rule produced each state change.
 
 ### Session persistence
 
-Session **names and working directories** outlive the daemon; the live processes
-and screens do not. The daemon keeps them in a tab-separated file, rewritten
+Session **names, working directories, and start commands** outlive the daemon;
+the live processes and screens do not. The daemon keeps them in a tab-separated file, rewritten
 atomically (temp file + `rename`) on every create/rename/kill and read back on
 every startup:
 
@@ -401,23 +407,53 @@ every startup:
 | Linux/macOS | `~/.local/share/asd/sessions.tsv` (`$XDG_DATA_HOME/asd/sessions.tsv` when set) |
 | Windows | `%LOCALAPPDATA%\asd\sessions.tsv` |
 
-One line per session, `name` TAB `cwd`:
+One line per session, `name` TAB `cwd` TAB `command`:
 
 ```tsv
-web	/home/me/proj
-logs	/var/log
-s0	
+web	/home/me/proj	npm run dev
 ```
+
+Either trailing field may be empty, so a plain shell session's line ends in a
+tab:
+
+| name | cwd | command |
+|---|---|---|
+| `web` | `/home/me/proj` | `npm run dev` |
+| `logs` | `/var/log` | *(empty: a plain shell)* |
+| `s0` | *(empty: cwd unreadable)* | *(empty)* |
 
 The cwd is empty when it could not be read — as on macOS, or for a session whose
 process is already gone (`s0` above); those come back in the daemon's default
-directory. Blank and nameless lines are skipped on read. Session names are
-`[A-Za-z0-9_-]` and paths don't contain tabs in practice, so no quoting or
-escaping is defined; the file is meant to be read, not hand-edited.
+directory. The command is empty for a session started as a plain shell, which is
+most of them. Blank and nameless lines are skipped on read. Session names are
+`[A-Za-z0-9_-]` and paths don't contain tabs in practice, so those two fields are
+written as-is; a command is arbitrary text, so a tab or newline in it is escaped
+(`\t`, `\n`, `\r`, `\\`) and nothing else is. The file is meant to be read, not
+hand-edited.
 
 On the next startup — `asd restart`, a reboot, or a crash — every entry is
 recreated as a fresh `$SHELL` in its saved directory. Killing a session or
 letting its shell exit rewrites the file without it, so it stays gone.
+
+**A recorded command comes back typed, not run.** The restored session is a
+shell with the command sitting on its prompt line, so you can press Enter to run
+it, edit it first, or Ctrl+C to drop it. asd will not re-run an arbitrary
+command on its own — a restart is not a reason to deploy again — so the
+confirmation is yours to give:
+
+```console
+$ asd new build --cmd 'cargo build --release && ./deploy.sh'
+$ asd restart
+$ asd attach build
+me@host:~/proj$ cargo build --release && ./deploy.sh▌   # waiting for Enter
+```
+
+The record belongs to the session, not to one boot: a session created with
+`--cmd` stages that command on every restart until the session is killed.
+
+To skip the confirmation, start the daemon with `asd daemon
+--run-restored-commands`, or set `session.run_restored_commands = true` in the
+config file so every daemon does it.
 
 The list belongs to the **data directory, not the socket**: `ASD_SOCKET` alone
 does not isolate it, so a second daemon run for experiments wants

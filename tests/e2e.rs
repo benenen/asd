@@ -113,10 +113,16 @@ impl Daemon {
     /// after the original daemon has stopped. Returns the child so the caller can
     /// SIGTERM it at the end.
     fn respawn_successor(&self) -> std::process::Child {
+        self.respawn_successor_with(&[])
+    }
+
+    /// A successor daemon on the same socket and data dir, with `extra` flags.
+    fn respawn_successor_with(&self, extra: &[&str]) -> std::process::Child {
         let child = Command::new(cli_exe())
             .arg("daemon")
             .arg("--socket")
             .arg(&self.socket)
+            .args(extra)
             .env("XDG_DATA_HOME", self.dir.join("data"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -3226,4 +3232,137 @@ async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// A restored session brings its command back to the prompt, and leaves it
+/// there. Re-running an arbitrary command on every daemon restart is not
+/// something a mux may decide by itself — the recorded command could be a
+/// deploy or a migration — so the restore types it and waits for a person.
+#[tokio::test]
+async fn restart_stages_the_recorded_command_without_running_it() {
+    let daemon = Daemon::start("stagecmd");
+    let marker = daemon.dir.join("it-ran");
+    let command = format!("touch '{}'; sleep 300", marker.display());
+
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "job", "--cmd", &command])
+            .status()
+            .unwrap()
+            .success(),
+        "create failed"
+    );
+    // A plain shell session alongside it: the common case, which must keep
+    // restoring exactly as before.
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "plain"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    // The create itself runs the command, as it always has.
+    wait_for(|| marker.exists(), "the created session to run its command").await;
+
+    // The persisted list records the command as a third field, and records
+    // nothing there for the shell session.
+    let state_path = daemon.dir.join("data/asd/sessions.tsv");
+    wait_for(
+        || {
+            std::fs::read_to_string(&state_path)
+                .map(|t| {
+                    t.lines()
+                        .any(|l| l.starts_with("job\t") && l.contains("touch"))
+                })
+                .unwrap_or(false)
+        },
+        "the command to reach the session list",
+    )
+    .await;
+    let state = std::fs::read_to_string(&state_path).unwrap();
+    let plain = state
+        .lines()
+        .find(|l| l.starts_with("plain\t"))
+        .expect("shell session missing from the list");
+    assert_eq!(
+        plain.splitn(3, '\t').nth(2),
+        Some(""),
+        "a shell session must record no command, got: {plain:?}"
+    );
+
+    // Clear the evidence, so anything that appears after the restart is a
+    // second run and not the first one's leftovers.
+    std::fs::remove_file(&marker).unwrap();
+
+    daemon.stop_and_wait();
+    let mut successor = daemon.respawn_successor();
+
+    let list = daemon.cli().args(["list"]).output().unwrap();
+    let list = String::from_utf8_lossy(&list.stdout);
+    assert!(list.contains("job"), "session not restored: {list}");
+
+    // The command is on the prompt line...
+    wait_for(
+        || {
+            let out = daemon.cli().args(["peek", "job"]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).contains("sleep 300")
+        },
+        "the recorded command to be typed at the restored prompt",
+    )
+    .await;
+    // ...and it did not run.
+    assert!(
+        !marker.exists(),
+        "the restored command ran without being confirmed"
+    );
+
+    // Enter is the confirmation.
+    assert!(
+        daemon
+            .cli()
+            .args(["send", "job", "--key", "Enter"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for(|| marker.exists(), "the staged command to run on Enter").await;
+
+    unsafe { libc::kill(successor.id() as i32, libc::SIGTERM) };
+    let _ = successor.wait();
+}
+
+/// The escape hatch: a daemon started with `--run-restored-commands` runs each
+/// restored command instead of waiting at the prompt.
+#[tokio::test]
+async fn run_restored_commands_runs_them_without_confirmation() {
+    let daemon = Daemon::start("runcmd");
+    let marker = daemon.dir.join("it-ran");
+    let command = format!("touch '{}'; sleep 300", marker.display());
+
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "job", "--cmd", &command])
+            .status()
+            .unwrap()
+            .success(),
+        "create failed"
+    );
+    wait_for(|| marker.exists(), "the created session to run its command").await;
+    std::fs::remove_file(&marker).unwrap();
+
+    daemon.stop_and_wait();
+    let mut successor = daemon.respawn_successor_with(&["--run-restored-commands"]);
+
+    // No Enter is sent: the flag supplies it.
+    wait_for(
+        || marker.exists(),
+        "the restored command to run on its own under --run-restored-commands",
+    )
+    .await;
+
+    unsafe { libc::kill(successor.id() as i32, libc::SIGTERM) };
+    let _ = successor.wait();
 }

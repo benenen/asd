@@ -23,3 +23,12 @@
 # scroll back / how much `asd peek --scrollback` returns). Default: 10000.
 # 0 disables scrollback. Memory grows only with lines actually produced.
 scrollback_lines = 10000
+
+# Whether a restored session's recorded command runs by itself. Default: false.
+# A restart recreates each session as a shell in its saved directory and types
+# the command it was created with at that prompt *without* running it, so a
+# restart never re-runs a deploy or a migration on its own — press Enter to run
+# it, edit it first, or Ctrl+C to drop it. Set true to have restored commands
+# run immediately; `asd daemon --run-restored-commands` does the same for a
+# single daemon.
+run_restored_commands = false

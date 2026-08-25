@@ -21,12 +21,17 @@ pub const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 pub struct Config {
     /// Lines of scrollback history each session's terminal keeps.
     pub scrollback_lines: usize,
+    /// Whether a restored session's recorded command runs by itself. Off by
+    /// default: a restart recreates the shell and leaves the command typed at
+    /// its prompt, so nothing re-runs until a person presses Enter.
+    pub run_restored_commands: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
+            run_restored_commands: false,
         }
     }
 }
@@ -44,6 +49,7 @@ struct RawConfig {
 #[serde(default)]
 struct RawSession {
     scrollback_lines: Option<usize>,
+    run_restored_commands: Option<bool>,
 }
 
 impl From<RawConfig> for Config {
@@ -54,6 +60,10 @@ impl From<RawConfig> for Config {
                 .session
                 .scrollback_lines
                 .unwrap_or(defaults.scrollback_lines),
+            run_restored_commands: raw
+                .session
+                .run_restored_commands
+                .unwrap_or(defaults.run_restored_commands),
         }
     }
 }
@@ -142,6 +152,14 @@ mod tests {
             Config::parse("this is not toml {{{").scrollback_lines,
             DEFAULT_SCROLLBACK_LINES
         );
+    }
+
+    #[test]
+    fn run_restored_commands_defaults_off_and_is_readable() {
+        assert!(!Config::parse("").run_restored_commands);
+        assert!(!Config::parse("[session]").run_restored_commands);
+        assert!(Config::parse("[session]\nrun_restored_commands = true").run_restored_commands);
+        assert!(!Config::parse("[session]\nrun_restored_commands = false").run_restored_commands);
     }
 
     #[test]

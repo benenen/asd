@@ -222,7 +222,13 @@ enum Cmd {
     },
     /// Run the mux daemon in the foreground (normally started on demand by
     /// `asd new` / `asd attach -A`)
-    Daemon,
+    Daemon {
+        /// Run each restored session's recorded command instead of leaving it
+        /// typed at the prompt for someone to confirm. Overrides the config
+        /// file's `session.run_restored_commands` for this daemon.
+        #[arg(long)]
+        run_restored_commands: bool,
+    },
     /// Restart the daemon: stop the running one and start a fresh copy of this
     /// binary. Handy after a rebuild bumps the protocol version. Sessions are
     /// recreated from the persisted list — each as a fresh shell in its saved
@@ -281,7 +287,9 @@ pub fn run(gui: Option<GuiLauncher>) -> anyhow::Result<()> {
     let args = Args::parse();
     match &args.cmd {
         // The daemon owns its own tokio runtime → dispatch before ours starts.
-        Some(Cmd::Daemon) => return asd_daemon::run(args.socket),
+        Some(Cmd::Daemon {
+            run_restored_commands,
+        }) => return asd_daemon::run(args.socket, *run_restored_commands),
         // No subcommand or `gui` → hand off to the injected GUI launcher.
         None => return launch_gui(gui, None),
         Some(Cmd::Gui { session }) => return launch_gui(gui, session.clone()),
@@ -562,7 +570,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                 asd_proto::PROTO_VERSION
             );
         }
-        Cmd::Daemon | Cmd::Gui { .. } | Cmd::Ui { .. } => {
+        Cmd::Daemon { .. } | Cmd::Gui { .. } | Cmd::Ui { .. } => {
             unreachable!("dispatched in `run` before the runtime starts")
         }
     }

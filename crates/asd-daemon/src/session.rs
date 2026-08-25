@@ -220,6 +220,12 @@ pub struct SessionHandle {
     pub name: String,
     /// The command this session runs (the `Create` cmd, or the default shell).
     pub command: String,
+    /// The command the session was asked for, when it was given one: what
+    /// `--cmd` said. `None` for a plain shell. Kept apart from `command`
+    /// because that one is a display string that falls back to the shell, while
+    /// this is the thing the persisted list restores — and a restored session
+    /// runs a shell while still remembering the command staged in it.
+    pub spawn_command: Option<String>,
     pub created_ms: u64,
     pub tx: mpsc::Sender<SessionMsg>,
     pub meta: Arc<SessionMeta>,
@@ -640,6 +646,7 @@ pub fn spawn_session(
     Ok(SessionHandle {
         name,
         command,
+        spawn_command: cmd,
         created_ms,
         tx,
         meta,

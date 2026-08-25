@@ -30,7 +30,10 @@ use asd_proto::paths;
 /// its own tokio runtime; call from a plain (non-async) context.
 ///
 /// `socket` defaults to `$ASD_SOCKET`, then `$XDG_RUNTIME_DIR/asd.sock`.
-pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
+/// `run_restored_commands` forces restored commands to run instead of waiting
+/// at their prompt, overriding the config file's `session.run_restored_commands`
+/// for this daemon only.
+pub fn run(socket: Option<PathBuf>, run_restored_commands: bool) -> anyhow::Result<()> {
     // try_init: the embedding binary may have installed a subscriber already
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -55,5 +58,5 @@ pub fn run(socket: Option<PathBuf>) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(server::serve(socket_path))
+    runtime.block_on(server::serve(socket_path, run_restored_commands))
 }
