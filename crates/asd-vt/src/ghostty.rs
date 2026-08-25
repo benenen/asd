@@ -30,6 +30,8 @@ use crate::{
 const CELL_PX: (u32, u32) = (8, 16);
 /// Bound unanswered theme probes from an unattached or non-terminal session.
 const MAX_PENDING_COLOR_QUERIES: usize = 32;
+/// Longest UTF-8 encoding of one codepoint, for sizing the cluster buffer.
+const MAX_UTF8_LEN: usize = 4;
 
 /// [`VtBackend`] implementation backed by libghostty-vt. `!Send`, owned
 /// exclusively by its holding thread.
@@ -293,7 +295,16 @@ impl VtBackend for GhosttyVt {
                 .update(row)
                 .expect("cell iterator update failed");
             while let Some(cell) = cell_iter.next() {
+                // Size the buffer before asking for the text. libghostty
+                // documents a too-small buffer as "writes nothing, reports the
+                // size it needs", but a multi-codepoint cluster crashes inside
+                // that path instead (verified against 0.2.0: an empty `String`
+                // plus a flag emoji segfaults in the C call). Asking how many
+                // codepoints the cell holds and reserving the UTF-8 worst case
+                // means the short-buffer path is never taken.
+                let codepoints = cell.graphemes_len().unwrap_or(1).max(1);
                 grapheme_buf.clear();
+                grapheme_buf.reserve(codepoints * MAX_UTF8_LEN);
                 cell.graphemes_utf8(&mut grapheme_buf)
                     .expect("cell grapheme read failed");
 

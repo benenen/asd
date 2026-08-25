@@ -681,3 +681,21 @@ fn synchronized_output_tracks_mode_2026() {
     vt.feed(b"\x1b[?2026l");
     assert!(!vt.synchronized_output(), "?2026l closes the update");
 }
+
+/// Rendering a cluster far larger than any fixed buffer must not take
+/// libghostty's short-buffer path, which crashes there instead of reporting the
+/// size it needs (0.2.0). Any program can turn clustering on and print one, and
+/// the daemon renders whatever a session prints, so this is reachable from
+/// session output alone.
+#[test]
+fn an_oversized_cluster_renders_instead_of_crashing() {
+    let mut vt = term(20, 3);
+    vt.feed(b"\x1b[?2027h");
+    let mut long = String::from("a");
+    for _ in 0..200 {
+        long.push('\u{0301}');
+    }
+    vt.feed(long.as_bytes());
+    let snap = vt.render_snapshot();
+    assert_eq!(snap.cells[0][0].grapheme, long);
+}
