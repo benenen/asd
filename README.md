@@ -141,6 +141,7 @@ asd ui                       # open the TUI: sidebar + live pane (Ctrl+A prefix)
 asd new [name] [--cmd CMD]   # create a session (auto-named s0, s1, …); default $SHELL
 asd attach <name>            # attach a VT-rendering client (detach: Ctrl-\)
 asd attach -A <name>         # attach, creating the session first if absent
+asd attach -r <name>         # watch read-only: keys go nowhere, size unaffected
 asd list                     # list sessions: name, size, status, clients, command
 asd kill <name>              # end a session (SIGHUP, then SIGKILL after 2s)
 ```
@@ -256,6 +257,15 @@ in another TUI transfers the view to that TUI; the displaced TUI stays open,
 shows an ASD placard, and can select the session again to take it back. This
 only governs TUI rendering: ordinary `asd attach` clients remain shared and
 continue to view and control the same session.
+
+**Watching without touching.** `asd attach --read-only` (`-r`) attaches a client
+that receives everything and sends nothing: the daemon drops its keystrokes
+instead of writing them to the pty, and leaves it out of size negotiation, so
+opening a watcher in a narrow window will not reflow the session under whoever
+is working in it. Useful for looking over an agent's shoulder without being one
+stray keystroke away from derailing it. It is a guard against accidents, not an
+access boundary — that same terminal can still run `asd send`, exactly as a
+`tmux attach -r` client can still run `tmux send-keys`.
 
 ### Remote SSH sessions
 

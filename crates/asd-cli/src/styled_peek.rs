@@ -43,6 +43,9 @@ pub(crate) async fn print_json(
             rows: 0,
             view_id: 0,
             appearance: TerminalAppearance::default(),
+            // This observer never writes; saying so keeps it out of size
+            // negotiation by contract rather than by the zero-size trick above.
+            read_only: true,
         })
         .await?;
     let snapshot_vt = match client.reader.read_frame().await? {

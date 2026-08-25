@@ -230,6 +230,7 @@ async fn drive(
                         rows,
                         view_id: 0,
                         appearance: crate::theme::TERMINAL_APPEARANCE,
+                        read_only: false,
                     }).await.is_err() {
                         return Err("attach write failed".to_string());
                     }

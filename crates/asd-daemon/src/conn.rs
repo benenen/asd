@@ -157,6 +157,7 @@ pub async fn handle_conn(
                 rows,
                 view_id,
                 appearance,
+                read_only,
             } => {
                 if client_kind == ClientKind::Tui && view_id == 0 {
                     reply(Frame::Error {
@@ -202,6 +203,7 @@ pub async fn handle_conn(
                         cols,
                         rows,
                         appearance,
+                        read_only,
                     })
                     .is_err()
                 {

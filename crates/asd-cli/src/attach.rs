@@ -50,7 +50,11 @@ enum Exit {
     DaemonGone,
 }
 
-pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
+/// Attach to `name` and render it until the detach key. `read_only` asks the
+/// daemon to drop this client's input and leave it out of size negotiation, and
+/// keeps this end from sending the keystrokes in the first place — belt and
+/// braces, so a viewer costs the session neither a byte nor a resize.
+pub async fn run(mut client: Client, name: &str, read_only: bool) -> anyhow::Result<()> {
     let (mut cols, mut rows) = term_size();
     // OSC replies arrive on stdin; raw mode prevents canonical input from
     // holding them for a newline. This still precedes the alternate screen, so
@@ -69,6 +73,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
             rows,
             view_id: 0,
             appearance: probe.appearance,
+            read_only,
         })
         .await?;
 
@@ -80,7 +85,11 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
         other => anyhow::bail!("expected Snapshot after Attach, got {other:?}"),
     };
 
-    eprintln!("[asd: attached to '{name}', detach: Ctrl-\\]");
+    if read_only {
+        eprintln!("[asd: watching '{name}' read-only, detach: Ctrl-\\]");
+    } else {
+        eprintln!("[asd: attached to '{name}', detach: Ctrl-\\]");
+    }
     // The Attach/Snapshot wait above stays in cooked mode, so Ctrl-C can still
     // interrupt a stalled daemon. Raw mode is needed only for the live client.
     let _raw = RawGuard::enable().context("enabling raw terminal mode")?;
@@ -234,7 +243,7 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                     // mirrors the session's encoding, and the viewport is 1:1,
                     // so no translation is needed). While scrolled back, the
                     // wheel still scrolls our view.
-                    if session_mouse && scroll == 0 {
+                    if session_mouse && scroll == 0 && !read_only {
                         if writer.write_frame(&Frame::Input { bytes: chunk }).await.is_err() {
                             break Exit::DaemonGone;
                         }
@@ -309,6 +318,9 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                     selection = None;
                     let _ = render_now(&mut vt, scroll, selection);
                 }
+                if read_only {
+                    continue; // the daemon would drop it; keep it off the wire
+                }
                 if writer.write_frame(&Frame::Input { bytes: chunk }).await.is_err() {
                     break Exit::DaemonGone;
                 }
@@ -317,7 +329,9 @@ pub async fn run(mut client: Client, name: &str) -> anyhow::Result<()> {
                 let (c, r) = term_size();
                 cols = c; rows = r;
                 vt.resize(cols.max(1), rows.max(1));
-                if writer.write_frame(&Frame::Resize { cols, rows }).await.is_err() {
+                if !read_only
+                    && writer.write_frame(&Frame::Resize { cols, rows }).await.is_err()
+                {
                     break Exit::DaemonGone;
                 }
                 let _ = render_now(&mut vt, scroll, selection);

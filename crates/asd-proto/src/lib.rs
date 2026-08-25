@@ -33,7 +33,10 @@
 //! says whether bytes are arriving; v15 adds `HostMetrics`/`HostMetricsReply`,
 //! letting a client read the daemon host's CPU, memory and network rates. The
 //! daemon samples them on its own timer and answers from that reading, so the
-//! request never measures anything and no client can drive the sampling rate.
+//! request never measures anything and no client can drive the sampling rate;
+//! v16 adds `Attach.read_only`, a viewer that receives the Snapshot and every
+//! Output while the daemon drops its input and keeps it out of the pty's size
+//! negotiation.
 
 mod codec;
 pub mod paths;
@@ -44,7 +47,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 15;
+pub const PROTO_VERSION: u32 = 16;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -299,6 +302,15 @@ pub enum Frame {
         /// each first non-`None` channel so multiple viewers cannot flip an
         /// application's theme underneath it.
         appearance: TerminalAppearance,
+        /// Watch without touching: the daemon drops this client's `Input` and
+        /// `Resize`, and leaves it out of size negotiation entirely, so a
+        /// viewer can neither type into the session nor shrink it. It still
+        /// receives the Snapshot and every Output.
+        ///
+        /// A guard against accidents, not an access boundary — the same
+        /// connection can still drive the session with the attach-free
+        /// scripting frames, as `tmux attach -r` can still `send-keys`.
+        read_only: bool,
     },
     /// Formatter dump used for attach and flow-control recovery.
     Snapshot {

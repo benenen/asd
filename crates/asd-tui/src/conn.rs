@@ -288,7 +288,7 @@ async fn drive(
                     if at.begin_view(name.clone(), view_id) {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
-                    if writer.write_frame(&Frame::Attach { name, cols, rows, view_id, appearance }).await.is_err() {
+                    if writer.write_frame(&Frame::Attach { name, cols, rows, view_id, appearance, read_only: false }).await.is_err() {
                         return Err("attach write failed".to_string());
                     }
                 }

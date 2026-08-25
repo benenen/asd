@@ -52,8 +52,14 @@ The complete crate ownership table is in
 - Ordinary `asd attach` clients and the desktop GUI are shared clients. Only
   `asd ui` has one exclusive interactive viewer per session; a new TUI viewer
   displaces the previous TUI without displacing shared clients.
-- PTY size is the per-axis minimum of all still-attached clients. A revoked or
-  dead client must be removed from both membership and size negotiation.
+- PTY size is the per-axis minimum of all still-attached clients that are not
+  read-only. A revoked or dead client must be removed from both membership and
+  size negotiation.
+- A read-only attachment receives the Snapshot and every Output like any other
+  client, but the daemon drops its input and keeps it out of size negotiation.
+  It guards against typing into the wrong session, not against a client that
+  means harm — the same connection can still drive the session with the
+  attach-free scripting frames.
 - Follow subscriptions are not attachments: they receive Output and activity
   status but do not receive Snapshots, count as attached clients, or affect PTY
   size.

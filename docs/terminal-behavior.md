@@ -8,8 +8,14 @@ in [`crates/asd-dioxus/README.md`](../crates/asd-dioxus/README.md).
 ## Client roles and TUI viewer ownership
 
 Ordinary `asd attach` and desktop GUI clients are shared: any number may view
-and type into one session. Only `asd ui` has an exclusive interactive viewer
-slot. Selecting a session in a second TUI atomically displaces the first TUI;
+and type into one session. `asd attach --read-only` is the same client with its
+writing half removed: it receives the Snapshot and every Output, while the
+daemon drops its `Input` and `Resize` and never enters it in size negotiation.
+The CLI also stops sending those frames, so a watcher costs the session nothing.
+This protects against typing into the wrong session, not against a client that
+means harm — nothing stops that connection from using the attach-free scripting
+frames, exactly as `tmux attach -r` cannot stop `tmux send-keys`. Only `asd ui`
+has an exclusive interactive viewer slot. Selecting a session in a second TUI atomically displaces the first TUI;
 the old process stays open, clears stale terminal contents, shows the ASD
 placard, and may explicitly select the row again to take the view back.
 
@@ -147,7 +153,10 @@ leave a host cursor artifact at the lower right.
 One PTY has one size. The daemon computes columns and rows independently as the
 minimum across all still-attached clients. This is deterministic and prevents a
 large client from making output that a small client cannot display. Closing a
-small client lets the PTY grow again. Followers do not participate.
+small client lets the PTY grow again. Followers do not participate, and neither
+do read-only attachments: a watcher renders whatever size the session already
+is, so opening one in a narrow window cannot reflow the work of the people
+typing. A `Resize` from a read-only client is dropped for the same reason.
 
 All detach paths, TUI revocation, slow-client removal, and failed direct sends
 must remove the client's size record and recompute. A stale size entry is a

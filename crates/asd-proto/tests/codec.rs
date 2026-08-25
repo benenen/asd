@@ -82,6 +82,7 @@ fn all_frames() -> Vec<Frame> {
                     b: 0x11,
                 }),
             },
+            read_only: false,
         },
         Frame::Attach {
             name: "unknown-theme".into(),
@@ -89,6 +90,15 @@ fn all_frames() -> Vec<Frame> {
             rows: 24,
             view_id: 0,
             appearance: TerminalAppearance::default(),
+            read_only: false,
+        },
+        Frame::Attach {
+            name: "watched".into(),
+            cols: 80,
+            rows: 24,
+            view_id: 0,
+            appearance: TerminalAppearance::default(),
+            read_only: true,
         },
         Frame::Snapshot {
             vt: b"\x1b[2J\x1b[Hhello".to_vec(),
@@ -205,7 +215,7 @@ fn all_frames() -> Vec<Frame> {
 
 #[test]
 fn protocol_version_covers_host_metrics() {
-    assert_eq!(asd_proto::PROTO_VERSION, 15);
+    assert_eq!(asd_proto::PROTO_VERSION, 16);
 }
 
 #[test]

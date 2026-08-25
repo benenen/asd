@@ -157,6 +157,9 @@ pub enum SessionMsg {
         cols: u16,
         rows: u16,
         appearance: TerminalAppearance,
+        /// Watch-only: no input from this client reaches the pty, and its size
+        /// stays out of the negotiation (`Frame::Attach.read_only`).
+        read_only: bool,
     },
     /// Keep the exclusive TUI owner's client-side view tag aligned with the
     /// canonical session name, including renames initiated by another client.
@@ -676,6 +679,10 @@ fn session_thread(
     let mut tui_owner: Option<TuiOwner> = None;
     // Each attached client's window size; the pty follows the smallest.
     let mut client_sizes: std::collections::HashMap<u64, (u16, u16)> = Default::default();
+    // Attached clients that may only watch. They are in `clients` — they get
+    // the Snapshot and every Output — but never in `client_sizes`, and their
+    // input is dropped rather than written to the pty.
+    let mut read_only_clients: std::collections::HashSet<u64> = Default::default();
     // `asd follow` subscribers. Deliberately not `clients`: they get Output but
     // no Snapshot, and they neither resize the pty nor count as attached.
     let mut followers: Vec<ClientSink> = Vec::new();
@@ -796,6 +803,13 @@ fn session_thread(
                 if !clients.iter().any(|client| client.id == client_id) {
                     continue;
                 }
+                if read_only_clients.contains(&client_id) {
+                    // Dropped silently, the way `tmux attach -r` drops a key: a
+                    // watcher typing is not an error to report back, it simply
+                    // does nothing.
+                    debug!(session = %name, client = client_id, "input from a read-only client");
+                    continue;
+                }
                 if pty_writer
                     .write_all(&bytes)
                     .and_then(|()| pty_writer.flush())
@@ -820,6 +834,9 @@ fn session_thread(
                 if !clients.iter().any(|client| client.id == client_id) {
                     continue;
                 }
+                if read_only_clients.contains(&client_id) {
+                    continue; // a watcher's window is not the session's business
+                }
                 client_sizes.insert(client_id, (cols, rows));
                 resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
             }
@@ -831,6 +848,7 @@ fn session_thread(
                 cols,
                 rows,
                 appearance,
+                read_only,
             } => {
                 let canonical_name = meta
                     .name
@@ -894,7 +912,11 @@ fn session_thread(
                 // is taken, so the dump it gets already describes the size
                 // everyone ends up at.
                 let new_id = sink.id;
-                client_sizes.insert(new_id, (cols, rows));
+                if read_only {
+                    read_only_clients.insert(new_id);
+                } else {
+                    client_sizes.insert(new_id, (cols, rows));
+                }
                 let mut with_new: Vec<ClientSink> = clients.clone();
                 with_new.push(sink.clone());
                 resize_to_clients(&*master, &mut vt, &meta, &with_new, &mut client_sizes);
@@ -911,9 +933,10 @@ fn session_thread(
                     }
                     meta.attached_clients
                         .store(clients.len() as u32, Ordering::Relaxed);
-                    info!(session = %name, clients = clients.len(), "client attached");
+                    info!(session = %name, clients = clients.len(), read_only, "client attached");
                 } else {
                     client_sizes.remove(&new_id);
+                    read_only_clients.remove(&new_id);
                     resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
                 }
             }
@@ -931,6 +954,7 @@ fn session_thread(
                         &mut clients,
                         &mut tui_owner,
                         &mut client_sizes,
+                        &mut read_only_clients,
                     );
                     meta.attached_clients
                         .store(clients.len() as u32, Ordering::Relaxed);
@@ -943,6 +967,7 @@ fn session_thread(
                     &mut clients,
                     &mut tui_owner,
                     &mut client_sizes,
+                    &mut read_only_clients,
                 );
                 meta.attached_clients
                     .store(clients.len() as u32, Ordering::Relaxed);
@@ -985,6 +1010,7 @@ fn session_thread(
                     &mut clients,
                     &mut tui_owner,
                     &mut client_sizes,
+                    &mut read_only_clients,
                 ) {
                     meta.attached_clients
                         .store(clients.len() as u32, Ordering::Relaxed);
@@ -1003,6 +1029,7 @@ fn session_thread(
                         &mut clients,
                         &mut tui_owner,
                         &mut client_sizes,
+                        &mut read_only_clients,
                     )
                 {
                     meta.attached_clients
@@ -1334,10 +1361,12 @@ fn remove_client_membership(
     clients: &mut Vec<ClientSink>,
     tui_owner: &mut Option<TuiOwner>,
     client_sizes: &mut std::collections::HashMap<u64, (u16, u16)>,
+    read_only_clients: &mut std::collections::HashSet<u64>,
 ) -> bool {
     let before = clients.len();
     clients.retain(|client| client.id != client_id);
     client_sizes.remove(&client_id);
+    read_only_clients.remove(&client_id);
     if tui_owner.is_some_and(|owner| owner.client_id == client_id) {
         *tui_owner = None;
     }
@@ -1528,12 +1557,19 @@ mod client_tests {
         });
         let mut sizes = std::collections::HashMap::from([(7, (40, 10))]);
 
+        let mut read_only: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        read_only.insert(7);
         assert!(remove_client_membership(
             7,
             &mut clients,
             &mut owner,
-            &mut sizes
+            &mut sizes,
+            &mut read_only
         ));
+        assert!(
+            read_only.is_empty(),
+            "a departing client's read-only marking must go with it"
+        );
         assert!(clients.is_empty());
         assert!(owner.is_none());
         assert!(sizes.is_empty());

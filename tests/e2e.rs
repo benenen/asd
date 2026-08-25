@@ -268,6 +268,25 @@ impl ProtoClient {
             rows,
             view_id,
             appearance: asd_proto::TerminalAppearance::default(),
+            read_only: false,
+        })
+        .await;
+        match self.recv().await {
+            Frame::Snapshot { vt } => vt,
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    /// Attach as a watcher: the daemon must drop this client's input and leave
+    /// it out of size negotiation.
+    async fn attach_read_only(&mut self, name: &str, cols: u16, rows: u16) -> Vec<u8> {
+        self.send(Frame::Attach {
+            name: name.into(),
+            cols,
+            rows,
+            view_id: 0,
+            appearance: asd_proto::TerminalAppearance::default(),
+            read_only: true,
         })
         .await;
         match self.recv().await {
@@ -420,6 +439,7 @@ async fn appearance_answers_query_that_predates_attach() {
                     b: 0x1e,
                 }),
             },
+            read_only: false,
         })
         .await;
     match client.recv().await {
@@ -484,6 +504,7 @@ async fn attached_color_query_is_daemon_only_and_answered_once() {
                     b: 0x1e,
                 }),
             },
+            read_only: false,
         })
         .await;
     match client.recv().await {
@@ -1912,6 +1933,7 @@ async fn attach_after_attached_session_dies_is_not_wedged() {
         rows: 24,
         view_id: 0,
         appearance: asd_proto::TerminalAppearance::default(),
+        read_only: false,
     })
     .await;
     match c.recv_skipping_output().await {
@@ -2577,6 +2599,7 @@ async fn second_tui_revokes_the_first_but_keeps_cli_attach_shared() {
             rows: 24,
             view_id: 0,
             appearance: TerminalAppearance::default(),
+            read_only: false,
         })
         .await;
     assert!(matches!(
@@ -3365,4 +3388,108 @@ async fn run_restored_commands_runs_them_without_confirmation() {
 
     unsafe { libc::kill(successor.id() as i32, libc::SIGTERM) };
     let _ = successor.wait();
+}
+
+/// A read-only client sees everything and reaches nothing. Its keystrokes are
+/// dropped by the daemon rather than written to the pty, while output keeps
+/// flowing to it — the point of the mode is watching an agent without being one
+/// keystroke away from derailing it.
+#[tokio::test]
+async fn a_read_only_client_watches_but_cannot_type() {
+    let daemon = Daemon::start("readonly");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "watched"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let watcher_marker = daemon.dir.join("watcher-typed");
+    let sender_marker = daemon.dir.join("sender-typed");
+
+    let mut watcher = ProtoClient::connect(&daemon.socket).await;
+    watcher.attach_read_only("watched", 80, 24).await;
+
+    // The watcher types a command that would leave a file behind.
+    watcher
+        .send(Frame::Input {
+            bytes: format!("touch '{}'\r", watcher_marker.display()).into_bytes(),
+        })
+        .await;
+
+    // Then a command goes in through a channel that is allowed to write. When
+    // its file appears, the pty has processed input that arrived *after* the
+    // watcher's — so the watcher's absence below is a fact, not a race.
+    assert!(
+        daemon
+            .cli()
+            .args([
+                "send",
+                "watched",
+                "--text",
+                &format!("touch '{}'", sender_marker.display()),
+                "--enter",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for(|| sender_marker.exists(), "the writable client's command").await;
+    assert!(
+        !watcher_marker.exists(),
+        "a read-only client's input reached the pty"
+    );
+
+    // ...and the watcher is still a viewer: it receives the output of what the
+    // other client did.
+    let seen = watcher.read_output_until(b"touch").await;
+    assert!(
+        String::from_utf8_lossy(&seen).contains("touch"),
+        "watcher stopped receiving output"
+    );
+}
+
+/// A watcher's window is not the session's business: attaching read-only at a
+/// smaller size leaves the pty where the typing clients put it, and a Resize
+/// from that client changes nothing either.
+#[tokio::test]
+async fn a_read_only_client_does_not_resize_the_session() {
+    let daemon = Daemon::start("rosize");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "sized"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // One ordinary client sets the size.
+    let mut typer = ProtoClient::connect(&daemon.socket).await;
+    typer.attach_sized("sized", 100, 30).await;
+    wait_for(
+        || {
+            let out = daemon.cli().args(["list"]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).contains("100x30")
+        },
+        "the attached client's size to take effect",
+    )
+    .await;
+
+    // A much smaller watcher joins. A read-write client this size would drag
+    // the pty down to 20x5.
+    let mut watcher = ProtoClient::connect(&daemon.socket).await;
+    watcher.attach_read_only("sized", 20, 5).await;
+    watcher.send(Frame::Resize { cols: 20, rows: 5 }).await;
+
+    // Give both a chance to be wrong, then assert they were not.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let out = daemon.cli().args(["list"]).output().unwrap();
+    let list = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        list.contains("100x30"),
+        "a read-only client resized the session: {list}"
+    );
 }

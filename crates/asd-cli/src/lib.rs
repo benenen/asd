@@ -219,6 +219,11 @@ enum Cmd {
         /// Raw byte proxy stdio ↔ UDS (for SSH dumb pipes); does not interpret the protocol
         #[arg(long)]
         stdio: bool,
+        /// Watch without touching: keys are not forwarded, and this viewer's
+        /// window never resizes the session. A guard against typing into the
+        /// wrong pane, not an access boundary — `asd send` still works
+        #[arg(short = 'r', long)]
+        read_only: bool,
     },
     /// Run the mux daemon in the foreground (normally started on demand by
     /// `asd new` / `asd attach -A`)
@@ -456,7 +461,12 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                 println!("kill signalled: {n}");
             }
         }
-        Cmd::Attach { name, auto, stdio } => {
+        Cmd::Attach {
+            name,
+            auto,
+            stdio,
+            read_only,
+        } => {
             if stdio {
                 // The pure byte proxy does no handshake: the pipe's far end
                 // speaks the protocol.
@@ -509,7 +519,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                 }
             }
 
-            attach::run(c, &name).await?;
+            attach::run(c, &name, read_only).await?;
         }
         Cmd::Rename { name, new_name } => control::rename(&socket, name, new_name).await?,
         Cmd::Send {
