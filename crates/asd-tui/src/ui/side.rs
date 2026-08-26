@@ -66,6 +66,20 @@ fn blocked(session: &asd_proto::SessionInfo) -> bool {
     session.state == asd_proto::AgentState::Blocked
 }
 
+/// What a sidebar row calls a session.
+///
+/// Most deliberate first: what the session said about itself with `asd
+/// status`, then the title its program set, then the command it is running.
+fn row_label(session: &asd_proto::SessionInfo) -> String {
+    if !session.status_line.trim().is_empty() {
+        session.status_line.trim().to_string()
+    } else if session.title.trim().is_empty() {
+        short_cmd(&session.command)
+    } else {
+        session.title.trim().to_string()
+    }
+}
+
 fn draw_title(
     buf: &mut Buffer,
     area: Rect,
@@ -120,15 +134,7 @@ fn draw_detail(buf: &mut Buffer, area: Rect, app: &App, session: &asd_proto::Ses
     let age = short_age(session.created_ms, app.now_ms);
     let cmd_w = (area.width - 1) as usize;
     let cmd_w = cmd_w.saturating_sub(ROW_TEXT_X as usize + age.len() + 2);
-    // Most deliberate first: what the session said about itself with `asd
-    // status`, then the title its program set, then the command it is running.
-    let label = if !session.status_line.trim().is_empty() {
-        session.status_line.trim().to_string()
-    } else if session.title.trim().is_empty() {
-        short_cmd(&session.command)
-    } else {
-        session.title.trim().to_string()
-    };
+    let label = row_label(session);
     // A marker as well as a colour: in a sidebar of twenty rows, colour alone
     // is easy to miss, and it is gone entirely for a colour-blind reader.
     let label = if blocked(session) {
@@ -232,6 +238,24 @@ mod tests {
             cols: 80,
             rows: 24,
         }
+    }
+
+    #[test]
+    fn what_a_session_says_outranks_its_title_and_command() {
+        use asd_proto::AgentState;
+
+        // `asd status` is the session speaking for itself, so it wins.
+        let mut session = info(AgentState::Idle, false);
+        session.status_line = "  waiting on review  ".into();
+        assert_eq!(row_label(&session), "waiting on review");
+
+        // Cleared, the title its program set speaks for it again.
+        session.status_line = "   ".into();
+        assert_eq!(row_label(&session), "Refactor auth");
+
+        // With neither, the row falls back to what is running.
+        session.title = String::new();
+        assert_eq!(row_label(&session), short_cmd("claude"));
     }
 
     #[test]
