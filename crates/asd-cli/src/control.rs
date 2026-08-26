@@ -408,6 +408,13 @@ pub(crate) fn status_label(info: &asd_proto::SessionInfo) -> &'static str {
 /// prompt — a state change, or output. Past this it reports a stall rather
 /// than sitting out the whole timeout, because the usual cause is a foreground
 /// program that does not read its input at all.
+///
+/// What the guard can speak to is silence: nothing came back. It cannot see
+/// through a cooked-mode tty, which echoes what is typed into it whether or
+/// not the program ever reads it — so a session left in cooked mode looks like
+/// it received the prompt, and `ask` settles on the activity rule instead. The
+/// programs that really eat input — full-screen TUIs — turn echo off, which is
+/// exactly where the guard fires.
 const ASK_STALL_MS: u64 = 5_000;
 
 /// Whether a prompt can be said to have landed: the agent is ready for more
@@ -454,7 +461,13 @@ pub async fn ask(
     })?;
     let mut c = client::connect(socket, ClientKind::Cli).await?;
 
-    let before = session_state(&mut c, &name).await?;
+    let probed = session_info(&mut c, &name).await?;
+    let before = probed.state;
+    // How stale the session's output already was when we asked. The stall
+    // guard below measures against this rather than against zero: the answer
+    // to a fast prompt can be stamped *before* the Ack completes the round
+    // trip, and then `idle_ms` and the elapsed time grow in lockstep forever.
+    let base_idle_ms = probed.idle_ms;
     if before == AgentState::Blocked {
         eprintln!(
             "ask: '{name}' is waiting for an answer of its own — \
@@ -507,8 +520,11 @@ pub async fn ask(
         // before the first poll — and `running` alone would not do, because a
         // session that printed something a second before the prompt is
         // "running" without having received anything.
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        if info.state != before || info.idle_ms < elapsed_ms {
+        // If nothing were to come out of the session, `idle_ms` would be its
+        // age at the pre-check plus everything since. Anything below that is
+        // output the prompt produced, however fast it came.
+        let quiet_idle_ms = base_idle_ms + started.elapsed().as_millis() as u64;
+        if info.state != before || info.idle_ms < quiet_idle_ms {
             stirred = true;
         }
         if stirred && ask_settled(&info, until) {
@@ -530,13 +546,16 @@ pub async fn ask(
     }
 }
 
-/// One session's screen-derived state, or the daemon's own "no such session".
-async fn session_state(c: &mut client::Client, name: &str) -> anyhow::Result<AgentState> {
+/// One session's entry in the list, or the daemon's own "no such session".
+async fn session_info(
+    c: &mut client::Client,
+    name: &str,
+) -> anyhow::Result<asd_proto::SessionInfo> {
     c.writer.write_frame(&Frame::ListSessions).await?;
     match c.reader.read_frame().await? {
         Some(Frame::SessionList { sessions }) => {
-            match sessions.iter().find(|info| info.name == name) {
-                Some(info) => Ok(info.state),
+            match sessions.into_iter().find(|info| info.name == name) {
+                Some(info) => Ok(info),
                 None => Err(exit::daemon(
                     "ask",
                     code::NO_SUCH_SESSION,

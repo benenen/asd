@@ -1410,7 +1410,7 @@ async fn wait_idle_and_timeout() {
     assert!(
         daemon
             .cli()
-            .args(["new", "quiet"])
+            .args(["new", "quiet", "--cmd", "exec bash --norc -i"])
             .output()
             .unwrap()
             .status
@@ -3684,16 +3684,68 @@ async fn ask_sends_and_waits_for_the_session_to_settle() {
     );
 }
 
+/// The stall guard measures against the age of the session's last output, not
+/// against zero. A session that has been quiet for a while and then answers
+/// instantly used to defeat it: the answer was stamped before the Ack for the
+/// prompt finished its round trip, so `idle_ms` and the elapsed time grew in
+/// lockstep and the guard reported a stall for a prompt that had plainly
+/// landed. Anything below the age it started from is output the prompt caused.
+///
+/// The shell is pinned to `--norc` because the race needs the whole answer —
+/// echo, command, new prompt — to finish inside the round trip. A shell that
+/// paints a title from its prompt takes longer than that and lands on the safe
+/// side of the window, so it never showed the bug.
+#[tokio::test]
+async fn ask_does_not_cry_stall_when_a_quiet_session_answers_instantly() {
+    let daemon = Daemon::start("askquiet");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "quiet", "--cmd", "exec bash --norc -i"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Let the session go properly quiet first: the bug only showed once the
+    // last output was older than the round trip that carries the prompt.
+    std::thread::sleep(Duration::from_millis(2_500));
+
+    let out = daemon
+        .cli()
+        .args(["ask", "quiet", "echo INSTANT-ANSWER", "--timeout", "20s"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("no sign of receiving"),
+        "the prompt landed, but ask reported a stall: {err}"
+    );
+    assert!(out.status.success(), "ask failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "idle");
+
+    let peek = daemon.cli().args(["peek", "quiet"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&peek.stdout).contains("INSTANT-ANSWER"),
+        "the prompt never reached the session"
+    );
+}
+
 /// A session whose foreground program never reads its input would otherwise
 /// absorb the prompt and leave `ask` waiting out the whole timeout. It gives up
 /// as soon as it is clear nothing received it — well before the 20s asked for.
+///
+/// Echo is off deliberately. A cooked-mode tty echoes what is typed into it
+/// whether or not the program ever reads it, so echo left on would put output
+/// on the wire and the session would look like it had received the prompt.
+/// This is the case the guard can actually speak to: nothing came out at all.
 #[tokio::test]
 async fn ask_gives_up_early_when_nothing_reads_the_prompt() {
     let daemon = Daemon::start("askstall");
     assert!(
         daemon
             .cli()
-            .args(["new", "deaf", "--cmd", "sleep 300"])
+            .args(["new", "deaf", "--cmd", "sh -c 'stty -echo; exec sleep 300'"])
             .status()
             .unwrap()
             .success()

@@ -70,8 +70,8 @@ enum Cmd {
     },
     /// Prompt a session and wait for it to settle. Unlike `send`, this refuses
     /// to type into a session that is already waiting for an answer of its own,
-    /// gives up early if nothing in it reads the input, and prints the state it
-    /// settled in (`idle` or `blocked`) so a caller can branch on it
+    /// gives up early if nothing comes back from it at all, and prints the
+    /// state it settled in (`idle` or `blocked`) so a caller can branch on it
     Ask {
         /// Session name
         name: String,

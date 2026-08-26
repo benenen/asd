@@ -165,13 +165,20 @@ things the pair cannot do on its own:
   answer to *that* question. `ask` reads the state first and exits 5 rather than
   answering someone else's dialog by accident. Answering one deliberately is
   what `send` is for.
-- **It gives up early when nothing received the prompt.** A foreground program
-  that never reads its input (a `sleep`, a paused build) swallows the text
-  silently, and waiting the full timeout for a settle that cannot come is a
-  waste. Any state change, or any output that arrives *after* the prompt, counts
-  as having received it; five seconds of neither is reported as a stall. The
-  guard tests output timing rather than the `running` flag, because a session
-  that printed something just before the prompt would otherwise look alive.
+- **It gives up early when nothing comes back at all.** A full-screen program
+  that never reads its input swallows the text silently, and waiting the full
+  timeout for a settle that cannot come is a waste. Any state change, or any
+  output newer than the session's last output when the prompt went in, counts as
+  having received it; five seconds of neither is reported as a stall. The guard
+  measures against that starting age rather than against zero, because a session
+  can answer faster than the acknowledgement for the prompt travels back, and
+  comparing with zero then makes an instant answer look like silence.
+
+  Silence is all the guard can test. A tty in cooked mode echoes what is typed
+  into it whether or not the program reads it, so a `sleep` with echo left on
+  looks like it received the prompt and `ask` falls through to the activity
+  rule. The programs that actually eat input turn echo off, which is where the
+  guard does fire.
 - **It says where it settled**, so a caller can branch on `blocked` without
   asking again.
 
