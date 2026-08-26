@@ -1,7 +1,10 @@
-# asd daemon configuration — example.
+# asd configuration — example.
+#
+# Two readers share this file and ignore each other's tables: the daemon reads
+# `[session]`, and `asd ui` reads `[keys]`.
 #
 # Copy this to your config path and edit — the file is never auto-created, and
-# the daemon looks for it at:
+# both look for it at:
 #   $ASD_CONFIG                        (if set, wins everywhere)
 #   $XDG_CONFIG_HOME/asd/config.toml   (unix, if XDG_CONFIG_HOME is set)
 #   ~/.config/asd/config.toml          (unix default)
@@ -14,9 +17,10 @@
 # the daemon rewrites (~/.local/share/asd, %LOCALAPPDATA%\asd) — nothing here
 # is ever overwritten behind your back.
 #
-# The daemon reads it once at startup, so run `asd restart` after editing to
-# apply changes. Every key is optional — anything omitted uses the default
-# shown below, and a missing or malformed file just means "all defaults".
+# Each reads it once at startup, so run `asd restart` after editing `[session]`
+# and reopen `asd ui` after editing `[keys]`. Every key is optional — anything
+# omitted uses the default shown below, and a missing or malformed file just
+# means "all defaults".
 
 [session]
 # Lines of scrollback history each session's terminal keeps (how far you can
@@ -32,3 +36,48 @@ scrollback_lines = 10000
 # run immediately; `asd daemon --run-restored-commands` does the same for a
 # single daemon.
 run_restored_commands = false
+
+
+# ---------------------------------------------------------------------------
+# `asd ui` key bindings. Read by the TUI; the daemon ignores this table.
+#
+# Two contexts. A `[keys.direct]` binding fires on its own, so it has to be a
+# chord the session below would never want. A `[keys.prefix]` binding fires
+# after the leader, where a bare letter is free to mean something.
+#
+# Each entry lists *all* the keys for that action, replacing the defaults
+# rather than adding to them. Write a key as optional `Ctrl+`/`Alt+`/`Shift+`/
+# `Super+` modifiers and one key name: a single character, an arrow (`Up`,
+# `Down`, `Left`, `Right`), `Esc`, `Enter`, `Tab`, `BackTab`, `Backspace`,
+# `PageUp`, `PageDown`, `Home`, `End`, `Insert`, `Delete`, or `F1`..`F12`. In
+# `[keys.prefix]` a plain `a-z` names a range.
+#
+# Bindings that cannot be compiled — an unknown key, two actions on one key,
+# something that shadows the leader — leave every default in place and say so
+# on the notice line, so a typo here can never lock you out of your sessions.
+# ---------------------------------------------------------------------------
+
+# [keys]
+# The prefix key. Press it, then a `[keys.prefix]` key. Default: "Ctrl+A".
+# leader = "Ctrl+A"
+
+# [keys.direct]
+# Move through the session list without the prefix. Default: Ctrl+Alt+↓ / ↑.
+# Some desktops take Ctrl+Alt+arrows for switching workspaces before the
+# terminal ever sees them; if yours does, rebind here.
+# select_next = ["Ctrl+Alt+Down"]
+# select_previous = ["Ctrl+Alt+Up"]
+# scroll_page_up = ["Shift+PageUp"]
+# scroll_page_down = ["Shift+PageDown"]
+
+# [keys.prefix]
+# select_next = ["j", "Down"]
+# select_previous = ["k", "Up"]
+# create = ["c"]
+# rename = ["r"]
+# kill = ["x"]
+# toggle_sidebar = ["b"]
+# toggle_status = ["s"]
+# reconnect = ["R"]
+# quit = ["q"]
+# cancel_prefix = ["Esc"]

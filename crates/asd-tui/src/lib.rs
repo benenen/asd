@@ -32,6 +32,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 
+mod config;
 mod conn;
 mod key;
 mod keymap;
@@ -707,6 +708,11 @@ fn event_loop(
         false,
     );
 
+    // Read before the first frame so the bindings the status bar advertises are
+    // the ones that will actually route. A file it cannot use costs the notice
+    // line, never the session list.
+    let (keymap, keymap_complaint) = config::keymap(&asd_proto::paths::config_path());
+
     let mut app = App {
         socket,
         conn,
@@ -733,9 +739,9 @@ fn event_loop(
         clipboard: None,
         cursor_tail: None,
         daemon_up: false,
-        notice: None,
+        notice: keymap_complaint,
         modal: None,
-        keymap: Keymap::default(),
+        keymap,
         now_ms: now_ms(),
         metrics: None,
         preferred,

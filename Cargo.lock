@@ -297,8 +297,10 @@ dependencies = [
  "chrono",
  "libc",
  "ratatui",
+ "serde",
  "tachyonfx",
  "tokio",
+ "toml",
  "tracing",
  "unicode-width",
 ]

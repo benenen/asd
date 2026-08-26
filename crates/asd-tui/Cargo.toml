@@ -15,6 +15,9 @@ asd-proto = { workspace = true }
 asd-vt = { workspace = true }
 chrono = { workspace = true }
 ratatui = { workspace = true }
+# The `[keys]` table of the same config.toml the daemon reads.
+serde = { workspace = true }
+toml = { workspace = true }
 tachyonfx = "0.25"
 # Display-width-aware truncation for sidebar rows (CJK glyphs are 2 cols); the
 # same crate ratatui already uses to lay out cells.

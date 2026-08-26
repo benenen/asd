@@ -24,6 +24,47 @@ pub(crate) enum KeyAction {
     SendLeaderLiteral,
 }
 
+/// The names `config.toml` gives the actions it can rebind, paired with the
+/// action itself so the two cannot drift.
+///
+/// `JumpTo` and `SendLeaderLiteral` are deliberately absent. The first is nine
+/// bindings the sidebar prints ordinals for, so rebinding one of them would
+/// make a row lie; the second is the leader pressed twice, which follows
+/// whatever the leader is set to.
+const CONFIG_NAMES: &[(&str, KeyAction)] = &[
+    ("select_next", KeyAction::SelectNext),
+    ("select_previous", KeyAction::SelectPrevious),
+    ("create", KeyAction::Create),
+    ("rename", KeyAction::Rename),
+    ("kill", KeyAction::Kill),
+    ("toggle_sidebar", KeyAction::ToggleSidebar),
+    ("toggle_status", KeyAction::ToggleStatus),
+    ("reconnect", KeyAction::Reconnect),
+    ("quit", KeyAction::Quit),
+    ("scroll_page_up", KeyAction::ScrollPageUp),
+    ("scroll_page_down", KeyAction::ScrollPageDown),
+    ("cancel_prefix", KeyAction::CancelPrefix),
+];
+
+impl KeyAction {
+    /// The action `name` stands for in `config.toml`, if it names one at all.
+    pub(crate) fn from_config_name(name: &str) -> Option<Self> {
+        CONFIG_NAMES
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, action)| *action)
+    }
+
+    /// What `config.toml` calls this action. Used to report a rebind that
+    /// named an action the context does not have.
+    pub(crate) fn config_name(self) -> &'static str {
+        CONFIG_NAMES
+            .iter()
+            .find(|(_, candidate)| *candidate == self)
+            .map_or("(unnameable)", |(name, _)| *name)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyResolution {
     PassThrough,
@@ -121,7 +162,9 @@ impl std::fmt::Display for KeymapError {
                 key,
                 action,
             } => write!(f, "{context} key {key} is repeated for {action:?}"),
-            Self::UnknownAction { action } => write!(f, "{action:?} is not bound in this context"),
+            Self::UnknownAction { action } => {
+                write!(f, "{} is not bound in this context", action.config_name())
+            }
             Self::ConflictingBinding {
                 context,
                 key,
@@ -235,6 +278,18 @@ impl Default for KeymapSpec {
                 .expect("default key names must be valid")
         };
         let direct = vec![
+            // Switching sessions is the one thing frequent enough to be worth a
+            // chord of its own: the prefix costs two keystrokes every time, and
+            // walking a sidebar of twenty is where that adds up. Ctrl+Alt is
+            // free of the leader and of anything a shell reads, but some
+            // desktops bind Ctrl+Alt+arrows to workspace switching — which is
+            // what `[keys.direct]` in config.toml is for.
+            Binding::fixed(patterns(&["Ctrl+Alt+Down"]), KeyAction::SelectNext, "next"),
+            Binding::fixed(
+                patterns(&["Ctrl+Alt+Up"]),
+                KeyAction::SelectPrevious,
+                "previous",
+            ),
             Binding::fixed(
                 patterns(&["Shift+PageUp"]),
                 KeyAction::ScrollPageUp,

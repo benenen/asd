@@ -242,6 +242,10 @@ These are the current defaults. `asd ui` uses a `Ctrl+A` prefix
 (screen-style): press it, then a key. Runtime hints and key dispatch are both
 generated from the same keymap registry so they stay in sync.
 
+`Ctrl+Alt+↓`/`Ctrl+Alt+↑` walk the session list on their own, without the
+prefix — the one move frequent enough to be worth its own chord. Everything
+else is behind the prefix:
+
 - `j`/`k` or arrows — switch session; `1`–`9` — jump to session *N* (each sidebar row shows its matching ordinal prefix)
 - `c` — new session
 - `r` — rename the selected session (input modal; `Enter` confirms, `Esc` cancels; empty and duplicate names are rejected)
@@ -253,6 +257,12 @@ generated from the same keymap registry so they stay in sync.
 - `R` — reconnect · `q` — quit · `Ctrl+A Ctrl+A` — send a literal `Ctrl+A` to the session
 
 Mouse: click a sidebar row to switch (or its `x` to kill), drag in the pane to select (copied via OSC 52), and **drag the sidebar↔pane divider** to resize the sidebar (clamped to a sensible min/max). `Shift+PageUp`/`PageDown` page the scrollback.
+
+All of it is rebindable, leader included, under `[keys]` in the config file
+below — worth knowing if your desktop takes `Ctrl+Alt`+arrows for switching
+workspaces before the terminal ever sees them. Bindings that will not compile
+leave every default in place and say why on the notice line, so a typo cannot
+lock you out of your sessions.
 
 Each session can be shown by only one `asd ui` at a time. Selecting a session
 in another TUI transfers the view to that TUI; the displaced TUI stays open,
@@ -319,8 +329,9 @@ same precedence as everywhere else, so exporting your own value overrides them.
 
 ### Configuration
 
-The daemon's config file is optional, read-only, and never auto-created — a
-missing file simply means "all defaults":
+The config file is optional, read-only, and never auto-created — a missing file
+simply means "all defaults". Two readers share it and ignore each other's
+tables: the daemon reads `[session]`, `asd ui` reads `[keys]`.
 
 | | |
 |---|---|
@@ -345,15 +356,34 @@ scrollback_lines = 10000
 # to press Enter. `asd daemon --run-restored-commands` forces it on for one
 # daemon.
 run_restored_commands = false
+
+[keys]
+# The TUI's prefix key. Press it, then a `[keys.prefix]` key. Default "Ctrl+A".
+leader = "Ctrl+A"
+
+[keys.direct]
+# Bindings that fire without the prefix, so they have to be chords the session
+# would never want. Default Ctrl+Alt+↓ / Ctrl+Alt+↑ for the session list.
+select_next = ["Ctrl+Alt+Down"]
+select_previous = ["Ctrl+Alt+Up"]
+
+[keys.prefix]
+# Bindings behind the leader, where a bare letter is free to mean something.
+# Each entry lists *all* the keys for that action, replacing the defaults.
+select_next = ["j", "Down"]
+quit = ["q"]
 ```
 
 Every key is optional and unknown keys are
 ignored, so a partial file merges onto the defaults and an older daemon
 tolerates a newer file. A malformed one is not fatal either — the daemon logs a
-warning and serves with defaults rather than refusing to start.
+warning and serves with defaults rather than refusing to start, and `asd ui`
+falls back to its default bindings with the reason on the notice line.
 
-The file is read **once, at daemon startup**, so run `asd restart` to apply an
-edit. `config.example.toml` in the repository root is a ready-to-copy template.
+The file is read **once at startup** by each of its readers, so run `asd
+restart` after editing `[session]` and reopen `asd ui` after editing `[keys]`.
+`config.example.toml` in the repository root is a ready-to-copy template that
+lists every action by name.
 
 ### Agent state
 

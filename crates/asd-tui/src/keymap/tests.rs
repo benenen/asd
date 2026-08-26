@@ -294,3 +294,14 @@ fn compile_rejects_duplicate_aliases_within_one_binding() {
         "errors: {errors:?}"
     );
 }
+
+/// The config's names and the actions they stand for are one table read in two
+/// directions; a name that only resolves one way is a rebind that reports an
+/// action nobody can write down.
+#[test]
+fn every_config_name_round_trips() {
+    for (name, action) in CONFIG_NAMES {
+        assert_eq!(KeyAction::from_config_name(name), Some(*action));
+        assert_eq!(action.config_name(), *name);
+    }
+}
