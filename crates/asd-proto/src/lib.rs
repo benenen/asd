@@ -495,15 +495,6 @@ pub enum Frame {
         /// quiet spell is reported mid-stream.
         exit: Option<SessionExit>,
     },
-    /// client → daemon: set (or clear, with an empty `line`) what a session
-    /// says it is doing. Name-addressed and attach-free, like the other
-    /// scripting frames, because the caller is usually the program *inside*
-    /// that session using `$ASD_SESSION`. Replies `Ack`, or `Error` when there
-    /// is no such session.
-    SetStatusLine {
-        name: String,
-        line: String,
-    },
     /// daemon → TUI: another `asd ui` took this session's exclusive view.
     /// The connection stays open so the displaced UI can keep listing sessions
     /// and explicitly select this one again to take it back.
@@ -523,6 +514,22 @@ pub enum Frame {
     Error {
         code: u32,
         msg: String,
+    },
+    /// client → daemon: set (or clear, with an empty `line`) what a session
+    /// says it is doing. Name-addressed and attach-free, like the other
+    /// scripting frames, because the caller is usually the program *inside*
+    /// that session using `$ASD_SESSION`. Replies `Ack`, or `Error` when there
+    /// is no such session.
+    ///
+    /// Last on purpose. postcard numbers variants by position, so a frame added
+    /// anywhere else renumbers everything after it — and the first casualty is
+    /// `Error` itself, which is how a daemon tells a client their versions
+    /// disagree. Appending keeps that message readable to a newer client, so an
+    /// upgrade in the wrong order says "proto version mismatch" instead of a
+    /// codec error. New frames go here.
+    SetStatusLine {
+        name: String,
+        line: String,
     },
 }
 
