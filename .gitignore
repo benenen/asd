@@ -25,6 +25,11 @@ target
 
 /target
 
+# Staging build trees. A second `CARGO_TARGET_DIR` next to `target/` is how a
+# rebuild gets staged without disturbing the one a running daemon was built
+# from, and it is as large and as disposable as `target/` itself.
+/target-*
+
 # Packaged release archives (`make package`/`dist`)
 /dist
 
