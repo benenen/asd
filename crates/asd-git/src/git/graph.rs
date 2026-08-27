@@ -11,34 +11,55 @@ use std::collections::HashMap;
 
 use crate::git::commit::CommitInfo;
 
-/// What to draw in one cell of one row. The `usize` is an index into the lane
-/// palette, except `HorizontalPipe`, which carries the horizontal run's colour
-/// and the colour of the vertical lane it crosses.
+/// What to draw in one cell of one row.
+///
+/// Every variant is defined by the strokes it connects, and the character in
+/// its doc comment is derived from those strokes — up is toward newer commits,
+/// down is toward older ones. A renderer is therefore a lookup from variant to
+/// character and needs to know nothing else. Nothing here is named for where a
+/// branch "goes": that reading is what let the emitted structure and the
+/// documented characters drift apart in the first place.
+///
+/// The `usize` is an index into the lane palette. Three variants carry two:
+/// where a run passes *through* a cell that a lane's vertical stroke also
+/// occupies, both owners are recorded as `(run, lane)` so the renderer can
+/// choose between them. A cell where a run *terminates* carries only the run's
+/// colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellType {
+    /// Nothing is drawn here.
     Empty,
-    /// A lane continuing straight down.
+    /// `│` — up, down. A lane running straight through the row.
     Pipe(usize),
     /// The commit marker itself.
     Commit(usize),
-    /// `╭` — a branch leaving to the up-right.
-    BranchRight(usize),
-    /// `╮` — a branch leaving to the up-left.
-    BranchLeft(usize),
-    /// `╰` — a branch joining from the down-right.
-    MergeRight(usize),
-    /// `╯` — a branch joining from the down-left.
-    MergeLeft(usize),
-    /// `─` — a horizontal run.
+    /// `─` — left, right. A run over a cell no lane occupies.
     Horizontal(usize),
-    /// A horizontal run crossing a vertical lane: `(horizontal, pipe)`.
+    /// `┼` — up, down, left, right. `(run, lane)`. A run crossing a lane that
+    /// carries on both above and below this row.
     HorizontalPipe(usize, usize),
-    /// `├`
+    /// `╭` — down, right. A lane that starts on this row and is reached from
+    /// its right, so it sits left of the commit.
+    BranchRight(usize),
+    /// `╮` — down, left. A lane that starts on this row and is reached from
+    /// its left, so it sits right of the commit.
+    BranchLeft(usize),
+    /// `╯` — up, left. A lane that ends on this row, joining leftwards into
+    /// the trunk.
+    MergeLeft(usize),
+    /// `├` — up, down, right. A lane running through the row that a run also
+    /// reaches from its right: the connector row's trunk, and a merge edge
+    /// landing on a live lane left of the commit.
     TeeRight(usize),
-    /// `┤`
+    /// `┤` — up, down, left. A lane running through the row that a merge edge
+    /// reaches from its left, so it sits right of the commit.
     TeeLeft(usize),
-    /// `┴` — a fork point.
-    TeeUp(usize),
+    /// `┬` — down, left, right. `(run, lane)`. A lane that starts on this row
+    /// underneath a run passing over it.
+    TeeDown(usize, usize),
+    /// `┴` — up, left, right. `(run, lane)`. A lane that ends on this row
+    /// underneath a run passing over it.
+    TeeUp(usize, usize),
 }
 
 /// One drawable row.
@@ -157,14 +178,20 @@ impl GraphBuilder {
         }
         let far = extra.iter().copied().max().unwrap_or(keep);
         // The run between the trunk and the furthest rejoining lane. A lane it
-        // crosses keeps its own colour underneath the horizontal.
-        for cell in cells.iter_mut().take(far).skip(keep + 1) {
+        // crosses keeps its own colour underneath the run.
+        for (i, cell) in cells.iter_mut().enumerate().take(far).skip(keep + 1) {
             *cell = match *cell {
+                // A rejoining lane is released a few statements below, so it
+                // has no stroke under this row: the run ends it rather than
+                // crossing it, or it would trail off into nothing.
+                CellType::Pipe(pipe) if extra.contains(&i) => CellType::TeeUp(color, pipe),
                 CellType::Pipe(pipe) => CellType::HorizontalPipe(color, pipe),
                 _ => CellType::Horizontal(color),
             };
         }
-        cells[keep] = CellType::TeeUp(color);
+        // The trunk carries on down to the commit this row joins at, so it
+        // needs a down stroke as well as the run leaving to its right.
+        cells[keep] = CellType::TeeRight(color);
         if far != keep {
             cells[far] = CellType::MergeLeft(color);
         }
@@ -181,14 +208,20 @@ impl GraphBuilder {
     /// `lane`: `free_lane` hands back the leftmost free slot, which can be to
     /// the left of a commit that took its own lane from `lane_of`.
     ///
-    /// The four terminals differ along two axes, and the variant names say
-    /// which side of the commit the branch lies on rather than which way the
-    /// stroke points: `*Right` lands at the right-hand end of the run and
-    /// `*Left` at the left-hand end, while `Branch*` marks a lane that begins
-    /// on this row and `Tee*` a lane that was already live and carries on
-    /// below. Teeing is what stops a merge onto an existing lane from erasing
-    /// that lane's pipe.
-    fn paint_merge_edge(cells: &mut Vec<CellType>, lane: usize, target: usize, color: usize) {
+    /// Every cell is chosen from the strokes it has to connect, which is why
+    /// the row painter has to have run first: a cell still holding `Pipe` is a
+    /// lane that was already live and so keeps an up stroke, while `Empty` is a
+    /// lane this very merge opens and so has none. `parents` names the lanes
+    /// this commit's parents landed on, which is what tells an opening lane
+    /// under the run (`┬`) from bare space the run merely passes over (`─`).
+    fn paint_merge_edge(
+        &self,
+        cells: &mut Vec<CellType>,
+        lane: usize,
+        target: usize,
+        color: usize,
+        parents: &[usize],
+    ) {
         if target == lane {
             return;
         }
@@ -201,18 +234,25 @@ impl GraphBuilder {
         } else {
             (target + 1, lane)
         };
-        for cell in cells.iter_mut().take(end).skip(first) {
+        for (i, cell) in cells.iter_mut().enumerate().take(end).skip(first) {
             *cell = match *cell {
                 CellType::Pipe(pipe) => CellType::HorizontalPipe(color, pipe),
+                // A parent's lane opens here and carries on below, so the run
+                // passing over it needs a down stroke too.
+                CellType::Empty if parents.contains(&i) => {
+                    CellType::TeeDown(color, self.lane_color.get(&i).copied().unwrap_or(i))
+                }
                 CellType::Empty => CellType::Horizontal(color),
                 other => other,
             };
         }
+        // The terminal: a live lane keeps its up and down strokes and only
+        // gains the run, while a lane opening here gains a down stroke instead.
         cells[target] = match (cells[target], target > lane) {
-            (CellType::Pipe(_), true) => CellType::TeeRight(color),
-            (CellType::Pipe(_), false) => CellType::TeeLeft(color),
-            (_, true) => CellType::BranchRight(color),
-            (_, false) => CellType::BranchLeft(color),
+            (CellType::Pipe(_), true) => CellType::TeeLeft(color),
+            (CellType::Pipe(_), false) => CellType::TeeRight(color),
+            (_, true) => CellType::BranchLeft(color),
+            (_, false) => CellType::BranchRight(color),
         };
     }
 
@@ -287,10 +327,10 @@ impl GraphBuilder {
         // One run per side, not one per parent: a parent lane in the middle of
         // a run stays a plain crossing, which is what the octopus case draws.
         if let Some(right) = extra_lanes.iter().copied().max().filter(|t| *t > lane) {
-            Self::paint_merge_edge(&mut cells, lane, right, color);
+            self.paint_merge_edge(&mut cells, lane, right, color, &extra_lanes);
         }
         if let Some(left) = extra_lanes.iter().copied().min().filter(|t| *t < lane) {
-            Self::paint_merge_edge(&mut cells, lane, left, color);
+            self.paint_merge_edge(&mut cells, lane, left, color, &extra_lanes);
         }
 
         debug_assert!(
@@ -390,7 +430,7 @@ mod tests {
             merge_row
                 .cells
                 .iter()
-                .any(|c| matches!(c, CellType::Horizontal(_) | CellType::BranchRight(_))),
+                .any(|c| matches!(c, CellType::Horizontal(_) | CellType::BranchLeft(_))),
             "a merge row draws an edge to the second parent: {:?}",
             merge_row.cells
         );
@@ -478,7 +518,7 @@ mod tests {
         let merge_row = &b.nodes()[at];
         assert_eq!(merge_row.lane, 0, "the merge keeps the trunk");
         assert!(
-            matches!(merge_row.cells.get(1), Some(CellType::TeeRight(_))),
+            matches!(merge_row.cells.get(1), Some(CellType::TeeLeft(_))),
             "the edge tees into the live lane rather than replacing it: {:?}",
             merge_row.cells
         );
@@ -524,7 +564,7 @@ mod tests {
             .expect("merge row exists");
         assert_eq!(merge_row.lane, 1, "the merge is not on the leftmost lane");
         assert!(
-            matches!(merge_row.cells.first(), Some(CellType::TeeLeft(_))),
+            matches!(merge_row.cells.first(), Some(CellType::TeeRight(_))),
             "the edge reaches left into the parent's live lane: {:?}",
             merge_row.cells
         );
@@ -535,36 +575,118 @@ mod tests {
     /// lane starts here or was already live.
     #[test]
     fn a_merge_run_crosses_the_lanes_between_it_and_the_parent() {
-        // Reaching right, over one live lane and one free one, onto a lane
-        // that is already live.
+        let b = GraphBuilder::new();
+
+        // Reaching right, over one live lane and one empty cell that no parent
+        // claims, onto a lane that is already live: the terminal keeps that
+        // lane's up and down strokes and adds the run arriving from its left.
         let mut cells = vec![
             CellType::Commit(3),
             CellType::Pipe(8),
             CellType::Empty,
             CellType::Pipe(9),
         ];
-        GraphBuilder::paint_merge_edge(&mut cells, 0, 3, 3);
+        b.paint_merge_edge(&mut cells, 0, 3, 3, &[3]);
         assert_eq!(
             cells,
             vec![
                 CellType::Commit(3),
                 CellType::HorizontalPipe(3, 8),
                 CellType::Horizontal(3),
-                CellType::TeeRight(3),
+                CellType::TeeLeft(3),
             ]
         );
 
-        // Reaching left, onto a lane that is not live yet.
+        // Reaching left, onto a lane that is not live yet: no up stroke, so a
+        // corner rather than a tee, and it opens toward the run on its right.
         let mut cells = vec![CellType::Empty, CellType::Pipe(8), CellType::Commit(3)];
-        GraphBuilder::paint_merge_edge(&mut cells, 2, 0, 3);
+        b.paint_merge_edge(&mut cells, 2, 0, 3, &[0]);
         assert_eq!(
             cells,
             vec![
-                CellType::BranchLeft(3),
+                CellType::BranchRight(3),
                 CellType::HorizontalPipe(3, 8),
                 CellType::Commit(3),
             ]
         );
+    }
+
+    /// The two rows an octopus draws, cell by cell. Between them they contain
+    /// every variant this layer emits for a fan-out and a rejoin, and both were
+    /// drawing strokes into nothing before: the lanes opening under the merge
+    /// run had no down stroke, and the lanes dying under the connector run were
+    /// painted as full crossings.
+    #[test]
+    fn an_octopus_draws_its_fan_out_and_its_rejoin() {
+        let fx = Fixture::new("layout-octopus-cells");
+        fx.commit("base");
+        for name in ["a", "b", "c"] {
+            fx.checkout("main");
+            fx.branch(name);
+            fx.commit(&format!("on {name}"));
+        }
+        fx.checkout("main");
+        fx.merge_many(&["a", "b", "c"], "octopus");
+
+        let b = layout_of(&fx);
+        let octopus = b
+            .nodes()
+            .iter()
+            .find(|n| n.commit.as_ref().is_some_and(|c| c.summary == "octopus"))
+            .expect("octopus row exists");
+        // `●┬┬╮`: the commit, two lanes opening under the run, and the furthest
+        // parent's lane opening toward the run on its left.
+        assert!(
+            matches!(
+                octopus.cells.as_slice(),
+                [
+                    CellType::Commit(_),
+                    CellType::TeeDown(..),
+                    CellType::TeeDown(..),
+                    CellType::BranchLeft(_)
+                ]
+            ),
+            "the fan-out opens a lane under every crossing: {:?}",
+            octopus.cells
+        );
+
+        let connector = b
+            .nodes()
+            .iter()
+            .find(|n| n.commit.is_none())
+            .expect("connector row exists");
+        // `├┴┴╯`: the trunk carrying on down to `base`, two lanes ending under
+        // the run, and the furthest one turning up-left into it.
+        assert!(
+            matches!(
+                connector.cells.as_slice(),
+                [
+                    CellType::TeeRight(_),
+                    CellType::TeeUp(..),
+                    CellType::TeeUp(..),
+                    CellType::MergeLeft(_)
+                ]
+            ),
+            "the rejoin ends every lane it joins: {:?}",
+            connector.cells
+        );
+        // Nothing survives the connector but the trunk, so no row below it may
+        // draw in a lane the connector just closed.
+        let at = b
+            .nodes()
+            .iter()
+            .position(|n| n.commit.is_none())
+            .expect("connector row exists");
+        for node in &b.nodes()[at + 1..] {
+            assert!(
+                node.cells
+                    .iter()
+                    .skip(1)
+                    .all(|c| matches!(c, CellType::Empty)),
+                "a lane the connector closed is drawn again below it: {:?}",
+                node.cells
+            );
+        }
     }
 
     #[test]
