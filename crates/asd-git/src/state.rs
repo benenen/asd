@@ -8,6 +8,7 @@ use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::git::commit::CommitInfo;
@@ -27,9 +28,13 @@ const PAGE_MARGIN: usize = 200;
 /// What `asd-tui` should do after handing over an event.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// Handled; nothing else to do.
+    /// Handled. The host keeps the overlay open and repaints: every
+    /// navigation key returns this, so treating it as "nothing changed"
+    /// would leave the selection visibly stuck. Nothing in phase 1
+    /// constructs `Redraw`, so `Consumed` is the repaint signal.
     Consumed,
-    /// Handled and the frame needs repainting.
+    /// Handled and the frame needs repainting. Reserved for phase 2's diff
+    /// worker; no phase 1 path returns it, so a host must not wait for it.
     Redraw,
     /// Close the overlay.
     Dismiss,
@@ -172,8 +177,19 @@ impl GitGraph {
             .and_then(|n| n.commit.as_ref())
     }
 
+    /// Handle one key.
+    ///
+    /// This ignores `KeyEvent::kind`: a host that forwards `Release` (or
+    /// `Repeat`) as well as `Press` — which crossterm does emit once the
+    /// kitty keyboard protocol is enabled — moves the selection twice per
+    /// keypress. Filtering to `KeyEventKind::Press` is the caller's job.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         let page = self.viewport_rows.max(1);
+        // A half page still has to be at least one row: `viewport_rows` is 1
+        // before the first frame and can be 1 in a three-row-tall overlay,
+        // and `1 / 2` would make these keys permanently dead rather than
+        // merely small-stepped.
+        let half_page = (page / 2).max(1);
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Char('j') | KeyCode::Down) => {
                 self.select(self.selected.saturating_add(1))
@@ -182,10 +198,10 @@ impl GitGraph {
                 self.select(self.selected.saturating_sub(1))
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
-                self.select(self.selected.saturating_add(page / 2))
+                self.select(self.selected.saturating_add(half_page))
             }
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
-                self.select(self.selected.saturating_sub(page / 2))
+                self.select(self.selected.saturating_sub(half_page))
             }
             (KeyModifiers::NONE, KeyCode::PageDown) => {
                 self.select(self.selected.saturating_add(page))
@@ -251,11 +267,33 @@ fn group_refs(refs: Vec<RefInfo>) -> HashMap<gix::ObjectId, Vec<RefInfo>> {
 
 impl Widget for &mut GitGraph {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // Clamp to the buffer before anything derives a sub-area from it.
+        // `Block::render` intersects internally, but `Block::inner` does not,
+        // so an `area` running past the buffer's edge would hand `draw_rows`
+        // and `draw_message` an out-of-bounds region and panic on `asd ui`'s
+        // main thread — blanking every session the user has open. Containment
+        // is this crate's own guarantee, not a precondition on its callers.
+        let area = area.intersection(buf.area);
+
         let title = format!(" Git Graph — {} ", self.repo.workdir().display());
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .title(title)
             .border_style(Style::default().fg(Color::Rgb(0x8B, 0x94, 0xA2)));
+        // A partial read keeps the rows it managed to read: one unreadable
+        // commit must not hide an otherwise fine history, so the failure is
+        // surfaced beside the graph rather than replacing it. It goes on the
+        // bottom border, not the top one, because the top title already
+        // carries the workdir path — a repository nested a few directories
+        // deep truncates anything appended after it clean off the border.
+        // With no rows at all there is nothing to hide, and the message
+        // becomes the whole body instead (below).
+        if let (Some(error), true) = (self.error.as_deref(), self.row_count() > 0) {
+            block = block.title_bottom(Line::styled(
+                format!(" partial read: {error} "),
+                Style::default().fg(Color::Rgb(0xD8, 0x6C, 0x6C)),
+            ));
+        }
         let inner = block.inner(area);
         block.render(area, buf);
         if inner.width == 0 || inner.height == 0 {
@@ -264,13 +302,12 @@ impl Widget for &mut GitGraph {
         // Remember the viewport so paging keys know their step next time.
         self.viewport_rows = inner.height as usize;
 
-        if let Some(error) = self.error.clone() {
-            let msg = format!("cannot read this repository: {error}");
-            crate::ui::graph_view::draw_message(buf, inner, &msg);
-            return;
-        }
         if self.row_count() == 0 {
-            crate::ui::graph_view::draw_message(buf, inner, "no commits yet");
+            let msg = match self.error.as_deref() {
+                Some(error) => format!("cannot read this repository: {error}"),
+                None => "no commits yet".to_string(),
+            };
+            crate::ui::graph_view::draw_message(buf, inner, &msg);
             return;
         }
         draw_rows(
@@ -292,6 +329,14 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Every symbol in `area`, row by row, as one string.
+    fn buffer_text(buf: &Buffer, area: Rect) -> String {
+        (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect()
     }
 
     fn graph_with(n: usize, tag: &str) -> (Fixture, GitGraph) {
@@ -422,7 +467,88 @@ mod tests {
                     }
                 }
             }
+
+            // The precondition violation itself, now that handling it is the
+            // contract rather than a demand on the caller: an area running
+            // past the buffer's edge, and one starting outside it entirely.
+            // `Block::render` self-defends, but `Block::inner` does not, so
+            // without the clamp in `render` these index out of bounds.
+            for &(bx, by, bw, bh) in &[
+                (0u16, 0u16, 0u16, 0u16),
+                (0, 0, 1, 1),
+                (0, 0, 5, 3),
+                (0, 0, 20, 8),
+                // A buffer that does not start at the origin: a clamp written
+                // as `min(width)` rather than a real intersection passes every
+                // case above and fails this one.
+                (4, 2, 12, 6),
+            ] {
+                let mut buf = Buffer::empty(Rect::new(bx, by, bw, bh));
+                for &area in &[
+                    Rect::new(0, 0, 200, 60),
+                    Rect::new(bx, by, 200, 60),
+                    Rect::new(bx.saturating_add(bw), by.saturating_add(bh), 40, 20),
+                    Rect::new(180, 50, 40, 20),
+                    Rect::new(u16::MAX - 2, u16::MAX - 2, 8, 8),
+                ] {
+                    (&mut *graph).render(area, &mut buf);
+                }
+            }
         }
+    }
+
+    #[test]
+    fn a_half_page_key_moves_even_when_the_viewport_is_one_row() {
+        // `viewport_rows` is 1 until the first frame, and stays 1 in a
+        // three-row-tall overlay. A raw `page / 2` is 0 there, which makes
+        // Ctrl-D and Ctrl-U permanently dead rather than merely small-stepped.
+        let (_fx, mut g) = graph_with(3, "state-halfpage");
+        assert_eq!(g.viewport_rows, 1, "no frame has been rendered yet");
+
+        g.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(g.selected(), 1, "Ctrl-D must move at least one row");
+        g.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(g.selected(), 0, "Ctrl-U must move at least one row");
+    }
+
+    #[test]
+    fn a_partial_read_error_does_not_hide_the_rows_it_did_read() {
+        // A mid-walk failure keeps the commits already drained. Showing the
+        // error *instead of* them would blank an otherwise fine history over
+        // one unreadable commit, so it belongs in the title, not the body.
+        let (_fx, mut g) = graph_with(3, "state-partial");
+        g.error = Some("reading a commit: object not found".to_string());
+
+        let area = Rect::new(0, 0, 60, 6);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let text = buffer_text(&buf, area);
+
+        assert!(
+            text.contains("commit 2"),
+            "the rows survive the error: {text:?}"
+        );
+        assert!(
+            text.contains("partial read"),
+            "the error is still surfaced: {text:?}"
+        );
+        assert!(
+            !text.contains("cannot read this repository"),
+            "the whole-body failure message is for an empty graph only: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_error_with_no_rows_is_the_whole_message() {
+        let fx = Fixture::new("state-error-empty");
+        let mut g = GitGraph::open(fx.path()).expect("an unborn repository opens");
+        g.error = Some("opening references: broken".to_string());
+
+        let area = Rect::new(0, 0, 60, 6);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let text = buffer_text(&buf, area);
+        assert!(text.contains("cannot read this repository"), "{text:?}");
     }
 
     #[test]
@@ -433,10 +559,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         (&mut g).render(area, &mut buf);
 
-        let text: String = (0..area.height)
-            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
-            .map(|(x, y)| buf[(x, y)].symbol().to_string())
-            .collect();
+        let text = buffer_text(&buf, area);
         assert!(text.contains("no commits yet"), "{text:?}");
     }
 
