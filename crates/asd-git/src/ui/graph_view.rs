@@ -21,6 +21,14 @@ const HASH_W: u16 = 8;
 
 /// The glyph for a cell. Rounded corners, matching keifu's default character
 /// set; the vocabulary is fixed so this is total.
+///
+/// The graph-cell loop in `draw_rows` writes exactly one buffer cell per
+/// glyph, unlike `put`, which understands double-width text. That is sound
+/// only because every glyph this function returns is single-width (box
+/// drawing characters and `●` are all narrow). If the vocabulary ever grows
+/// to include a wide character, the graph-cell loop needs the same
+/// width-aware handling `put` already has, or a wide glyph would straddle
+/// two buffer cells while only one is accounted for.
 pub fn cell_glyph(cell: CellType) -> char {
     match cell {
         CellType::Empty => ' ',
@@ -58,11 +66,6 @@ fn cell_color(cell: CellType) -> Color {
             lane_color(run)
         }
     }
-}
-
-/// Style applied to one row on top of its cell colours.
-pub struct RowStyle {
-    pub selected: bool,
 }
 
 /// `[main]`, `[origin/main]`, `(v1.2)` — the decorations for one commit.
@@ -292,17 +295,30 @@ mod tests {
         assert_eq!(buf[(0, 0)].symbol(), " ");
     }
 
-    /// A degenerate-size sweep, not asked for by the brief. Small and
-    /// zero-sized areas are exactly where index arithmetic goes wrong, and
-    /// the render path panicking takes down every session's display at once
-    /// (`asd ui` is a resident multiplexer, not a one-shot renderer), so this
-    /// exercises every area from 0x0 up to 12x6 against a deliberately messy
-    /// set of rows: a wide multi-lane row carrying every two-colour cell
-    /// variant, full branch/tag/remote decorations, and a summary far longer
-    /// than any of the areas under test, plus a bare connector row (`commit:
-    /// None`). The only assertion is that none of this panics.
+    /// A degenerate-size-and-origin sweep, not asked for by the brief. Small
+    /// and zero-sized areas are exactly where index arithmetic goes wrong,
+    /// and the render path panicking takes down every session's display at
+    /// once (`asd ui` is a resident multiplexer, not a one-shot renderer),
+    /// so this exercises every area from 0x0 up to 12x6 at several non-zero
+    /// origins against a deliberately messy set of rows: a wide multi-lane
+    /// row carrying every two-colour cell variant, full branch/tag/remote
+    /// decorations, a summary far longer than any of the areas under test, a
+    /// double-width CJK summary, and a bare connector row (`commit: None`).
+    ///
+    /// The origin matters as much as the size: `area.x`/`area.y` are zero in
+    /// every other test in this file, but the overlay is drawn inset in
+    /// production, so a non-zero origin is the normal case, not an edge
+    /// case. It is also exactly the shape of the one real bug this task
+    /// found (`hash_x` undershooting `area.x` on a narrow area) — that bug
+    /// is fixed, but nothing short of a sweep like this one locks the fix in
+    /// against a future edit to `put` or `hash_x`. Each buffer is sized to
+    /// `(ox + width, oy + height)`, the minimum that still contains `area`
+    /// — ratatui's own precondition for indexing into it — rather than
+    /// testing what happens when that precondition is violated.
+    ///
+    /// The only assertion is that none of this panics.
     #[test]
-    fn no_area_from_zero_to_12x6_panics_on_a_realistic_row_set() {
+    fn no_area_from_zero_to_12x6_at_several_origins_panics_on_a_realistic_row_set() {
         let commit_id = gix::ObjectId::empty_blob(gix::hash::Kind::Sha1);
         let wide_row = GraphNode {
             commit: Some(CommitInfo {
@@ -336,11 +352,12 @@ mod tests {
                 CellType::MergeLeft(0),
             ],
         };
-        let nodes = vec![
-            wide_row,
-            connector_row,
-            node("third row", 0, vec![CellType::Commit(0)]),
-        ];
+        // A double-width CJK summary: `put` is the only path arbitrary text
+        // flows through (the fixed glyph vocabulary is all narrow, see the
+        // note on `cell_glyph`), and a wide glyph straddling the right edge
+        // of a narrow area is a real case for user-supplied commit text.
+        let cjk_row = node("宽字符摘要超长提交信息行", 0, vec![CellType::Commit(0)]);
+        let nodes = vec![wide_row, connector_row, cjk_row];
 
         let mut decorations = HashMap::new();
         decorations.insert(
@@ -364,16 +381,29 @@ mod tests {
             ],
         );
 
-        for width in 0..=12u16 {
-            for height in 0..=6u16 {
-                let area = Rect::new(0, 0, width, height);
-                let mut buf = Buffer::empty(area);
-                // Also try selecting a row and scrolling, both in and out of
-                // range, since those are the other inputs that shift index
-                // arithmetic around.
-                draw_rows(&mut buf, area, &nodes, &decorations, 0, 0);
-                draw_rows(&mut buf, area, &nodes, &decorations, 1, 2);
-                draw_rows(&mut buf, area, &nodes, &decorations, 50, 50);
+        for &ox in &[0u16, 1, 5] {
+            for &oy in &[0u16, 1, 3] {
+                for width in 0..=12u16 {
+                    for height in 0..=6u16 {
+                        let area = Rect::new(ox, oy, width, height);
+                        // Sized to the minimum that still contains `area`:
+                        // ratatui's indexing precondition, which is what the
+                        // whole panic-safety argument for `put`'s clamping
+                        // rests on.
+                        let mut buf = Buffer::empty(Rect::new(
+                            0,
+                            0,
+                            ox.saturating_add(width),
+                            oy.saturating_add(height),
+                        ));
+                        // Also try selecting a row and scrolling, both in and
+                        // out of range, since those are the other inputs
+                        // that shift index arithmetic around.
+                        draw_rows(&mut buf, area, &nodes, &decorations, 0, 0);
+                        draw_rows(&mut buf, area, &nodes, &decorations, 1, 2);
+                        draw_rows(&mut buf, area, &nodes, &decorations, 50, 50);
+                    }
+                }
             }
         }
         // Reaching here without a panic is the assertion.
