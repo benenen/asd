@@ -57,6 +57,13 @@ pub(crate) fn open_at(path: &Path) -> Result<GitGraph, OverlayError> {
     Ok(GitGraph::open(path)?)
 }
 
+/// `path` with its symlinks resolved, or `path` unchanged when it cannot be
+/// resolved (it vanished, or a component is unreadable). Only ever used to
+/// compare two paths, where falling back costs a rebuild and nothing worse.
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 impl App {
     /// The pid of the session the sidebar has selected, if it is known.
     fn active_pid(&self) -> Option<u32> {
@@ -120,7 +127,16 @@ impl App {
         // A session sitting in a submodule of the open repository reads as
         // the same repository here and keeps the superproject's graph. That
         // is a stale view, not an unsound one, and `Ctrl+A g` twice re-opens.
-        if cwd.starts_with(current.workdir()) {
+        //
+        // Both sides are canonicalized first. gix's `workdir()` and the cwd
+        // read out of the process can name the same directory through
+        // different symlinks (macOS `/var` -> `/private/var`, or any
+        // symlinked checkout), and comparing them raw then fails for *every*
+        // switch inside one repository — rebuilding the whole graph and
+        // losing the scroll position, which is the exact cost this comparison
+        // exists to avoid. `Repo::open`'s own tests canonicalize for the same
+        // reason.
+        if canonical(&cwd).starts_with(canonical(current.workdir())) {
             return;
         }
         match open_at(&cwd) {
