@@ -134,6 +134,23 @@ mod tests {
         );
     }
 
+    /// The overlay's wrapper around `session_cwd`, exercised here rather than
+    /// beside the rest of `graph_overlay`'s tests: it only holds where
+    /// `session_cwd` can read a directory at all, and a `#[cfg(unix)]` at a
+    /// call site is exactly what this module exists to absorb. Windows'
+    /// `session_cwd` is a documented `None`, so there the overlay reports that
+    /// the directory could not be determined — for every pid, its own
+    /// included.
+    #[test]
+    fn the_overlay_resolves_a_live_pid_to_its_directory() {
+        let path =
+            crate::graph_overlay::resolve_repo_path(std::process::id()).expect("own pid resolves");
+        assert_eq!(
+            path.canonicalize().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+
     #[test]
     fn pid_zero_is_never_a_process() {
         assert!(session_cwd(0).is_none());

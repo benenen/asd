@@ -482,6 +482,13 @@ pub(crate) struct App {
     /// through, because it stays up long enough that swallowing `Ctrl+A` would
     /// mean not being able to switch sessions or quit asd while it is open.
     pub git_graph: Option<asd_git::GitGraph>,
+    /// A follow the next session list has to finish. `Ev::Created` selects the
+    /// new session before the list carrying its pid arrives, so the overlay has
+    /// no directory to resolve yet — and `self.active` is already set by then,
+    /// so no later `select` would retry on its own. Retried once when a list
+    /// lands rather than attempted on every poll: a session sitting outside a
+    /// repository would otherwise re-raise its notice every `LIST_INTERVAL`.
+    git_graph_follow_pending: bool,
     /// Declarative global/PREFIX bindings and their pending leader state.
     pub keymap: Keymap,
     pub now_ms: u64,
@@ -747,6 +754,7 @@ fn event_loop(
         notice: keymap_complaint,
         modal: None,
         git_graph: None,
+        git_graph_follow_pending: false,
         keymap,
         now_ms: now_ms(),
         metrics: None,
@@ -1315,6 +1323,11 @@ impl App {
                     if let Some(name) = pick {
                         self.select(name);
                     }
+                }
+                // A follow that ran before this list could not see the session's
+                // pid. It is here now.
+                if std::mem::take(&mut self.git_graph_follow_pending) {
+                    self.follow_git_graph();
                 }
             }
             Ev::Metrics(sample) => {

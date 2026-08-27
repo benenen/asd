@@ -97,11 +97,14 @@ impl App {
         let Some(current) = self.git_graph.as_ref() else {
             return;
         };
-        // A session whose pid is not known yet — created a moment ago, before
-        // the list that carries the pid arrived — has nothing to follow to.
-        // Leave the overlay on the repository it is already showing rather
-        // than complaining about a directory nobody asked for.
+        // A session whose pid is not known yet — `Ev::Created` selects it
+        // before the list that carries the pid arrives — has nothing to
+        // resolve. This is a retry, not a give-up: `self.active` is already
+        // set, so no later `select` would come back to it, and the overlay
+        // would sit on the previous session's repository for good. The next
+        // session list finishes the job.
         let Some(pid) = self.active_pid() else {
+            self.git_graph_follow_pending = true;
             return;
         };
         let Ok(cwd) = resolve_repo_path(pid) else {
@@ -122,7 +125,10 @@ impl App {
         }
         match open_at(&cwd) {
             Ok(graph) => self.git_graph = Some(graph),
-            Err(_) => self.notice = Some("this session is not in a git repository".into()),
+            // The real error, the same one `Ctrl+A g` would have shown: which
+            // of "not a git repository", "no working tree" and an I/O failure
+            // it was, and on which path.
+            Err(e) => self.notice = Some(e.to_string()),
         }
         self.dirty = true;
     }
@@ -185,6 +191,140 @@ impl App {
 mod tests {
     use super::*;
 
+    use crate::conn::{Conn, Ev};
+
+    /// A minimal `App`. The connection actor is pointed at a socket path that
+    /// does not exist: it fails to connect, reports `Ev::Down` into a channel
+    /// nothing reads, and ends — which is all a test that never talks to a
+    /// daemon needs from it.
+    fn test_app() -> App {
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+        let socket = std::env::temp_dir().join(format!("asd-no-daemon-{}", std::process::id()));
+        let conn = Conn::spawn(socket.clone(), 1, ev_tx.clone());
+        App {
+            socket,
+            conn,
+            ev_rx,
+            ev_tx,
+            connection_generation: 1,
+            sessions: Vec::new(),
+            running_activity: Default::default(),
+            host_links: Default::default(),
+            active: None,
+            view_revoked: None,
+            vt: None,
+            scroll: 0,
+            grid: (80, 24),
+            vt_grid: (80, 24),
+            term_size: (110, 25),
+            sidebar_w: crate::ui::SIDEBAR_W,
+            sidebar_scroll: 0,
+            sidebar_hidden: false,
+            status_hidden: false,
+            dragging_divider: false,
+            sel: None,
+            selecting: false,
+            clipboard: None,
+            cursor_tail: None,
+            daemon_up: false,
+            notice: None,
+            modal: None,
+            git_graph: None,
+            git_graph_follow_pending: false,
+            keymap: crate::keymap::Keymap::default(),
+            now_ms: 0,
+            metrics: None,
+            preferred: None,
+            terminal_appearance: Default::default(),
+            startup_input: Vec::new(),
+            // Never inherited from the environment: this test process may
+            // itself be running inside an asd session.
+            self_session: None,
+            cache: None,
+            parked: Vec::new(),
+            pane_hold: None,
+            pane_cache: None,
+            pane_needs_render: true,
+            sync_since: None,
+            row_fx: Vec::new(),
+            running_fx: Vec::new(),
+            last_frame: std::time::Instant::now(),
+            dirty: true,
+            quit: false,
+        }
+    }
+
+    fn session(name: &str, pid: u32) -> asd_proto::SessionInfo {
+        asd_proto::SessionInfo {
+            name: name.to_string(),
+            command: "shell".to_string(),
+            title: String::new(),
+            status_line: String::new(),
+            created_ms: 0,
+            idle_ms: 0,
+            running: false,
+            state: asd_proto::AgentState::Unknown,
+            attached_clients: 1,
+            pid,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    #[test]
+    fn a_follow_that_cannot_see_a_pid_yet_is_finished_by_the_next_list() {
+        // `Ev::Created` selects the new session before the list carrying its
+        // pid arrives, so `follow_git_graph` has nothing to resolve. Because
+        // `self.active` is set by then, no later `select` revisits it — drop
+        // the follow here and the overlay shows the *previous* session's
+        // repository for as long as it stays open.
+        let Ok(graph) = GitGraph::open(Path::new(".")) else {
+            // No `.git` (a source tarball): there is no overlay to follow.
+            return;
+        };
+        let mut app = test_app();
+        app.git_graph = Some(graph);
+        app.active = Some("brand-new".to_string());
+        assert!(app.active_pid().is_none(), "the list has not arrived yet");
+
+        app.follow_git_graph();
+        assert!(
+            app.git_graph_follow_pending,
+            "an unresolvable follow is handed to the next list, not dropped"
+        );
+        assert!(
+            app.notice.is_none(),
+            "and says nothing while it waits: {:?}",
+            app.notice
+        );
+
+        // The list lands, carrying the pid. This process is inside the asd
+        // repository the overlay is already showing, so the follow resolves
+        // and keeps the graph rather than rebuilding it.
+        app.on_conn_event(Ev::Sessions(vec![session("brand-new", std::process::id())]));
+        assert!(
+            !app.git_graph_follow_pending,
+            "the list consumes the pending follow"
+        );
+        assert!(app.git_graph.is_some(), "the overlay is still open");
+        assert!(
+            app.notice.is_none(),
+            "a resolved follow raises nothing: {:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn a_follow_with_no_overlay_open_arms_nothing() {
+        let mut app = test_app();
+        app.active = Some("brand-new".to_string());
+        app.follow_git_graph();
+        assert!(
+            !app.git_graph_follow_pending,
+            "there is no overlay to re-target"
+        );
+    }
+
     #[test]
     fn a_session_without_a_pid_cannot_be_resolved() {
         // pid 0 means "not known yet"; the overlay must say so rather than
@@ -193,18 +333,6 @@ mod tests {
             resolve_repo_path(0),
             Err(OverlayError::UnknownDirectory)
         ));
-    }
-
-    // Windows' `session_cwd` is a documented `None`, so there is no pid this
-    // can resolve there — including the test's own.
-    #[cfg(unix)]
-    #[test]
-    fn this_process_resolves_to_its_own_directory() {
-        let path = resolve_repo_path(std::process::id()).expect("own pid resolves");
-        assert_eq!(
-            path.canonicalize().unwrap(),
-            std::env::current_dir().unwrap().canonicalize().unwrap()
-        );
     }
 
     #[test]
