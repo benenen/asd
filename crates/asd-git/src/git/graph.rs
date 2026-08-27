@@ -710,4 +710,135 @@ mod tests {
             );
         }
     }
+
+    /// A repository with enough branching that batch boundaries land in the
+    /// middle of forks rather than on quiet linear stretches.
+    fn braided_fixture(tag: &str) -> Fixture {
+        let fx = Fixture::new(tag);
+        fx.commit("base");
+        for round in 0..8 {
+            let branch = format!("side{round}");
+            fx.checkout("main");
+            fx.branch(&branch);
+            fx.commit(&format!("side {round} a"));
+            fx.commit(&format!("side {round} b"));
+            fx.checkout("main");
+            fx.commit(&format!("main {round}"));
+            fx.merge(&branch, &format!("merge {round}"));
+        }
+        fx
+    }
+
+    #[test]
+    fn feeding_in_batches_matches_feeding_all_at_once() {
+        let fx = braided_fixture("layout-incremental");
+        let repo = Repo::open(fx.path()).unwrap();
+
+        let all: Vec<_> = repo.walk().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(all.len() > 20, "fixture must be big enough to split");
+
+        let mut oneshot = GraphBuilder::new();
+        for c in all.iter().cloned() {
+            oneshot.feed(c);
+        }
+
+        // Split at several offsets: a boundary inside a fork is where a
+        // rebuild-free builder would diverge from a full rebuild.
+        for split in [1, 3, all.len() / 3, all.len() / 2, all.len() - 1] {
+            let mut incremental = GraphBuilder::new();
+            for c in all[..split].iter().cloned() {
+                incremental.feed(c);
+            }
+            for c in all[split..].iter().cloned() {
+                incremental.feed(c);
+            }
+            assert_eq!(
+                incremental.nodes(),
+                oneshot.nodes(),
+                "rows differ when split at {split}"
+            );
+            assert_eq!(
+                incremental.max_lane(),
+                oneshot.max_lane(),
+                "max_lane differs when split at {split}"
+            );
+        }
+    }
+
+    /// The octopus fan-out and rejoin tests above match `TeeDown(..)` /
+    /// `TeeUp(..)` with a wildcard for both fields, so a payload of
+    /// `(run, lane)` swapped to `(lane, run)` would still pass them. Pin the
+    /// concrete values here instead: the run colour (0, the octopus's own)
+    /// and the crossed lane's colour (1 or 2) are distinct numbers, so an
+    /// accidental field swap in `CellType` would fail this assertion.
+    #[test]
+    fn a_tee_down_records_run_before_the_crossed_lane() {
+        let fx = Fixture::new("layout-tee-field-order");
+        fx.commit("base");
+        for name in ["a", "b", "c"] {
+            fx.checkout("main");
+            fx.branch(name);
+            fx.commit(&format!("on {name}"));
+        }
+        fx.checkout("main");
+        fx.merge_many(&["a", "b", "c"], "octopus");
+
+        let b = layout_of(&fx);
+        let octopus = b
+            .nodes()
+            .iter()
+            .find(|n| n.commit.as_ref().is_some_and(|c| c.summary == "octopus"))
+            .expect("octopus row exists");
+        assert_eq!(
+            octopus.cells,
+            vec![
+                CellType::Commit(0),
+                CellType::TeeDown(0, 1),
+                CellType::TeeDown(0, 2),
+                CellType::BranchLeft(0),
+            ],
+            "octopus row cells: {:?}",
+            octopus.cells
+        );
+
+        let connector = b
+            .nodes()
+            .iter()
+            .find(|n| n.commit.is_none())
+            .expect("connector row exists");
+        assert_eq!(
+            connector.cells,
+            vec![
+                CellType::TeeRight(0),
+                CellType::TeeUp(0, 1),
+                CellType::TeeUp(0, 2),
+                CellType::MergeLeft(0),
+            ],
+            "connector row cells: {:?}",
+            connector.cells
+        );
+    }
+
+    #[test]
+    fn a_partial_load_leaves_open_lanes_rather_than_dropping_edges() {
+        let fx = braided_fixture("layout-partial");
+        let repo = Repo::open(fx.path()).unwrap();
+        let all: Vec<_> = repo.walk().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+
+        let mut partial = GraphBuilder::new();
+        for c in all[..10].iter().cloned() {
+            partial.feed(c);
+        }
+        // Rows already emitted must be byte-identical to the same prefix of a
+        // full load: loading more may append, never revise.
+        let mut full = GraphBuilder::new();
+        for c in all.iter().cloned() {
+            full.feed(c);
+        }
+        assert_eq!(
+            partial.nodes(),
+            &full.nodes()[..partial.nodes().len()],
+            "a partial load must be a prefix of the full load"
+        );
+    }
 }
