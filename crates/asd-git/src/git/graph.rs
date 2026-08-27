@@ -782,37 +782,28 @@ mod tests {
         fx
     }
 
-    /// Guards the fixture above against regressing into the shape the
+    /// Guards the fixture above against regressing into the shape a
     /// reviewer flagged (round 1 fix): every branch closing before the next
     /// one opens, which pins `max_lane` at 1 for the whole history and never
-    /// exercises a `row_cells` sizing bug at all. Checked two ways: directly
-    /// against `git log --graph`'s own view of concurrently open branches,
-    /// and against the builder's own row widths.
+    /// exercises a `row_cells` sizing bug at all.
+    ///
+    /// This does NOT also check `git log --graph`'s own rendering. An
+    /// earlier version of this test did, on the theory that the widest
+    /// `*`/`|`/`/`/`\` column run `git` draws is an independent signal of
+    /// concurrency. It is not: `git log --graph` pads a merge commit's own
+    /// line to `"*   "` for alignment regardless of how many lanes are
+    /// actually open, so a single, non-concurrent fork-and-merge trips the
+    /// same threshold as three genuinely overlapping branches do. Reproduced
+    /// directly: both a minimal one-fork-one-merge repo and the pre-fix
+    /// serial version of `braided_fixture` (every branch closed before the
+    /// next opened) print a widest column of 4, the same value this fixture
+    /// produces -- so that check would have passed unchanged on the exact
+    /// fixture it was meant to reject. The two assertions below are the
+    /// real, falsifiable guard; they go through `GraphBuilder` itself rather
+    /// than a rendering `feed` never sees.
     #[test]
     fn braided_fixture_actually_widens_the_graph() {
         let fx = braided_fixture("layout-braid-shape");
-
-        // `git log --graph` draws one `*`/`|` column per concurrently open
-        // branch. If the fixture only ever has one branch open at a time,
-        // every graph line has at most two columns (`* ` or `| `) before the
-        // subject text. Collect the widest column count `git` itself draws,
-        // as an independent check that does not go through `GraphBuilder`.
-        let graph = fx.git(&["log", "--graph", "--oneline", "--all"]);
-        let widest_git_column = graph
-            .lines()
-            .map(|line| {
-                line.chars()
-                    .take_while(|c| matches!(c, '*' | '|' | '/' | '\\' | ' '))
-                    .count()
-            })
-            .max()
-            .unwrap_or(0);
-        assert!(
-            widest_git_column > 2,
-            "git log --graph never draws more than one open branch column; \
-             the fixture is not actually concurrent:\n{graph}"
-        );
-
         let repo = Repo::open(fx.path()).unwrap();
         let all: Vec<_> = repo.walk().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         let mut b = GraphBuilder::new();
@@ -830,7 +821,10 @@ mod tests {
         // and `max_lane` only ever grows as more (older) history is fed. A
         // fixture that truly widens partway through must therefore show at
         // least two distinct row widths: some rows recorded before the
-        // graph ever widened, and some after.
+        // graph ever widened, and some after. This is not implied by the
+        // `max_lane` check above: a fixture could reach `max_lane == 3` with
+        // every row emitted after the final widening, and only this check
+        // would catch that.
         let widths: std::collections::HashSet<usize> =
             b.nodes().iter().map(|n| n.cells.len()).collect();
         assert!(
