@@ -73,28 +73,21 @@ impl Fixture {
         self.git(&["rev-parse", "HEAD"])
     }
 
-    // Unused by phase 1's tests (only `open`/`commit` are needed to test
-    // discovery); later tasks build branch/merge topologies to test lane
-    // layout with this same fixture.
-    #[allow(dead_code)]
     pub(crate) fn branch(&self, name: &str) {
         self.git(&["checkout", "--quiet", "-b", name]);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn checkout(&self, name: &str) {
         self.git(&["checkout", "--quiet", name]);
     }
 
     /// Merge `name` into the current branch, always creating a merge commit.
-    #[allow(dead_code)]
     pub(crate) fn merge(&self, name: &str, summary: &str) -> String {
         self.clock.set(self.clock.get() + 60);
         self.git(&["merge", "--quiet", "--no-ff", "-m", summary, name]);
         self.git(&["rev-parse", "HEAD"])
     }
 
-    #[allow(dead_code)]
     pub(crate) fn tag(&self, name: &str) {
         self.git(&["tag", name]);
     }

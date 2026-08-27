@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::git::commit::{CommitInfo, ReadError};
+
 /// Why a path could not be shown as a graph. Each variant is a different thing
 /// to tell the user, so the overlay never has to render a generic failure.
 #[derive(Debug, thiserror::Error)]
@@ -27,9 +29,6 @@ const OBJECT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
 /// An open repository. Cheap to hold; the expensive state is gix's own caches.
 pub struct Repo {
-    // Read only through `gix()`, which later tasks (commit reading, ref
-    // reading) call; unused for now since phase 1 stops at discovery.
-    #[allow(dead_code)]
     inner: gix::Repository,
     workdir: PathBuf,
 }
@@ -73,10 +72,80 @@ impl Repo {
         &self.workdir
     }
 
-    // Unused until later tasks add commit/ref reading on top of this handle.
-    #[allow(dead_code)]
     pub(crate) fn gix(&self) -> &gix::Repository {
         &self.inner
+    }
+
+    /// The object HEAD resolves to, or `None` in an unborn repository.
+    pub fn head(&self) -> Option<gix::ObjectId> {
+        self.inner.head_id().ok().map(|id| id.detach())
+    }
+
+    /// Every tip the graph should cover: HEAD plus all local and remote
+    /// branches, so the walk shows the whole repository rather than one branch.
+    fn tips(&self) -> Result<Vec<gix::ObjectId>, ReadError> {
+        let mut tips: Vec<gix::ObjectId> = Vec::new();
+        if let Some(head) = self.head() {
+            tips.push(head);
+        }
+        for r in self.refs()? {
+            if matches!(
+                r.kind,
+                crate::git::refs::RefKind::LocalBranch | crate::git::refs::RefKind::RemoteBranch
+            ) {
+                tips.push(r.target);
+            }
+        }
+        tips.sort();
+        tips.dedup();
+        Ok(tips)
+    }
+
+    /// Walk the history newest-first. The iterator is lazy: taking 500 items
+    /// costs 500 commits, not the whole repository.
+    pub fn walk(
+        &self,
+    ) -> Result<impl Iterator<Item = Result<CommitInfo, ReadError>> + '_, ReadError> {
+        use gix::revision::walk::Sorting;
+        use gix::traverse::commit::simple::CommitTimeOrder;
+
+        let tips = self.tips()?;
+        let walk = self
+            .inner
+            .rev_walk(tips)
+            .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
+            .all()
+            .map_err(|e| ReadError::from_err("walking history", e))?;
+
+        Ok(walk.map(move |info| {
+            let info = info.map_err(|e| ReadError::from_err("reading a commit", e))?;
+            let commit = self
+                .inner
+                .find_commit(info.id)
+                .map_err(|e| ReadError::from_err("finding a commit", e))?;
+            let message = commit
+                .message()
+                .map_err(|e| ReadError::from_err("reading a commit message", e))?;
+            let author = commit
+                .author()
+                .map_err(|e| ReadError::from_err("reading a commit author", e))?;
+            let time = match info.commit_time {
+                Some(t) => t,
+                None => {
+                    author
+                        .time()
+                        .map_err(|e| ReadError::from_err("reading a commit time", e))?
+                        .seconds
+                }
+            };
+            Ok(CommitInfo {
+                id: info.id,
+                parents: info.parent_ids.iter().copied().collect(),
+                summary: message.summary().to_string(),
+                author: author.name.to_string(),
+                time,
+            })
+        }))
     }
 }
 
