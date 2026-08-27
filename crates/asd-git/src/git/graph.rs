@@ -711,22 +711,133 @@ mod tests {
         }
     }
 
-    /// A repository with enough branching that batch boundaries land in the
-    /// middle of forks rather than on quiet linear stretches.
+    /// A repository whose branches have overlapping, staggered lifetimes:
+    /// at several points two or three lanes are open concurrently, and each
+    /// round's overlap starts and ends at a different point in the history
+    /// than the last. This is deliberately not "one branch open at a time,
+    /// serially" -- that shape never forces `max_lane` past 1, because a
+    /// branch that closes before the next one opens never needs a lane the
+    /// first branch was not already using. `y{round}` is left open into the
+    /// next round on purpose, so the overlap also straddles round
+    /// boundaries rather than resetting to a single lane between them. The
+    /// result (checked by `braided_fixture_actually_widens_the_graph`
+    /// below) is a row-width profile that climbs unevenly across the walk,
+    /// which is exactly the shape needed to catch a `row_cells` sizing bug:
+    /// a row painted before a later fork widened the graph.
     fn braided_fixture(tag: &str) -> Fixture {
         let fx = Fixture::new(tag);
         fx.commit("base");
-        for round in 0..8 {
-            let branch = format!("side{round}");
+
+        // A branch carried over from the previous round, still open when
+        // this round's two branches fork off.
+        let mut carry: Option<String> = None;
+        for round in 0..4 {
+            let x = format!("x{round}");
+            let y = format!("y{round}");
+
+            // Open `x` and `y` off the current tip of `main` while `carry`
+            // (if any) is still unmerged: up to three lanes are alive at
+            // once here, and this round's `main` tip differs from every
+            // other round's, so the widening lands at a different point in
+            // the history each time.
             fx.checkout("main");
-            fx.branch(&branch);
-            fx.commit(&format!("side {round} a"));
-            fx.commit(&format!("side {round} b"));
+            fx.branch(&x);
+            fx.commit(&format!("{x} 1"));
+
             fx.checkout("main");
-            fx.commit(&format!("main {round}"));
-            fx.merge(&branch, &format!("merge {round}"));
+            fx.branch(&y);
+            fx.commit(&format!("{y} 1"));
+
+            fx.checkout(&x);
+            fx.commit(&format!("{x} 2"));
+
+            fx.checkout("main");
+            fx.commit(&format!("main {round} a"));
+
+            // Close the previous round's carried branch now, in the middle
+            // of this round's `x`/`y` overlap rather than between rounds.
+            if let Some(prev) = carry.take() {
+                fx.checkout("main");
+                fx.merge(&prev, &format!("merge {prev}"));
+            }
+
+            fx.checkout(&y);
+            fx.commit(&format!("{y} 2"));
+
+            fx.checkout("main");
+            fx.commit(&format!("main {round} b"));
+
+            // Close `x` this round, but leave `y` open into the next round
+            // so the overlap straddles the round boundary.
+            fx.checkout("main");
+            fx.merge(&x, &format!("merge {x}"));
+
+            carry = Some(y);
+        }
+        // Close whatever branch is still open at the end.
+        if let Some(prev) = carry.take() {
+            fx.checkout("main");
+            fx.merge(&prev, &format!("merge {prev}"));
         }
         fx
+    }
+
+    /// Guards the fixture above against regressing into the shape the
+    /// reviewer flagged (round 1 fix): every branch closing before the next
+    /// one opens, which pins `max_lane` at 1 for the whole history and never
+    /// exercises a `row_cells` sizing bug at all. Checked two ways: directly
+    /// against `git log --graph`'s own view of concurrently open branches,
+    /// and against the builder's own row widths.
+    #[test]
+    fn braided_fixture_actually_widens_the_graph() {
+        let fx = braided_fixture("layout-braid-shape");
+
+        // `git log --graph` draws one `*`/`|` column per concurrently open
+        // branch. If the fixture only ever has one branch open at a time,
+        // every graph line has at most two columns (`* ` or `| `) before the
+        // subject text. Collect the widest column count `git` itself draws,
+        // as an independent check that does not go through `GraphBuilder`.
+        let graph = fx.git(&["log", "--graph", "--oneline", "--all"]);
+        let widest_git_column = graph
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .take_while(|c| matches!(c, '*' | '|' | '/' | '\\' | ' '))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest_git_column > 2,
+            "git log --graph never draws more than one open branch column; \
+             the fixture is not actually concurrent:\n{graph}"
+        );
+
+        let repo = Repo::open(fx.path()).unwrap();
+        let all: Vec<_> = repo.walk().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        let mut b = GraphBuilder::new();
+        for c in all {
+            b.feed(c);
+        }
+        assert!(
+            b.max_lane() > 1,
+            "max_lane is {}, so no more than two branches were ever open at \
+             once -- the fixture does not widen the graph",
+            b.max_lane()
+        );
+
+        // Row width is frozen at push time from `max_lane` as it stood then,
+        // and `max_lane` only ever grows as more (older) history is fed. A
+        // fixture that truly widens partway through must therefore show at
+        // least two distinct row widths: some rows recorded before the
+        // graph ever widened, and some after.
+        let widths: std::collections::HashSet<usize> =
+            b.nodes().iter().map(|n| n.cells.len()).collect();
+        assert!(
+            widths.len() > 1,
+            "every row is the same width ({widths:?}), so the fixture never \
+             exercises a row painted before a later widening"
+        );
     }
 
     #[test]
