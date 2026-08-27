@@ -14,6 +14,26 @@ pub enum OpenError {
     /// whose worktree is gone).
     #[error("{path} has no working tree")]
     NoWorkTree { path: PathBuf },
+    /// A repository *was* found, but git's ownership check rejected it: the
+    /// dubious-ownership case — a container, `sudo`, a mounted volume, a
+    /// session running as another user. Calling that "not a git repository"
+    /// would send the user hunting for a missing `.git` that is right there.
+    ///
+    /// Unreachable through `Repo::open` as it stands, and deliberately kept
+    /// anyway. gix's default discovery policy is `Required(Trust::Reduced)`,
+    /// and `Trust` has no level *below* `Reduced` — so an unowned repository
+    /// clears the bar and simply opens with reduced trust. The variant is
+    /// where the rejection must land the moment that policy is tightened, or
+    /// gix changes its default; routing it into `NotARepository` in the
+    /// meantime is how the wrong message gets written by accident later.
+    #[error(
+        "{path}: git does not trust this repository's ownership (see `safe.directory` in git-config)"
+    )]
+    Untrusted {
+        path: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("opening {path}: {source}")]
     Io {
         path: PathBuf,
@@ -47,14 +67,40 @@ impl std::fmt::Debug for Repo {
 impl Repo {
     /// Open the repository containing `path`, searching upwards for `.git`.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
-        let mut inner = gix::discover(path).map_err(|source| match source {
-            gix::discover::Error::Discover(_) => OpenError::NotARepository {
-                path: path.to_path_buf(),
-            },
-            other => OpenError::Io {
-                path: path.to_path_buf(),
-                source: Box::new(other),
-            },
+        let mut inner = gix::discover(path).map_err(|source| {
+            use gix::discover::upwards::Error as Discover;
+            let path = path.to_path_buf();
+            match source {
+                // Discovery failing is not one thing, and each kind sends the
+                // user somewhere different. Only a genuine "searched upwards
+                // and found nothing" is `NotARepository`.
+                gix::discover::Error::Discover(e @ Discover::NoTrustedGitRepository { .. }) => {
+                    OpenError::Untrusted {
+                        path,
+                        source: Box::new(e),
+                    }
+                }
+                // Three filesystem failures, not three missing repositories.
+                // `InaccessibleDirectory` is the one that actually bites: the
+                // session's directory was deleted or is unreadable, and
+                // "not a git repository" would have the user looking for a
+                // `.git` when the problem is the path itself. `CheckTrust`
+                // belongs here too despite its name — it is the `io::Error`
+                // from stat-ing the candidate, not an ownership verdict.
+                gix::discover::Error::Discover(
+                    e @ (Discover::CurrentDir(_)
+                    | Discover::InaccessibleDirectory { .. }
+                    | Discover::CheckTrust { .. }),
+                ) => OpenError::Io {
+                    path,
+                    source: Box::new(e),
+                },
+                gix::discover::Error::Discover(_) => OpenError::NotARepository { path },
+                other => OpenError::Io {
+                    path,
+                    source: Box::new(other),
+                },
+            }
         })?;
         inner.object_cache_size_if_unset(OBJECT_CACHE_BYTES);
         let workdir = inner
@@ -173,6 +219,28 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let err = Repo::open(&dir).expect_err("a plain directory is not a repository");
         assert!(matches!(err, OpenError::NotARepository { .. }), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_path_is_an_io_failure_not_a_missing_repository() {
+        // `resolve_repo_path` reads a live session's cwd, which can be gone
+        // by the time the overlay opens it. gix answers
+        // `Discover::InaccessibleDirectory`, and reporting that as "not a git
+        // repository" sends the user looking for a `.git` when the problem is
+        // the path. A plain file stands in for the same class of failure.
+        let dir = std::env::temp_dir().join(format!("asd-git-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("not-a-directory");
+        std::fs::write(&file, b"").unwrap();
+
+        let err = Repo::open(&file).expect_err("a file is not a directory to discover from");
+        assert!(matches!(err, OpenError::Io { .. }), "{err:?}");
+
+        let missing = dir.join("vanished");
+        let err = Repo::open(&missing).expect_err("a path that does not exist cannot be opened");
+        assert!(matches!(err, OpenError::Io { .. }), "{err:?}");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
