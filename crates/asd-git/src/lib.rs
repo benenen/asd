@@ -8,5 +8,6 @@
 pub mod git;
 
 pub use git::commit::{CommitInfo, ReadError};
+pub use git::graph::{CellType, GraphBuilder, GraphNode};
 pub use git::refs::{RefInfo, RefKind};
 pub use git::repo::{OpenError, Repo};

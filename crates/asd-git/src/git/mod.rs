@@ -2,6 +2,7 @@
 //! part worth testing hardest, and it must be testable without a terminal.
 
 pub mod commit;
+pub mod graph;
 pub mod refs;
 pub mod repo;
 
