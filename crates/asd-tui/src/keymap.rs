@@ -462,6 +462,18 @@ impl Keymap {
             .map_or(KeyResolution::PassThrough, KeyResolution::Action)
     }
 
+    /// Whether this key belongs to asd's own leader chord: the leader itself,
+    /// or the key completing an already-armed prefix.
+    ///
+    /// A long-lived overlay consumes every ordinary key but must let the chord
+    /// through whole. Testing only the leader would arm the prefix and then
+    /// hand the *next* key to the overlay, leaving the prefix armed and the
+    /// binding unreachable — so `Ctrl+A g` could open the overlay but never
+    /// close it.
+    pub(crate) fn leader_sequence(&self, key: &KeyEvent) -> bool {
+        self.prefix_active || self.leader.matches(key)
+    }
+
     pub(crate) fn current_hint(&self) -> KeyHint {
         if self.prefix_active {
             KeyHint {

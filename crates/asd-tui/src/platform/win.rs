@@ -40,10 +40,6 @@ pub(crate) fn spawn_tty_watchdog() {}
 /// the process and walking its PEB, which needs a privilege the TUI does not
 /// ask for. The overlay reports that the directory could not be determined,
 /// exactly as it does on a macOS host.
-///
-/// `#[allow(dead_code)]`: Task 11 wires the first call site into the overlay;
-/// remove this once that caller lands.
-#[allow(dead_code)]
 pub(crate) fn session_cwd(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }

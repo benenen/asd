@@ -34,6 +34,7 @@ use ratatui::crossterm::execute;
 
 mod config;
 mod conn;
+mod graph_overlay;
 mod key;
 mod keymap;
 mod modal;
@@ -477,6 +478,10 @@ pub(crate) struct App {
     /// An open modal overlay (rename input or kill confirmation); captures all
     /// keys until it closes.
     pub modal: Option<Modal>,
+    /// The git graph overlay, when open. Unlike a modal it lets the leader
+    /// through, because it stays up long enough that swallowing `Ctrl+A` would
+    /// mean not being able to switch sessions or quit asd while it is open.
+    pub git_graph: Option<asd_git::GitGraph>,
     /// Declarative global/PREFIX bindings and their pending leader state.
     pub keymap: Keymap,
     pub now_ms: u64,
@@ -741,6 +746,7 @@ fn event_loop(
         daemon_up: false,
         notice: keymap_complaint,
         modal: None,
+        git_graph: None,
         keymap,
         now_ms: now_ms(),
         metrics: None,
@@ -787,6 +793,10 @@ fn event_loop(
         let wall_now_ms = now_ms();
         app.dirty |= wall_clock_tick_due(app.now_ms, wall_now_ms, !app.status_hidden);
         app.dirty |= app.expire_running_sessions(now);
+        if let Some(graph) = app.git_graph.as_mut() {
+            let work_landed = graph.poll();
+            app.dirty |= work_landed;
+        }
         let timing = loop_timing(
             last_frame_flush,
             now,
@@ -1201,6 +1211,9 @@ impl App {
             rows: self.grid.1,
             appearance: self.terminal_appearance,
         });
+        // Every selection change lands here, so this is the one place an open
+        // overlay has to be re-targeted.
+        self.follow_git_graph();
         self.dirty = true;
     }
 
@@ -1424,6 +1437,15 @@ impl App {
             self.on_modal_key(k);
             return;
         }
+        // The overlay owns every ordinary key, but asd's own leader chord is
+        // passed through whole — the leader itself *and* the key that follows
+        // it — so session switching and quitting keep working while it is up.
+        // Letting only the leader through would arm the prefix and then feed
+        // the next key to the overlay, which is worse than swallowing both.
+        if self.git_graph.is_some() && !self.keymap.leader_sequence(&k) && self.on_git_graph_key(k)
+        {
+            return;
+        }
         match self.keymap.resolve(&k) {
             KeyResolution::PassThrough => {
                 if let Some(ev) = key::map_key(&k) {
@@ -1474,9 +1496,7 @@ impl App {
                 }
             }
             KeyAction::CancelPrefix => {}
-            // The overlay itself is Task 11's job; for now the action exists
-            // and routes here, but does nothing.
-            KeyAction::ToggleGitGraph => {}
+            KeyAction::ToggleGitGraph => self.toggle_git_graph(),
         }
     }
 
@@ -1626,6 +1646,12 @@ impl App {
         // modal-relevant mouse actions) so a click can't select/kill/scroll or
         // start a selection behind the overlay.
         if self.modal.is_some() {
+            return;
+        }
+        // The overlay covers sidebar and pane both, so nothing behind it is a
+        // sensible click target. It sits below a modal for the same reason the
+        // key path does: a modal opened over it is drawn on top of it.
+        if self.on_git_graph_mouse(m) {
             return;
         }
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
@@ -1794,11 +1820,7 @@ impl App {
                         (!text.is_empty()).then_some(text)
                     });
                 if let Some(text) = text {
-                    use std::io::Write;
-                    let mut out = std::io::stdout();
-                    let _ = out.write_all(&asd_vt::clip::osc52_copy(&text));
-                    let _ = out.flush();
-                    self.clipboard = Some(text);
+                    self.copy_to_host(text);
                 }
                 self.dirty = true;
             }
@@ -1815,6 +1837,17 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Put `text` on the host's clipboard with OSC 52. The single place that
+    /// writes the sequence, so the overlay hands text back instead of emitting
+    /// its own.
+    pub(crate) fn copy_to_host(&mut self, text: String) {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&asd_vt::clip::osc52_copy(&text));
+        let _ = out.flush();
+        self.clipboard = Some(text);
     }
 
     /// Recompute the pane grid from the current terminal size + sidebar state;

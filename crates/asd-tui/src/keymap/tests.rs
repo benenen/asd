@@ -326,3 +326,27 @@ fn every_config_name_round_trips() {
         assert_eq!(action.config_name(), *name);
     }
 }
+
+#[test]
+fn the_leader_chord_is_recognized_whole_not_just_its_first_key() {
+    // The git graph overlay consumes every key `leader_sequence` rejects. If it
+    // reported only the leader, `Ctrl+A` would arm the prefix and the overlay
+    // would then eat the `g`/`q`/`n` that completes the chord — leaving the
+    // prefix armed and every prefix binding unreachable while it is open.
+    let ctrl_a = press(KeyCode::Char('a'), KeyModifiers::CONTROL);
+    let g = press(KeyCode::Char('g'), KeyModifiers::NONE);
+    let mut map = Keymap::default();
+
+    assert!(!map.leader_sequence(&g), "a bare key is the overlay's");
+    assert!(map.leader_sequence(&ctrl_a));
+    assert_eq!(map.resolve(&ctrl_a), KeyResolution::Consumed);
+    assert!(
+        map.leader_sequence(&g),
+        "the key after the leader completes the chord"
+    );
+    assert_eq!(
+        map.resolve(&g),
+        KeyResolution::Action(KeyAction::ToggleGitGraph)
+    );
+    assert!(!map.leader_sequence(&g), "the prefix is spent again");
+}

@@ -114,10 +114,6 @@ pub(crate) fn spawn_tty_watchdog() {
 ///
 /// macOS has no `/proc`, so the read simply fails and the caller reports that
 /// the session's directory could not be determined — no three-way OS split.
-///
-/// `#[allow(dead_code)]`: Task 11 wires the first call site into the overlay;
-/// remove this once that caller lands.
-#[allow(dead_code)]
 pub(crate) fn session_cwd(pid: u32) -> Option<std::path::PathBuf> {
     if pid == 0 {
         return None;

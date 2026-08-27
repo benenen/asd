@@ -15,8 +15,10 @@
 //!   resolving which repository a session is sitting in. `None` on platforms
 //!   without a way to read it.
 //!
-//! The latter two are best-effort terminal hygiene: a platform without the
-//! mechanism provides a no-op rather than making callers ask whether it exists.
+//! [`install_terminating_signal_restore`] and [`spawn_tty_watchdog`] are
+//! best-effort terminal hygiene, and [`session_cwd`] is best-effort in the same
+//! way: a platform without the mechanism provides a no-op — or `None` — rather
+//! than making callers ask whether it exists.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -27,13 +29,9 @@ mod imp;
 #[path = "win.rs"]
 mod imp;
 
-pub(crate) use imp::{connect_stream, install_terminating_signal_restore, spawn_tty_watchdog};
-// Task 11 wires the first call site into the overlay; until then this import
-// itself is unused from the crate's point of view, same as the `#[allow(dead_code)]`
-// on each platform's `session_cwd` definition. Remove both allows once that
-// caller lands.
-#[allow(unused_imports)]
-pub(crate) use imp::session_cwd;
+pub(crate) use imp::{
+    connect_stream, install_terminating_signal_restore, session_cwd, spawn_tty_watchdog,
+};
 
 /// The daemon side of a connection, type-erased for the framed codec.
 pub(crate) type BoxRead = Box<dyn AsyncRead + Unpin + Send>;

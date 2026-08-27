@@ -11,6 +11,9 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 asd-client = { workspace = true }
+# The commit-graph overlay (`Ctrl+A g`). Self-contained: it knows a filesystem
+# path, not asd, and reaches crossterm only through `ratatui::crossterm`.
+asd-git = { workspace = true }
 asd-proto = { workspace = true }
 asd-vt = { workspace = true }
 chrono = { workspace = true }

@@ -313,6 +313,7 @@ version = "0.1.13"
 dependencies = [
  "anyhow",
  "asd-client",
+ "asd-git",
  "asd-proto",
  "asd-vt",
  "chrono",

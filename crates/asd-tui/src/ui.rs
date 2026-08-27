@@ -195,6 +195,14 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     app.process_fx(f.buffer_mut(), side);
     draw_pane(f, app, pane);
 
+    // The git graph overlay covers sidebar and pane both, and suppresses the
+    // cursor the same way a modal does. A modal is layered on top of it: the
+    // overlay lets asd's leader chord through, so `Ctrl+A r` / `Ctrl+A x` can
+    // open one while it is up.
+    if app.git_graph.is_some() {
+        draw_git_graph(f, app);
+    }
+
     if let Some(modal) = &app.modal
         && let Some(position) = draw_modal(f, modal)
     {
@@ -205,11 +213,13 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
 fn draw_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let selection = app.sel_viewport();
     let modal_open = app.modal.is_some();
+    let overlay_open = app.git_graph.is_some();
     if let Some(snapshot) = app.snapshot() {
         pane::render(f.buffer_mut(), area, &snapshot, selection);
         // Anchor the OS input-method (IME) popup and TUI programs like codex/vim
         // at the real terminal cursor. Suppress it under a modal or scrollback.
         if !modal_open
+            && !overlay_open
             && app.scroll == 0
             && let Some((cx, cy)) = snapshot.cursor.position
             && cx < area.width
@@ -230,6 +240,40 @@ fn draw_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             selectable,
             &app.keymap,
         );
+    }
+}
+
+/// Where the git graph overlay goes: inset from the frame edge so the asd UI
+/// stays visible as a border around it, or `None` when the terminal has no room
+/// for it at all.
+///
+/// This runs on `asd ui`'s only thread, so a `Rect` reaching outside the frame
+/// would panic the whole client and blank every session the user has open. The
+/// inset is therefore dropped rather than saturated on a terminal too small to
+/// carry it — a saturating inset produces a zero-width `Rect` at a non-zero `x`,
+/// which is both empty and no longer inside the frame — and a rect that still
+/// comes out empty yields `None`.
+fn overlay_rect(area: Rect) -> Option<Rect> {
+    let inset_x = if area.width > 8 { 2 } else { 0 };
+    let inset_y = if area.height > 6 { 1 } else { 0 };
+    let rect = Rect {
+        x: area.x + inset_x,
+        y: area.y + inset_y,
+        width: area.width.saturating_sub(inset_x * 2),
+        height: area.height.saturating_sub(inset_y * 2),
+    };
+    (rect.width > 0 && rect.height > 0).then_some(rect)
+}
+
+/// The git graph overlay. `GitGraph::render` clamps to the buffer as well; the
+/// two guards are independent on purpose.
+fn draw_git_graph(f: &mut Frame<'_>, app: &mut App) {
+    let Some(rect) = overlay_rect(f.area()) else {
+        return;
+    };
+    f.render_widget(Clear, rect);
+    if let Some(graph) = app.git_graph.as_mut() {
+        f.render_widget(graph, rect);
     }
 }
 
@@ -373,6 +417,37 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overlay is drawn on `asd ui`'s only thread, so a rect escaping the
+    /// frame panics the client and blanks every session at once. Sweep every
+    /// small size, including origins that are not 0: an inset that saturates
+    /// instead of dropping leaves `x` moved but `width` at 0, which lands
+    /// outside the frame.
+    #[test]
+    fn the_overlay_rect_never_escapes_the_frame() {
+        for &(ox, oy) in &[(0u16, 0u16), (3, 2)] {
+            for width in 0..=14u16 {
+                for height in 0..=12u16 {
+                    let area = Rect::new(ox, oy, width, height);
+                    let Some(rect) = overlay_rect(area) else {
+                        continue;
+                    };
+                    assert!(rect.width > 0 && rect.height > 0, "{area:?} -> {rect:?}");
+                    assert_eq!(
+                        rect,
+                        rect.intersection(area),
+                        "{area:?} -> {rect:?} leaves the frame"
+                    );
+                }
+            }
+        }
+        assert_eq!(overlay_rect(Rect::new(0, 0, 0, 0)), None);
+        assert_eq!(overlay_rect(Rect::new(4, 4, 0, 5)), None);
+        assert_eq!(
+            overlay_rect(Rect::new(0, 0, 80, 24)),
+            Some(Rect::new(2, 1, 76, 22))
+        );
+    }
 
     #[test]
     fn truncate_respects_display_width() {
