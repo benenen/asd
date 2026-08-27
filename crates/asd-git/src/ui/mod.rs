@@ -2,3 +2,4 @@
 //! belongs to `crate::git::graph`.
 
 pub mod colors;
+pub mod graph_view;
