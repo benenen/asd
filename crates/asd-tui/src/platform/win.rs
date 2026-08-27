@@ -35,3 +35,15 @@ pub(crate) fn install_terminating_signal_restore() {}
 
 /// No-op: see the module docs.
 pub(crate) fn spawn_tty_watchdog() {}
+
+/// No-op: reading another process's current directory on Windows means opening
+/// the process and walking its PEB, which needs a privilege the TUI does not
+/// ask for. The overlay reports that the directory could not be determined,
+/// exactly as it does on a macOS host.
+///
+/// `#[allow(dead_code)]`: Task 11 wires the first call site into the overlay;
+/// remove this once that caller lands.
+#[allow(dead_code)]
+pub(crate) fn session_cwd(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}

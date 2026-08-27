@@ -11,6 +11,9 @@
 //! - [`install_terminating_signal_restore`] — put the terminal back when the
 //!   process is killed outright, which normal cleanup never sees.
 //! - [`spawn_tty_watchdog`] — exit when the hosting terminal disappears.
+//! - [`session_cwd`] — the working directory of a live local process, for
+//!   resolving which repository a session is sitting in. `None` on platforms
+//!   without a way to read it.
 //!
 //! The latter two are best-effort terminal hygiene: a platform without the
 //! mechanism provides a no-op rather than making callers ask whether it exists.
@@ -25,6 +28,12 @@ mod imp;
 mod imp;
 
 pub(crate) use imp::{connect_stream, install_terminating_signal_restore, spawn_tty_watchdog};
+// Task 11 wires the first call site into the overlay; until then this import
+// itself is unused from the crate's point of view, same as the `#[allow(dead_code)]`
+// on each platform's `session_cwd` definition. Remove both allows once that
+// caller lands.
+#[allow(unused_imports)]
+pub(crate) use imp::session_cwd;
 
 /// The daemon side of a connection, type-erased for the framed codec.
 pub(crate) type BoxRead = Box<dyn AsyncRead + Unpin + Send>;

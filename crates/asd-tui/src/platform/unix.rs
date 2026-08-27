@@ -104,3 +104,48 @@ pub(crate) fn spawn_tty_watchdog() {
         })
         .expect("tty watchdog thread");
 }
+
+/// The cwd of a live local process, or `None` when it cannot be read.
+///
+/// This is the same `/proc` read the daemon does in
+/// `asd-daemon/src/platform/unix.rs`. It is duplicated rather than shared
+/// because `asd-tui` may not depend on `asd-daemon`: the TUI is a terminal-side
+/// client and carries no PTY or process management.
+///
+/// macOS has no `/proc`, so the read simply fails and the caller reports that
+/// the session's directory could not be determined — no three-way OS split.
+///
+/// `#[allow(dead_code)]`: Task 11 wires the first call site into the overlay;
+/// remove this once that caller lands.
+#[allow(dead_code)]
+pub(crate) fn session_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_this_process_cwd() {
+        let mine = session_cwd(std::process::id()).expect("/proc/self/cwd is readable");
+        assert_eq!(
+            mine.canonicalize().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn pid_zero_is_never_a_process() {
+        assert!(session_cwd(0).is_none());
+    }
+
+    #[test]
+    fn an_unknown_pid_is_none_rather_than_a_panic() {
+        // A pid this high is not allocated on any default Linux configuration.
+        assert!(session_cwd(u32::MAX).is_none());
+    }
+}
