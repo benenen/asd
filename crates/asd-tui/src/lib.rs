@@ -851,24 +851,7 @@ fn event_loop(
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
                 Event::Mouse(m) => app.on_mouse(m, terminal.size()?),
-                Event::Paste(text) => {
-                    // A modal owns input: route a paste into the rename field,
-                    // swallow it under the kill-confirm — never leak it to the
-                    // session.
-                    if let Some(Modal::Rename(input)) = app.modal.as_mut() {
-                        for c in text.chars() {
-                            input.insert(c);
-                        }
-                        app.dirty = true;
-                    } else if app.modal.is_none() {
-                        if app.scroll != 0 {
-                            app.pane_needs_render = true;
-                        }
-                        app.scroll = 0;
-                        let bytes = app.paste(&text);
-                        app.send(Cmd::Input(bytes));
-                    }
-                }
+                Event::Paste(text) => app.on_paste(&text),
                 // Only a wake-up: the loop head above re-reads the real size and
                 // applies it, on this pass and on every pass after — including
                 // the resizes whose event never reaches us.
@@ -1441,6 +1424,35 @@ impl App {
             }
         }
         self.dirty = true;
+    }
+
+    /// Route a bracketed paste.
+    ///
+    /// Whatever owns input owns the paste too, and it must never leak to the
+    /// session: pasting a command or a token into a shell that is hidden
+    /// behind an overlay runs it on the next `Enter`, in whichever session
+    /// happens to be attached. A modal takes it (into the rename field, or
+    /// swallowed under the kill-confirm); the git overlay has no text field,
+    /// so it simply drops it. Only with nothing on top does the paste reach
+    /// the session — and only then does it un-scroll the pane, which is the
+    /// other half of the same rule.
+    fn on_paste(&mut self, text: &str) {
+        if let Some(Modal::Rename(input)) = self.modal.as_mut() {
+            for c in text.chars() {
+                input.insert(c);
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.modal.is_some() || self.git_graph.is_some() {
+            return;
+        }
+        if self.scroll != 0 {
+            self.pane_needs_render = true;
+        }
+        self.scroll = 0;
+        let bytes = self.paste(text);
+        self.send(Cmd::Input(bytes));
     }
 
     fn on_key(&mut self, k: CtKey) {
