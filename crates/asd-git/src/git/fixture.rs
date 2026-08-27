@@ -83,8 +83,20 @@ impl Fixture {
 
     /// Merge `name` into the current branch, always creating a merge commit.
     pub(crate) fn merge(&self, name: &str, summary: &str) -> String {
+        self.merge_many(&[name], summary)
+    }
+
+    /// Merge every branch in `names` into the current branch in one commit,
+    /// always creating a merge commit. Two or more names make an octopus.
+    ///
+    /// This exists so an octopus does not have to be spelled as a raw `git`
+    /// call: `git` alone does not advance the fixture clock, which would leave
+    /// the merge sharing a commit time with the branch tip it merges.
+    pub(crate) fn merge_many(&self, names: &[&str], summary: &str) -> String {
         self.clock.set(self.clock.get() + 60);
-        self.git(&["merge", "--quiet", "--no-ff", "-m", summary, name]);
+        let mut args = vec!["merge", "--quiet", "--no-ff", "-m", summary];
+        args.extend_from_slice(names);
+        self.git(&args);
         self.git(&["rev-parse", "HEAD"])
     }
 
