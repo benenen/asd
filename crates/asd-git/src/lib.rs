@@ -6,10 +6,12 @@
 //! terminal state.
 
 pub mod git;
+pub mod state;
 pub mod ui;
 
 pub use git::commit::{CommitInfo, ReadError};
 pub use git::graph::{CellType, GraphBuilder, GraphNode};
 pub use git::refs::{RefInfo, RefKind};
 pub use git::repo::{OpenError, Repo};
+pub use state::{GitGraph, Outcome, PAGE_FIRST};
 pub use ui::colors::{LANE_COLORS, lane_color};

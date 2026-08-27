@@ -117,6 +117,17 @@ fn put(buf: &mut Buffer, area: Rect, x: u16, y: u16, text: &str, style: Style) -
     cx
 }
 
+/// One centred line, for "no commits yet" and read failures.
+pub fn draw_message(buf: &mut Buffer, area: Rect, text: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let y = area.y + area.height / 2;
+    let width = unicode_width::UnicodeWidthStr::width(text) as u16;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    put(buf, area, x, y, text, Style::default().fg(Color::DarkGray));
+}
+
 /// Paint `nodes[first_row..]` into `area`, highlighting `selected`.
 pub fn draw_rows(
     buf: &mut Buffer,
