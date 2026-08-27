@@ -105,6 +105,36 @@ fn the_leader_and_the_prefix_table_are_configurable_too() {
 }
 
 #[test]
+fn the_git_graph_toggle_is_rebindable() {
+    let (mut map, complaint) = from_text(
+        r#"
+[keys.prefix]
+toggle_git_graph = ["G"]
+"#,
+    );
+    assert!(complaint.is_none(), "{complaint:?}");
+
+    assert_eq!(
+        map.resolve(&press(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+        KeyResolution::Consumed
+    );
+    assert_eq!(
+        map.resolve(&press(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+        KeyResolution::Action(KeyAction::ToggleGitGraph)
+    );
+
+    // The rebind replaces the default rather than adding to it.
+    assert_eq!(
+        map.resolve(&press(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+        KeyResolution::Consumed
+    );
+    assert_eq!(
+        map.resolve(&press(KeyCode::Char('g'), KeyModifiers::NONE)),
+        KeyResolution::Action(KeyAction::CancelPrefix)
+    );
+}
+
+#[test]
 fn a_misspelled_action_is_reported_rather_than_ignored() {
     let (mut map, complaint) = from_text(
         r#"

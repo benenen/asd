@@ -78,6 +78,8 @@ run_restored_commands = false
 # kill = ["x"]
 # toggle_sidebar = ["b"]
 # toggle_status = ["s"]
+# Open the git graph overlay for the focused session's repository.
+# toggle_git_graph = ["g"]
 # reconnect = ["R"]
 # quit = ["q"]
 # cancel_prefix = ["Esc"]

@@ -1474,6 +1474,9 @@ impl App {
                 }
             }
             KeyAction::CancelPrefix => {}
+            // The overlay itself is Task 11's job; for now the action exists
+            // and routes here, but does nothing.
+            KeyAction::ToggleGitGraph => {}
         }
     }
 

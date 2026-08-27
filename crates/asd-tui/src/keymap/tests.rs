@@ -295,6 +295,27 @@ fn compile_rejects_duplicate_aliases_within_one_binding() {
     );
 }
 
+#[test]
+fn the_leader_then_g_opens_the_git_graph() {
+    let mut map = Keymap::default();
+
+    assert_eq!(
+        map.resolve(&press(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+        KeyResolution::Consumed,
+        "Ctrl+A arms the prefix"
+    );
+    assert_eq!(
+        map.resolve(&press(KeyCode::Char('g'), KeyModifiers::NONE)),
+        KeyResolution::Action(KeyAction::ToggleGitGraph)
+    );
+
+    // Without the prefix, `g` still belongs to the session.
+    assert_eq!(
+        map.resolve(&press(KeyCode::Char('g'), KeyModifiers::NONE)),
+        KeyResolution::PassThrough
+    );
+}
+
 /// The config's names and the actions they stand for are one table read in two
 /// directions; a name that only resolves one way is a rebind that reports an
 /// action nobody can write down.
