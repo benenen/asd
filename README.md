@@ -256,9 +256,12 @@ else is behind the prefix:
   dropping right to left as the terminal narrows)
 - `g` — open the git graph for the focused session's repository (`j`/`k` move,
   `Ctrl+d`/`Ctrl+u` page, `g`/`G` jump to newest/oldest, `@` returns to HEAD,
-  `y` copies the selected hash, `q` or `Esc` closes). The prefix reaches
-  through it, so `Ctrl+A 1` switches session and re-aims the graph. Finding a
-  session's directory needs `/proc`, so this is Linux-only for now
+  `R` re-reads the repository, `y` copies the selected hash, `q` or `Esc`
+  closes). The prefix reaches through it, so `Ctrl+A 1` switches session and
+  re-aims the graph — and `Ctrl+A Ctrl+A` still sends a literal `Ctrl+A` to
+  the session *behind* the overlay, since the whole leader sequence is passed
+  through. Finding a session's directory needs `/proc`, so this is Linux-only
+  for now
 - `R` — reconnect · `q` — quit · `Ctrl+A Ctrl+A` — send a literal `Ctrl+A` to the session
 
 Mouse: click a sidebar row to switch (or its `x` to kill), drag in the pane to select (copied via OSC 52), and **drag the sidebar↔pane divider** to resize the sidebar (clamped to a sensible min/max). `Shift+PageUp`/`PageDown` page the scrollback.

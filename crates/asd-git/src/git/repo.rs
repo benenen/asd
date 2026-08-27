@@ -147,8 +147,16 @@ impl Repo {
         Ok(tips)
     }
 
-    /// Walk the history newest-first. The iterator is lazy: taking 500 items
-    /// costs 500 commits, not the whole repository.
+    /// Walk the history newest-first.
+    ///
+    /// The iterator is lazy, but no caller exploits that: `GitGraph::reload`
+    /// drains it in one `collect()` — see the comment there for why it has to
+    /// — so in practice opening the overlay costs O(whole repository), one
+    /// read of every commit reachable from every tip. That work happens on
+    /// `asd ui`'s single render thread, the one that paints every session, and
+    /// it was measured at 152 ms for 14 500 commits. Do not plan a feature
+    /// around taking only the first *n* items being cheap: nothing takes only
+    /// the first *n*.
     pub fn walk(
         &self,
     ) -> Result<impl Iterator<Item = Result<CommitInfo, ReadError>> + '_, ReadError> {

@@ -289,8 +289,6 @@ dependencies = [
 name = "asd-git"
 version = "0.1.13"
 dependencies = [
- "anyhow",
- "chrono",
  "gix",
  "ratatui",
  "thiserror 2.0.18",

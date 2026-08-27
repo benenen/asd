@@ -17,8 +17,13 @@ use crate::git::refs::RefInfo;
 use crate::git::repo::{OpenError, Repo};
 use crate::ui::graph_view::draw_rows;
 
-/// Rows loaded before the first frame. Large enough to fill any terminal
-/// several times over, small enough that opening is instant.
+/// Rows fed into the *layout* before the first frame. Large enough to fill any
+/// terminal several times over, small enough that the first layout is cheap.
+///
+/// It bounds the layout only, never the read: by the time it is used `reload`
+/// has already drained the entire history walk, so opening costs O(whole
+/// repository) whatever this number is. Lowering it does not make opening
+/// faster.
 pub const PAGE_FIRST: usize = 500;
 /// Rows added each time the selection approaches the loaded tail.
 pub const PAGE_MORE: usize = 2000;
@@ -26,7 +31,13 @@ pub const PAGE_MORE: usize = 2000;
 const PAGE_MARGIN: usize = 200;
 
 /// What `asd-tui` should do after handing over an event.
+///
+/// `#[non_exhaustive]`: phases 2 and 3 add outcomes for the write dialogs, and
+/// a host that matches every variant today must keep compiling then. Hosts
+/// need a fallback arm; treating an unknown outcome as "handled, repaint" is
+/// the safe reading.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Outcome {
     /// Handled. The host keeps the overlay open and repaints: every
     /// navigation key returns this, so treating it as "nothing changed"
@@ -44,6 +55,7 @@ pub enum Outcome {
 }
 
 /// The overlay: a repository, the rows loaded from it, and the view state.
+#[derive(Debug)]
 pub struct GitGraph {
     repo: Repo,
     builder: GraphBuilder,
@@ -179,10 +191,12 @@ impl GitGraph {
 
     /// Handle one key.
     ///
-    /// This ignores `KeyEvent::kind`: a host that forwards `Release` (or
-    /// `Repeat`) as well as `Press` — which crossterm does emit once the
-    /// kitty keyboard protocol is enabled — moves the selection twice per
-    /// keypress. Filtering to `KeyEventKind::Press` is the caller's job.
+    /// This ignores `KeyEvent::kind`: a host that forwards `Release` as well
+    /// as `Press` — which crossterm does emit once the kitty keyboard
+    /// protocol is enabled — moves the selection twice per keypress.
+    /// Filtering `KeyEventKind::Release` out is the caller's job. `Repeat`
+    /// must *not* be filtered: it is what makes holding `j` down keep
+    /// scrolling.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         let page = self.viewport_rows.max(1);
         // A half page still has to be at least one row: `viewport_rows` is 1

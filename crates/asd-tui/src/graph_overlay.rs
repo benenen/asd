@@ -169,6 +169,11 @@ impl App {
                 self.copy_to_host(text);
                 self.dirty = true;
             }
+            // `Outcome` is `#[non_exhaustive]`: phases 2 and 3 add variants.
+            // An outcome this build does not know was still *handled* by the
+            // overlay, so repaint and keep the key — falling through to the
+            // session would type it into a hidden shell.
+            _ => self.dirty = true,
         }
         true
     }
@@ -198,6 +203,7 @@ impl App {
                 self.copy_to_host(text);
                 self.dirty = true;
             }
+            _ => self.dirty = true,
         }
         true
     }
@@ -436,12 +442,7 @@ mod tests {
     fn a_non_repository_reports_which_path_failed() {
         let dir = std::env::temp_dir().join(format!("asd-overlay-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Matched rather than `expect_err`: that needs `T: Debug`, and
-        // `GitGraph` does not implement it.
-        let err = match open_at(&dir) {
-            Ok(_) => panic!("a plain directory is not a repository: {}", dir.display()),
-            Err(err) => err,
-        };
+        let err = open_at(&dir).expect_err("a plain directory is not a repository");
         let msg = err.to_string();
         assert!(
             msg.contains(&dir.display().to_string()),
