@@ -58,6 +58,7 @@ repository = ""
 asd-cli = { path = "crates/asd-cli" }
 asd-client = { path = "crates/asd-client" }
 asd-dioxus = { path = "crates/asd-dioxus" }
+asd-git = { path = "crates/asd-git" }
 asd-daemon = { path = "crates/asd-daemon" }
 asd-proto = { path = "crates/asd-proto" }
 asd-tui = { path = "crates/asd-tui" }
@@ -75,6 +76,16 @@ nix = { version = "0.30", features = ["signal", "process", "term", "fs"] }
 # same terminal in one binary, and crossterm keeps process-global mode state, so
 # two versions would each restore what only they knew about.
 crossterm = "0.29"
+# Pure-Rust git. Chosen over git2 so the Windows GNU cross-check does not have
+# to carry a C toolchain. `sha1` is not optional: without it `gix_hash::Kind`
+# has no variants and gix-hash itself fails to compile.
+gix = { version = "0.87", default-features = false, features = [
+    "sha1",
+    "revision",
+    "index",
+    "max-performance-safe",
+    "parallel",
+] }
 portable-pty = "0.9"
 postcard = { version = "1", features = ["use-std"] }
 ratatui = "0.30.2"

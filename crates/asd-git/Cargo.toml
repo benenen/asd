@@ -1,0 +1,17 @@
+[package]
+name = "asd-git"
+description = "Commit-graph model and ratatui widget for the asd TUI's git overlay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Contract: this crate knows about a filesystem path, not about asd. It depends
+# on no other asd crate. crossterm is reached only through `ratatui::crossterm`
+# so the binary cannot end up with two versions of it.
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+gix = { workspace = true }
+ratatui = { workspace = true }
+thiserror = { workspace = true }
+unicode-width = "0.2"
