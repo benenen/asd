@@ -30,6 +30,8 @@ pub const PAGE_FIRST: usize = 500;
 pub const PAGE_MORE: usize = 2000;
 /// How close the selection may get to the tail before more is loaded.
 const PAGE_MARGIN: usize = 200;
+/// Rows one wheel notch moves.
+const WHEEL_ROWS: isize = 3;
 
 /// What `asd-tui` should do after handing over an event.
 ///
@@ -40,13 +42,16 @@ const PAGE_MARGIN: usize = 200;
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Outcome {
-    /// Handled. The host keeps the overlay open and repaints: every
-    /// navigation key returns this, so treating it as "nothing changed"
-    /// would leave the selection visibly stuck. Nothing in phase 1
-    /// constructs `Redraw`, so `Consumed` is the repaint signal.
+    /// Handled. The host keeps the overlay open. After a key it repaints —
+    /// every navigation key returns this, so treating it as "nothing changed"
+    /// would leave the selection visibly stuck. After a *mouse* event the
+    /// host repaints only when `selected()` moved, because pointer motion is
+    /// reported continuously and repainting per report would redraw the whole
+    /// overlay on every pixel of movement.
     Consumed,
-    /// Handled and the frame needs repainting. Reserved for phase 2's diff
-    /// worker; no phase 1 path returns it, so a host must not wait for it.
+    /// Handled, and something changed that the host cannot see by comparing
+    /// `selected()`: focus moved between panes, or a pane other than the
+    /// graph scrolled. The frame must be repainted.
     Redraw,
     /// Close the overlay.
     Dismiss,
@@ -92,17 +97,19 @@ pub struct GitGraph {
     /// The three panes' rectangles from the last frame, so a mouse event can
     /// be routed to the pane it landed in. Empty until the first render.
     layout: LayoutMap,
-    /// Lines scrolled past in the detail pane. Task 8 moves this; here it
-    /// only affects which rows `draw_detail` skips.
+    /// Lines scrolled past in the detail pane.
     detail_scroll: usize,
-    /// Which pane has keyboard focus. Task 8 moves this; here it only
-    /// decides the detail pane's border colour.
+    /// Rows the detail pane had to show in the last frame, so scrolling it
+    /// can stop at the end instead of running off into blank space. Zero
+    /// until the first frame, and whenever the area is too short to give the
+    /// detail pane any height at all.
+    detail_rows: usize,
+    /// Which pane has keyboard focus. `Tab` moves it; it decides which pane
+    /// `j`/`k` act on and which border is tinted.
     focus: Pane,
-    /// Which row is selected in the changed-files pane. Task 8 moves this;
-    /// here it only decides which row `draw_files` highlights.
+    /// Which row is selected in the changed-files pane.
     file_selected: usize,
-    /// Rows scrolled past in the changed-files pane. Task 8 moves this; here
-    /// it only affects which rows `draw_files` skips.
+    /// Rows scrolled past in the changed-files pane.
     file_scroll: usize,
 }
 
@@ -130,6 +137,7 @@ impl GitGraph {
             detail_for: None,
             layout: LayoutMap::default(),
             detail_scroll: 0,
+            detail_rows: 0,
             focus: Pane::Graph,
             file_selected: 0,
             file_scroll: 0,
@@ -150,6 +158,21 @@ impl GitGraph {
 
     pub fn selected(&self) -> usize {
         self.selected
+    }
+
+    /// Which pane the keyboard is aimed at.
+    pub fn focus(&self) -> Pane {
+        self.focus
+    }
+
+    /// Which row of the changed-files pane is selected.
+    pub fn file_selected(&self) -> usize {
+        self.file_selected
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layout_for_test(&self) -> LayoutMap {
+        self.layout
     }
 
     /// Take everything the worker finished. Returns true when the frame needs
@@ -271,7 +294,20 @@ impl GitGraph {
     fn select(&mut self, index: usize) -> Outcome {
         self.ensure_loaded_around(index);
         let last = self.row_count().saturating_sub(1);
-        self.selected = index.min(last);
+        let next = index.min(last);
+        if next != self.selected {
+            // The lower panes describe the selected commit, so a different
+            // commit starts them at the top. The detail pane in particular
+            // changes the moment the selection does — before any reply — so
+            // leaving its offset alone would show the new commit already
+            // scrolled. `accept_reply` resets the file list again when the
+            // reply lands, which is the point at which the list it indexes
+            // into actually exists.
+            self.detail_scroll = 0;
+            self.file_selected = 0;
+            self.file_scroll = 0;
+        }
+        self.selected = next;
         // Keep the selection inside the viewport.
         if self.selected < self.first_row {
             self.first_row = self.selected;
@@ -280,6 +316,101 @@ impl GitGraph {
         }
         self.request_detail();
         Outcome::Consumed
+    }
+
+    /// How many rows `pane`'s list has.
+    fn pane_len(&self, pane: Pane) -> usize {
+        match pane {
+            Pane::Graph => self.row_count(),
+            Pane::Files => match &self.detail {
+                DetailState::Ready(d) => d.files.len(),
+                _ => 0,
+            },
+            // The detail pane scrolls by line and has no selection, so it has
+            // no list length; `move_pane` clamps it against `detail_rows`.
+            Pane::Detail => 0,
+        }
+    }
+
+    /// Move `pane`'s selection or scroll by `delta` rows.
+    ///
+    /// The pane is an argument rather than being read from `self.focus`
+    /// because the wheel scrolls the pane under the pointer, not the focused
+    /// one. Passing it in means the focus is never swapped and so cannot be
+    /// left somewhere the user did not put it — including on the paths that
+    /// return early because the movement was clamped away.
+    ///
+    /// `Redraw` rather than `Consumed` where something moved that is not the
+    /// graph selection: the host detects a moved graph selection itself, but
+    /// cannot see a scrolled detail pane, so a wheel over one would otherwise
+    /// change the state without repainting it.
+    fn move_pane(&mut self, pane: Pane, delta: isize) -> Outcome {
+        match pane {
+            Pane::Graph => {
+                let next = if delta < 0 {
+                    self.selected.saturating_sub(delta.unsigned_abs())
+                } else {
+                    self.selected.saturating_add(delta as usize)
+                };
+                self.select(next)
+            }
+            Pane::Files => {
+                let last = self.pane_len(Pane::Files).saturating_sub(1);
+                let next = if delta < 0 {
+                    self.file_selected.saturating_sub(delta.unsigned_abs())
+                } else {
+                    self.file_selected.saturating_add(delta as usize)
+                }
+                .min(last);
+                if next == self.file_selected {
+                    return Outcome::Consumed;
+                }
+                self.file_selected = next;
+                self.keep_file_visible();
+                Outcome::Redraw
+            }
+            Pane::Detail => {
+                // One line stays on screen at the bottom: scrolling into
+                // blank space would need as many keys to come back from as it
+                // took to get there, and would repaint the overlay for each.
+                let visible = (self.layout.detail.height.saturating_sub(2) as usize).max(1);
+                let last = self.detail_rows.saturating_sub(visible);
+                let next = if delta < 0 {
+                    self.detail_scroll.saturating_sub(delta.unsigned_abs())
+                } else {
+                    self.detail_scroll.saturating_add(delta as usize)
+                }
+                .min(last);
+                if next == self.detail_scroll {
+                    return Outcome::Consumed;
+                }
+                self.detail_scroll = next;
+                Outcome::Redraw
+            }
+        }
+    }
+
+    /// Move the focused pane, which is what the keyboard acts on.
+    fn move_focused(&mut self, delta: isize) -> Outcome {
+        self.move_pane(self.focus, delta)
+    }
+
+    /// Keep the file selection inside the changed-files pane's viewport.
+    ///
+    /// The height comes from the last frame's layout: before the first frame
+    /// there is no viewport to scroll within, and leaving the offset alone
+    /// there is right, because nothing has been shown yet.
+    fn keep_file_visible(&mut self) {
+        if self.file_selected < self.file_scroll {
+            self.file_scroll = self.file_selected;
+            return;
+        }
+        // The pane draws inside its border, so two of its rows are not list
+        // rows.
+        let visible = self.layout.files.height.saturating_sub(2) as usize;
+        if visible > 0 && self.file_selected >= self.file_scroll.saturating_add(visible) {
+            self.file_scroll = self.file_selected + 1 - visible;
+        }
     }
 
     /// The commit on the selected row, if that row is a commit rather than a
@@ -327,6 +458,11 @@ impl GitGraph {
 
     /// Handle one key.
     ///
+    /// The movement keys act on the focused pane, which `Tab` cycles. The
+    /// keys that are about a *commit* rather than about a list — `g`, `G`,
+    /// `@`, `y`, `R` — stay on the graph whatever has focus: they have no
+    /// meaning in the two panes that describe the commit the graph selected.
+    ///
     /// This ignores `KeyEvent::kind`: a host that forwards `Release` as well
     /// as `Press` — which crossterm does emit once the kitty keyboard
     /// protocol is enabled — moves the selection twice per keypress.
@@ -340,25 +476,35 @@ impl GitGraph {
         // and `1 / 2` would make these keys permanently dead rather than
         // merely small-stepped.
         let half_page = (page / 2).max(1);
+        // Both step counts come from a `u16` pane height, so neither can be
+        // large enough for the `isize` conversion to wrap.
+        let page = page as isize;
+        let half_page = half_page as isize;
         match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Char('j') | KeyCode::Down) => {
-                self.select(self.selected.saturating_add(1))
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                self.focus = match self.focus {
+                    Pane::Graph => Pane::Detail,
+                    Pane::Detail => Pane::Files,
+                    Pane::Files => Pane::Graph,
+                };
+                Outcome::Redraw
             }
-            (KeyModifiers::NONE, KeyCode::Char('k') | KeyCode::Up) => {
-                self.select(self.selected.saturating_sub(1))
+            // Crossterm reports Shift+Tab as `BackTab`, and with `SHIFT` set
+            // on most terminals but not all, so the modifier is not matched.
+            (_, KeyCode::BackTab) => {
+                self.focus = match self.focus {
+                    Pane::Graph => Pane::Files,
+                    Pane::Files => Pane::Detail,
+                    Pane::Detail => Pane::Graph,
+                };
+                Outcome::Redraw
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
-                self.select(self.selected.saturating_add(half_page))
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
-                self.select(self.selected.saturating_sub(half_page))
-            }
-            (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.select(self.selected.saturating_add(page))
-            }
-            (KeyModifiers::NONE, KeyCode::PageUp) => {
-                self.select(self.selected.saturating_sub(page))
-            }
+            (KeyModifiers::NONE, KeyCode::Char('j') | KeyCode::Down) => self.move_focused(1),
+            (KeyModifiers::NONE, KeyCode::Char('k') | KeyCode::Up) => self.move_focused(-1),
+            (KeyModifiers::CONTROL, KeyCode::Char('d')) => self.move_focused(half_page),
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => self.move_focused(-half_page),
+            (KeyModifiers::NONE, KeyCode::PageDown) => self.move_focused(page),
+            (KeyModifiers::NONE, KeyCode::PageUp) => self.move_focused(-page),
             (KeyModifiers::NONE, KeyCode::Char('g') | KeyCode::Home) => self.select(0),
             (KeyModifiers::SHIFT, KeyCode::Char('G')) | (_, KeyCode::End) => {
                 // Jumping to the bottom means the bottom of the whole history,
@@ -397,10 +543,38 @@ impl GitGraph {
         }
     }
 
+    /// Handle one mouse event, routed by the pane it landed in.
+    ///
+    /// Coordinates are the terminal's own, and so are the rectangles in
+    /// `layout`: the host renders this widget at an absolute `Rect` and hands
+    /// the event over unchanged.
     pub fn on_mouse(&mut self, ev: MouseEvent) -> Outcome {
+        if let Some(pane) = crate::ui::layout::pane_at(&self.layout, ev.column, ev.row) {
+            if matches!(ev.kind, MouseEventKind::Down(_)) {
+                if self.focus == pane {
+                    return Outcome::Consumed;
+                }
+                self.focus = pane;
+                return Outcome::Redraw;
+            }
+            // Scrolling acts on the pane under the pointer, not the focused
+            // one — that is what a reader expects from a wheel. The focus
+            // itself is left alone.
+            return match ev.kind {
+                MouseEventKind::ScrollDown => self.move_pane(pane, WHEEL_ROWS),
+                MouseEventKind::ScrollUp => self.move_pane(pane, -WHEEL_ROWS),
+                // Mouse capture reports motion continuously. Answering
+                // `Consumed` without moving anything is what stops the host
+                // repainting the overlay per report.
+                _ => Outcome::Consumed,
+            };
+        }
+        // No pane under the pointer: the overlay's own border, or the very
+        // first frame not yet drawn. Fall back to the focused pane so the
+        // wheel still does what `j`/`k` would.
         match ev.kind {
-            MouseEventKind::ScrollDown => self.select(self.selected.saturating_add(3)),
-            MouseEventKind::ScrollUp => self.select(self.selected.saturating_sub(3)),
+            MouseEventKind::ScrollDown => self.move_focused(WHEEL_ROWS),
+            MouseEventKind::ScrollUp => self.move_focused(-WHEEL_ROWS),
             _ => Outcome::Consumed,
         }
     }
@@ -471,7 +645,10 @@ impl Widget for &mut GitGraph {
             self.first_row,
             self.selected,
         );
-        crate::ui::commit_detail::draw_detail(
+        // The row count comes back from the draw so the scroll can stop at
+        // the end of the pane's content without this module having to keep a
+        // second copy of how that content is laid out.
+        self.detail_rows = crate::ui::commit_detail::draw_detail(
             buf,
             map.detail,
             self.selected_commit(),
@@ -494,7 +671,7 @@ impl Widget for &mut GitGraph {
 mod tests {
     use super::*;
     use crate::git::fixture::Fixture;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -880,6 +1057,225 @@ mod tests {
 
         let text = buffer_text(&buf, area);
         assert!(text.contains("no commits yet"), "{text:?}");
+    }
+
+    /// A repository whose single commit touches `files` files, opened and
+    /// polled until its detail has arrived.
+    fn ready_graph(tag: &str, files: usize) -> (Fixture, GitGraph) {
+        let fx = Fixture::new(tag);
+        for i in 0..files {
+            std::fs::write(fx.path().join(format!("f{i}.txt")), "one\n").unwrap();
+            fx.git(&["add", "."]);
+        }
+        fx.commit("first");
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(g.detail(), DetailState::Loading) {
+            assert!(std::time::Instant::now() < deadline, "detail never arrived");
+            g.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (fx, g)
+    }
+
+    #[test]
+    fn tab_cycles_focus_through_the_three_panes() {
+        let (_fx, mut g) = ready_graph("focus-cycle", 2);
+        assert_eq!(g.focus(), Pane::Graph);
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(g.focus(), Pane::Detail);
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(g.focus(), Pane::Files);
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(g.focus(), Pane::Graph, "Tab wraps");
+    }
+
+    #[test]
+    fn back_tab_cycles_the_other_way() {
+        let (_fx, mut g) = ready_graph("focus-backtab", 2);
+        g.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(g.focus(), Pane::Files);
+        g.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(g.focus(), Pane::Detail);
+        g.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(g.focus(), Pane::Graph);
+    }
+
+    #[test]
+    fn j_moves_the_file_selection_when_the_files_pane_has_focus() {
+        let (_fx, mut g) = ready_graph("focus-files", 3);
+        let commit_row = g.selected();
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(g.focus(), Pane::Files);
+
+        assert_eq!(g.file_selected(), 0);
+        g.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(g.file_selected(), 1, "j moves within the file list");
+        assert_eq!(
+            g.selected(),
+            commit_row,
+            "and leaves the commit selection alone"
+        );
+    }
+
+    #[test]
+    fn the_file_selection_cannot_run_past_the_list() {
+        let (_fx, mut g) = ready_graph("focus-clamp", 2);
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for _ in 0..20 {
+            g.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        assert_eq!(g.file_selected(), 1, "two files means the last index is 1");
+    }
+
+    #[test]
+    fn a_click_moves_focus_to_the_pane_that_was_clicked() {
+        let (_fx, mut g) = ready_graph("focus-click", 2);
+        // Render once so the layout map is populated.
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let map = g.layout_for_test();
+        assert!(
+            map.files.height > 0,
+            "the fixture area is tall enough to split"
+        );
+
+        g.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: map.files.x + 1,
+            row: map.files.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(g.focus(), Pane::Files);
+    }
+
+    #[test]
+    fn switching_commits_resets_the_file_selection() {
+        let fx = Fixture::new("focus-reset");
+        std::fs::write(fx.path().join("a.txt"), "1\n").unwrap();
+        fx.git(&["add", "."]);
+        fx.commit("first");
+        std::fs::write(fx.path().join("b.txt"), "2\n").unwrap();
+        std::fs::write(fx.path().join("c.txt"), "3\n").unwrap();
+        fx.git(&["add", "."]);
+        fx.commit("second");
+
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(g.detail(), DetailState::Loading) {
+            assert!(std::time::Instant::now() < deadline);
+            g.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        g.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(g.file_selected(), 1);
+
+        // Move to the older commit; its file list is different.
+        g.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        // Focus is on Files, so move the commit selection via the graph pane.
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(g.focus(), Pane::Graph);
+        g.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(g.detail(), DetailState::Loading) {
+            assert!(std::time::Instant::now() < deadline);
+            g.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            g.file_selected(),
+            0,
+            "a new commit starts at its first file"
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_pane_under_the_pointer_and_leaves_focus_alone() {
+        // Four files so the list has somewhere to move to, and a rendered
+        // frame so the layout map can route by coordinate.
+        let (_fx, mut g) = ready_graph("focus-wheel", 4);
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let map = g.layout_for_test();
+
+        let wheel = |kind, x, y| MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Focus stays on the graph throughout: the wheel is not a click.
+        assert_eq!(g.focus(), Pane::Graph);
+        g.on_mouse(wheel(
+            MouseEventKind::ScrollDown,
+            map.files.x + 1,
+            map.files.y + 1,
+        ));
+        assert_eq!(g.file_selected(), 3, "the files pane scrolled");
+        assert_eq!(g.focus(), Pane::Graph, "the wheel did not move focus");
+
+        // And again where the movement is clamped away, which is the path
+        // that returns early: the focus must still be where it was.
+        g.on_mouse(wheel(
+            MouseEventKind::ScrollDown,
+            map.files.x + 1,
+            map.files.y + 1,
+        ));
+        assert_eq!(g.file_selected(), 3);
+        assert_eq!(g.focus(), Pane::Graph);
+
+        // The wheel over the graph still moves the commit selection.
+        g.on_mouse(wheel(
+            MouseEventKind::ScrollDown,
+            map.graph.x + 1,
+            map.graph.y,
+        ));
+        assert_eq!(g.focus(), Pane::Graph);
+        assert_eq!(
+            g.file_selected(),
+            3,
+            "which is not the files pane's business"
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_scrolls_but_not_past_its_own_content() {
+        let (_fx, mut g) = ready_graph("focus-detail-scroll", 1);
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+
+        g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(g.focus(), Pane::Detail);
+        // The detail pane here is 19 rows tall and its content is 6 rows, so
+        // there is nothing to scroll to and the offset must stay put rather
+        // than run off into blank space.
+        for _ in 0..40 {
+            g.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            g.detail_scroll, 0,
+            "content shorter than the pane never scrolls"
+        );
+        assert_eq!(g.selected(), 0, "and the commit selection did not move");
+    }
+
+    #[test]
+    fn a_repeat_key_still_moves_the_selection() {
+        // The host forwards `Repeat` deliberately, so holding `j` keeps
+        // scrolling. `on_key` must not filter it back out.
+        let (_fx, mut g) = graph_with(3, "state-repeat");
+        let mut k = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        k.kind = ratatui::crossterm::event::KeyEventKind::Repeat;
+        g.on_key(k);
+        assert_eq!(g.selected(), 1);
     }
 
     #[test]

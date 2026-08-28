@@ -13,6 +13,9 @@ use crate::state::DetailState;
 use crate::ui::graph_view::put;
 
 /// Render the pane, including its border.
+///
+/// Returns how many rows the pane's content has, which is what bounds a
+/// caller's scroll offset. A pane with nothing to draw returns 0.
 pub fn draw_detail(
     buf: &mut Buffer,
     area: Rect,
@@ -20,9 +23,9 @@ pub fn draw_detail(
     detail: &DetailState,
     scroll: usize,
     focused: bool,
-) {
+) -> usize {
     if area.width == 0 || area.height == 0 {
-        return;
+        return 0;
     }
     let border = if focused {
         Style::default().fg(Color::Rgb(0xF3, 0xB2, 0x4C))
@@ -35,9 +38,9 @@ pub fn draw_detail(
         .border_style(border);
     let inner = block.inner(area);
     block.render(area, buf);
-    let Some(commit) = commit else { return };
+    let Some(commit) = commit else { return 0 };
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return 0;
     }
 
     let mut rows: Vec<(String, Style)> = Vec::new();
@@ -85,6 +88,7 @@ pub fn draw_detail(
         let y = inner.y + i as u16;
         put(buf, inner, inner.x, y, text, *style);
     }
+    rows.len()
 }
 
 /// `YYYY-MM-DD HH:MM` in the host's local time, similar to the status bar's
