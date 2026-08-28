@@ -112,20 +112,38 @@ mod tests {
 
     #[test]
     fn a_rect_at_the_u16_edge_does_not_panic() {
-        // `y + height` in the short-area branch, and `y + graph_h` /
-        // `x + detail_w` in the side-by-side branch, all sit at the type's
-        // ceiling here: a raw `+` would panic in debug and silently wrap in
-        // release. `split` is public and Task 8 may call it with any `Rect`
-        // at all, not only one bounded by a real terminal's buffer, so this
-        // has to hold structurally, not just for the one caller in `render`.
+        // `Rect::new` clamps `width`/`height` so `x + width` and `y + height`
+        // never exceed `u16::MAX` (its own doc comment says so explicitly),
+        // so building the edge cases with `Rect::new` would not actually
+        // reach the overflow: its clamp fires first and hands `split` an
+        // already-safe `Rect`. `Rect`'s fields are public, though, and
+        // `split` is exported for Task 8 to call directly, so a caller that
+        // builds a `Rect` with a struct literal instead of `::new` can still
+        // hand it one that violates that invariant. These three trigger,
+        // respectively: `y + height` in the short-area branch, and
+        // `y + graph_h` / `x + detail_w` in the side-by-side branch.
+        let short_branch_y_overflows = Rect {
+            x: 0,
+            y: u16::MAX - 4,
+            width: 10,
+            height: 8, // < MIN_SPLIT_HEIGHT: takes the short-area branch.
+        };
+        let side_by_side_lower_y_overflows = Rect {
+            x: 0,
+            y: u16::MAX - 4,
+            width: 10,
+            height: 20, // >= MIN_SPLIT_HEIGHT: takes the side-by-side branch.
+        };
+        let side_by_side_files_x_overflows = Rect {
+            x: u16::MAX - 4,
+            y: 0,
+            width: 20,
+            height: 20,
+        };
         for r in [
-            // Short-area branch (height < MIN_SPLIT_HEIGHT).
-            Rect::new(u16::MAX - 4, u16::MAX - 4, 10, 4),
-            // Side-by-side branch (height >= MIN_SPLIT_HEIGHT): exercises
-            // both `inner.y + graph_h` and `inner.x + detail_w`.
-            Rect::new(u16::MAX - 4, u16::MAX - 4, 10, 20),
-            Rect::new(0, u16::MAX, 10, 20),
-            Rect::new(u16::MAX, 0, 20, 20),
+            short_branch_y_overflows,
+            side_by_side_lower_y_overflows,
+            side_by_side_files_x_overflows,
         ] {
             let map = split(r);
             assert!(map.graph.width <= r.width && map.graph.height <= r.height);
