@@ -30,22 +30,27 @@ const MIN_SPLIT_HEIGHT: u16 = 12;
 /// beneath it.
 pub fn split(inner: Rect) -> LayoutMap {
     if inner.height < MIN_SPLIT_HEIGHT || inner.width == 0 {
+        let below = inner.y.saturating_add(inner.height);
         return LayoutMap {
             graph: inner,
-            detail: Rect::new(inner.x, inner.y + inner.height, inner.width, 0),
-            files: Rect::new(inner.x, inner.y + inner.height, 0, 0),
+            detail: Rect::new(inner.x, below, inner.width, 0),
+            files: Rect::new(inner.x, below, 0, 0),
         };
     }
     let lower_h = inner.height / 2;
     let graph_h = inner.height - lower_h;
     let detail_w = inner.width / 2;
     let files_w = inner.width - detail_w;
-    let lower_y = inner.y + graph_h;
+    // Same reasoning as the short-area branch above: `split` is public and a
+    // caller (Task 8) may hand it any `Rect`, not only one bounded by a real
+    // terminal's buffer, so these must saturate rather than wrap or panic.
+    let lower_y = inner.y.saturating_add(graph_h);
+    let files_x = inner.x.saturating_add(detail_w);
 
     LayoutMap {
         graph: Rect::new(inner.x, inner.y, inner.width, graph_h),
         detail: Rect::new(inner.x, lower_y, detail_w, lower_h),
-        files: Rect::new(inner.x + detail_w, lower_y, files_w, lower_h),
+        files: Rect::new(files_x, lower_y, files_w, lower_h),
     }
 }
 
@@ -102,6 +107,29 @@ mod tests {
             let map = split(Rect::new(0, 0, w, h));
             assert!(map.graph.width <= w && map.graph.height <= h);
             assert!(map.detail.width <= w && map.files.width <= w);
+        }
+    }
+
+    #[test]
+    fn a_rect_at_the_u16_edge_does_not_panic() {
+        // `y + height` in the short-area branch, and `y + graph_h` /
+        // `x + detail_w` in the side-by-side branch, all sit at the type's
+        // ceiling here: a raw `+` would panic in debug and silently wrap in
+        // release. `split` is public and Task 8 may call it with any `Rect`
+        // at all, not only one bounded by a real terminal's buffer, so this
+        // has to hold structurally, not just for the one caller in `render`.
+        for r in [
+            // Short-area branch (height < MIN_SPLIT_HEIGHT).
+            Rect::new(u16::MAX - 4, u16::MAX - 4, 10, 4),
+            // Side-by-side branch (height >= MIN_SPLIT_HEIGHT): exercises
+            // both `inner.y + graph_h` and `inner.x + detail_w`.
+            Rect::new(u16::MAX - 4, u16::MAX - 4, 10, 20),
+            Rect::new(0, u16::MAX, 10, 20),
+            Rect::new(u16::MAX, 0, 20, 20),
+        ] {
+            let map = split(r);
+            assert!(map.graph.width <= r.width && map.graph.height <= r.height);
+            assert!(map.detail.width <= r.width && map.files.width <= r.width);
         }
     }
 
