@@ -46,7 +46,7 @@ fn fit_path(path: &str, max: usize) -> String {
 }
 
 /// Render the pane, including its border.
-pub fn draw_files(
+pub(crate) fn draw_files(
     buf: &mut Buffer,
     area: Rect,
     detail: &DetailState,

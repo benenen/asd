@@ -29,7 +29,7 @@ const HASH_W: u16 = 8;
 /// to include a wide character, the graph-cell loop needs the same
 /// width-aware handling `put` already has, or a wide glyph would straddle
 /// two buffer cells while only one is accounted for.
-pub fn cell_glyph(cell: CellType) -> char {
+pub(crate) fn cell_glyph(cell: CellType) -> char {
     match cell {
         CellType::Empty => ' ',
         CellType::Pipe(_) => '│',
@@ -128,7 +128,7 @@ pub(crate) fn put(buf: &mut Buffer, area: Rect, x: u16, y: u16, text: &str, styl
 }
 
 /// One centred line, for "no commits yet" and read failures.
-pub fn draw_message(buf: &mut Buffer, area: Rect, text: &str) {
+pub(crate) fn draw_message(buf: &mut Buffer, area: Rect, text: &str) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -141,7 +141,7 @@ pub fn draw_message(buf: &mut Buffer, area: Rect, text: &str) {
 /// The `o`/`t` toggles, bundled into one argument rather than two bare
 /// `bool`s so `draw_rows` stays under clippy's argument-count lint.
 #[derive(Debug, Clone, Copy)]
-pub struct RefToggles {
+pub(crate) struct RefToggles {
     pub show_remotes: bool,
     pub show_tags: bool,
 }
@@ -151,7 +151,7 @@ pub struct RefToggles {
 /// `toggles` is the `o`/`t` state: a decoration whose kind is currently
 /// hidden is left out of the row it would have appeared on, without touching
 /// `decorations` itself.
-pub fn draw_rows(
+pub(crate) fn draw_rows(
     buf: &mut Buffer,
     area: Rect,
     nodes: &[GraphNode],

@@ -17,7 +17,7 @@ use crate::git::repo::{OpenError, Repo};
 use crate::ui::highlight::Highlighter;
 
 /// How many unchanged lines a file diff keeps around each change.
-pub const DIFF_CONTEXT: u32 = 3;
+pub(crate) const DIFF_CONTEXT: u32 = 3;
 
 /// How many of a file diff's lines are syntax-highlighted.
 ///
@@ -26,11 +26,11 @@ pub const DIFF_CONTEXT: u32 = 3;
 /// three seconds of worker time before the view could show anything. Past this
 /// many lines the rest of the diff is carried unstyled — still numbered, still
 /// readable, just not coloured.
-pub const MAX_HIGHLIGHT_LINES: usize = 5_000;
+pub(crate) const MAX_HIGHLIGHT_LINES: usize = 5_000;
 
 /// Work for the diff thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Request {
+pub(crate) enum Request {
     /// The changed-file list and totals for one commit.
     Commit(gix::ObjectId),
     /// One file's diff within one commit.
@@ -40,7 +40,7 @@ pub enum Request {
 /// A finished computation. Errors are carried as text because they cross a
 /// thread boundary and are only ever shown to the user.
 #[derive(Debug)]
-pub enum Reply {
+pub(crate) enum Reply {
     Commit {
         id: gix::ObjectId,
         result: Result<CommitDiff, String>,
@@ -68,7 +68,7 @@ pub struct HighlightedDiff {
     /// line's spans concatenate back to that line's text.
     ///
     /// Shorter than `diff.lines` when the diff ran past
-    /// [`MAX_HIGHLIGHT_LINES`], and empty for a binary diff. A line with no
+    /// `MAX_HIGHLIGHT_LINES`, and empty for a binary diff. A line with no
     /// entry is painted unstyled, so the view must index this with `get`.
     pub spans: Vec<Vec<(Style, String)>>,
     /// Display width of the widest line number in `diff`, which is how wide
@@ -108,7 +108,7 @@ impl HighlightedDiff {
 
 /// Owns the thread. Dropping it closes the request channel, which is how the
 /// thread learns to exit; a resident UI must not leave threads behind.
-pub struct DiffWorker {
+pub(crate) struct DiffWorker {
     tx: Sender<Request>,
     rx: Receiver<Reply>,
     // Only read by the `#[cfg(test)]` accessor below, which is how
@@ -132,7 +132,7 @@ impl DiffWorker {
     ///
     /// The repository is opened on the worker thread's own handle: `gix`'s
     /// `Repository` is not shared across threads here, so each side owns one.
-    pub fn new(path: &Path) -> Result<Self, OpenError> {
+    pub(crate) fn new(path: &Path) -> Result<Self, OpenError> {
         // Fail fast on the caller's thread if the path is not a repository, so
         // the error reaches the user as an open failure rather than as a dead
         // worker.
@@ -163,14 +163,14 @@ impl DiffWorker {
 
     /// Post work. A closed channel means the thread died; the worker records
     /// that and later requests are dropped rather than panicking.
-    pub fn request(&mut self, req: Request) {
+    pub(crate) fn request(&mut self, req: Request) {
         if self.tx.send(req).is_err() {
             self.alive = false;
         }
     }
 
     /// Take every finished reply. Never blocks.
-    pub fn drain(&mut self) -> Vec<Reply> {
+    pub(crate) fn drain(&mut self) -> Vec<Reply> {
         let mut out = Vec::new();
         loop {
             match self.rx.try_recv() {
@@ -187,7 +187,7 @@ impl DiffWorker {
 
     /// False once the thread has gone. The caller shows "diffs unavailable"
     /// and keeps the rest of the overlay working.
-    pub fn is_alive(&self) -> bool {
+    pub(crate) fn is_alive(&self) -> bool {
         self.alive
     }
 

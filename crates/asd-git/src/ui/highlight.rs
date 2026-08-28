@@ -5,7 +5,7 @@
 //! block comment or a multi-line string is only coloured correctly when the
 //! parser carried state forward from the lines above it, so one
 //! [`HighlightLines`] lives for as long as the file being highlighted and is
-//! thrown away only by [`Highlighter::reset`] or by the path changing.
+//! thrown away only by `Highlighter::reset` or by the path changing.
 //!
 //! The default syntax set and theme are deserialised once per process and
 //! shared, because `asd ui` paints every open session from the thread that
@@ -63,7 +63,7 @@ fn theme() -> &'static Theme {
 /// Feed it a file's lines in order. It keeps syntect's parse state between
 /// calls so multi-line constructs continue correctly, and starts over when the
 /// path changes or [`reset`](Self::reset) is called.
-pub struct Highlighter {
+pub(crate) struct Highlighter {
     /// The file currently being highlighted, and its parse state. The `'static`
     /// is real rather than a placeholder: [`HighlightLines`] borrows only the
     /// theme, and the theme lives in a `static` rather than in this struct, so
@@ -91,7 +91,7 @@ impl Highlighter {
     ///
     /// The first one in the process pays for both dumps (2.6 ms in release,
     /// 40 ms in debug); every later one is free.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let _ = syntaxes();
         let _ = theme();
         Self { current: None }
@@ -101,7 +101,7 @@ impl Highlighter {
     /// lines, so without this a file that opens a block comment would leave
     /// the next file's first line inside it — including when the next file is
     /// the same path at a different commit, which a path check cannot catch.
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.current = None;
     }
 
@@ -111,7 +111,7 @@ impl Highlighter {
     /// `text` is one line without its terminator. The round-trip is checked,
     /// not assumed: anything that would drop characters degrades to a single
     /// unstyled span, which is also what a path with no known syntax gives.
-    pub fn line(&mut self, path: &str, text: &str) -> Vec<(Style, String)> {
+    pub(crate) fn line(&mut self, path: &str, text: &str) -> Vec<(Style, String)> {
         let syntaxes = syntaxes();
         let Some(syntax) = syntax_for(syntaxes, path) else {
             // Drop any state so returning to a highlighted file restarts it

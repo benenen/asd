@@ -234,7 +234,12 @@ impl GitGraph {
     }
 
     /// Which pane the keyboard is aimed at.
-    pub fn focus(&self) -> Pane {
+    ///
+    /// Test-only, like [`GitGraph::layout_for_test`]: [`Pane`] does not cross
+    /// the crate boundary, and the host routes input by handing events over
+    /// rather than by asking which pane has focus.
+    #[cfg(test)]
+    pub(crate) fn focus(&self) -> Pane {
         self.focus
     }
 

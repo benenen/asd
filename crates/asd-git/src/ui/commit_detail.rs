@@ -29,7 +29,7 @@ use crate::ui::graph_view::put;
 ///
 /// Returns how many rows the pane's content has, which is what bounds a
 /// caller's scroll offset. A pane with nothing to draw returns 0.
-pub fn draw_detail(
+pub(crate) fn draw_detail(
     buf: &mut Buffer,
     area: Rect,
     commit: Option<&CommitInfo>,

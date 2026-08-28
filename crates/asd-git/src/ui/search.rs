@@ -1,7 +1,7 @@
 //! The search dropdown, drawn over the graph pane.
 //!
 //! The query on the first row, then one row per match. Every character goes
-//! through [`put`], which is this crate's only clamped text writer: nothing
+//! through `graph_view::put`, which is this crate's only clamped text writer: nothing
 //! here indexes the buffer, because this draws on `asd ui`'s render thread
 //! where one out-of-bounds write blanks every session's display.
 
@@ -31,7 +31,7 @@ const MAX_MATCH_ROWS: usize = 10;
 /// beneath it. `nodes` is the slice the row indices in `search` came from.
 /// `not_loaded` is how many commits the graph has read but not yet laid out,
 /// which is how many rows the search could not see.
-pub fn draw_search(
+pub(crate) fn draw_search(
     buf: &mut Buffer,
     area: Rect,
     search: &Search,

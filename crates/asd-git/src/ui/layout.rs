@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 
 /// The overlay's panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pane {
+pub(crate) enum Pane {
     Graph,
     Detail,
     Files,
@@ -16,10 +16,10 @@ pub enum Pane {
 /// Pane rectangles for one frame. A zero-height detail and files pane means
 /// the area was too short to split and the graph took all of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct LayoutMap {
-    pub graph: Rect,
-    pub detail: Rect,
-    pub files: Rect,
+pub(crate) struct LayoutMap {
+    pub(crate) graph: Rect,
+    pub(crate) detail: Rect,
+    pub(crate) files: Rect,
 }
 
 /// Below this many rows the lower half is not worth having: a two-row pane
@@ -28,7 +28,7 @@ const MIN_SPLIT_HEIGHT: u16 = 12;
 
 /// Split the overlay's inner area: graph on top, detail and files side by side
 /// beneath it.
-pub fn split(inner: Rect) -> LayoutMap {
+pub(crate) fn split(inner: Rect) -> LayoutMap {
     if inner.height < MIN_SPLIT_HEIGHT || inner.width == 0 {
         let below = inner.y.saturating_add(inner.height);
         return LayoutMap {
@@ -55,7 +55,7 @@ pub fn split(inner: Rect) -> LayoutMap {
 }
 
 /// Which pane contains `(x, y)`, if any.
-pub fn pane_at(map: &LayoutMap, x: u16, y: u16) -> Option<Pane> {
+pub(crate) fn pane_at(map: &LayoutMap, x: u16, y: u16) -> Option<Pane> {
     let hit = |r: Rect| {
         r.width > 0
             && r.height > 0

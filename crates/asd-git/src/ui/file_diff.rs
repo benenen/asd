@@ -7,7 +7,7 @@
 //! [`crate::worker`], because highlighting is ~141 us per line — 23 ms for a
 //! 60-line screenful, every frame, on the thread that paints every open
 //! session. A line with no spans (a diff past
-//! [`crate::worker::MAX_HIGHLIGHT_LINES`]) is painted from its own text
+//! `worker::MAX_HIGHLIGHT_LINES`) is painted from its own text
 //! instead, so it is still numbered and readable.
 
 use ratatui::buffer::Buffer;
@@ -33,7 +33,12 @@ const TAB_WIDTH: usize = 4;
 ///
 /// Returns how many rows of diff the view had room for, which is what bounds
 /// the caller's scroll offset. A view with no room returns 0.
-pub fn draw_file_diff(buf: &mut Buffer, area: Rect, state: &FileDiffState, scroll: usize) -> usize {
+pub(crate) fn draw_file_diff(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &FileDiffState,
+    scroll: usize,
+) -> usize {
     if area.width == 0 || area.height == 0 {
         return 0;
     }

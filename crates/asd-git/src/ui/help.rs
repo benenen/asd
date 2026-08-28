@@ -1,7 +1,7 @@
 //! The help popup, drawn over the whole overlay.
 //!
 //! A fixed key table, centred in whatever area it is given and clamped to it.
-//! Every character goes through [`put`], the crate's only clamped text
+//! Every character goes through `graph_view::put`, the crate's only clamped text
 //! writer: nothing here indexes the buffer, because this draws on `asd ui`'s
 //! render thread, where one out-of-bounds write blanks every session's
 //! display at once.
@@ -50,7 +50,7 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 /// Render the popup, centred in `area` and never larger than it.
-pub fn draw_help(buf: &mut Buffer, area: Rect) {
+pub(crate) fn draw_help(buf: &mut Buffer, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
