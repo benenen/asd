@@ -143,3 +143,12 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.regex-syntax]
 opt-level = 3
+# fuzzy-matcher is the same shape of cliff on the same thread, one layer
+# closer to the user: `search::rank` scores every loaded row from `on_key`,
+# and in `asd ui` that is the thread painting every open session. Measured
+# here over the 500 rows `PAGE_FIRST` lays out first: 6.8 ms per keystroke
+# unoptimised, 0.9 ms with this entry. Ranking off this thread — cached
+# haystacks, or the worker — is the real fix and is a task, not a profile
+# line; this is what keeps a dev build typeable until then.
+[profile.dev.package.fuzzy-matcher]
+opt-level = 3

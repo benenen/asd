@@ -8,6 +8,14 @@
 //! cannot be found. Nothing here reads the repository: this runs from
 //! `on_key`, on the render thread, and a walk of the whole history per
 //! keystroke is exactly what that thread must not do.
+//!
+//! What it does do is still proportional to the loaded rows. Measured per
+//! keystroke: 0.9 ms over the 500 rows `PAGE_FIRST` lays out, and about 56 ms
+//! in a release build over the ~14 500 rows one `G` loads. The workspace
+//! `[profile.dev.package.fuzzy-matcher]` entry is what keeps the first number
+//! from being 6.8 ms in a dev build; the second needs the haystacks cached on
+//! the node or the ranking moved to the worker, which is a task rather than a
+//! patch.
 
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
