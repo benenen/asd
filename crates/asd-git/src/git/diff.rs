@@ -74,8 +74,10 @@ impl Repo {
             .diff_resource_cache_for_tree_diff()
             .map_err(|e| ReadError::from_err("preparing a diff cache", e))?;
         let mut out = CommitDiff::default();
+        // Raised after the walk, for the reason given in `file_diff`.
+        let mut failure: Option<ReadError> = None;
 
-        old_tree
+        let walk = old_tree
             .changes()
             .map_err(|e| ReadError::from_err("starting a tree diff", e))?
             .for_each_to_obtain_tree(
@@ -108,29 +110,43 @@ impl Repo {
                         removals: 0,
                         binary: false,
                     };
-                    // A file whose blob cannot be diffed is listed without counts
-                    // rather than failing the whole commit. gix's diff-preparation
-                    // and line-counting steps use distinct error types with no
-                    // `From` conversion between them, so this is two nested
-                    // `if let`s rather than one chained `Result`; either failure
-                    // means the same thing here: treat the file as binary.
-                    if let Ok(mut prepared) = change.diff(&mut cache) {
-                        if let Ok(Some(counts)) = prepared.line_counts() {
+                    // `line_counts` returns `Ok(None)` for a binary blob and
+                    // only for that, so binary is the `Ok(None)` arm alone. A
+                    // real failure — an unreadable object, an unset resource —
+                    // is an error rather than a file silently listed as binary.
+                    let mut prepared = match change.diff(&mut cache) {
+                        Ok(prepared) => prepared,
+                        Err(e) => {
+                            failure = Some(ReadError::from_err("reading a file's blobs", e));
+                            return Ok(Action::Break(()));
+                        }
+                    };
+                    match prepared.line_counts() {
+                        Ok(Some(counts)) => {
                             stat.insertions = counts.insertions;
                             stat.removals = counts.removals;
                             out.insertions += counts.insertions;
                             out.removals += counts.removals;
-                        } else {
-                            stat.binary = true;
                         }
-                    } else {
-                        stat.binary = true;
+                        Ok(None) => stat.binary = true,
+                        Err(e) => {
+                            failure =
+                                Some(ReadError::from_err("counting a file's changed lines", e));
+                            return Ok(Action::Break(()));
+                        }
                     }
                     out.files.push(stat);
                     Ok(Action::Continue(()))
                 },
-            )
-            .map_err(|e| ReadError::from_err("walking a tree diff", e))?;
+            );
+
+        // The callback stops the walk by breaking, which gix then reports as a
+        // cancellation, so the captured cause has to be raised before that
+        // generic error is turned into one.
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        walk.map_err(|e| ReadError::from_err("walking a tree diff", e))?;
 
         out.files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
@@ -212,8 +228,12 @@ impl Repo {
         // buffers. gix's own `line_counts` disables it the same way.
         cache.options.skip_internal_diff_if_external_is_configured = false;
         let mut found: Option<FileDiff> = None;
+        // Raised after the walk: the callback cannot return an error without
+        // gix flattening it to "The user-provided callback failed", which would
+        // throw away the message the user is meant to read.
+        let mut failure: Option<ReadError> = None;
 
-        old_tree
+        let walk = old_tree
             .changes()
             .map_err(|e| ReadError::from_err("starting a tree diff", e))?
             .for_each_to_obtain_tree(
@@ -227,15 +247,24 @@ impl Repo {
                     {
                         return Ok(Action::Continue(()));
                     }
-                    let Ok(platform) = change.diff(&mut cache) else {
-                        found = Some(FileDiff::binary(path));
-                        return Ok(Action::Continue(()));
+                    // Only a binary blob is reported as binary. An unreadable
+                    // object or an unset resource is a genuine failure and must
+                    // not masquerade as "this file has no text".
+                    let platform = match change.diff(&mut cache) {
+                        Ok(platform) => platform,
+                        Err(e) => {
+                            failure = Some(ReadError::from_err("reading a file's blobs", e));
+                            return Ok(Action::Break(()));
+                        }
                     };
                     // `lines()` gives hunk contents but throws the line numbers
                     // away, so drop one level to reach hunks that carry ranges.
-                    let Ok(prep) = platform.resource_cache.prepare_diff() else {
-                        found = Some(FileDiff::binary(path));
-                        return Ok(Action::Continue(()));
+                    let prep = match platform.resource_cache.prepare_diff() {
+                        Ok(prep) => prep,
+                        Err(e) => {
+                            failure = Some(ReadError::from_err("preparing a file diff", e));
+                            return Ok(Action::Break(()));
+                        }
                     };
                     // A binary blob is not an error here: `prepare_diff`
                     // succeeds and says so through its operation.
@@ -254,8 +283,14 @@ impl Repo {
                     found = Some(assemble(path, &input, diff.hunks(), context));
                     Ok(Action::Continue(()))
                 },
-            )
-            .map_err(|e| ReadError::from_err("walking a tree diff", e))?;
+            );
+
+        // See `commit_diff`: a break is reported as a cancelled walk, so the
+        // real cause must be raised ahead of it.
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        walk.map_err(|e| ReadError::from_err("walking a tree diff", e))?;
 
         found.ok_or_else(|| ReadError(format!("{path} was not changed by this commit")))
     }
@@ -269,13 +304,16 @@ fn assemble(
     hunks: impl Iterator<Item = gix::diff::blob::Hunk>,
     context: u32,
 ) -> FileDiff {
+    // Peekable because the trailing context below has to stop where the next
+    // hunk's own lines begin.
+    let mut hunks = hunks.peekable();
     let text = |token| String::from_utf8_lossy(input.interner[token]).into_owned();
     let mut lines: Vec<DiffLine> = Vec::new();
     let mut truncated = false;
     // The first line of `before`/`after` not yet emitted, 0-based.
     let (mut old_cursor, mut new_cursor) = (0u32, 0u32);
 
-    for hunk in hunks {
+    while let Some(hunk) = hunks.next() {
         if lines.len() >= MAX_DIFF_LINES {
             truncated = true;
             break;
@@ -308,8 +346,18 @@ fn assemble(
         old_cursor = hunk.before.end;
         new_cursor = hunk.after.end;
 
-        // Trailing context.
-        let tail_end = (hunk.before.end + context).min(input.before.len() as u32);
+        // Trailing context. `HunkIter` splits on a single unchanged line, so
+        // two changes `context` or fewer lines apart are two hunks whose
+        // context regions overlap. Without the clamp to the next hunk's first
+        // line, this loop emits that line as unchanged — with its stale
+        // pre-change text — and the next hunk then emits it again as a removal.
+        // A `context` wide enough to span a whole later hunk would replay a
+        // whole block and walk the line numbers backwards. git stops the same
+        // way, as does imara's own unified-diff printer.
+        let mut tail_end = (hunk.before.end + context).min(input.before.len() as u32);
+        if let Some(next) = hunks.peek() {
+            tail_end = tail_end.min(next.before.start);
+        }
         for i in hunk.before.end..tail_end {
             let new = new_cursor + (i - old_cursor);
             lines.push(DiffLine::Context {
@@ -583,5 +631,143 @@ mod tests {
                 ('.', 17, 15),
             ]
         );
+    }
+
+    /// Render a `FileDiff` the way `git diff` renders its hunk bodies, so the
+    /// two can be compared directly rather than against a hand-written guess.
+    fn rendered(d: &FileDiff) -> Vec<String> {
+        d.lines
+            .iter()
+            .map(|l| match l {
+                DiffLine::Context { text, .. } => format!(" {text}"),
+                DiffLine::Added { text, .. } => format!("+{text}"),
+                DiffLine::Removed { text, .. } => format!("-{text}"),
+            })
+            .collect()
+    }
+
+    /// The hunk bodies of `git diff -U{context}` across the last commit, with
+    /// the headers dropped: the same shape `rendered` produces.
+    fn git_rendered(fx: &Fixture, path: &str, context: u32) -> Vec<String> {
+        let out = fx.git(&[
+            "diff",
+            &format!("-U{context}"),
+            "HEAD~1",
+            "HEAD",
+            "--",
+            path,
+        ]);
+        out.lines()
+            .skip_while(|l| !l.starts_with("@@"))
+            .filter(|l| !l.starts_with("@@"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `HunkIter` splits hunks on a single unchanged line, so two changes that
+    /// sit within `context` of each other produce two hunks whose context
+    /// regions overlap. The trailing context of the first must stop where the
+    /// second begins, or the shared line is emitted twice — once as unchanged,
+    /// carrying its stale pre-change text.
+    ///
+    /// The expectation here is real `git diff -Un` output read back from the
+    /// fixture, not a written-down guess.
+    #[test]
+    fn hunks_close_together_render_exactly_like_git() {
+        // (description, changed 1-based lines, context)
+        let cases: [(&str, &[usize], u32); 4] = [
+            ("one unchanged line between two hunks", &[3, 5], 2),
+            ("exactly `context` unchanged lines between", &[3, 6], 2),
+            ("context wide enough to span the later hunk", &[3, 5], 5),
+            ("three changes in a row", &[3, 5, 7], 2),
+        ];
+        for (what, changed, context) in cases {
+            let before: String = (1..=12).map(|i| format!("{i}\n")).collect();
+            let after: String = (1..=12)
+                .map(|i| {
+                    if changed.contains(&i) {
+                        format!("X{i}\n")
+                    } else {
+                        format!("{i}\n")
+                    }
+                })
+                .collect();
+
+            let fx = Fixture::new("filediff-close");
+            write_commit(&fx, "a.txt", &before, "first");
+            let id = write_commit(&fx, "a.txt", &after, "edits");
+
+            let repo = Repo::open(fx.path()).unwrap();
+            let d = repo
+                .file_diff(id.parse().unwrap(), "a.txt", context)
+                .unwrap();
+
+            assert_eq!(
+                rendered(&d),
+                git_rendered(&fx, "a.txt", context),
+                "{what}: shape {} does not match git",
+                shape(&d)
+            );
+
+            // A duplicated line also walks the numbering backwards, so pin
+            // that separately: each side's numbers strictly increase.
+            let (mut last_old, mut last_new) = (0u32, 0u32);
+            for line in &d.lines {
+                let (old, new) = match line {
+                    DiffLine::Context { old, new, .. } => (Some(*old), Some(*new)),
+                    DiffLine::Added { new, .. } => (None, Some(*new)),
+                    DiffLine::Removed { old, .. } => (Some(*old), None),
+                };
+                if let Some(old) = old {
+                    assert!(old > last_old, "{what}: old went {last_old} -> {old}");
+                    last_old = old;
+                }
+                if let Some(new) = new {
+                    assert!(new > last_new, "{what}: new went {last_new} -> {new}");
+                    last_new = new;
+                }
+            }
+        }
+    }
+
+    /// A blob that cannot be read is a failure, not a binary file. Both are
+    /// reported through the same gix call sites, and conflating them turns a
+    /// corrupt repository into a diff that quietly renders as "binary".
+    #[test]
+    fn an_unreadable_blob_is_an_error_rather_than_a_binary_file() {
+        let fx = Fixture::new("diff-corrupt");
+        write_commit(&fx, "a.txt", "1\n2\n3\n", "first");
+        let id = write_commit(&fx, "a.txt", "1\nTWO\n3\n", "change two");
+
+        // Corrupt the loose object holding the new content of a.txt.
+        let blob = fx.git(&["rev-parse", "HEAD:a.txt"]);
+        let obj = fx
+            .path()
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        assert!(obj.exists(), "{} should be a loose object", obj.display());
+        std::fs::write(&obj, b"not a git object at all").unwrap();
+
+        let repo = Repo::open(fx.path()).unwrap();
+        let id: gix::ObjectId = id.parse().unwrap();
+
+        for err in [
+            repo.commit_diff(id).err(),
+            repo.file_diff(id, "a.txt", 2).err(),
+        ] {
+            let err = err.expect("a corrupt blob must not read as a binary file");
+            let msg = err.to_string();
+            // The cause has to survive: gix reports the callback's break as a
+            // bare cancellation, which on its own says nothing useful.
+            assert!(
+                msg.contains("loose object"),
+                "the real cause was swallowed: {msg}"
+            );
+            assert!(
+                !msg.contains("cancelled"),
+                "a cancellation leaked out instead of the cause: {msg}"
+            );
+        }
     }
 }
