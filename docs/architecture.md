@@ -35,7 +35,7 @@ from the root binary, so the CLI library never imports a GUI framework.
 | `asd-vt` | `VtBackend`, libghostty-vt adapter, render snapshots, terminal helpers | No GUI, portable-pty, or protocol dependency |
 | `asd-daemon` | PTY/session ownership, terminal state, registry, local service | No GUI dependency, including transitive GUI frameworks |
 | `asd-cli` | CLI commands, VT attach client, embedded daemon, `--stdio` proxy | GUI launcher is injected; no GUI framework |
-| `asd-git` | Commit-graph model and ratatui widget behind the TUI's git overlay | No other asd crate; crossterm only through `ratatui::crossterm` |
+| `asd-git` | Commit-graph model, background diff worker, and the three-pane git overlay widgets: graph, commit detail, changed files, syntax-highlighted file diff, search, and help | No other asd crate; crossterm only through `ratatui::crossterm`; the diff worker owns its own threads and never touches the daemon or a PTY |
 | `asd-tui` | ratatui `asd ui`, sidebar, terminal pane, scrollback, selection | No GUI framework or PTY/process management |
 | `asd-dioxus` | Desktop UI, ghostty-web renderer, saved hosts, pure-Rust SSH | No portable-pty or local process management |
 | root `asd` | Feature composition and command dispatch | No direct implementation logic from the two feature families |
