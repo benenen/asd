@@ -433,28 +433,41 @@ mod tests {
         );
     }
 
+    /// A graph deeper than the pane is wide must not panic, must not write
+    /// outside the area, and must not eat the columns the summary needs: the
+    /// graph column budget is a third of the width for exactly that reason.
+    ///
+    /// The last part is what has to be asserted on the buffer. `buf.area()` is
+    /// a property of the test's own buffer that no implementation can affect,
+    /// so a test resting on it stays green with the budget deleted.
     #[test]
     fn a_row_wider_than_the_area_is_truncated_not_sliced() {
-        // A graph deeper than the pane is wide must not panic and must not
-        // write outside the area.
         let cells = vec![CellType::Pipe(0); 200];
         let nodes = vec![node("deep", 0, cells)];
-        let area = Rect::new(0, 0, 10, 1);
+        let toggles = RefToggles {
+            show_remotes: true,
+            show_tags: true,
+        };
+
+        let area = Rect::new(0, 0, 30, 1);
         let mut buf = Buffer::empty(area);
-        draw_rows(
-            &mut buf,
-            area,
-            &nodes,
-            &Default::default(),
-            RefToggles {
-                show_remotes: true,
-                show_tags: true,
-            },
-            0,
-            0,
+        draw_rows(&mut buf, area, &nodes, &Default::default(), toggles, 0, 0);
+        let row: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            row.starts_with("││││││││││ deep"),
+            "ten columns of graph — a third of thirty — then the summary: {row:?}"
         );
-        // Reaching here without a panic is the assertion.
-        assert_eq!(buf.area().width, 10);
+
+        // The degenerate end of the same behaviour: an area with barely room
+        // for either. Reaching here without a panic is the point.
+        let narrow = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(narrow);
+        draw_rows(&mut buf, narrow, &nodes, &Default::default(), toggles, 0, 0);
+        let row: String = (0..narrow.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            row.starts_with("│││"),
+            "three columns of graph — a third of ten: {row:?}"
+        );
     }
 
     #[test]

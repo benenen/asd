@@ -203,6 +203,14 @@ mod tests {
 
         s.backspace(&nodes);
         assert_eq!(s.query(), "alph");
+        // The reset this test is named for: a changed query is a different
+        // result list, so the old highlight index means nothing in it. Without
+        // asserting it, deleting `selected = 0` from `rerank` passes.
+        assert_eq!(
+            s.selected(),
+            Some(0),
+            "editing the query puts the highlight back on the best match"
+        );
     }
 
     /// `editing_the_query_moves_through_matches` cannot tell `selected` from

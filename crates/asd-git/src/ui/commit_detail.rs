@@ -259,21 +259,48 @@ mod tests {
         assert_eq!(text_of(&buf, inner).trim(), "");
     }
 
+    /// Not panicking is the floor, not the guarantee: this draws into part of
+    /// a buffer that also holds the host's own frame, so a write one row past
+    /// the area is a stray glyph in someone else's session rather than a
+    /// crash. This sweep used to size its buffer with slack on every side and
+    /// assert nothing, so a write at `area.y + area.height` landed inside it
+    /// and went unnoticed; it now takes the sentinel-margin shape of
+    /// `ui/help.rs` and `ui/file_diff.rs`.
     #[test]
     fn every_small_area_and_scroll_offset_is_safe() {
-        for w in 0..14u16 {
-            for h in 0..8u16 {
-                for scroll in [0usize, 1, 50] {
-                    let area = Rect::new(2, 1, w, h);
-                    let mut buf = Buffer::empty(Rect::new(0, 0, w + 3, h + 2));
-                    draw_detail(
-                        &mut buf,
-                        area,
-                        Some(&commit()),
-                        &crate::state::DetailState::Loading,
-                        scroll,
-                        true,
-                    );
+        for &(ox, oy) in &[(0u16, 0u16), (2, 1), (5, 3)] {
+            for w in 0..14u16 {
+                for h in 0..8u16 {
+                    for scroll in [0usize, 1, 50] {
+                        let area = Rect::new(ox, oy, w, h);
+                        let full = Rect::new(
+                            0,
+                            0,
+                            ox.saturating_add(w).saturating_add(3),
+                            oy.saturating_add(h).saturating_add(3),
+                        );
+                        let mut buf = Buffer::filled(full, ratatui::buffer::Cell::new("\u{2591}"));
+                        draw_detail(
+                            &mut buf,
+                            area,
+                            Some(&commit()),
+                            &crate::state::DetailState::Loading,
+                            scroll,
+                            true,
+                        );
+                        for y in full.y..full.y + full.height {
+                            for x in full.x..full.x + full.width {
+                                if area.contains(ratatui::layout::Position::new(x, y)) {
+                                    continue;
+                                }
+                                assert_eq!(
+                                    buf[(x, y)].symbol(),
+                                    "\u{2591}",
+                                    "wrote to ({x}, {y}), outside {area:?}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

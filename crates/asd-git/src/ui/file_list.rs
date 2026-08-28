@@ -274,18 +274,45 @@ mod tests {
         assert!(text_of(&buf, area).contains("unavailable"));
     }
 
+    /// Not panicking is the floor, not the guarantee: this draws into part of
+    /// a buffer that also holds the host's own frame, so a write one row past
+    /// the area is a stray glyph in someone else's session rather than a
+    /// crash. This sweep used to size its buffer with slack on every side and
+    /// assert nothing, so a write at `area.y + area.height` landed inside it
+    /// and went unnoticed; it now takes the sentinel-margin shape of
+    /// `ui/help.rs` and `ui/file_diff.rs`.
     #[test]
     fn every_small_area_selection_and_scroll_is_safe() {
         let d = ready(vec![
             stat("a.txt", FileChange::Modified, 3, 1),
             stat("b/c/d.txt", FileChange::Deleted, 0, 9),
         ]);
-        for w in 0..16u16 {
-            for h in 0..7u16 {
-                for (sel, scroll) in [(0usize, 0usize), (1, 0), (99, 99)] {
-                    let area = Rect::new(1, 2, w, h);
-                    let mut buf = Buffer::empty(Rect::new(0, 0, w + 2, h + 3));
-                    draw_files(&mut buf, area, &d, sel, scroll, true);
+        for &(ox, oy) in &[(0u16, 0u16), (1, 2), (5, 3)] {
+            for w in 0..16u16 {
+                for h in 0..7u16 {
+                    for (sel, scroll) in [(0usize, 0usize), (1, 0), (99, 99)] {
+                        let area = Rect::new(ox, oy, w, h);
+                        let full = Rect::new(
+                            0,
+                            0,
+                            ox.saturating_add(w).saturating_add(3),
+                            oy.saturating_add(h).saturating_add(3),
+                        );
+                        let mut buf = Buffer::filled(full, ratatui::buffer::Cell::new("\u{2591}"));
+                        draw_files(&mut buf, area, &d, sel, scroll, true);
+                        for y in full.y..full.y + full.height {
+                            for x in full.x..full.x + full.width {
+                                if area.contains(ratatui::layout::Position::new(x, y)) {
+                                    continue;
+                                }
+                                assert_eq!(
+                                    buf[(x, y)].symbol(),
+                                    "\u{2591}",
+                                    "wrote to ({x}, {y}), outside {area:?}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

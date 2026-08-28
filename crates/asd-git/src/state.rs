@@ -1341,6 +1341,11 @@ mod tests {
     fn y_hands_the_hash_back_to_the_host() {
         // asd-tui owns the OSC 52 path; this crate must not emit it itself.
         let (_fx, mut g) = graph_with(2, "state-copy");
+        // Move off row 0 first: the hash of whichever row happens to be
+        // selected first is the one hash a wrong implementation is most
+        // likely to hand back by accident.
+        g.on_key(key(KeyCode::Char('j')));
+        let selected = g.selected_id().expect("row 1 is a commit").to_string();
         let Outcome::Copy(text) = g.on_key(key(KeyCode::Char('y'))) else {
             panic!("y must yield Outcome::Copy");
         };
@@ -1349,6 +1354,9 @@ mod tests {
             40,
             "a full sha1, not the abbreviation: {text:?}"
         );
+        // Length alone cannot tell one commit's hash from another's, which is
+        // the only mistake this key can make.
+        assert_eq!(text, selected, "the selected commit's hash, not another's");
     }
 
     #[test]
@@ -1550,8 +1558,16 @@ mod tests {
         ] {
             for &ox in &[0u16, 2] {
                 for &oy in &[0u16, 1] {
-                    for width in 0..=10u16 {
-                        for height in 0..=6u16 {
+                    // Past `MIN_SPLIT_HEIGHT` + the two border rows on both
+                    // counts: a sweep that stops at height 6 leaves `inner`
+                    // four rows tall, takes the short-area branch every time
+                    // and never renders the three-pane layout the overlay
+                    // actually uses — nor any of the `inner.y + graph_h`
+                    // arithmetic that comes with it. The wider widths are
+                    // there so the lower two panes have room to draw content
+                    // rather than only their borders.
+                    for width in (0..=10u16).chain([20, 40]) {
+                        for height in 0..=18u16 {
                             let area = Rect::new(ox, oy, width, height);
                             // Sized to the minimum that still contains `area`,
                             // which is ratatui's own indexing precondition.
@@ -1702,6 +1718,67 @@ mod tests {
         (fx, g)
     }
 
+    /// `keep_file_visible` is the only thing that moves `file_scroll`, and
+    /// nothing in the crate asserted on that field at all — a changed-files
+    /// pane that never scrolled would have looked exactly as green. Both
+    /// directions: down, where the selection reaches the bottom of the
+    /// viewport, and back up, where it passes the top of it.
+    #[test]
+    fn the_file_list_scrolls_to_keep_the_selection_on_screen() {
+        let files = 8usize;
+        let (_fx, mut g) = ready_graph("file-scroll", files);
+        // A frame first: the viewport height comes from the last layout, and
+        // before there is one there is nothing to scroll within.
+        let area = Rect::new(0, 0, 70, 16);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let visible = g.layout_for_test().files.height.saturating_sub(2) as usize;
+        assert!(
+            visible > 0 && visible < files,
+            "the fixture needs more files than the pane can show, got {visible}"
+        );
+
+        g.on_key(key(KeyCode::Tab));
+        g.on_key(key(KeyCode::Tab));
+        assert_eq!(g.focus(), Pane::Files);
+        assert_eq!(g.file_scroll, 0);
+
+        // Down to the last row that already fits: nothing moves yet.
+        for _ in 0..visible - 1 {
+            g.on_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(g.file_selected(), visible - 1);
+        assert_eq!(g.file_scroll, 0, "the last visible row needs no scroll");
+
+        g.on_key(key(KeyCode::Char('j')));
+        assert_eq!(g.file_scroll, 1, "one row past the bottom scrolls by one");
+
+        while g.file_selected() < files - 1 {
+            g.on_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(
+            g.file_scroll,
+            files - visible,
+            "the last file sits on the last row of the pane"
+        );
+
+        // Back up. The offset follows only once the selection would leave the
+        // top of the viewport, and then stays with it.
+        for _ in 0..visible {
+            g.on_key(key(KeyCode::Char('k')));
+        }
+        assert_eq!(g.file_selected(), files - 1 - visible);
+        assert_eq!(
+            g.file_scroll,
+            files - 1 - visible,
+            "scrolling back up follows the selection"
+        );
+        while g.file_selected() > 0 {
+            g.on_key(key(KeyCode::Char('k')));
+        }
+        assert_eq!(g.file_scroll, 0, "the first file is back on the first row");
+    }
+
     #[test]
     fn tab_cycles_focus_through_the_three_panes() {
         let (_fx, mut g) = ready_graph("focus-cycle", 2);
@@ -1766,14 +1843,28 @@ mod tests {
             map.files.height > 0,
             "the fixture area is tall enough to split"
         );
+        assert_eq!(g.focus(), Pane::Graph, "focus starts on the graph");
 
-        g.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: map.files.x + 1,
-            row: map.files.y + 1,
-            modifiers: KeyModifiers::NONE,
-        });
+        // Every pane in turn. One click on one pane cannot tell routing from
+        // a handler that assigns the same constant whatever was clicked.
+        fn click(g: &mut GitGraph, r: Rect) -> Outcome {
+            g.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: r.x + 1,
+                row: r.y + 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        }
+        assert_eq!(click(&mut g, map.files), Outcome::Redraw);
         assert_eq!(g.focus(), Pane::Files);
+        assert_eq!(click(&mut g, map.detail), Outcome::Redraw);
+        assert_eq!(g.focus(), Pane::Detail);
+        assert_eq!(click(&mut g, map.graph), Outcome::Redraw);
+        assert_eq!(g.focus(), Pane::Graph);
+        // Clicking the pane that already has focus moves nothing, so the host
+        // is told there is nothing to repaint.
+        assert_eq!(click(&mut g, map.graph), Outcome::Consumed);
+        assert_eq!(g.focus(), Pane::Graph);
     }
 
     #[test]
@@ -2498,6 +2589,10 @@ mod tests {
 
     // ---- decorated-row jumping (`[`/`]`), ref toggles (`o`/`t`), help (`?`) --
 
+    /// Both directions, and neither of them ending at row 0: with only two
+    /// decorated rows and every backward jump starting from the lower one,
+    /// `[` and "jump to the top" are the same number, and a `[` that did
+    /// nothing but `select(0)` would pass. Three decorated rows separate them.
     #[test]
     fn bracket_keys_jump_between_decorated_rows() {
         let fx = Fixture::new("keys-branch-jump");
@@ -2506,22 +2601,35 @@ mod tests {
         fx.commit("first");
         fx.tag("v1");
         fx.commit("second");
+        fx.tag("v2");
         fx.commit("third");
+        fx.commit("fourth");
 
         let mut g = GitGraph::open(fx.path()).unwrap();
         settle(&mut g);
-        let start = g.selected();
+        // Rows, newest first: 0 `fourth` (on `main`), 1 `third` (bare),
+        // 2 `second` (v2), 3 `first` (v1).
+        assert_eq!(g.row_count(), 4);
+        assert_eq!(g.selected(), 0);
+        assert!(g.decorations_at(1).is_none(), "third carries no ref");
 
         g.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
-        let after = g.selected();
-        assert!(after > start, "] moves down to the next decorated row");
+        assert_eq!(g.selected(), 2, "] skipped the undecorated row");
         assert!(
-            g.decorations_at(after).is_some(),
+            g.decorations_at(2).is_some(),
             "the row it landed on carries a ref"
         );
+        g.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        assert_eq!(g.selected(), 3, "] reached the oldest decorated row");
 
         g.on_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
-        assert_eq!(g.selected(), start, "[ comes back");
+        assert_eq!(
+            g.selected(),
+            2,
+            "[ moves to the previous decorated row, not to the top"
+        );
+        g.on_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert_eq!(g.selected(), 0, "[ skipped the undecorated row on the way");
     }
 
     /// `]`/`[` must not wrap: past either end of the graph they stop rather
@@ -2529,35 +2637,48 @@ mod tests {
     #[test]
     fn bracket_keys_stop_at_the_ends_rather_than_wrapping() {
         let fx = Fixture::new("keys-branch-jump-ends");
-        fx.commit("oldest"); // row 2, tagged below
-        fx.commit("middle"); // row 1, undecorated: what actually has to be jumped over
+        fx.commit("oldest"); // row 3, tagged below
+        fx.commit("lower"); // row 2, tagged below: the row `[` stops at first
+        fx.commit("upper"); // row 1, undecorated: what a jump has to skip over
         fx.commit("newest"); // row 0, decorated too: `main` always points at HEAD
 
-        // Tag the oldest commit specifically, so `middle` is the one row with
-        // no decoration at all — the row a jump actually has to skip over,
-        // rather than every row happening to carry one.
-        let oldest = fx.git(&["rev-parse", "HEAD~2"]);
+        // Tag two specific commits, so `upper` is the one row with no
+        // decoration at all — the row a jump actually has to skip over,
+        // rather than every row happening to carry one. Two tags rather than
+        // one so a backward jump has somewhere to stop that is not the top:
+        // with a single one, `[` and `select(0)` are the same number.
+        let oldest = fx.git(&["rev-parse", "HEAD~3"]);
         fx.git(&["tag", "v1", &oldest]);
+        let lower = fx.git(&["rev-parse", "HEAD~2"]);
+        fx.git(&["tag", "v2", &lower]);
 
         let mut g = GitGraph::open(fx.path()).unwrap();
         settle(&mut g);
-        assert_eq!(g.row_count(), 3);
+        assert_eq!(g.row_count(), 4);
         // Row 0 (`newest`, on `main`) is already decorated, so the real
-        // exercise is row 1 (`middle`), which is not: `]` has to skip past it
-        // to land on row 2.
+        // exercise is row 1 (`upper`), which is not: a jump has to skip past
+        // it in either direction.
         assert!(g.decorations_at(0).is_some());
-        assert!(g.decorations_at(1).is_none(), "middle carries no ref");
+        assert!(g.decorations_at(1).is_none(), "upper carries no ref");
 
         assert_eq!(g.on_key(key(KeyCode::Char(']'))), Outcome::Consumed);
-        assert_eq!(g.selected(), 2, "] skipped the undecorated middle row");
+        assert_eq!(g.selected(), 2, "] skipped the undecorated upper row");
+        g.on_key(key(KeyCode::Char(']')));
+        assert_eq!(g.selected(), 3, "] reached the last decorated row");
 
         // Already at the last row in the graph: another `]` must not wrap
         // back around to row 0.
         g.on_key(key(KeyCode::Char(']')));
-        assert_eq!(g.selected(), 2, "] does not wrap past the last row");
+        assert_eq!(g.selected(), 3, "] does not wrap past the last row");
 
+        assert_eq!(g.on_key(key(KeyCode::Char('['))), Outcome::Consumed);
+        assert_eq!(
+            g.selected(),
+            2,
+            "[ stops at the previous decorated row rather than jumping to the top"
+        );
         g.on_key(key(KeyCode::Char('[')));
-        assert_eq!(g.selected(), 0, "[ skipped back over the middle row");
+        assert_eq!(g.selected(), 0, "[ skipped back over the upper row");
         g.on_key(key(KeyCode::Char('[')));
         assert_eq!(g.selected(), 0, "[ does not wrap past the first row");
     }
@@ -2584,6 +2705,20 @@ mod tests {
             g.decorations_at(g.selected()).is_some(),
             "landed on the tagged commit, not the uncommitted row"
         );
+
+        // The same in reverse: `[` from the tagged commit stops at the newest
+        // commit, which `main` decorates, and never on the synthetic row
+        // above it — which is also what tells `[` apart from "go to the top".
+        g.on_key(key(KeyCode::Char(']')));
+        assert_eq!(g.selected(), 2, "] reached the tagged oldest commit");
+        g.on_key(key(KeyCode::Char('[')));
+        assert_eq!(g.selected(), 1, "[ stopped at the commit `main` decorates");
+        g.on_key(key(KeyCode::Char('[')));
+        assert_eq!(
+            g.selected(),
+            1,
+            "[ has nowhere further to go: row 0 carries no commit"
+        );
     }
 
     /// `decorations_at` is toggle-aware specifically so `[`/`]` do not land
@@ -2595,42 +2730,64 @@ mod tests {
     #[test]
     fn bracket_keys_skip_a_ref_that_is_currently_hidden_by_a_toggle() {
         let fx = Fixture::new("keys-branch-jump-hidden-toggle");
-        fx.commit("oldest"); // row 2, tagged below: its only decoration
-        fx.commit("middle"); // row 1, undecorated
+        fx.commit("oldest"); // row 3, tagged below: its only decoration
+        fx.commit("middle"); // row 2, undecorated
+        fx.commit("second"); // row 1, tagged below: its only decoration
         fx.commit("newest"); // row 0, decorated too: `main` always points at HEAD
 
-        let oldest = fx.git(&["rev-parse", "HEAD~2"]);
+        let oldest = fx.git(&["rev-parse", "HEAD~3"]);
         fx.git(&["tag", "v1", &oldest]);
+        let second = fx.git(&["rev-parse", "HEAD~1"]);
+        fx.git(&["tag", "v2", &second]);
 
         let mut g = GitGraph::open(fx.path()).unwrap();
         settle(&mut g);
-        assert_eq!(g.row_count(), 3);
+        assert_eq!(g.row_count(), 4);
         assert_eq!(g.selected(), 0);
 
         // With tags shown, `]` skips the undecorated `middle` row and lands
         // on `oldest`, whose only decoration is the tag.
-        assert!(g.decorations_at(2).is_some(), "oldest carries the tag");
+        assert!(g.decorations_at(1).is_some(), "second carries a tag");
+        assert!(g.decorations_at(2).is_none(), "middle carries no ref");
+        assert!(g.decorations_at(3).is_some(), "oldest carries the tag");
+        g.on_key(key(KeyCode::Char(']')));
         g.on_key(key(KeyCode::Char(']')));
         assert_eq!(
             g.selected(),
-            2,
-            "] lands on the tagged row while tags are shown"
+            3,
+            "] lands on the tagged rows while tags are shown"
         );
-        g.on_key(key(KeyCode::Char('['))); // back to the top for the real test below
+        // Backwards it stops at the *other* tagged row, not at the top: a
+        // `[` that only ever went to row 0 would be indistinguishable here.
+        g.on_key(key(KeyCode::Char('[')));
+        assert_eq!(g.selected(), 1, "[ stops at the nearer tagged row");
+        g.on_key(key(KeyCode::Char('[')));
+        assert_eq!(g.selected(), 0, "back to the top for the real test below");
 
-        // `t` hides tags. `oldest` now has nothing visible on it either, so
-        // `]` must skip straight past both undecorated rows and stop at the
-        // top rather than landing on a row with nothing shown on screen.
+        // `t` hides tags. Both tagged rows now have nothing visible on them,
+        // so `]` must skip straight past all three and stop at the top rather
+        // than landing on a row with nothing shown on screen.
         g.on_key(key(KeyCode::Char('t')));
         assert!(
-            g.decorations_at(2).is_none(),
-            "the tag is hidden, so this row no longer counts as decorated"
+            g.decorations_at(1).is_none() && g.decorations_at(3).is_none(),
+            "the tags are hidden, so those rows no longer count as decorated"
         );
         assert_eq!(g.on_key(key(KeyCode::Char(']'))), Outcome::Consumed);
         assert_eq!(
             g.selected(),
             0,
             "] must not land on a row whose only decoration is hidden"
+        );
+
+        // And the same backwards: from the bottom, `[` has to pass both
+        // hidden-tag rows and stop at `main`, which is still drawn.
+        g.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(g.selected(), 3, "G goes to the last row");
+        assert_eq!(g.on_key(key(KeyCode::Char('['))), Outcome::Consumed);
+        assert_eq!(
+            g.selected(),
+            0,
+            "[ must not land on a row whose only decoration is hidden either"
         );
     }
 
