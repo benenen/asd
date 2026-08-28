@@ -85,7 +85,16 @@ gix = { version = "0.87", default-features = false, features = [
     "index",
     "max-performance-safe",
     "parallel",
+    "blob-diff",
+    "status",
+    "dirwalk",
+    "attributes",
+    "excludes",
 ] }
+# Pure-Rust syntax highlighting. `default-fancy` selects fancy-regex over the
+# C `onig` backend, which is what keeps the Windows GNU cross-check clean.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+fuzzy-matcher = "0.3"
 portable-pty = "0.9"
 postcard = { version = "1", features = ["use-std"] }
 ratatui = "0.30.2"

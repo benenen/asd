@@ -9,7 +9,9 @@ license.workspace = true
 # on no other asd crate. crossterm is reached only through `ratatui::crossterm`
 # so the binary cannot end up with two versions of it.
 [dependencies]
+fuzzy-matcher = { workspace = true }
 gix = { workspace = true }
 ratatui = { workspace = true }
+syntect = { workspace = true }
 thiserror = { workspace = true }
 unicode-width = "0.2"
