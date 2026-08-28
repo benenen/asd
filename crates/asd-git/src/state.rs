@@ -191,20 +191,6 @@ impl GitGraph {
             file_diff_rows: 0,
         };
         me.reload();
-        // Off the render thread: the host opens the overlay from a key
-        // handler, not from `render`, so the working-tree walk this costs
-        // (12 ms on this repository) does not stall a paint. Must run before
-        // `load_more` feeds the first page: `GraphBuilder` never revises a
-        // row once emitted, so the synthetic row can only be inserted while
-        // the builder is still empty. A failure here (a filesystem hiccup
-        // reading the tree) is not worth failing the whole overlay over, so
-        // it is folded into "no known uncommitted changes" like the
-        // decorations lookup above.
-        if let Ok(count) = me.repo.working_changes()
-            && count > 0
-        {
-            me.builder.feed_uncommitted(count);
-        }
         me.load_more(PAGE_FIRST);
         me.request_detail();
         Ok(me)
@@ -332,8 +318,30 @@ impl GitGraph {
     }
 
     /// Re-read the whole history from scratch.
+    ///
+    /// The synthetic uncommitted-changes row is (re-)seeded here, immediately
+    /// after the builder is recreated, rather than as a step each caller adds
+    /// afterward: `reload` is the only place that resets `self.builder`, so
+    /// folding the row into it here is what makes "the row is present
+    /// whenever the builder is fresh" true for every caller, including ones
+    /// added later, rather than an invariant `open` and the `R` handler each
+    /// had to remember to uphold on their own — which is exactly how `R`
+    /// dropped the row the first time around, by calling `reload` without
+    /// repeating the three lines `open` had.
+    ///
+    /// The working-tree walk this costs (12 ms on this repository) runs here
+    /// unconditionally, so both callers of `reload` — `open` and `R` — must
+    /// stay off the render thread, which they already are (a key handler and
+    /// `open` itself, never `render`). A failure reading the tree is not
+    /// worth failing the reload over, so it is folded into "no known
+    /// uncommitted changes" like the decorations lookup in `open`.
     fn reload(&mut self) {
         self.builder = GraphBuilder::new();
+        if let Ok(count) = self.repo.working_changes()
+            && count > 0
+        {
+            self.builder.feed_uncommitted(count);
+        }
         self.exhausted = false;
         self.error = None;
         match self.repo.walk() {
@@ -985,6 +993,41 @@ mod tests {
     fn a_clean_repository_shows_no_uncommitted_row() {
         let (_fx, g) = graph_with(2, "state-clean-no-row");
         assert_eq!(g.row_count(), 2, "no synthetic row when the tree is clean");
+    }
+
+    /// Regression: `reload` (driven here by `Shift+R`) used to reset the
+    /// builder without re-seeding the uncommitted row, so a same-repository
+    /// refresh made the row vanish while the tree was still dirty — the row
+    /// only came back by dismissing and reopening the overlay. `reload` now
+    /// seeds the row itself, so both of its callers (`open` and this `R`
+    /// handler) get it for free; this test exercises the second caller,
+    /// which `opening_a_dirty_repository_shows_the_uncommitted_row_above_the_newest_commit`
+    /// does not touch at all.
+    #[test]
+    fn refreshing_a_dirty_repository_keeps_the_uncommitted_row() {
+        let fx = Fixture::new("state-uncommitted-refresh");
+        fx.commit("first");
+        fx.commit("second");
+        std::fs::write(fx.path().join("dirty.txt"), "x\n").unwrap();
+
+        let mut g = GitGraph::open(fx.path()).expect("fixture opens");
+        assert_eq!(g.row_count(), 3, "two commits plus the synthetic row");
+
+        g.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+
+        assert_eq!(
+            g.row_count(),
+            3,
+            "the refresh must not drop the synthetic row while the tree is still dirty"
+        );
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let text = buffer_text(&buf, area);
+        assert!(
+            text.contains("1 uncommitted changes"),
+            "the row's count is still rendered after the refresh: {text:?}"
+        );
     }
 
     #[test]
