@@ -64,9 +64,12 @@ pub enum CellType {
 
 /// One drawable row.
 ///
-/// `commit: None` marks a connector row — a row that draws edges but stands for
-/// no commit. Keeping that shape means the renderer only ever paints `cells`
-/// and never has to ask what a row means.
+/// `commit: None` marks a row that stands for no commit — either a connector
+/// row or the synthetic uncommitted-changes row. `uncommitted` tells those two
+/// apart: `None` for a connector, `Some(count)` for the uncommitted row.
+/// Keeping the shape this way means the renderer still only ever has to paint
+/// `cells` for the graph portion, and asks `uncommitted` only to decide what
+/// (if anything) to write beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphNode {
     pub commit: Option<CommitInfo>,
@@ -76,6 +79,9 @@ pub struct GraphNode {
     /// are not uniform width once a later fork widens the graph. A renderer
     /// must pad short rows rather than assume every row is `max_lane + 1`.
     pub cells: Vec<CellType>,
+    /// `Some(count)` marks the synthetic "uncommitted changes" row;
+    /// `None` for every ordinary commit row and every connector row.
+    pub uncommitted: Option<usize>,
 }
 
 /// Accumulates rows as commits are fed in. Rows already emitted are never
@@ -200,6 +206,7 @@ impl GraphBuilder {
             lane: keep,
             color_index: color,
             cells,
+            uncommitted: None,
         });
     }
 
@@ -350,6 +357,24 @@ impl GraphBuilder {
             lane,
             color_index: color,
             cells,
+            uncommitted: None,
+        });
+    }
+
+    /// Insert the synthetic "uncommitted changes" row above everything else.
+    ///
+    /// Must be called before the first `feed`: rows already emitted are never
+    /// revised (see the module-level comment and
+    /// `feeding_in_batches_matches_feeding_all_at_once`), so this cannot be
+    /// slotted in above history that already has rows.
+    pub fn feed_uncommitted(&mut self, count: usize) {
+        debug_assert!(self.nodes.is_empty(), "the uncommitted row comes first");
+        self.nodes.push(GraphNode {
+            commit: None,
+            lane: 0,
+            color_index: 0,
+            cells: vec![CellType::Commit(0)],
+            uncommitted: Some(count),
         });
     }
 }
@@ -396,6 +421,52 @@ mod tests {
         let b = GraphBuilder::new();
         assert!(b.nodes().is_empty());
         assert_eq!(b.max_lane(), 0);
+    }
+
+    /// `feed_uncommitted` must land as row 0, be distinguishable from a
+    /// connector row via `uncommitted`, and leave every subsequent row's lane
+    /// layout, colours, and cells exactly as a plain load would produce them.
+    #[test]
+    fn feed_uncommitted_prepends_a_synthetic_row_without_disturbing_the_rest() {
+        let fx = Fixture::new("layout-uncommitted");
+        fx.commit("base");
+        fx.branch("side");
+        fx.commit("on side");
+        fx.checkout("main");
+        fx.commit("on main");
+        fx.merge("side", "merge side");
+
+        let plain = layout_of(&fx);
+
+        let repo = Repo::open(fx.path()).unwrap();
+        let mut with_uncommitted = GraphBuilder::new();
+        with_uncommitted.feed_uncommitted(3);
+        for commit in repo.walk().unwrap() {
+            with_uncommitted.feed(commit.unwrap());
+        }
+
+        assert_eq!(
+            with_uncommitted.nodes().len(),
+            plain.nodes().len() + 1,
+            "exactly one row was inserted"
+        );
+        let synthetic = &with_uncommitted.nodes()[0];
+        assert_eq!(
+            synthetic.commit, None,
+            "the synthetic row stands for no commit"
+        );
+        assert_eq!(
+            synthetic.uncommitted,
+            Some(3),
+            "it carries the uncommitted count"
+        );
+        assert_eq!(synthetic.cells, vec![CellType::Commit(0)]);
+
+        // Every row after the synthetic one must be byte-identical to a plain
+        // load: the extra row must not perturb lane assignment, colour
+        // numbering, or any other row's cells.
+        assert_eq!(&with_uncommitted.nodes()[1..], plain.nodes());
+        assert_eq!(with_uncommitted.max_lane(), plain.max_lane());
     }
 
     /// Summaries of the real-commit rows, in order. Connector rows are skipped.

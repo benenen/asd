@@ -181,7 +181,21 @@ pub fn draw_rows(
         }
 
         let Some(commit) = node.commit.as_ref() else {
-            continue; // A connector row draws edges and nothing else.
+            // The synthetic uncommitted-changes row has no commit either, but
+            // carries its count in `uncommitted` and gets a label instead of
+            // the summary/decorations/hash a real commit row draws below.
+            if let Some(count) = node.uncommitted {
+                let x = area.x.saturating_add(graph_w).saturating_add(GAP);
+                put(
+                    buf,
+                    area,
+                    x,
+                    y,
+                    &format!("{count} uncommitted changes"),
+                    base,
+                );
+            }
+            continue; // A plain connector row draws edges and nothing else.
         };
 
         let mut x = area.x.saturating_add(graph_w).saturating_add(GAP);
@@ -238,6 +252,7 @@ mod tests {
             lane,
             color_index: 0,
             cells,
+            uncommitted: None,
         }
     }
 
@@ -272,6 +287,31 @@ mod tests {
         assert!(
             row.contains("hello world"),
             "row carries the summary: {row:?}"
+        );
+    }
+
+    #[test]
+    fn the_uncommitted_row_draws_its_marker_and_count_not_a_summary() {
+        let uncommitted_row = GraphNode {
+            commit: None,
+            lane: 0,
+            color_index: 0,
+            cells: vec![CellType::Commit(0)],
+            uncommitted: Some(3),
+        };
+        let nodes = vec![uncommitted_row];
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buf = Buffer::empty(area);
+        draw_rows(&mut buf, area, &nodes, &Default::default(), 0, 0);
+
+        let row: String = (0..40)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(row.starts_with('●'), "row starts with the marker: {row:?}");
+        assert!(
+            row.contains("3 uncommitted changes"),
+            "row carries the count: {row:?}"
         );
     }
 
@@ -318,7 +358,9 @@ mod tests {
     /// origins against a deliberately messy set of rows: a wide multi-lane
     /// row carrying every two-colour cell variant, full branch/tag/remote
     /// decorations, a summary far longer than any of the areas under test, a
-    /// double-width CJK summary, and a bare connector row (`commit: None`).
+    /// double-width CJK summary, a bare connector row (`commit: None`), and
+    /// the synthetic uncommitted-changes row (`commit: None`, `uncommitted:
+    /// Some(_)`).
     ///
     /// The origin matters as much as the size: `area.x`/`area.y` are zero in
     /// every other test in this file, but the overlay is drawn inset in
@@ -356,6 +398,7 @@ mod tests {
                 CellType::MergeLeft(9),
                 CellType::Horizontal(10),
             ],
+            uncommitted: None,
         };
         let connector_row = GraphNode {
             commit: None,
@@ -366,13 +409,25 @@ mod tests {
                 CellType::TeeUp(0, 1),
                 CellType::MergeLeft(0),
             ],
+            uncommitted: None,
         };
         // A double-width CJK summary: `put` is the only path arbitrary text
         // flows through (the fixed glyph vocabulary is all narrow, see the
         // note on `cell_glyph`), and a wide glyph straddling the right edge
         // of a narrow area is a real case for user-supplied commit text.
         let cjk_row = node("宽字符摘要超长提交信息行", 0, vec![CellType::Commit(0)]);
-        let nodes = vec![wide_row, connector_row, cjk_row];
+        // The synthetic uncommitted-changes row: no commit, so it takes the
+        // same early-return path as `connector_row`, but writes a label
+        // `connector_row` does not, which is new render logic this sweep
+        // needs to cover independently.
+        let uncommitted_row = GraphNode {
+            commit: None,
+            lane: 0,
+            color_index: 0,
+            cells: vec![CellType::Commit(0)],
+            uncommitted: Some(12),
+        };
+        let nodes = vec![wide_row, connector_row, cjk_row, uncommitted_row];
 
         let mut decorations = HashMap::new();
         decorations.insert(

@@ -6,6 +6,7 @@ pub mod diff;
 pub mod graph;
 pub mod refs;
 pub mod repo;
+pub mod status;
 
 #[cfg(test)]
 pub(crate) mod fixture;

@@ -191,6 +191,20 @@ impl GitGraph {
             file_diff_rows: 0,
         };
         me.reload();
+        // Off the render thread: the host opens the overlay from a key
+        // handler, not from `render`, so the working-tree walk this costs
+        // (12 ms on this repository) does not stall a paint. Must run before
+        // `load_more` feeds the first page: `GraphBuilder` never revises a
+        // row once emitted, so the synthetic row can only be inserted while
+        // the builder is still empty. A failure here (a filesystem hiccup
+        // reading the tree) is not worth failing the whole overlay over, so
+        // it is folded into "no known uncommitted changes" like the
+        // decorations lookup above.
+        if let Ok(count) = me.repo.working_changes()
+            && count > 0
+        {
+            me.builder.feed_uncommitted(count);
+        }
         me.load_more(PAGE_FIRST);
         me.request_detail();
         Ok(me)
@@ -933,6 +947,44 @@ mod tests {
         let (_fx, g) = graph_with(3, "state-open");
         assert_eq!(g.selected(), 0);
         assert_eq!(g.row_count(), 3);
+    }
+
+    /// `open` must call `working_changes` and, when it is non-zero, insert
+    /// the synthetic row before loading the first page — the actual wiring
+    /// `feed_uncommitted`'s own unit test cannot exercise, since that test
+    /// drives `GraphBuilder` directly rather than going through `open`.
+    #[test]
+    fn opening_a_dirty_repository_shows_the_uncommitted_row_above_the_newest_commit() {
+        let fx = Fixture::new("state-uncommitted");
+        fx.commit("first");
+        fx.commit("second");
+        std::fs::write(fx.path().join("dirty.txt"), "x\n").unwrap();
+
+        let mut g = GitGraph::open(fx.path()).expect("fixture opens");
+        assert_eq!(g.row_count(), 3, "two commits plus the synthetic row");
+        assert_eq!(g.selected(), 0, "the synthetic row is selected first");
+        assert_eq!(
+            g.selected_id(),
+            None,
+            "the synthetic row has no commit, so no diff request is made"
+        );
+
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let text = buffer_text(&buf, area);
+        assert!(
+            text.contains("1 uncommitted changes"),
+            "the row's count is rendered: {text:?}"
+        );
+    }
+
+    /// The converse of the test above: a clean tree must not grow a phantom
+    /// row, or every repository would show "0 uncommitted changes" forever.
+    #[test]
+    fn a_clean_repository_shows_no_uncommitted_row() {
+        let (_fx, g) = graph_with(2, "state-clean-no-row");
+        assert_eq!(g.row_count(), 2, "no synthetic row when the tree is clean");
     }
 
     #[test]
