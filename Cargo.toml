@@ -121,6 +121,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+# Temporary pin for Windows VT input and bracketed-paste events. This is the
+# pinned head of crossterm PR #1030; remove the patch after an equivalent
+# crates.io release. A workspace-wide patch is required so ratatui and asd-cli
+# cannot link separate process-global crossterm state.
+[patch.crates-io]
+crossterm = { git = "https://github.com/crossterm-rs/crossterm.git", rev = "94ed7154e35d24a2f643c61760e1eb05b8ca9e63" }
+
 [profile.release]
 lto = "thin"
 

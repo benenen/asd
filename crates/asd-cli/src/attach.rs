@@ -93,9 +93,14 @@ pub async fn run(mut client: Client, name: &str, read_only: bool) -> anyhow::Res
     // The Attach/Snapshot wait above stays in cooked mode, so Ctrl-C can still
     // interrupt a stalled daemon. Raw mode is needed only for the live client.
     let _raw = RawGuard::enable().context("enabling raw terminal mode")?;
+    // Windows Console otherwise filters bracketed-paste and SGR mouse bytes
+    // before this raw-byte client can see them. Declared before `_screen` so
+    // the screen guard disables those host modes before this restores the
+    // original input transport bit. Unix is an explicit no-op.
+    let _vt_input = platform::VtInputGuard::enable()?;
     // Alt screen only — no mouse tracking is enabled here. We enable/disable it
     // dynamically to mirror the session (see `sync_host_modes`). Dropped before
-    // RawGuard.
+    // VtInputGuard and RawGuard.
     let _screen = ScreenGuard::enter().context("entering alternate screen")?;
 
     // Our local mirror of the session terminal.
@@ -341,8 +346,7 @@ pub async fn run(mut client: Client, name: &str, read_only: bool) -> anyhow::Res
 
     reader_task.abort();
     stdin_task.abort();
-    drop(_screen); // restore the terminal (leave alt screen, show cursor, ...)
-    drop(_raw);
+    restore_live_terminal_guards(_screen, _vt_input, _raw);
 
     match exit {
         Exit::Detached => eprintln!("[asd: detached]"),
@@ -358,6 +362,18 @@ pub async fn run(mut client: Client, name: &str, read_only: bool) -> anyhow::Res
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     std::process::exit(0);
+}
+
+/// Restore every live-terminal layer before the hard process exit above.
+///
+/// Order is part of the contract: disable screen-owned mouse/paste modes while
+/// VT input can still carry them, restore that transport bit, then restore raw
+/// input. A generic helper keeps the otherwise-unobservable `process::exit`
+/// path covered by a drop-order test.
+fn restore_live_terminal_guards<Screen, VtInput, Raw>(screen: Screen, vt_input: VtInput, raw: Raw) {
+    drop(screen);
+    drop(vt_input);
+    drop(raw);
 }
 
 /// Position the viewport at `scroll` and paint one frame (with the active
@@ -572,6 +588,28 @@ fn restore_sequence() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_terminal_guards_restore_in_transport_order() {
+        struct DropMark {
+            name: &'static str,
+            order: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        }
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.order.borrow_mut().push(self.name);
+            }
+        }
+
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mark = |name| DropMark {
+            name,
+            order: std::rc::Rc::clone(&order),
+        };
+        restore_live_terminal_guards(mark("screen"), mark("vt-input"), mark("raw"));
+
+        assert_eq!(*order.borrow(), ["screen", "vt-input", "raw"]);
+    }
 
     #[test]
     fn shift_paging_keys_drive_scrollback() {

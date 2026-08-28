@@ -14,6 +14,8 @@
 //!   own no terminal.
 //! - [`stop_daemon`] — end the daemon recorded in the pid file, for a restart.
 //! - [`RawGuard`] — put the terminal in raw mode, restore it on drop.
+//! - [`VtInputGuard`] — expose the live attach input as VT bytes where the
+//!   console needs an explicit transport bit.
 //! - [`install_terminating_signal_restore`] — hand the terminal back even when
 //!   the process is killed, which skips every `Drop`.
 //! - [`term_size`] — the terminal's cell dimensions.
@@ -33,8 +35,8 @@ mod imp;
 mod imp;
 
 pub(crate) use imp::{
-    RawGuard, Winch, configure_detached, connect_stream, install_terminating_signal_restore,
-    run_stdio_proxy, stop_daemon, term_size, winch,
+    RawGuard, VtInputGuard, Winch, configure_detached, connect_stream,
+    install_terminating_signal_restore, run_stdio_proxy, stop_daemon, term_size, winch,
 };
 
 /// The daemon side of a connection, type-erased for the framed codec.
