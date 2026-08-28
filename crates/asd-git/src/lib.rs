@@ -10,7 +10,7 @@ pub mod state;
 pub mod ui;
 
 pub use git::commit::{CommitInfo, ReadError};
-pub use git::diff::{CommitDiff, FileChange, FileStat};
+pub use git::diff::{CommitDiff, DiffLine, FileChange, FileDiff, FileStat, MAX_DIFF_LINES};
 pub use git::graph::{CellType, GraphBuilder, GraphNode};
 pub use git::refs::{RefInfo, RefKind};
 pub use git::repo::{OpenError, Repo};
