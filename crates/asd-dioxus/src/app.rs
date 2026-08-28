@@ -440,7 +440,9 @@ pub fn App() -> Element {
                             class: "bar-btn",
                             title: "kill the active session",
                             onclick: move |_| {
-                                if let Some((host, name)) = model.read().active.clone() {
+                                if let Some((host, name)) = model.read().active.clone()
+                                    && !model.read().is_closing(host, &name)
+                                {
                                     confirm_kill.set(Some((host, name)));
                                 }
                             },
@@ -469,12 +471,13 @@ pub fn App() -> Element {
                 {
                     let name_btn = name.clone();
                     let tx = tx.clone();
+                    let mut model_kill = model;
                     rsx! {
                         div { class: "confirm-overlay",
                             div { class: "confirm-card",
                                 div { class: "confirm-title", "Kill session \"{name}\"?" }
                                 div { class: "confirm-msg",
-                                    "The session and its processes are terminated (SIGHUP). This can't be undone."
+                                    "The session and its processes are terminated. This can't be undone."
                                 }
                                 div { class: "confirm-actions",
                                     button {
@@ -485,7 +488,9 @@ pub fn App() -> Element {
                                     button {
                                         class: "bar-btn danger",
                                         onclick: move |_| {
-                                            let _ = tx.send(AppCmd::Kill { host, name: name_btn.clone() });
+                                            if model_kill.write().mark_closing(host, &name_btn) {
+                                                let _ = tx.send(AppCmd::Kill { host, name: name_btn.clone() });
+                                            }
                                             confirm_kill.set(None);
                                         },
                                         "Kill"
@@ -645,6 +650,7 @@ fn host_group(
                     let name_kill = name.clone();
                     let name_dbl = name.clone();
                     let name_kbd = name.clone();
+                    let closing = model.read().is_closing(id, &name);
                     let siblings = sibling_names.clone();
                     let tx_rename = tx.clone();
                     // This row's inline-rename state, if it is the one being edited.
@@ -654,6 +660,7 @@ fn host_group(
                         .filter(|r| r.host == id && r.old == name)
                         .cloned();
                     let row = crate::model::session_row_class(is_active, s.state);
+                    let row = if closing { format!("{row} closing") } else { row.to_string() };
                     let blocked = s.state == asd_proto::AgentState::Blocked;
                     let sdot = if attached { "session-dot attached" } else { "session-dot" };
                     let sdot = if remote { format!("{sdot} remote") } else { sdot.to_string() };
@@ -741,15 +748,16 @@ fn host_group(
                             span { class: "session-age", "{age}" }
                             button {
                                 class: "icon-btn kill",
-                                title: "kill {name}",
+                                title: if closing { "closing" } else { "kill session" },
+                                disabled: closing,
                                 onclick: move |e| {
                                     e.stop_propagation();
                                     confirm_kill.set(Some((id, name_kill.clone())));
                                 },
-                                "×"
+                                if closing { "…" } else { "×" }
                             }
                             }
-                            div { class: "session-cmd", "{cmd}" }
+                            div { class: "session-cmd", if closing { "closing…" } else { "{cmd}" } }
                         }
                     }
                 }

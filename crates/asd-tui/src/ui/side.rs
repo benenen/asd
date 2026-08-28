@@ -90,6 +90,9 @@ fn draw_title(
 ) {
     let selected = app.active.as_deref() == Some(&session.name);
     let is_self = app.self_session.as_deref() == Some(&session.name);
+    let closing = app
+        .closing_sessions
+        .contains(&session.name, session.pid, session.created_ms);
     let row_bg = if selected {
         Style::new().bg(SELECT_BG)
     } else {
@@ -107,7 +110,7 @@ fn draw_title(
         row_bg.fg(DIM)
     };
     buf.set_string(area.left() + 1, y, format!("{ordinal:<2}"), ordinal_style);
-    let name_style = if is_self {
+    let name_style = if is_self || closing {
         row_bg.fg(DIM)
     } else if blocked(session) {
         row_bg.fg(ALERT).add_modifier(Modifier::BOLD)
@@ -121,11 +124,15 @@ fn draw_title(
         (area.width - 1).saturating_sub(ROW_TEXT_X + 3) as usize,
     );
     buf.set_string(area.left() + ROW_TEXT_X, y, &name, name_style);
-    buf.set_string(area.right() - 3, y, "x", row_bg.fg(DIM));
+    let kill_mark = if closing { "…" } else { "x" };
+    buf.set_string(area.right() - 3, y, kill_mark, row_bg.fg(DIM));
 }
 
 fn draw_detail(buf: &mut Buffer, area: Rect, app: &App, session: &asd_proto::SessionInfo, y: u16) {
     let is_self = app.self_session.as_deref() == Some(&session.name);
+    let closing = app
+        .closing_sessions
+        .contains(&session.name, session.pid, session.created_ms);
     let row_bg = if app.active.as_deref() == Some(&session.name) {
         Style::new().bg(SELECT_BG)
     } else {
@@ -134,16 +141,23 @@ fn draw_detail(buf: &mut Buffer, area: Rect, app: &App, session: &asd_proto::Ses
     let age = short_age(session.created_ms, app.now_ms);
     let cmd_w = (area.width - 1) as usize;
     let cmd_w = cmd_w.saturating_sub(ROW_TEXT_X as usize + age.len() + 2);
-    let label = row_label(session);
-    // A marker as well as a colour: in a sidebar of twenty rows, colour alone
-    // is easy to miss, and it is gone entirely for a colour-blind reader.
-    let label = if blocked(session) {
-        format!("! {label}")
+    let label = if closing {
+        "closing…".to_string()
     } else {
-        label
+        let label = row_label(session);
+        // A marker as well as a colour: in a sidebar of twenty rows, colour
+        // alone is easy to miss, and it is gone entirely for a colour-blind
+        // reader.
+        if blocked(session) {
+            format!("! {label}")
+        } else {
+            label
+        }
     };
     let cmd = truncate(&label, cmd_w);
-    let cmd_fg = if blocked(session) {
+    let cmd_fg = if closing {
+        DIM
+    } else if blocked(session) {
         ALERT
     } else if session.running && !is_self {
         ACCENT

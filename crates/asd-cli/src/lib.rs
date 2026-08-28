@@ -59,7 +59,7 @@ enum Cmd {
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
-    /// Kill a session (SIGHUP, with SIGKILL fallback after 2s)
+    /// End a session (graceful with a force fallback where the platform allows)
     #[command(group(clap::ArgGroup::new("kill_target").required(true).args(["name", "all"])))]
     Kill {
         /// Session name

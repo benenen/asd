@@ -44,7 +44,7 @@ env:
 jobs:
   # Each flavor is built rather than `cargo check`ed: check would not link, and
   # the kernel32 imports the daemon and CLI declare by hand (OpenProcess,
-  # TerminateProcess, GenerateConsoleCtrlEvent) only resolve at link time.
+  # TerminateProcess, WaitForSingleObject) only resolve at link time.
   build:
     name: build (${{ matrix.flavor }})
     runs-on: windows-latest

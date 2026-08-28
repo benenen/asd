@@ -1416,9 +1416,9 @@ fn broadcast(clients: &mut Vec<ClientSink>, meta: &SessionMeta, frame: Frame) ->
 }
 
 /// Kill the session's child process (ignored when the pid is already zeroed).
-/// `force`: false = graceful (SIGHUP / best-effort CTRL_BREAK), true = force
-/// (SIGKILL / TerminateProcess). The platform difference lives in
-/// `platform::kill_child`.
+/// On Unix, `force` selects SIGHUP or SIGKILL. Windows has no deliverable
+/// SIGHUP analogue for a ConPTY child, so both paths use TerminateProcess. The
+/// platform difference lives in `platform::kill_child`.
 pub fn kill_child(meta: &SessionMeta, force: bool) {
     let pid = meta.child_pid.load(Ordering::Relaxed);
     if pid == 0 {
@@ -1427,7 +1427,7 @@ pub fn kill_child(meta: &SessionMeta, force: bool) {
     crate::platform::kill_child(pid, force);
 }
 
-/// Ask a child to stop, then force it after the same grace period as `Kill`.
+/// Ask a child to stop, then force it after the Unix grace period if it remains.
 /// Used for an explicit kill and for a broken PTY response path: continuing a
 /// session whose terminal queries can no longer be answered leaves the child
 /// blocked indefinitely with no usable terminal channel.

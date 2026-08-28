@@ -65,6 +65,8 @@ const RUNNING_SHIMMER_FRAME_INTERVAL: Duration = Duration::from_millis(500);
 const HOST_URL_SCAN_DEBOUNCE: Duration = Duration::from_millis(100);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const FAST_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// A failed platform kill must not leave the row permanently locked.
+const CLOSING_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_CONNECTION_GENERATION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,6 +409,81 @@ fn row_y(side: ratatui::layout::Rect, i: usize, offset: usize) -> Option<u16> {
     (y + 1 < side.bottom()).then_some(y)
 }
 
+#[derive(Clone, Copy)]
+struct ClosingSession {
+    pid: u32,
+    created_ms: u64,
+    started: Instant,
+}
+
+#[derive(Default)]
+struct ClosingSessions(HashMap<String, ClosingSession>);
+
+impl ClosingSessions {
+    fn begin(&mut self, name: &str, pid: u32, created_ms: u64, started: Instant) -> bool {
+        if self.0.get(name).is_some_and(|pending| {
+            pending.pid == pid
+                && pending.created_ms == created_ms
+                && started.saturating_duration_since(pending.started) < CLOSING_TIMEOUT
+        }) {
+            return false;
+        }
+        self.0.insert(
+            name.to_string(),
+            ClosingSession {
+                pid,
+                created_ms,
+                started,
+            },
+        );
+        true
+    }
+
+    fn contains(&self, name: &str, pid: u32, created_ms: u64) -> bool {
+        self.0.get(name).is_some_and(|pending| {
+            pending.pid == pid
+                && pending.created_ms == created_ms
+                && pending.started.elapsed() < CLOSING_TIMEOUT
+        })
+    }
+
+    fn reconcile<'a>(
+        &mut self,
+        live: impl IntoIterator<Item = (&'a str, u32, u64)>,
+        now: Instant,
+    ) -> Vec<String> {
+        let live: HashMap<(u32, u64), &str> = live
+            .into_iter()
+            .map(|(name, pid, created_ms)| ((pid, created_ms), name))
+            .collect();
+        let mut expired = Vec::new();
+        let mut next = HashMap::new();
+        for pending in std::mem::take(&mut self.0).into_values() {
+            let Some(name) = live.get(&(pending.pid, pending.created_ms)) else {
+                continue;
+            };
+            let timed_out = now.saturating_duration_since(pending.started) >= CLOSING_TIMEOUT;
+            if timed_out {
+                expired.push((*name).to_string());
+            } else {
+                next.insert((*name).to_string(), pending);
+            }
+        }
+        self.0 = next;
+        expired
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn rename(&mut self, old: &str, new: &str) {
+        if let Some(pending) = self.0.remove(old) {
+            self.0.insert(new.to_string(), pending);
+        }
+    }
+}
+
 pub(crate) struct App {
     socket: PathBuf,
     conn: Conn,
@@ -415,6 +492,9 @@ pub(crate) struct App {
     connection_generation: u64,
 
     pub sessions: Vec<SessionInfo>,
+    /// Kill requests that have been sent but whose session is still present in
+    /// the daemon's latest list. A stale immediate list must not erase this.
+    closing_sessions: ClosingSessions,
     /// Monotonic idle deadlines derived from the last list response and from
     /// live output for the attached session. This removes list-poll lag without
     /// letting an older list sample override output observed locally afterward.
@@ -732,6 +812,7 @@ fn event_loop(
         ev_tx,
         connection_generation,
         sessions: Vec::new(),
+        closing_sessions: ClosingSessions::default(),
         running_activity: RunningActivity::default(),
         host_links: HostLinkState::default(),
         active: None,
@@ -1238,6 +1319,7 @@ impl App {
             Ev::Down(reason) => {
                 self.daemon_up = false;
                 self.notice = Some(reason);
+                self.closing_sessions.clear();
                 self.active = None;
                 self.view_revoked = None;
                 self.vt = None;
@@ -1259,6 +1341,14 @@ impl App {
                     self.apply_rename(&old_name, &new_name);
                 }
                 let observed_at = Instant::now();
+                let expired = self.closing_sessions.reconcile(
+                    list.iter()
+                        .map(|session| (session.name.as_str(), session.pid, session.created_ms)),
+                    observed_at,
+                );
+                if !expired.is_empty() {
+                    self.notice = Some(format!("{} did not close — try again", expired.join(", ")));
+                }
                 self.running_activity = self.running_activity.with_list(&list, observed_at);
                 let list = sessions_with_activity(&list, &self.running_activity, observed_at);
                 // Drop parked terminals of sessions that no longer exist.
@@ -1503,7 +1593,22 @@ impl App {
             }
             KeyAction::Kill => {
                 if let Some(name) = self.active.clone() {
-                    self.modal = Some(Modal::KillConfirm { target: name });
+                    let closing = self
+                        .sessions
+                        .iter()
+                        .find(|session| session.name == name)
+                        .is_some_and(|session| {
+                            self.closing_sessions.contains(
+                                &session.name,
+                                session.pid,
+                                session.created_ms,
+                            )
+                        });
+                    if closing {
+                        self.notice = Some(format!("{name} is already closing"));
+                    } else {
+                        self.modal = Some(Modal::KillConfirm { target: name });
+                    }
                 }
             }
             KeyAction::Rename => {
@@ -1583,7 +1688,20 @@ impl App {
             Act::Close => self.modal = None,
             Act::Kill(name) => {
                 self.modal = None;
-                self.send(Cmd::Kill { name });
+                if let Some(session) = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.name == name)
+                    .cloned()
+                    && self.closing_sessions.begin(
+                        &session.name,
+                        session.pid,
+                        session.created_ms,
+                        Instant::now(),
+                    )
+                {
+                    self.send(Cmd::Kill { name });
+                }
             }
             Act::TryRename(target, new) => {
                 let existing: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
@@ -1628,6 +1746,7 @@ impl App {
         if self.view_revoked.as_deref() == Some(target) {
             self.view_revoked = Some(new.to_string());
         }
+        self.closing_sessions.rename(target, new);
         for s in &mut self.sessions {
             if s.name == target {
                 s.name = new.to_string();
@@ -1766,12 +1885,19 @@ impl App {
                     m.row,
                 ) {
                     let name = self.sessions[i].name.clone();
+                    let closing = self.closing_sessions.contains(
+                        &name,
+                        self.sessions[i].pid,
+                        self.sessions[i].created_ms,
+                    );
                     if kill {
                         if self.self_session.as_deref() == Some(&name) {
                             // Never kill the session hosting this UI (same guard
                             // as `select`) — it would tear the UI down.
                             self.notice =
                                 Some(format!("{name} hosts this UI — can't kill it here"));
+                        } else if closing {
+                            self.notice = Some(format!("{name} is already closing"));
                         } else {
                             // Same path as Ctrl+A x: confirm first, never kill
                             // outright.
@@ -2011,6 +2137,32 @@ fn encode_sgr_mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_state_survives_a_stale_list_and_clears_when_the_session_is_gone() {
+        let mut closing = ClosingSessions::default();
+        let started = Instant::now();
+        assert!(closing.begin("doomed", 42, 100, started));
+        assert!(!closing.begin("doomed", 42, 100, started));
+        assert!(closing.contains("doomed", 42, 100));
+
+        closing.reconcile([("keep", 7, 50), ("doomed", 42, 100)], started);
+        assert!(closing.contains("doomed", 42, 100));
+
+        closing.reconcile([("keep", 7, 50), ("renamed", 42, 100)], started);
+        assert!(closing.contains("renamed", 42, 100));
+
+        closing.reconcile([("keep", 7, 50), ("renamed", 43, 101)], started);
+        assert!(!closing.contains("renamed", 43, 101));
+
+        closing.begin("stuck", 99, 200, started);
+        let expired = closing.reconcile(
+            [("keep", 7, 50), ("stuck", 99, 200)],
+            started + CLOSING_TIMEOUT,
+        );
+        assert_eq!(expired, vec!["stuck"]);
+        assert!(!closing.contains("stuck", 99, 200));
+    }
 
     #[test]
     fn reconnect_ignores_events_from_superseded_connection() {

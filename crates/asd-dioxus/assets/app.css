@@ -56,6 +56,7 @@ button { font-family: inherit; }
 .session-row { padding:6px 8px 6px 14px; margin:2px 0 2px 4px; border-radius:6px; cursor:pointer; display:flex; flex-direction:column; gap:3px; font-size:13px; }
 .session-row:hover { background:#171D25; }
 .session-row.active { background:rgba(243,178,76,0.12); }
+.session-row.closing { opacity:0.58; cursor:progress; }
 .session-main { display:flex; align-items:center; gap:8px; min-width:0; }
 .session-dot { width:8px; height:8px; border-radius:50%; border:2px solid #F3B24C; flex:none; }
 .session-dot.attached { background:#F3B24C; }

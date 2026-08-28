@@ -267,8 +267,9 @@ impl Registry {
         self.sessions.is_empty()
     }
 
-    /// Shutdown (spec §5): SIGHUP each session's child → wait 2s → SIGKILL
-    /// stragglers. Blocking version, called only on the daemon exit path.
+    /// Shutdown (spec §5): ask each child to stop, wait 2s, then force any
+    /// stragglers. Windows stops immediately because ConPTY has no deliverable
+    /// graceful console signal. Blocking version, called only on daemon exit.
     pub fn shutdown_all(registry: &Arc<Mutex<Self>>) {
         let handles: Vec<SessionHandle> = registry
             .lock()
@@ -280,7 +281,7 @@ impl Registry {
         if handles.is_empty() {
             return;
         }
-        info!(count = handles.len(), "shutting down sessions (SIGHUP)");
+        info!(count = handles.len(), "shutting down sessions");
         for h in &handles {
             kill_child(&h.meta, false);
         }
@@ -291,7 +292,7 @@ impl Registry {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        info!("grace period over, SIGKILL remaining children");
+        info!("grace period over, force-killing remaining children");
         for h in &handles {
             kill_child(&h.meta, true);
         }
@@ -319,5 +320,70 @@ impl Registry {
             sampled_age_ms: u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX),
             ..sample
         })
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn killing_a_conpty_session_does_not_wait_for_a_console_signal() {
+        crate::platform::harden_dll_search();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "asd-windows-kill-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pipe = std::path::PathBuf::from(format!(
+            r"\\.\pipe\asd-windows-kill-test-{}-{unique}",
+            std::process::id()
+        ));
+        let registry = Arc::new(Mutex::new(Registry::new(0, dir.join("sessions.tsv"), pipe)));
+
+        Registry::create(&registry, Some("doomed".to_string()), None, None).unwrap();
+        let handle = registry.lock().unwrap().get("doomed").unwrap();
+        let child_pid = handle
+            .meta
+            .child_pid
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(child_pid, 0, "the test must exercise a real ConPTY child");
+        let started = std::time::Instant::now();
+        handle.tx.send(SessionMsg::Kill).unwrap();
+        let deadline = started + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline
+            && registry.lock().unwrap().get("doomed").is_some()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let closed = registry.lock().unwrap().get("doomed").is_none();
+        let elapsed = started.elapsed();
+        if !closed {
+            crate::platform::kill_child(child_pid, true);
+            let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < cleanup_deadline
+                && registry.lock().unwrap().get("doomed").is_some()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            closed,
+            "a Windows kill must close its ConPTY session within one second; elapsed {elapsed:?}"
+        );
+        assert!(!handle.meta.alive.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            handle
+                .meta
+                .child_pid
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 }

@@ -107,7 +107,9 @@ async fn shutdown(registry: &Arc<Mutex<Registry>>, pid_path: &Path) {
     // Capture final cwds and freeze the session list before killing children.
     registry.lock().unwrap().freeze_and_persist();
 
-    // Shutdown: terminate each child → wait 2s → force-kill stragglers.
+    // Registry keeps the cross-platform shutdown sequence; this platform's
+    // first step already terminates each child because ConPTY has no graceful
+    // console signal the daemon can deliver.
     let reg = Arc::clone(registry);
     let _ = tokio::task::spawn_blocking(move || Registry::shutdown_all(&reg)).await;
     // The pipe itself is a kernel object and disappears with the process; only
@@ -166,7 +168,6 @@ mod win32 {
         fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
         fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
         fn CloseHandle(hObject: isize) -> i32;
-        fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) -> i32;
         fn WaitForSingleObject(hHandle: isize, dwMilliseconds: u32) -> u32;
     }
 
@@ -175,18 +176,18 @@ mod win32 {
     const PROCESS_TERMINATE: u32 = 0x0001;
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const INFINITE: u32 = 0xFFFF_FFFF;
-    const CTRL_BREAK_EVENT: u32 = 1;
     const INVALID_HANDLE_VALUE: isize = -1;
 
     /// Force-kill the process via TerminateProcess.
-    pub fn force_kill(pid: u32) {
+    pub fn force_kill(pid: u32) -> std::io::Result<()> {
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if handle != 0 && handle != INVALID_HANDLE_VALUE {
-            unsafe {
-                TerminateProcess(handle, 1);
-                CloseHandle(handle);
-            }
+        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
         }
+        let terminated = unsafe { TerminateProcess(handle, 1) };
+        let error = (terminated == 0).then(std::io::Error::last_os_error);
+        unsafe { CloseHandle(handle) };
+        error.map_or(Ok(()), Err)
     }
 
     /// Point the loader at System32 for every later load-by-name. Returns
@@ -209,30 +210,18 @@ mod win32 {
             CloseHandle(handle);
         }
     }
-
-    /// Best-effort graceful stop, the nearest Windows analogue to SIGHUP.
-    /// Returns whether the event was actually delivered.
-    ///
-    /// Two caveats make this fail far more often than it succeeds, so the
-    /// caller must not assume the child is going away:
-    /// `GenerateConsoleCtrlEvent`'s second argument is a process *group* id,
-    /// not a pid, so it only reaches a child created with
-    /// `CREATE_NEW_PROCESS_GROUP`; and it only reaches processes sharing the
-    /// *caller's* console, which a ConPTY child of a daemon does not.
-    pub fn graceful_kill(pid: u32) -> bool {
-        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0 }
-    }
 }
 
-/// End the process `pid`: `force` skips straight to TerminateProcess.
+/// End the process `pid` immediately.
 ///
-/// A graceful stop that could not be delivered would otherwise leave the child
-/// running until the 2s grace period expires and something else force-kills it —
-/// so every `asd kill` would stall for two seconds and the child would still die
-/// abruptly. Falling through costs the child nothing it was going to get anyway.
-pub(crate) fn kill_child(pid: u32, force: bool) {
-    if force || !win32::graceful_kill(pid) {
-        win32::force_kill(pid);
+/// A ConPTY child neither shares the daemon's console nor has to be its own
+/// process group, so `GenerateConsoleCtrlEvent` cannot provide the SIGHUP-like
+/// grace period the Unix implementation has. Its success return also does not
+/// mean this child received anything. Waiting on it only delays the same
+/// `TerminateProcess` that Windows must use in the end.
+pub(crate) fn kill_child(pid: u32, _force: bool) {
+    if let Err(error) = win32::force_kill(pid) {
+        warn!(pid, %error, "failed to terminate Windows session child");
     }
 }
 

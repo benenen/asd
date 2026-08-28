@@ -3,6 +3,9 @@
 //! `Send` data owned by the app's signals; the connections live in per-host
 //! tokio tasks (see [`crate::conn`]).
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use asd_proto::SessionInfo;
 
 use crate::settings::SshAuth;
@@ -12,6 +15,15 @@ pub type HostId = u64;
 
 /// The local daemon's fixed id.
 pub const LOCAL_ID: HostId = 0;
+
+const CLOSING_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq)]
+struct ClosingSession {
+    pid: u32,
+    created_ms: u64,
+    started: Instant,
+}
 
 /// How to reach a host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +117,9 @@ pub struct Model {
     pub hosts: Vec<Host>,
     /// The session being viewed: `(host, name)`.
     pub active: Option<(HostId, String)>,
+    /// Kill requests that have been sent but are still present in the most
+    /// recent list for their host.
+    closing: HashMap<(HostId, String), ClosingSession>,
     next_id: HostId,
 }
 
@@ -119,6 +134,7 @@ impl Model {
                 sessions: Vec::new(),
             }],
             active: None,
+            closing: HashMap::new(),
             next_id: 1,
         }
     }
@@ -173,12 +189,16 @@ impl Model {
             return; // the local host is permanent
         }
         self.hosts.retain(|h| h.id != id);
+        self.closing.retain(|(host, _), _| *host != id);
         if self.active.as_ref().is_some_and(|(h, _)| *h == id) {
             self.active = None;
         }
     }
 
     pub fn set_state(&mut self, id: HostId, state: HostState) {
+        if !matches!(state, HostState::Up) {
+            self.closing.retain(|(host, _), _| *host != id);
+        }
         if let Some(h) = self.host_mut(id) {
             h.state = state;
         }
@@ -187,6 +207,21 @@ impl Model {
     /// Replace a host's session list. If the active session vanished (killed or
     /// exited elsewhere), the selection is cleared.
     pub fn set_sessions(&mut self, id: HostId, sessions: Vec<SessionInfo>) {
+        let now = Instant::now();
+        let mut next = HashMap::new();
+        for ((host, name), pending) in std::mem::take(&mut self.closing) {
+            if host != id {
+                next.insert((host, name), pending);
+                continue;
+            }
+            if let Some(session) = sessions.iter().find(|session| {
+                session.pid == pending.pid && session.created_ms == pending.created_ms
+            }) && now.saturating_duration_since(pending.started) < CLOSING_TIMEOUT
+            {
+                next.insert((host, session.name.clone()), pending);
+            }
+        }
+        self.closing = next;
         if let Some(h) = self.host_mut(id) {
             h.sessions = sessions;
         }
@@ -204,10 +239,53 @@ impl Model {
         self.active = Some((host, name));
     }
 
+    pub fn mark_closing(&mut self, host: HostId, name: &str) -> bool {
+        let Some(session) = self
+            .host(host)
+            .and_then(|host| host.sessions.iter().find(|session| session.name == name))
+        else {
+            return false;
+        };
+        let key = (host, name.to_string());
+        if self.closing.get(&key).is_some_and(|pending| {
+            pending.pid == session.pid
+                && pending.created_ms == session.created_ms
+                && pending.started.elapsed() < CLOSING_TIMEOUT
+        }) {
+            return false;
+        }
+        self.closing.insert(
+            key,
+            ClosingSession {
+                pid: session.pid,
+                created_ms: session.created_ms,
+                started: Instant::now(),
+            },
+        );
+        true
+    }
+
+    pub fn is_closing(&self, host: HostId, name: &str) -> bool {
+        let Some(session) = self
+            .host(host)
+            .and_then(|host| host.sessions.iter().find(|session| session.name == name))
+        else {
+            return false;
+        };
+        self.closing
+            .get(&(host, name.to_string()))
+            .is_some_and(|pending| {
+                pending.pid == session.pid
+                    && pending.created_ms == session.created_ms
+                    && pending.started.elapsed() < CLOSING_TIMEOUT
+            })
+    }
+
     /// Optimistically rename a session locally so the sidebar (and the active
     /// selection, if it was the renamed one) update immediately; the next list
     /// poll confirms it, or reverts it if the daemon rejected the rename.
     pub fn rename_session(&mut self, host: HostId, old: &str, new: &str) {
+        let pending = self.closing.remove(&(host, old.to_string()));
         if let Some(h) = self.host_mut(host)
             && let Some(s) = h.sessions.iter_mut().find(|s| s.name == old)
         {
@@ -219,6 +297,9 @@ impl Model {
             .is_some_and(|(h, n)| *h == host && n == old)
         {
             self.active = Some((host, new.to_string()));
+        }
+        if let Some(pending) = pending {
+            self.closing.insert((host, new.to_string()), pending);
         }
     }
 
@@ -450,6 +531,83 @@ mod tests {
         assert!(m.is_active(LOCAL_ID, "web"));
         m.set_sessions(LOCAL_ID, vec![info("logs", 0, 0)]);
         assert_eq!(m.active, None);
+    }
+
+    #[test]
+    fn closing_state_survives_a_stale_list_and_clears_when_the_session_is_gone() {
+        let identified = |name: &str, pid: u32, created_ms: u64| {
+            let mut session = info(name, created_ms, 0);
+            session.pid = pid;
+            session
+        };
+        let mut m = Model::with_local();
+        m.set_sessions(
+            LOCAL_ID,
+            vec![identified("web", 42, 100), identified("logs", 43, 101)],
+        );
+        assert!(m.mark_closing(LOCAL_ID, "web"));
+        assert!(!m.mark_closing(LOCAL_ID, "web"));
+        assert!(m.is_closing(LOCAL_ID, "web"));
+
+        let remote = m.add_remote(spec_id(17, "me", "remote", 22));
+        m.set_sessions(remote, vec![identified("web", 42, 100)]);
+        assert!(
+            m.is_closing(LOCAL_ID, "web"),
+            "another host's list must not clear a local pending close"
+        );
+
+        m.set_sessions(
+            LOCAL_ID,
+            vec![identified("web", 42, 100), identified("logs", 43, 101)],
+        );
+        assert!(m.is_closing(LOCAL_ID, "web"));
+
+        m.set_sessions(
+            LOCAL_ID,
+            vec![identified("api", 42, 100), identified("logs", 43, 101)],
+        );
+        assert!(
+            m.is_closing(LOCAL_ID, "api"),
+            "an external rename must carry the pending close by stable identity"
+        );
+
+        m.set_sessions(LOCAL_ID, vec![identified("logs", 43, 101)]);
+        assert!(!m.is_closing(LOCAL_ID, "api"));
+
+        m.set_sessions(
+            LOCAL_ID,
+            vec![identified("web", 44, 200), identified("logs", 43, 101)],
+        );
+        assert!(m.mark_closing(LOCAL_ID, "web"));
+        m.set_sessions(
+            LOCAL_ID,
+            vec![identified("web", 45, 201), identified("logs", 43, 101)],
+        );
+        assert!(
+            !m.is_closing(LOCAL_ID, "web"),
+            "a new same-name session must not inherit an old pending close"
+        );
+
+        assert!(m.mark_closing(LOCAL_ID, "logs"));
+        m.closing
+            .get_mut(&(LOCAL_ID, "logs".to_string()))
+            .unwrap()
+            .started = Instant::now() - CLOSING_TIMEOUT;
+        m.set_sessions(
+            LOCAL_ID,
+            vec![identified("web", 45, 201), identified("logs", 43, 101)],
+        );
+        assert!(
+            !m.is_closing(LOCAL_ID, "logs"),
+            "a failed close must time out and allow another attempt"
+        );
+
+        assert!(m.mark_closing(LOCAL_ID, "logs"));
+        m.set_state(LOCAL_ID, HostState::Down("connection lost".to_string()));
+        assert!(
+            !m.is_closing(LOCAL_ID, "logs"),
+            "a dropped host cannot leave an unsendable close pending"
+        );
     }
 
     #[test]
