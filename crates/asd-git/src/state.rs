@@ -98,6 +98,12 @@ pub struct GitGraph {
     /// Which pane has keyboard focus. Task 8 moves this; here it only
     /// decides the detail pane's border colour.
     focus: Pane,
+    /// Which row is selected in the changed-files pane. Task 8 moves this;
+    /// here it only decides which row `draw_files` highlights.
+    file_selected: usize,
+    /// Rows scrolled past in the changed-files pane. Task 8 moves this; here
+    /// it only affects which rows `draw_files` skips.
+    file_scroll: usize,
 }
 
 impl GitGraph {
@@ -125,6 +131,8 @@ impl GitGraph {
             layout: LayoutMap::default(),
             detail_scroll: 0,
             focus: Pane::Graph,
+            file_selected: 0,
+            file_scroll: 0,
         };
         me.reload();
         me.load_more(PAGE_FIRST);
@@ -186,6 +194,12 @@ impl GitGraph {
                     Ok(diff) => DetailState::Ready(diff),
                     Err(msg) => DetailState::Failed(msg),
                 };
+                // A new commit's file list must start at its first file, not
+                // wherever the previous commit's list happened to leave off.
+                if matches!(self.detail, DetailState::Ready(_)) {
+                    self.file_selected = 0;
+                    self.file_scroll = 0;
+                }
                 true
             }
             // File replies are handled in the task that adds the file view.
@@ -464,6 +478,14 @@ impl Widget for &mut GitGraph {
             &self.detail,
             self.detail_scroll,
             self.focus == Pane::Detail,
+        );
+        crate::ui::file_list::draw_files(
+            buf,
+            map.files,
+            &self.detail,
+            self.file_selected,
+            self.file_scroll,
+            self.focus == Pane::Files,
         );
     }
 }
