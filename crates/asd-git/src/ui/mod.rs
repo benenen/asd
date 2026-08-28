@@ -6,4 +6,5 @@ pub mod colors;
 pub mod commit_detail;
 pub mod file_list;
 pub mod graph_view;
+pub mod highlight;
 pub mod layout;
