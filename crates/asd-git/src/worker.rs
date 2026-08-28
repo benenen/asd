@@ -129,6 +129,26 @@ impl DiffWorker {
     pub(crate) fn thread_finished_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.finished)
     }
+
+    /// Close the request side of the channel without touching the reply
+    /// side, so a reply already sent by the background thread stays sitting
+    /// in `rx`, retrievable by `drain`, after the thread notices the closed
+    /// request channel and exits.
+    ///
+    /// This lets a test reproduce, deterministically rather than by racing
+    /// real timing, the exact sequence `poll` must handle correctly: the
+    /// worker thread finishing a request, sending its reply, and then dying,
+    /// all before the reply is drained. Assigning over `self.tx` drops the
+    /// original sender, which is what makes the background thread's next
+    /// `recv` on the paired receiver fail; any request already queued ahead
+    /// of that point is still delivered first, so this does not lose work
+    /// that was already accepted.
+    #[cfg(test)]
+    pub(crate) fn close_requests_for_test(&mut self) {
+        let (tx, rx) = channel::<Request>();
+        drop(rx);
+        self.tx = tx;
+    }
 }
 
 /// The thread body. Returns when the request channel closes.

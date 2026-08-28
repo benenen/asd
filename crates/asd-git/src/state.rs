@@ -133,18 +133,29 @@ impl GitGraph {
 
     /// Take everything the worker finished. Returns true when the frame needs
     /// repainting.
+    ///
+    /// Replies are applied before the worker's aliveness is acted on. There
+    /// is no cancellation, so a request always completes; if the thread dies
+    /// right after sending its last reply, that reply is still sitting in
+    /// the channel when `drain` takes it, and it must be shown rather than
+    /// thrown away in favour of a bare "unavailable". Aliveness is only a
+    /// backstop for the request that death left with no answer at all: if
+    /// nothing resolved the outstanding request, `detail` is still `Loading`
+    /// after the loop below, and a `Loading` that will now never resolve is
+    /// exactly when the fallback belongs.
     pub fn poll(&mut self) -> bool {
         let Some(worker) = self.worker.as_mut() else {
             return false;
         };
         let replies = worker.drain();
-        if !worker.is_alive() && !matches!(self.detail, DetailState::Unavailable) {
-            self.detail = DetailState::Unavailable;
-            return true;
-        }
+        let alive = worker.is_alive();
         let mut dirty = false;
         for reply in replies {
             dirty |= self.accept_reply(reply);
+        }
+        if !alive && matches!(self.detail, DetailState::Loading) {
+            self.detail = DetailState::Unavailable;
+            dirty = true;
         }
         dirty
     }
@@ -632,6 +643,61 @@ mod tests {
         assert!(
             matches!(g.detail(), DetailState::Loading),
             "a stale reply must not become the current detail"
+        );
+    }
+
+    #[test]
+    fn a_reply_that_arrives_as_the_worker_dies_is_still_applied() {
+        // There is no cancellation: an in-flight request always completes,
+        // so its reply can still be sitting in the channel at the exact
+        // moment the background thread notices its work channel closed and
+        // exits. `poll` must apply that reply before it acts on the death,
+        // not instead of it -- otherwise a perfectly good diff is thrown
+        // away in favour of "unavailable". `close_requests_for_test`
+        // reproduces this deterministically: it closes only the request
+        // side of the channel, so the one request `open` already queued is
+        // still delivered and answered before the thread sees the closed
+        // channel and exits, leaving its reply sitting in `rx` unread.
+        let fx = Fixture::new("state-die-with-reply");
+        std::fs::write(fx.path().join("a.txt"), "one\ntwo\n").unwrap();
+        fx.git(&["add", "a.txt"]);
+        fx.commit("first");
+
+        let mut g = GitGraph::open(fx.path()).expect("fixture opens");
+        // `open` already posted a request for the newest (only) commit.
+        assert!(matches!(g.detail(), DetailState::Loading));
+
+        let worker = g.worker.as_mut().expect("worker started");
+        let finished = worker.thread_finished_flag();
+        worker.close_requests_for_test();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker thread never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // The thread is gone, but its final reply is still queued, unread.
+        assert!(g.poll(), "applying the final reply must repaint");
+        match g.detail() {
+            DetailState::Ready(d) => {
+                assert_eq!(d.files.len(), 1);
+                assert_eq!(d.files[0].path, "a.txt");
+            }
+            other => {
+                panic!("the reply that beat the death notice must still be applied, got {other:?}")
+            }
+        }
+
+        // Nothing is left outstanding, and the worker's death was already
+        // noticed: a second poll must settle rather than keep reporting
+        // change forever.
+        assert!(
+            !g.poll(),
+            "no outstanding work once the worker's death has been noticed"
         );
     }
 
