@@ -84,12 +84,16 @@ fn decoration_text(refs: &[RefInfo]) -> String {
 /// Write `text` at `(x, y)`, stopping at `area`'s right edge. Returns the
 /// column just past what was written.
 ///
+/// This is the crate's single clamped text writer: every pane that draws
+/// arbitrary text (commit summaries, hashes, decorations, and the panes added
+/// in later tasks) goes through it rather than writing buffer cells directly.
+///
 /// `x` is clamped to `area`'s left edge before anything is written: a caller
 /// that computes a starting column from a saturating subtraction (the hash
 /// column, on a narrow area) can otherwise hand back a value that undershoots
 /// `area.x`, which would write outside the intended region — or outside the
 /// buffer entirely, if the buffer's own area is no wider than `area`.
-fn put(buf: &mut Buffer, area: Rect, x: u16, y: u16, text: &str, style: Style) -> u16 {
+pub(crate) fn put(buf: &mut Buffer, area: Rect, x: u16, y: u16, text: &str, style: Style) -> u16 {
     let mut cx = x.max(area.x);
     let right = area.x.saturating_add(area.width);
     for ch in text.chars() {

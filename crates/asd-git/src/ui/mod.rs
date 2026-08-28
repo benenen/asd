@@ -3,5 +3,6 @@
 //! sit on screen — is `layout`.
 
 pub mod colors;
+pub mod commit_detail;
 pub mod graph_view;
 pub mod layout;

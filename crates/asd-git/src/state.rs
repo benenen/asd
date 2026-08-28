@@ -16,7 +16,7 @@ use crate::git::graph::GraphBuilder;
 use crate::git::refs::RefInfo;
 use crate::git::repo::{OpenError, Repo};
 use crate::ui::graph_view::draw_rows;
-use crate::ui::layout::LayoutMap;
+use crate::ui::layout::{LayoutMap, Pane};
 
 /// Rows fed into the *layout* before the first frame. Large enough to fill any
 /// terminal several times over, small enough that the first layout is cheap.
@@ -92,6 +92,12 @@ pub struct GitGraph {
     /// The three panes' rectangles from the last frame, so a mouse event can
     /// be routed to the pane it landed in. Empty until the first render.
     layout: LayoutMap,
+    /// Lines scrolled past in the detail pane. Task 8 moves this; here it
+    /// only affects which rows `draw_detail` skips.
+    detail_scroll: usize,
+    /// Which pane has keyboard focus. Task 8 moves this; here it only
+    /// decides the detail pane's border colour.
+    focus: Pane,
 }
 
 impl GitGraph {
@@ -117,6 +123,8 @@ impl GitGraph {
             detail: DetailState::Unavailable,
             detail_for: None,
             layout: LayoutMap::default(),
+            detail_scroll: 0,
+            focus: Pane::Graph,
         };
         me.reload();
         me.load_more(PAGE_FIRST);
@@ -448,6 +456,14 @@ impl Widget for &mut GitGraph {
             &self.decorations,
             self.first_row,
             self.selected,
+        );
+        crate::ui::commit_detail::draw_detail(
+            buf,
+            map.detail,
+            self.selected_commit(),
+            &self.detail,
+            self.detail_scroll,
+            self.focus == Pane::Detail,
         );
     }
 }
