@@ -966,7 +966,13 @@ impl Widget for &mut GitGraph {
             // screen is that keys stopped doing what they did is a trap, and
             // `Esc` is the only way out of it.
             if self.mode == Mode::Search {
-                crate::ui::search::draw_search(buf, inner, &self.search, self.builder.nodes());
+                crate::ui::search::draw_search(
+                    buf,
+                    inner,
+                    &self.search,
+                    self.builder.nodes(),
+                    self.pending.len(),
+                );
             }
             return;
         }
@@ -1003,7 +1009,16 @@ impl Widget for &mut GitGraph {
         // Last, and over the graph pane: it is a layer on top of the three
         // panes rather than one of them, and the rows it lists are graph rows.
         if self.mode == Mode::Search {
-            crate::ui::search::draw_search(buf, map.graph, &self.search, self.builder.nodes());
+            crate::ui::search::draw_search(
+                buf,
+                map.graph,
+                &self.search,
+                self.builder.nodes(),
+                // `reload` drains the whole walk into `pending` up front, so
+                // its length is exactly how many commits the layout has not
+                // taken yet — the rows `rank` could not see.
+                self.pending.len(),
+            );
         }
     }
 }
@@ -2207,6 +2222,54 @@ mod tests {
             "the graph did not scroll under the dropdown"
         );
         assert_eq!(g.mode(), Mode::Search);
+    }
+
+    /// The dropdown's "not loaded" warning has to come from the graph's real
+    /// backlog, not from a constant. `reload` drains the whole walk into
+    /// `pending` and `load_more` takes from it, so `pending.len()` is exactly
+    /// the number of commits `rank` could not see. Reaching `PAGE_FIRST` with
+    /// a fixture would mean 500 `git commit` invocations, so the backlog is
+    /// planted directly — the wiring is what is under test, not paging.
+    #[test]
+    fn the_dropdown_reports_the_graphs_real_unloaded_backlog() {
+        let (_fx, mut g) = searchable("state-search-backlog");
+        let area = Rect::new(0, 0, 70, 24);
+
+        g.on_key(key(KeyCode::Char('/')));
+        type_query(&mut g, "alpha");
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        assert!(
+            !buffer_text(&buf, area).contains("not loaded"),
+            "a fully loaded graph has nothing to warn about"
+        );
+
+        // Two commits the layout has not taken. `exhausted` goes with them:
+        // it is the flag `load_more` sets when `pending` runs dry.
+        let backlog: Vec<CommitInfo> = ["not loaded one", "not loaded two"]
+            .iter()
+            .map(|summary| CommitInfo {
+                id: gix::ObjectId::empty_blob(gix::hash::Kind::Sha1),
+                parents: Vec::new(),
+                summary: (*summary).into(),
+                author: "asd test".into(),
+                time: 0,
+            })
+            .collect();
+        g.pending = backlog.into_iter();
+        g.exhausted = false;
+
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let text = buffer_text(&buf, area);
+        assert!(
+            text.contains("2 not loaded"),
+            "the backlog must be reported: {text:?}"
+        );
+        assert!(
+            !text.contains("not loaded one"),
+            "an unloaded commit is not searchable, only counted: {text:?}"
+        );
     }
 
     /// Reopening starts from an empty query: the row indices in a stale match
