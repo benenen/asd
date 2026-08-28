@@ -504,6 +504,12 @@ pub(crate) struct App {
     /// Keys typed during the short startup color probe, forwarded after the
     /// first session is selected rather than swallowed.
     startup_input: Vec<u8>,
+    /// True after selecting a session and before its authoritative Snapshot
+    /// has populated the new local VT. Paste mode is unknown in this window.
+    snapshot_pending: bool,
+    /// Paste events captured while `snapshot_pending`. Keep event boundaries
+    /// so each one is encoded independently after the new VT mode is known.
+    pending_pastes: Vec<String>,
     /// The session this UI itself runs inside ($ASD_SESSION, set by the
     /// daemon at spawn): attaching it would be a render feedback loop, so it
     /// is never selectable here.
@@ -680,11 +686,22 @@ pub fn run(socket: PathBuf, session: Option<String>) -> anyhow::Result<()> {
         ratatui::restore();
         prev_hook(info);
     }));
-    let _ = execute!(
+    if let Err(error) = execute!(
         std::io::stdout(),
         event::EnableMouseCapture,
         event::EnableBracketedPaste
-    );
+    ) {
+        // Enabling mouse capture may have succeeded before bracketed paste
+        // failed. Undo both plus raw/alternate-screen state before surfacing
+        // the error; silently continuing would turn pasted newlines into Enter.
+        let _ = execute!(
+            std::io::stdout(),
+            event::DisableBracketedPaste,
+            event::DisableMouseCapture
+        );
+        ratatui::restore();
+        return Err(anyhow::Error::new(error).context("enabling host input modes"));
+    }
 
     let result = event_loop(&mut terminal, &frame, socket, session, probe);
 
@@ -761,6 +778,8 @@ fn event_loop(
         preferred,
         terminal_appearance: probe.appearance,
         startup_input: probe.input,
+        snapshot_pending: false,
+        pending_pastes: Vec::new(),
         self_session: std::env::var("ASD_SESSION").ok(),
         cache: None,
         parked: Vec::new(),
@@ -1179,6 +1198,8 @@ impl App {
         // bound is generous; a failed attach clears the hold via its own
         // event well before this.
         self.pane_hold = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        self.snapshot_pending = true;
+        self.pending_pastes.clear();
         self.vt = Some(GhosttyVt::new(self.grid.0, self.grid.1, SCROLLBACK));
         self.vt_grid = self.grid;
         self.scroll = 0;
@@ -1241,6 +1262,8 @@ impl App {
                 self.active = None;
                 self.view_revoked = None;
                 self.vt = None;
+                self.snapshot_pending = false;
+                self.pending_pastes.clear();
                 self.pane_cache = None;
                 // Otherwise the bar keeps showing the last CPU/memory/network
                 // reading, frozen, beside a clock that is local and keeps
@@ -1290,6 +1313,8 @@ impl App {
                     self.active = None;
                     self.view_revoked = None;
                     self.vt = None;
+                    self.snapshot_pending = false;
+                    self.pending_pastes.clear();
                 }
                 if self.active.is_none() {
                     let not_self = |name: &str| self.self_session.as_deref() != Some(name);
@@ -1370,6 +1395,13 @@ impl App {
                     let input = asd_client::terminal::prepare_probe_input(input, bracketed);
                     self.send(Cmd::Input(input));
                 }
+                if snapshot {
+                    self.snapshot_pending = false;
+                    for paste in std::mem::take(&mut self.pending_pastes) {
+                        let input = self.paste(&paste);
+                        self.send(Cmd::Input(input));
+                    }
+                }
                 // The terminal changed: the pane must regenerate next draw.
                 self.pane_needs_render = true;
                 if snapshot {
@@ -1387,6 +1419,8 @@ impl App {
                     // Whatever the pane was holding for is not coming.
                     self.pane_hold = None;
                     self.cache = None;
+                    self.snapshot_pending = false;
+                    self.pending_pastes.clear();
                 }
             }
             Ev::ViewRevoked {
@@ -1400,6 +1434,8 @@ impl App {
                     self.view_revoked = Some(name.clone());
                     self.notice = Some(format!("{name} — view opened in another asd ui"));
                     self.vt = None;
+                    self.snapshot_pending = false;
+                    self.pending_pastes.clear();
                     self.cache = None;
                     self.pane_hold = None;
                     self.pane_cache = None;
@@ -1451,6 +1487,10 @@ impl App {
             self.pane_needs_render = true;
         }
         self.scroll = 0;
+        if self.snapshot_pending {
+            self.pending_pastes.push(text.to_string());
+            return;
+        }
         let bytes = self.paste(text);
         self.send(Cmd::Input(bytes));
     }

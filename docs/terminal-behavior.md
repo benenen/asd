@@ -118,9 +118,16 @@ coordinates are 1:1, so translating them would be incorrect.
 Bracketed paste (`2004`) follows the application's current mode:
 
 - `asd attach` mirrors mode 2004 so the host adds bracket markers and forwards
-  the resulting bytes;
+  the resulting bytes. On Windows it holds virtual-terminal input for the live
+  attach loop, otherwise Console filters those markers before stdin sees them;
 - `asd ui` receives `Event::Paste` after crossterm has stripped the host
-  markers, so it conditionally restores them around the payload;
+  markers, so it conditionally restores them around the payload. Its pinned
+  crossterm Windows VT-input adapter supplies that same event on modern
+  Windows terminals and retains the Win32 fallback elsewhere;
+- while an initial attach or session switch is waiting for its Snapshot,
+  `asd ui` preserves paste-event boundaries and delays encoding until the new
+  session's mode 2004 state is authoritative; an empty or parked VT must never
+  decide how the paste is sent;
 - do not add markers when the application did not request 2004, or they appear
   as literal text;
 - remove an embedded closing marker from pasted content before wrapping it, so

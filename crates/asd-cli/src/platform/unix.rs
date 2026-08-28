@@ -96,6 +96,15 @@ fn process_alive(pid: i32) -> bool {
 
 // ---- Terminal ---------------------------------------------------------------
 
+/// Unix already exposes terminal input as a VT byte stream.
+pub(crate) struct VtInputGuard;
+
+impl VtInputGuard {
+    pub(crate) fn enable() -> anyhow::Result<Self> {
+        Ok(Self)
+    }
+}
+
 /// Terminal size; 80×24 when unavailable (not a tty).
 pub(crate) fn term_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };

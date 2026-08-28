@@ -110,6 +110,79 @@ mod win32 {
 
 // ---- Terminal ---------------------------------------------------------------
 
+const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+fn with_vt_input(mode: u32) -> u32 {
+    mode | ENABLE_VIRTUAL_TERMINAL_INPUT
+}
+
+fn restore_vt_input(mode: u32, enabled_before: bool) -> u32 {
+    if enabled_before {
+        mode | ENABLE_VIRTUAL_TERMINAL_INPUT
+    } else {
+        mode & !ENABLE_VIRTUAL_TERMINAL_INPUT
+    }
+}
+
+fn console_input_mode() -> std::io::Result<u32> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE};
+
+    let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if input.is_null() || input == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut mode = 0u32;
+    if unsafe { GetConsoleMode(input, &mut mode) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(mode)
+}
+
+fn set_console_input_mode(mode: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+
+    let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if input.is_null() || input == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { SetConsoleMode(input, mode) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Keeps stdin on the VT byte transport for the live attach loop.
+///
+/// Unlike the TUI, `asd attach` reads raw stdin bytes rather than crossterm
+/// events. Windows filters bracketed-paste and SGR mouse sequences unless VT
+/// input is enabled, so hold that one console bit until the screen guard has
+/// disabled the corresponding host modes. Every other live console-mode bit
+/// is preserved on restore.
+pub(crate) struct VtInputGuard {
+    enabled_before: bool,
+}
+
+impl VtInputGuard {
+    pub(crate) fn enable() -> anyhow::Result<Self> {
+        let mode = console_input_mode().context("reading Windows console input mode")?;
+        set_console_input_mode(with_vt_input(mode))
+            .context("enabling Windows virtual terminal input")?;
+        Ok(Self {
+            enabled_before: mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0,
+        })
+    }
+}
+
+impl Drop for VtInputGuard {
+    fn drop(&mut self) {
+        if let Ok(mode) = console_input_mode() {
+            let _ = set_console_input_mode(restore_vt_input(mode, self.enabled_before));
+        }
+    }
+}
+
 /// Terminal size; 80×24 when unavailable (not a tty).
 pub(crate) fn term_size() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or((80, 24))
@@ -156,4 +229,35 @@ impl Winch {
 
 pub(crate) fn winch() -> anyhow::Result<Winch> {
     Ok(Winch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VT_INPUT: u32 = 0x0200;
+
+    #[test]
+    fn enabling_vt_input_preserves_every_other_console_mode() {
+        let original = 0x0008 | 0x0040;
+        assert_eq!(with_vt_input(original), original | VT_INPUT);
+    }
+
+    #[test]
+    fn restoring_vt_input_changes_only_the_bit_the_guard_owns() {
+        let current = 0x0008 | 0x0040 | VT_INPUT;
+        assert_eq!(restore_vt_input(current, false), current & !VT_INPUT);
+        assert_eq!(restore_vt_input(current & !VT_INPUT, true), current);
+    }
+
+    #[test]
+    #[ignore = "requires a real Windows console"]
+    fn vt_input_guard_enables_and_restores_the_console_mode() {
+        let before = console_input_mode().unwrap();
+        {
+            let _guard = VtInputGuard::enable().unwrap();
+            assert_ne!(console_input_mode().unwrap() & VT_INPUT, 0);
+        }
+        assert_eq!(console_input_mode().unwrap() & VT_INPUT, before & VT_INPUT);
+    }
 }

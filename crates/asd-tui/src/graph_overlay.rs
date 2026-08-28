@@ -260,6 +260,8 @@ mod tests {
             preferred: None,
             terminal_appearance: Default::default(),
             startup_input: Vec::new(),
+            snapshot_pending: false,
+            pending_pastes: Vec::new(),
             // Never inherited from the environment: this test process may
             // itself be running inside an asd session.
             self_session: None,
@@ -488,6 +490,60 @@ mod tests {
             other => panic!("an unobstructed paste is session input: {other:?}"),
         }
         assert_eq!(app.scroll, 0, "and it jumps the pane back to live");
+    }
+
+    #[test]
+    fn paste_during_initial_attach_waits_for_the_snapshot_mode() {
+        let (mut app, mut cmds) = app_watching_commands();
+        app.select("demo".to_string());
+        assert!(matches!(cmds.try_recv(), Ok(Cmd::Attach { name, .. }) if name == "demo"));
+
+        app.on_paste("echo one\recho two");
+        assert!(matches!(
+            cmds.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        app.on_conn_event(Ev::Bytes {
+            name: "demo".to_string(),
+            data: b"\x1b[?2004h".to_vec(),
+            snapshot: true,
+        });
+        assert!(matches!(
+            cmds.try_recv(),
+            Ok(Cmd::Input(bytes))
+                if bytes == b"\x1b[200~echo one\recho two\x1b[201~"
+        ));
+    }
+
+    #[test]
+    fn paste_during_switch_uses_the_new_sessions_mode() {
+        let (mut app, mut cmds) = app_watching_commands();
+        app.select("old".to_string());
+        assert!(matches!(cmds.try_recv(), Ok(Cmd::Attach { name, .. }) if name == "old"));
+        app.on_conn_event(Ev::Bytes {
+            name: "old".to_string(),
+            data: b"\x1b[?2004h".to_vec(),
+            snapshot: true,
+        });
+
+        app.select("new".to_string());
+        assert!(matches!(cmds.try_recv(), Ok(Cmd::Attach { name, .. }) if name == "new"));
+        app.on_paste("line one\rline two");
+        assert!(matches!(
+            cmds.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        app.on_conn_event(Ev::Bytes {
+            name: "new".to_string(),
+            data: Vec::new(),
+            snapshot: true,
+        });
+        assert!(matches!(
+            cmds.try_recv(),
+            Ok(Cmd::Input(bytes)) if bytes == b"line one\rline two"
+        ));
     }
 
     #[test]
