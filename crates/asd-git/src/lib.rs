@@ -17,4 +17,5 @@ pub use git::refs::{RefInfo, RefKind};
 pub use git::repo::{OpenError, Repo};
 pub use state::{DetailState, GitGraph, Outcome, PAGE_FIRST};
 pub use ui::colors::{LANE_COLORS, lane_color};
+pub use ui::layout::{LayoutMap, Pane, pane_at, split};
 pub use worker::{DiffWorker, Reply, Request};

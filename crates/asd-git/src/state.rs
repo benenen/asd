@@ -16,6 +16,7 @@ use crate::git::graph::GraphBuilder;
 use crate::git::refs::RefInfo;
 use crate::git::repo::{OpenError, Repo};
 use crate::ui::graph_view::draw_rows;
+use crate::ui::layout::LayoutMap;
 
 /// Rows fed into the *layout* before the first frame. Large enough to fill any
 /// terminal several times over, small enough that the first layout is cheap.
@@ -88,6 +89,9 @@ pub struct GitGraph {
     /// Which commit the outstanding request (if any) is for. A reply whose id
     /// does not match this is stale and must be discarded.
     detail_for: Option<gix::ObjectId>,
+    /// The three panes' rectangles from the last frame, so a mouse event can
+    /// be routed to the pane it landed in. Empty until the first render.
+    layout: LayoutMap,
 }
 
 impl GitGraph {
@@ -112,6 +116,7 @@ impl GitGraph {
             worker,
             detail: DetailState::Unavailable,
             detail_for: None,
+            layout: LayoutMap::default(),
         };
         me.reload();
         me.load_more(PAGE_FIRST);
@@ -433,9 +438,12 @@ impl Widget for &mut GitGraph {
             crate::ui::graph_view::draw_message(buf, inner, &msg);
             return;
         }
+        let map = crate::ui::layout::split(inner);
+        self.layout = map; // remembered for mouse routing
+        self.viewport_rows = map.graph.height as usize;
         draw_rows(
             buf,
-            inner,
+            map.graph,
             self.builder.nodes(),
             &self.decorations,
             self.first_row,
