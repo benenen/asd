@@ -128,7 +128,11 @@ pub fn draw_files(
         // searching the already-formatted text (which is measured in bytes
         // and disagrees with `put` the moment anything upstream is not
         // plain ASCII).
-        if file.binary {
+        if file.unreadable.is_some() {
+            // Marked, not omitted: the row says why the counts are missing,
+            // and the rest of the commit is listed either way.
+            put(buf, inner, x, y, "  unreadable", base.fg(RED));
+        } else if file.binary {
             put(buf, inner, x, y, "  binary", base.fg(DIM));
         } else {
             let x = put(
@@ -176,6 +180,7 @@ mod tests {
             insertions: ins,
             removals: rem,
             binary: false,
+            unreadable: None,
         }
     }
 
@@ -218,6 +223,25 @@ mod tests {
             "{}",
             text_of(&buf, area)
         );
+    }
+
+    /// An unreadable blob is neither binary nor a file with no changes:
+    /// showing `+0 -0` would be a wrong answer where "unreadable" is the
+    /// honest one, and the row exists at all because the rest of the commit
+    /// is still listed around it.
+    #[test]
+    fn an_unreadable_file_says_so_instead_of_showing_zero_counts() {
+        let area = Rect::new(0, 0, 50, 6);
+        let mut buf = Buffer::empty(area);
+        let mut bad = stat("a.txt", FileChange::Modified, 0, 0);
+        bad.unreadable = Some("reading a file's blobs: loose object".into());
+        let good = stat("b.txt", FileChange::Modified, 3, 1);
+        draw_files(&mut buf, area, &ready(vec![bad, good]), 0, 0, false);
+        let text = text_of(&buf, area);
+        assert!(text.contains("unreadable"), "{text}");
+        assert!(!text.contains("+0"), "no invented counts: {text}");
+        assert!(text.contains("b.txt"), "the other file survives: {text}");
+        assert!(text.contains("+3"), "with its own counts: {text}");
     }
 
     #[test]

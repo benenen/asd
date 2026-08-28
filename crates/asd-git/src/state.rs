@@ -1209,6 +1209,55 @@ mod tests {
         );
     }
 
+    /// Since the uncommitted row exists, "the selected row is not a commit"
+    /// is an ordinary state rather than the connector-row curiosity it was:
+    /// `g`/`Home` lands on it whenever the tree is dirty, and `open` starts
+    /// there. Moving onto such a row must clear the detail rather than leave
+    /// the previous commit's diff on screen under a row it does not describe,
+    /// and a reply for that previous commit must no longer be accepted.
+    #[test]
+    fn selecting_a_row_with_no_commit_clears_the_detail() {
+        let fx = Fixture::new("state-noncommit-detail");
+        std::fs::write(fx.path().join("a.txt"), "1\n").unwrap();
+        fx.git(&["add", "."]);
+        fx.commit("first");
+        std::fs::write(fx.path().join("dirty.txt"), "x\n").unwrap();
+
+        let mut g = GitGraph::open(fx.path()).expect("fixture opens");
+        assert_eq!(g.row_count(), 2, "one commit plus the synthetic row");
+
+        // Down onto the commit, and answer its request, so there is a real
+        // diff on screen for the move back to clear.
+        g.on_key(key(KeyCode::Char('j')));
+        let id = g.selected_id().expect("row 1 is the commit");
+        assert!(g.accept_reply_for_test(asd_git_reply_commit(id)));
+        assert!(matches!(g.detail(), DetailState::Ready(_)));
+
+        // `g` goes back to row 0, which stands for no commit at all.
+        g.on_key(key(KeyCode::Char('g')));
+        assert_eq!(g.selected(), 0);
+        assert_eq!(g.selected_id(), None);
+        assert_eq!(
+            g.detail(),
+            &DetailState::Ready(Default::default()),
+            "an empty detail, not the commit's"
+        );
+        assert!(
+            !g.accept_reply_for_test(asd_git_reply_commit(id)),
+            "a reply for the commit left behind must not land on this row"
+        );
+
+        // And the panes say so rather than describing the commit below.
+        let area = Rect::new(0, 0, 70, 24);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let text = buffer_text(&buf, area);
+        assert!(
+            text.contains("no files changed"),
+            "the files pane is empty for a non-commit row: {text:?}"
+        );
+    }
+
     /// The converse of the test above: a clean tree must not grow a phantom
     /// row, or every repository would show "0 uncommitted changes" forever.
     #[test]
@@ -1883,15 +1932,15 @@ mod tests {
         crate::worker::Reply::File {
             commit,
             path: path.to_string(),
-            result: Ok(crate::worker::HighlightedDiff {
-                diff: crate::git::diff::FileDiff {
+            result: Ok(crate::worker::HighlightedDiff::new(
+                crate::git::diff::FileDiff {
                     path: path.to_string(),
                     lines: Vec::new(),
                     binary: false,
                     truncated: false,
                 },
-                spans: Vec::new(),
-            }),
+                Vec::new(),
+            )),
         }
     }
 

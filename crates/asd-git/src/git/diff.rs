@@ -33,6 +33,15 @@ pub struct FileStat {
     pub removals: u32,
     /// True when the content could not be diffed as text.
     pub binary: bool,
+    /// Why this file's blobs could not be read, when they could not be.
+    ///
+    /// A soft failure: the counts are unknown and stay 0, the row is marked,
+    /// and the rest of the commit is listed as usual. One corrupt object
+    /// blanking both the detail and changed-files panes would say less about
+    /// the commit than listing every file but one — the same reading the
+    /// overlay already takes of an unreadable *commit*, which is surfaced
+    /// beside the history rather than in place of it.
+    pub unreadable: Option<String>,
 }
 
 /// Everything the detail and file panes need for one commit.
@@ -50,6 +59,10 @@ impl Repo {
     ///
     /// Cost is proportional to the commit's size, so this belongs on the worker
     /// thread and never on the thread that paints the UI.
+    ///
+    /// A file whose blobs cannot be read is marked
+    /// ([`FileStat::unreadable`]) rather than failing the call: the other
+    /// files in the commit are still worth showing.
     pub fn commit_diff(&self, id: gix::ObjectId) -> Result<CommitDiff, ReadError> {
         let repo = self.gix();
         let commit = repo
@@ -74,8 +87,6 @@ impl Repo {
             .diff_resource_cache_for_tree_diff()
             .map_err(|e| ReadError::from_err("preparing a diff cache", e))?;
         let mut out = CommitDiff::default();
-        // Raised after the walk, for the reason given in `file_diff`.
-        let mut failure: Option<ReadError> = None;
 
         let walk = old_tree
             .changes()
@@ -109,30 +120,32 @@ impl Repo {
                         insertions: 0,
                         removals: 0,
                         binary: false,
+                        unreadable: None,
                     };
                     // `line_counts` returns `Ok(None)` for a binary blob and
                     // only for that, so binary is the `Ok(None)` arm alone. A
                     // real failure — an unreadable object, an unset resource —
-                    // is an error rather than a file silently listed as binary.
-                    let mut prepared = match change.diff(&mut cache) {
-                        Ok(prepared) => prepared,
+                    // marks the row instead, rather than being listed as
+                    // binary (which would be a wrong answer) or aborting the
+                    // walk (which would hide every other file in the commit).
+                    match change.diff(&mut cache) {
+                        Ok(mut prepared) => match prepared.line_counts() {
+                            Ok(Some(counts)) => {
+                                stat.insertions = counts.insertions;
+                                stat.removals = counts.removals;
+                                out.insertions += counts.insertions;
+                                out.removals += counts.removals;
+                            }
+                            Ok(None) => stat.binary = true,
+                            Err(e) => {
+                                stat.unreadable = Some(
+                                    ReadError::from_err("counting a file's changed lines", e).0,
+                                );
+                            }
+                        },
                         Err(e) => {
-                            failure = Some(ReadError::from_err("reading a file's blobs", e));
-                            return Ok(Action::Break(()));
-                        }
-                    };
-                    match prepared.line_counts() {
-                        Ok(Some(counts)) => {
-                            stat.insertions = counts.insertions;
-                            stat.removals = counts.removals;
-                            out.insertions += counts.insertions;
-                            out.removals += counts.removals;
-                        }
-                        Ok(None) => stat.binary = true,
-                        Err(e) => {
-                            failure =
-                                Some(ReadError::from_err("counting a file's changed lines", e));
-                            return Ok(Action::Break(()));
+                            stat.unreadable =
+                                Some(ReadError::from_err("reading a file's blobs", e).0);
                         }
                     }
                     out.files.push(stat);
@@ -140,12 +153,9 @@ impl Repo {
                 },
             );
 
-        // The callback stops the walk by breaking, which gix then reports as a
-        // cancellation, so the captured cause has to be raised before that
-        // generic error is turned into one.
-        if let Some(e) = failure {
-            return Err(e);
-        }
+        // Nothing in the callback breaks the walk any more, so its only error
+        // is a genuine failure to walk the trees — which is about the commit
+        // rather than about one file, and so is fatal to this call.
         walk.map_err(|e| ReadError::from_err("walking a tree diff", e))?;
 
         out.files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -886,6 +896,18 @@ mod tests {
         }
     }
 
+    /// Corrupt the loose object holding `path` at HEAD.
+    fn corrupt_head_blob(fx: &Fixture, path: &str) {
+        let blob = fx.git(&["rev-parse", &format!("HEAD:{path}")]);
+        let obj = fx
+            .path()
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        assert!(obj.exists(), "{} should be a loose object", obj.display());
+        std::fs::write(&obj, b"not a git object at all").unwrap();
+    }
+
     /// A blob that cannot be read is a failure, not a binary file. Both are
     /// reported through the same gix call sites, and conflating them turns a
     /// corrupt repository into a diff that quietly renders as "binary".
@@ -894,36 +916,78 @@ mod tests {
         let fx = Fixture::new("diff-corrupt");
         write_commit(&fx, "a.txt", "1\n2\n3\n", "first");
         let id = write_commit(&fx, "a.txt", "1\nTWO\n3\n", "change two");
-
-        // Corrupt the loose object holding the new content of a.txt.
-        let blob = fx.git(&["rev-parse", "HEAD:a.txt"]);
-        let obj = fx
-            .path()
-            .join(".git/objects")
-            .join(&blob[..2])
-            .join(&blob[2..]);
-        assert!(obj.exists(), "{} should be a loose object", obj.display());
-        std::fs::write(&obj, b"not a git object at all").unwrap();
+        corrupt_head_blob(&fx, "a.txt");
 
         let repo = Repo::open(fx.path()).unwrap();
         let id: gix::ObjectId = id.parse().unwrap();
 
-        for err in [
-            repo.commit_diff(id).err(),
-            repo.file_diff(id, "a.txt", 2).err(),
-        ] {
-            let err = err.expect("a corrupt blob must not read as a binary file");
-            let msg = err.to_string();
-            // The cause has to survive: gix reports the callback's break as a
-            // bare cancellation, which on its own says nothing useful.
-            assert!(
-                msg.contains("loose object"),
-                "the real cause was swallowed: {msg}"
-            );
-            assert!(
-                !msg.contains("cancelled"),
-                "a cancellation leaked out instead of the cause: {msg}"
-            );
-        }
+        // `file_diff` was asked for this one file and has nothing else to
+        // give back, so it fails — and says why.
+        let Err(err) = repo.file_diff(id, "a.txt", 2) else {
+            panic!("a corrupt blob must not read as a binary file");
+        };
+        let msg = err.to_string();
+        // The cause has to survive: gix reports the callback's break as a
+        // bare cancellation, which on its own says nothing useful.
+        assert!(
+            msg.contains("loose object"),
+            "the real cause was swallowed: {msg}"
+        );
+        assert!(
+            !msg.contains("cancelled"),
+            "a cancellation leaked out instead of the cause: {msg}"
+        );
+
+        // `commit_diff` marks the file instead. Not binary: that would be a
+        // wrong answer rather than a missing one.
+        let d = repo.commit_diff(id).expect("the commit is still readable");
+        let stat = d.files.iter().find(|f| f.path == "a.txt").unwrap();
+        assert!(!stat.binary, "a corrupt blob is not a binary file");
+        let why = stat
+            .unreadable
+            .as_deref()
+            .expect("the row is marked unreadable");
+        assert!(
+            why.contains("loose object"),
+            "the cause was swallowed: {why}"
+        );
+    }
+
+    /// One corrupt object must not blank the whole changed-files pane. The
+    /// commit's other files are exactly what the reader still needs, and the
+    /// overlay already takes that reading one layer up for an unreadable
+    /// *commit*.
+    #[test]
+    fn one_unreadable_file_does_not_hide_the_rest_of_the_commit() {
+        let fx = Fixture::new("diff-corrupt-partial");
+        std::fs::write(fx.path().join("a.txt"), "1\n2\n3\n").unwrap();
+        std::fs::write(fx.path().join("b.txt"), "x\n").unwrap();
+        fx.git(&["add", "."]);
+        fx.commit("first");
+        std::fs::write(fx.path().join("a.txt"), "1\nTWO\n3\n").unwrap();
+        std::fs::write(fx.path().join("b.txt"), "x\ny\n").unwrap();
+        fx.git(&["add", "."]);
+        let id = fx.commit("change both");
+        corrupt_head_blob(&fx, "a.txt");
+
+        let repo = Repo::open(fx.path()).unwrap();
+        let d = repo
+            .commit_diff(id.parse().unwrap())
+            .expect("one bad blob must not fail the commit");
+
+        let paths: Vec<&str> = d.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.txt", "b.txt"], "both files are still listed");
+        assert!(d.files[0].unreadable.is_some(), "the bad one is marked");
+        assert_eq!(
+            (
+                d.files[1].insertions,
+                d.files[1].removals,
+                &d.files[1].unreadable
+            ),
+            (1, 0, &None),
+            "the good one still carries real counts"
+        );
+        // The header totals are what could be counted, not zero.
+        assert_eq!((d.insertions, d.removals), (1, 0));
     }
 }

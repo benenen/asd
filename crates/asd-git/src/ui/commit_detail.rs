@@ -1,4 +1,17 @@
-//! The commit detail pane: who wrote this commit, when, and its message.
+//! The commit detail pane: who wrote this commit, when, how much it changed,
+//! and its summary line.
+//!
+//! The summary line, and only that. [`CommitInfo::summary`] comes from gix's
+//! `message.summary()`, which folds everything up to the first blank line into
+//! one line, so a commit *body* is not shown here — nor anywhere else in the
+//! overlay. Carrying it is a later phase's feature; what this doc must not do
+//! is promise "its message" and leave the reader hunting for the rest.
+//!
+//! One consequence is worth knowing before wondering whether the scroll is
+//! broken: the pane is six rows for any commit, which is shorter than any
+//! realistic pane, so `Tab` to it followed by `j`/`k`/`Ctrl+d` clamps to a
+//! no-op every time. The scroll is wired and correct; it has nothing to
+//! scroll until there is a body to put in it.
 //!
 //! Every index is clamped to `area` before use. This runs on `asd ui`'s render
 //! thread, where an out-of-bounds write blanks every session's display.
@@ -72,6 +85,10 @@ pub fn draw_detail(
         }
     }
     rows.push((String::new(), plain));
+    // `summary` is one line by construction, as the module doc explains, so
+    // this runs exactly once. It stays a loop because that is what keeps the
+    // pane correct — rather than painting an escaped newline across a row —
+    // on the day a later phase carries the commit body on `CommitInfo`.
     for line in commit.summary.lines() {
         rows.push((
             line.to_string(),
@@ -180,6 +197,7 @@ mod tests {
                 insertions: 3,
                 removals: 1,
                 binary: false,
+                unreadable: None,
             }],
             insertions: 3,
             removals: 1,

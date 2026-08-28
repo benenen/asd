@@ -71,6 +71,39 @@ pub struct HighlightedDiff {
     /// [`MAX_HIGHLIGHT_LINES`], and empty for a binary diff. A line with no
     /// entry is painted unstyled, so the view must index this with `get`.
     pub spans: Vec<Vec<(Style, String)>>,
+    /// Display width of the widest line number in `diff`, which is how wide
+    /// the viewer's gutter has to be.
+    ///
+    /// Sized against the whole diff, not the visible window, so the gutter
+    /// does not jump about as the reader scrolls — and measured here, once,
+    /// for the same reason `spans` is. It is a pure function of the diff, and
+    /// deriving it in the view walked every line of a diff up to
+    /// [`crate::git::diff::MAX_DIFF_LINES`] long, per frame, on the thread
+    /// that paints every open session.
+    pub num_w: usize,
+}
+
+/// Decimal digits in `n`, without allocating.
+fn digits(n: u32) -> usize {
+    n.checked_ilog10().unwrap_or(0) as usize + 1
+}
+
+impl HighlightedDiff {
+    /// Pair a diff with the spans computed for it, measuring the gutter once.
+    pub fn new(diff: FileDiff, spans: Vec<Vec<(Style, String)>>) -> Self {
+        let num_w = diff
+            .lines
+            .iter()
+            .map(|l| match l {
+                DiffLine::Context { old, new, .. } => digits(*old).max(digits(*new)),
+                DiffLine::Added { new, .. } => digits(*new),
+                DiffLine::Removed { old, .. } => digits(*old),
+            })
+            .max()
+            // An empty diff still needs a one-column gutter to line up with.
+            .unwrap_or(1);
+        Self { diff, spans, num_w }
+    }
 }
 
 /// Owns the thread. Dropping it closes the request channel, which is how the
@@ -241,7 +274,7 @@ fn highlight(
             DiffLine::Removed { text, .. } => old_side.line(&diff.path, text),
         });
     }
-    HighlightedDiff { diff, spans }
+    HighlightedDiff::new(diff, spans)
 }
 
 #[cfg(test)]

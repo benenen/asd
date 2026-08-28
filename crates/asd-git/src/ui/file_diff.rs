@@ -29,16 +29,6 @@ const ACCENT: Color = Color::Rgb(0xF3, 0xB2, 0x4C);
 /// tab-indented file would come out flush left.
 const TAB_WIDTH: usize = 4;
 
-/// Decimal digits in `n`, without allocating.
-///
-/// The gutter is sized against every line of the diff, up to
-/// [`crate::git::diff::MAX_DIFF_LINES`] of them, once per frame. Doing that
-/// with `to_string().len()` would be two allocations per line — 40 000 of them
-/// per frame on a large diff, on the render thread.
-fn digits(n: u32) -> usize {
-    n.checked_ilog10().unwrap_or(0) as usize + 1
-}
-
 /// Render the view, including its border.
 ///
 /// Returns how many rows of diff the view had room for, which is what bounds
@@ -98,18 +88,9 @@ pub fn draw_file_diff(buf: &mut Buffer, area: Rect, state: &FileDiffState, scrol
         return rows;
     }
 
-    // Number columns are sized to the largest line number actually present, so
-    // the gutter does not jump about as the reader scrolls.
-    let num_w = diff
-        .lines
-        .iter()
-        .map(|l| match l {
-            DiffLine::Context { old, new, .. } => digits(*old).max(digits(*new)),
-            DiffLine::Added { new, .. } => digits(*new),
-            DiffLine::Removed { old, .. } => digits(*old),
-        })
-        .max()
-        .unwrap_or(1);
+    // Measured by the worker, over the whole diff, so the gutter is neither
+    // re-derived per frame nor jumping about as the reader scrolls.
+    let num_w = highlighted.num_w;
     // A background that stopped where the text does would read as a ragged
     // block, so a changed row is filled first and painted over.
     let blank = " ".repeat(inner.width as usize);
@@ -245,7 +226,7 @@ mod tests {
                 | DiffLine::Removed { text, .. } => hl.line(path, text),
             })
             .collect();
-        HighlightedDiff { diff, spans }
+        HighlightedDiff::new(diff, spans)
     }
 
     #[test]
@@ -265,6 +246,44 @@ mod tests {
         assert!(
             text.contains("  2 + "),
             "an addition on the new side only: {text:?}"
+        );
+    }
+
+    /// The gutter is measured against the whole diff, not the window on
+    /// screen: numbers that widen as the reader scrolls past line 99 would
+    /// shift every line of text sideways under them. That measurement lives on
+    /// `HighlightedDiff` rather than here because it is a pure function of the
+    /// diff, and the alternative was walking every line of it per frame on the
+    /// thread that paints every open session.
+    #[test]
+    fn the_gutter_is_sized_by_the_whole_diff_not_the_visible_window() {
+        let lines: Vec<DiffLine> = (1..=200u32)
+            .map(|n| DiffLine::Context {
+                old: n,
+                new: n,
+                text: format!("line {n}"),
+            })
+            .collect();
+        let h = HighlightedDiff::new(
+            FileDiff {
+                path: "a.rs".into(),
+                lines,
+                binary: false,
+                truncated: false,
+            },
+            Vec::new(),
+        );
+        assert_eq!(h.num_w, 3, "two hundred lines need three columns");
+
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buf = Buffer::empty(area);
+        draw_file_diff(&mut buf, area, &FileDiffState::Ready(h), 0);
+        // The first content row, inside the border. Only six rows are on
+        // screen, so a gutter sized by the window would be one column wide.
+        let row: String = (1..area.width - 1).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(
+            row.starts_with("  1   1   line 1"),
+            "the first row is three columns wide on both sides: {row:?}"
         );
     }
 
