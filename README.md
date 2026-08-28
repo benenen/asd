@@ -255,20 +255,21 @@ else is behind the prefix:
   daemon host's CPU, memory, and network throughput (each behind its own icon,
   dropping right to left as the terminal narrows)
 - `g` — open the git graph for the focused session's repository: a graph pane
-  plus a commit detail pane and a changed-files pane (`j`/`k` or arrows move
-  the focused pane, `Ctrl+d`/`Ctrl+u` half-page, `PageDown`/`PageUp` page,
+  plus a commit detail pane and a changed-files pane (`j`/`k` or arrows move the
+  focused pane, `Ctrl+d`/`Ctrl+u` half-page, `PageDown`/`PageUp` page,
   `g`/`Home` and `G`/`End` jump to the newest/oldest commit, `@` returns to
   HEAD, `Tab`/`Shift+Tab` cycle focus between the three panes, `Enter` on the
-  changed-files pane opens the selected file's diff (`j`/`k` scroll it, `g`/`G`
-  jump to its ends, `q`/`Esc` returns to the three panes), `/` searches commit
-  summaries and authors (arrows or `Ctrl+j`/`Ctrl+k` move the match, `Enter`
-  jumps to it, `Esc` cancels), `[`/`]` jump to the previous/next commit that
-  carries a branch or tag, `o`/`t` toggle whether remote branches/tags are
-  drawn, `?` shows a help popup, `R` re-reads the repository, `y` copies the
+  changed-files pane opens the selected file's diff (`j`/`k` scroll it,
+  `Ctrl+d`/`Ctrl+u` half-page, `PageDown`/`PageUp` page, `g`/`G` jump to its
+  ends, `q`/`Esc` returns to the three panes), `/` searches commit summaries and
+  authors (arrows or `Ctrl+j`/`Ctrl+k` move the match, `Enter` jumps to it,
+  `Esc` cancels), `[`/`]` jump to the previous/next commit that carries a branch
+  or tag, `o`/`t` toggle whether remote branches/tags are drawn, `?` shows a
+  help popup (any key closes it), `R` re-reads the repository, `y` copies the
   selected commit's hash, `q` or `Esc` unwinds one layer and eventually closes
-  the overlay. The prefix reaches through it, so `Ctrl+A 1` switches session
-  and re-aims the graph — and `Ctrl+A Ctrl+A` still sends a literal `Ctrl+A` to
-  the session *behind* the overlay, since the whole leader sequence is passed
+  the overlay. The prefix reaches through it, so `Ctrl+A 1` switches session and
+  re-aims the graph — and `Ctrl+A Ctrl+A` still sends a literal `Ctrl+A` to the
+  session *behind* the overlay, since the whole leader sequence is passed
   through. Finding a session's directory needs `/proc`, so this is Linux-only
   for now
 - `R` — reconnect · `q` — quit · `Ctrl+A Ctrl+A` — send a literal `Ctrl+A` to the session

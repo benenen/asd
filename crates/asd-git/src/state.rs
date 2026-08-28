@@ -2493,6 +2493,54 @@ mod tests {
         );
     }
 
+    /// `decorations_at` is toggle-aware specifically so `[`/`]` do not land
+    /// on a commit whose only decoration is currently hidden — this is the
+    /// jump-plus-toggle interaction that motivated changing `decorations_at`
+    /// away from the brief's given (toggle-blind) version. Nothing else in
+    /// this file exercises that combination: the bracket tests above never
+    /// toggle anything, and the toggle tests never jump.
+    #[test]
+    fn bracket_keys_skip_a_ref_that_is_currently_hidden_by_a_toggle() {
+        let fx = Fixture::new("keys-branch-jump-hidden-toggle");
+        fx.commit("oldest"); // row 2, tagged below: its only decoration
+        fx.commit("middle"); // row 1, undecorated
+        fx.commit("newest"); // row 0, decorated too: `main` always points at HEAD
+
+        let oldest = fx.git(&["rev-parse", "HEAD~2"]);
+        fx.git(&["tag", "v1", &oldest]);
+
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        settle(&mut g);
+        assert_eq!(g.row_count(), 3);
+        assert_eq!(g.selected(), 0);
+
+        // With tags shown, `]` skips the undecorated `middle` row and lands
+        // on `oldest`, whose only decoration is the tag.
+        assert!(g.decorations_at(2).is_some(), "oldest carries the tag");
+        g.on_key(key(KeyCode::Char(']')));
+        assert_eq!(
+            g.selected(),
+            2,
+            "] lands on the tagged row while tags are shown"
+        );
+        g.on_key(key(KeyCode::Char('['))); // back to the top for the real test below
+
+        // `t` hides tags. `oldest` now has nothing visible on it either, so
+        // `]` must skip straight past both undecorated rows and stop at the
+        // top rather than landing on a row with nothing shown on screen.
+        g.on_key(key(KeyCode::Char('t')));
+        assert!(
+            g.decorations_at(2).is_none(),
+            "the tag is hidden, so this row no longer counts as decorated"
+        );
+        assert_eq!(g.on_key(key(KeyCode::Char(']'))), Outcome::Consumed);
+        assert_eq!(
+            g.selected(),
+            0,
+            "] must not land on a row whose only decoration is hidden"
+        );
+    }
+
     #[test]
     fn o_and_t_toggle_which_refs_are_drawn() {
         let (_fx, mut g) = ready_graph("keys-toggles", 1);
