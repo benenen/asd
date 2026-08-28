@@ -92,7 +92,9 @@ pub enum Mode {
     Search,
     /// The key-table popup, over the whole overlay. Only reachable from
     /// `Normal` (`?`), and every key — not just `q`/`Esc` — returns to it, so
-    /// there is no way to get stuck behind a help screen.
+    /// there is no way to get stuck behind a help screen. The mouse is
+    /// ignored outright: an input that closes nothing must not act on the
+    /// panes the popup covers either.
     Help,
 }
 
@@ -951,11 +953,14 @@ impl GitGraph {
                 _ => Outcome::Consumed,
             };
         }
-        // The dropdown is modal too. `layout` still holds a live three-pane
-        // frame here, so routing by it would work — and would move the graph
-        // selection under the dropdown, which is exactly what `Esc` promises
-        // not to do. The wheel does nothing instead.
-        if self.mode == Mode::Search {
+        // The dropdown and the help popup are modal too. `layout` still holds
+        // a live three-pane frame here, so routing by it would work — and
+        // would move the graph selection under the dropdown, which is exactly
+        // what `Esc` promises not to do, or act on panes under a help screen
+        // that every *key* dismisses. Without this the pointer is the only
+        // input that neither closes a layer nor is ignored by it. Both do
+        // nothing instead.
+        if matches!(self.mode, Mode::Search | Mode::Help) {
             return Outcome::Consumed;
         }
         if let Some(pane) = crate::ui::layout::pane_at(&self.layout, ev.column, ev.row) {
@@ -2340,6 +2345,45 @@ mod tests {
             "the graph did not scroll under the dropdown"
         );
         assert_eq!(g.mode(), Mode::Search);
+    }
+
+    /// The help popup covers the whole overlay and every key dismisses it, so
+    /// the pointer must not be the one input that quietly acts on the panes
+    /// underneath — the same concern as the dropdown above, and the same
+    /// answer. A wheel would move the selection and post a worker request; a
+    /// click would silently reassign focus.
+    #[test]
+    fn the_mouse_does_nothing_while_the_help_popup_is_open() {
+        let (_fx, mut g) = searchable("state-help-mouse");
+        let area = Rect::new(0, 0, 70, 24);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let map = g.layout_for_test();
+        assert!(
+            map.files.height > 0,
+            "the fixture area is tall enough to split"
+        );
+        g.on_key(key(KeyCode::Char('?')));
+        assert_eq!(g.mode(), Mode::Help);
+
+        let outcome = g.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: map.graph.x + 1,
+            row: map.graph.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(outcome, Outcome::Consumed);
+        assert_eq!(g.selected(), 0, "the graph did not scroll under the popup");
+
+        let outcome = g.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: map.files.x + 1,
+            row: map.files.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(outcome, Outcome::Consumed);
+        assert_eq!(g.focus(), Pane::Graph, "focus did not move under the popup");
+        assert_eq!(g.mode(), Mode::Help, "and the popup is still up");
     }
 
     /// The dropdown's "not loaded" warning has to come from the graph's real
