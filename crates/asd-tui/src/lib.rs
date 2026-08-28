@@ -24,7 +24,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use asd_client::terminal::ProbeResult;
-use asd_proto::{SessionInfo, TerminalAppearance};
+use asd_proto::{SessionIdentity, SessionInfo, TerminalAppearance};
 use asd_vt::{GhosttyVt, KeyEvent, RenderSnapshot, VtBackend};
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent as CtKey, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -332,8 +332,8 @@ fn sessions_with_running(
 }
 
 /// Find a rename of the active live session between two list samples. Names
-/// are mutable; the process id plus creation timestamp identify this daemon
-/// session across that change without confusing it with a newly created name.
+/// are mutable; the opaque instance identity identifies this daemon session
+/// across that change without confusing it with a newly created name.
 fn renamed_active_session(
     active: Option<&str>,
     previous: &[SessionInfo],
@@ -344,11 +344,7 @@ fn renamed_active_session(
         .find(|session| Some(session.name.as_str()) == active)?;
     current
         .iter()
-        .find(|session| {
-            session.pid == old.pid
-                && session.created_ms == old.created_ms
-                && session.name != old.name
-        })
+        .find(|session| session.identity() == old.identity() && session.name != old.name)
         .map(|session| (old.name.clone(), session.name.clone()))
 }
 
@@ -411,8 +407,7 @@ fn row_y(side: ratatui::layout::Rect, i: usize, offset: usize) -> Option<u16> {
 
 #[derive(Clone, Copy)]
 struct ClosingSession {
-    pid: u32,
-    created_ms: u64,
+    identity: SessionIdentity,
     started: Instant,
 }
 
@@ -420,46 +415,37 @@ struct ClosingSession {
 struct ClosingSessions(HashMap<String, ClosingSession>);
 
 impl ClosingSessions {
-    fn begin(&mut self, name: &str, pid: u32, created_ms: u64, started: Instant) -> bool {
+    fn begin(&mut self, name: &str, identity: SessionIdentity, started: Instant) -> bool {
         if self.0.get(name).is_some_and(|pending| {
-            pending.pid == pid
-                && pending.created_ms == created_ms
+            pending.identity == identity
                 && started.saturating_duration_since(pending.started) < CLOSING_TIMEOUT
         }) {
             return false;
         }
-        self.0.insert(
-            name.to_string(),
-            ClosingSession {
-                pid,
-                created_ms,
-                started,
-            },
-        );
+        self.0
+            .insert(name.to_string(), ClosingSession { identity, started });
         true
     }
 
-    fn contains(&self, name: &str, pid: u32, created_ms: u64) -> bool {
+    fn contains(&self, name: &str, identity: SessionIdentity) -> bool {
         self.0.get(name).is_some_and(|pending| {
-            pending.pid == pid
-                && pending.created_ms == created_ms
-                && pending.started.elapsed() < CLOSING_TIMEOUT
+            pending.identity == identity && pending.started.elapsed() < CLOSING_TIMEOUT
         })
     }
 
     fn reconcile<'a>(
         &mut self,
-        live: impl IntoIterator<Item = (&'a str, u32, u64)>,
+        live: impl IntoIterator<Item = (&'a str, SessionIdentity)>,
         now: Instant,
     ) -> Vec<String> {
-        let live: HashMap<(u32, u64), &str> = live
+        let live: HashMap<SessionIdentity, &str> = live
             .into_iter()
-            .map(|(name, pid, created_ms)| ((pid, created_ms), name))
+            .map(|(name, identity)| (identity, name))
             .collect();
         let mut expired = Vec::new();
         let mut next = HashMap::new();
         for pending in std::mem::take(&mut self.0).into_values() {
-            let Some(name) = live.get(&(pending.pid, pending.created_ms)) else {
+            let Some(name) = live.get(&pending.identity) else {
                 continue;
             };
             let timed_out = now.saturating_duration_since(pending.started) >= CLOSING_TIMEOUT;
@@ -482,6 +468,21 @@ impl ClosingSessions {
             self.0.insert(new.to_string(), pending);
         }
     }
+}
+
+fn take_kill_confirmation(
+    modal: &mut Option<Modal>,
+    closing: &mut ClosingSessions,
+    now: Instant,
+) -> Option<Cmd> {
+    let (name, identity) = match modal.as_ref()? {
+        Modal::KillConfirm { target, identity } => (target.clone(), *identity),
+        Modal::Rename(_) => return None,
+    };
+    *modal = None;
+    closing
+        .begin(&name, identity, now)
+        .then_some(Cmd::Kill { name, identity })
 }
 
 pub(crate) struct App {
@@ -1343,7 +1344,7 @@ impl App {
                 let observed_at = Instant::now();
                 let expired = self.closing_sessions.reconcile(
                     list.iter()
-                        .map(|session| (session.name.as_str(), session.pid, session.created_ms)),
+                        .map(|session| (session.name.as_str(), session.identity())),
                     observed_at,
                 );
                 if !expired.is_empty() {
@@ -1593,21 +1594,22 @@ impl App {
             }
             KeyAction::Kill => {
                 if let Some(name) = self.active.clone() {
-                    let closing = self
+                    let session = self
                         .sessions
                         .iter()
                         .find(|session| session.name == name)
-                        .is_some_and(|session| {
-                            self.closing_sessions.contains(
-                                &session.name,
-                                session.pid,
-                                session.created_ms,
-                            )
-                        });
+                        .cloned();
+                    let closing = session.as_ref().is_some_and(|session| {
+                        self.closing_sessions
+                            .contains(&session.name, session.identity())
+                    });
                     if closing {
                         self.notice = Some(format!("{name} is already closing"));
-                    } else {
-                        self.modal = Some(Modal::KillConfirm { target: name });
+                    } else if let Some(session) = session {
+                        self.modal = Some(Modal::KillConfirm {
+                            target: name,
+                            identity: session.identity(),
+                        });
                     }
                 }
             }
@@ -1637,14 +1639,12 @@ impl App {
         enum Act {
             Keep,
             Close,
-            Kill(String),
+            Kill,
             TryRename(String, String),
         }
         let act = match self.modal.as_mut() {
-            Some(Modal::KillConfirm { target }) => match k.code {
-                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    Act::Kill(target.clone())
-                }
+            Some(Modal::KillConfirm { .. }) => match k.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => Act::Kill,
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Act::Close,
                 _ => Act::Keep,
             },
@@ -1686,21 +1686,13 @@ impl App {
         match act {
             Act::Keep => {}
             Act::Close => self.modal = None,
-            Act::Kill(name) => {
-                self.modal = None;
-                if let Some(session) = self
-                    .sessions
-                    .iter()
-                    .find(|session| session.name == name)
-                    .cloned()
-                    && self.closing_sessions.begin(
-                        &session.name,
-                        session.pid,
-                        session.created_ms,
-                        Instant::now(),
-                    )
-                {
-                    self.send(Cmd::Kill { name });
+            Act::Kill => {
+                if let Some(cmd) = take_kill_confirmation(
+                    &mut self.modal,
+                    &mut self.closing_sessions,
+                    Instant::now(),
+                ) {
+                    self.send(cmd);
                 }
             }
             Act::TryRename(target, new) => {
@@ -1885,11 +1877,8 @@ impl App {
                     m.row,
                 ) {
                     let name = self.sessions[i].name.clone();
-                    let closing = self.closing_sessions.contains(
-                        &name,
-                        self.sessions[i].pid,
-                        self.sessions[i].created_ms,
-                    );
+                    let identity = self.sessions[i].identity();
+                    let closing = self.closing_sessions.contains(&name, identity);
                     if kill {
                         if self.self_session.as_deref() == Some(&name) {
                             // Never kill the session hosting this UI (same guard
@@ -1901,7 +1890,10 @@ impl App {
                         } else {
                             // Same path as Ctrl+A x: confirm first, never kill
                             // outright.
-                            self.modal = Some(Modal::KillConfirm { target: name });
+                            self.modal = Some(Modal::KillConfirm {
+                                target: name,
+                                identity,
+                            });
                         }
                     } else {
                         self.select(name);
@@ -2139,29 +2131,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn kill_confirmation_sends_the_original_identity_after_same_name_replacement() {
+        let original = SessionIdentity { instance_id: 1 };
+        let replacement = SessionIdentity { instance_id: 2 };
+        let mut modal = Some(Modal::KillConfirm {
+            target: "web".to_string(),
+            identity: original,
+        });
+        let mut closing = ClosingSessions::default();
+
+        let cmd = take_kill_confirmation(&mut modal, &mut closing, Instant::now()).unwrap();
+
+        assert!(matches!(
+            cmd,
+            Cmd::Kill {
+                name,
+                identity
+            } if name == "web" && identity == original
+        ));
+        assert!(modal.is_none());
+        assert!(closing.contains("web", original));
+        assert!(!closing.contains("web", replacement));
+    }
+
+    #[test]
     fn closing_state_survives_a_stale_list_and_clears_when_the_session_is_gone() {
         let mut closing = ClosingSessions::default();
         let started = Instant::now();
-        assert!(closing.begin("doomed", 42, 100, started));
-        assert!(!closing.begin("doomed", 42, 100, started));
-        assert!(closing.contains("doomed", 42, 100));
+        let identity = |instance_id| SessionIdentity { instance_id };
+        assert!(closing.begin("doomed", identity(100), started));
+        assert!(!closing.begin("doomed", identity(100), started));
+        assert!(closing.contains("doomed", identity(100)));
 
-        closing.reconcile([("keep", 7, 50), ("doomed", 42, 100)], started);
-        assert!(closing.contains("doomed", 42, 100));
+        closing.reconcile([("keep", identity(50)), ("doomed", identity(100))], started);
+        assert!(closing.contains("doomed", identity(100)));
 
-        closing.reconcile([("keep", 7, 50), ("renamed", 42, 100)], started);
-        assert!(closing.contains("renamed", 42, 100));
+        closing.reconcile(
+            [("keep", identity(50)), ("renamed", identity(100))],
+            started,
+        );
+        assert!(closing.contains("renamed", identity(100)));
 
-        closing.reconcile([("keep", 7, 50), ("renamed", 43, 101)], started);
-        assert!(!closing.contains("renamed", 43, 101));
+        closing.reconcile(
+            [("keep", identity(50)), ("renamed", identity(101))],
+            started,
+        );
+        assert!(!closing.contains("renamed", identity(101)));
 
-        closing.begin("stuck", 99, 200, started);
+        closing.begin("stuck", identity(200), started);
         let expired = closing.reconcile(
-            [("keep", 7, 50), ("stuck", 99, 200)],
+            [("keep", identity(50)), ("stuck", identity(200))],
             started + CLOSING_TIMEOUT,
         );
         assert_eq!(expired, vec!["stuck"]);
-        assert!(!closing.contains("stuck", 99, 200));
+        assert!(!closing.contains("stuck", identity(200)));
     }
 
     #[test]
@@ -2197,8 +2220,9 @@ mod tests {
 
     #[test]
     fn list_race_recognizes_an_external_rename_by_session_identity() {
-        let info = |name: &str, pid: u32, created_ms: u64| SessionInfo {
+        let info = |name: &str, pid: u32, created_ms: u64, instance_id: u128| SessionInfo {
             name: name.to_string(),
+            instance_id,
             command: "shell".to_string(),
             title: String::new(),
             status_line: String::new(),
@@ -2211,9 +2235,9 @@ mod tests {
             cols: 80,
             rows: 24,
         };
-        let previous = vec![info("old", 42, 100)];
-        let renamed = vec![info("new", 42, 100)];
-        let replacement = vec![info("new", 42, 101)];
+        let previous = vec![info("old", 42, 100, 1)];
+        let renamed = vec![info("new", 42, 100, 1)];
+        let replacement = vec![info("new", 42, 100, 2)];
 
         assert_eq!(
             renamed_active_session(Some("old"), &previous, &renamed),
@@ -2222,7 +2246,7 @@ mod tests {
         assert_eq!(
             renamed_active_session(Some("old"), &previous, &replacement),
             None,
-            "a reused pid for a newly created session is not a rename"
+            "a reused pid and timestamp for a new instance is not a rename"
         );
     }
 
@@ -2306,6 +2330,7 @@ mod tests {
     fn running_session_expires_locally_without_another_list_response() {
         let session = SessionInfo {
             name: "agent".to_string(),
+            instance_id: 1,
             command: "codex".to_string(),
             title: String::new(),
             status_line: String::new(),
@@ -2360,6 +2385,7 @@ mod tests {
         let listed_at = Instant::now();
         let session = SessionInfo {
             name: "agent".to_string(),
+            instance_id: 1,
             command: "codex".to_string(),
             title: String::new(),
             status_line: String::new(),
@@ -2388,6 +2414,7 @@ mod tests {
         let listed_at = Instant::now();
         let idle_session = SessionInfo {
             name: "agent".to_string(),
+            instance_id: 1,
             command: "codex".to_string(),
             title: String::new(),
             status_line: String::new(),
@@ -2469,6 +2496,7 @@ mod tests {
     fn daemon_idle_sample_is_never_resurrected_locally() {
         let session = SessionInfo {
             name: "idle".to_string(),
+            instance_id: 1,
             command: "bash".to_string(),
             title: String::new(),
             status_line: String::new(),

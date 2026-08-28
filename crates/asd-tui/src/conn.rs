@@ -38,6 +38,7 @@ pub enum Cmd {
     Create,
     Kill {
         name: String,
+        identity: asd_proto::SessionIdentity,
     },
     /// Rename session `name` to `new_name`.
     Rename {
@@ -311,8 +312,8 @@ async fn drive(
                         return Err("create write failed".to_string());
                     }
                 }
-                Some(Cmd::Kill { name }) => {
-                    if writer.write_frame(&Frame::Kill { name }).await.is_err() {
+                Some(Cmd::Kill { name, identity }) => {
+                    if writer.write_frame(&Frame::Kill { name, identity }).await.is_err() {
                         return Err("kill write failed".to_string());
                     }
                     let _ = writer.write_frame(&Frame::ListSessions).await;
@@ -360,6 +361,7 @@ mod tests {
     fn info(name: &str, pid: u32, created_ms: u64) -> asd_proto::SessionInfo {
         asd_proto::SessionInfo {
             name: name.to_string(),
+            instance_id: created_ms as u128,
             command: "shell".to_string(),
             title: String::new(),
             status_line: String::new(),

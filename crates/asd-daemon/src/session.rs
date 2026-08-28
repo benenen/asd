@@ -14,7 +14,8 @@ use std::sync::atomic::{
 use std::sync::{Arc, Mutex, mpsc};
 
 use asd_proto::{
-    AgentState, Frame, IDLE_SETTLE_MS, SessionExit, TerminalAppearance, TerminalColor, code,
+    AgentState, Frame, IDLE_SETTLE_MS, SessionExit, SessionIdentity, TerminalAppearance,
+    TerminalColor, code,
 };
 
 use crate::detect::Detector;
@@ -223,6 +224,7 @@ pub const MAX_HISTORY_ROWS_PER_FETCH: u32 = 2000;
 #[derive(Clone)]
 pub struct SessionHandle {
     pub name: String,
+    pub identity: SessionIdentity,
     /// The command this session runs (the `Create` cmd, or the default shell).
     pub command: String,
     /// The command the session was asked for, when it was given one: what
@@ -269,6 +271,10 @@ pub struct SessionMeta {
 }
 
 impl SessionHandle {
+    pub fn identity(&self) -> SessionIdentity {
+        self.identity
+    }
+
     pub fn info(&self) -> asd_proto::SessionInfo {
         // Report the live foreground command (what's actually running in the
         // terminal now), falling back to the spawn command when it can't be
@@ -297,6 +303,7 @@ impl SessionHandle {
             .unwrap_or_else(|_| self.name.clone());
         asd_proto::SessionInfo {
             name,
+            instance_id: self.identity.instance_id,
             command,
             status_line,
             title,
@@ -554,6 +561,11 @@ pub fn spawn_session(
     context: SessionContext,
     registry: Arc<Mutex<Registry>>,
 ) -> anyhow::Result<SessionHandle> {
+    let mut instance_bytes = [0u8; 16];
+    getrandom::fill(&mut instance_bytes)?;
+    let identity = SessionIdentity {
+        instance_id: u128::from_le_bytes(instance_bytes),
+    };
     let pty = native_pty_system();
     let pair = pty.openpty(PtySize {
         rows,
@@ -662,6 +674,7 @@ pub fn spawn_session(
 
     Ok(SessionHandle {
         name,
+        identity,
         command,
         spawn_command: cmd,
         created_ms,

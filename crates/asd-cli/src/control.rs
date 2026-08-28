@@ -1346,6 +1346,7 @@ mod tests {
     fn info(name: &str, running: bool) -> asd_proto::SessionInfo {
         asd_proto::SessionInfo {
             name: name.to_string(),
+            instance_id: 1,
             command: "bash".to_string(),
             title: String::new(),
             status_line: String::new(),

@@ -361,6 +361,7 @@ mod tests {
     fn session(name: &str, pid: u32) -> asd_proto::SessionInfo {
         asd_proto::SessionInfo {
             name: name.to_string(),
+            instance_id: u128::from(pid),
             command: "shell".to_string(),
             title: String::new(),
             status_line: String::new(),

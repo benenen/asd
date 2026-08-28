@@ -20,8 +20,7 @@ const CLOSING_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq)]
 struct ClosingSession {
-    pid: u32,
-    created_ms: u64,
+    identity: asd_proto::SessionIdentity,
     started: Instant,
 }
 
@@ -214,9 +213,10 @@ impl Model {
                 next.insert((host, name), pending);
                 continue;
             }
-            if let Some(session) = sessions.iter().find(|session| {
-                session.pid == pending.pid && session.created_ms == pending.created_ms
-            }) && now.saturating_duration_since(pending.started) < CLOSING_TIMEOUT
+            if let Some(session) = sessions
+                .iter()
+                .find(|session| session.identity() == pending.identity)
+                && now.saturating_duration_since(pending.started) < CLOSING_TIMEOUT
             {
                 next.insert((host, session.name.clone()), pending);
             }
@@ -239,30 +239,32 @@ impl Model {
         self.active = Some((host, name));
     }
 
-    pub fn mark_closing(&mut self, host: HostId, name: &str) -> bool {
-        let Some(session) = self
-            .host(host)
-            .and_then(|host| host.sessions.iter().find(|session| session.name == name))
-        else {
-            return false;
-        };
+    pub fn mark_closing(
+        &mut self,
+        host: HostId,
+        name: &str,
+        identity: asd_proto::SessionIdentity,
+    ) -> bool {
         let key = (host, name.to_string());
         if self.closing.get(&key).is_some_and(|pending| {
-            pending.pid == session.pid
-                && pending.created_ms == session.created_ms
-                && pending.started.elapsed() < CLOSING_TIMEOUT
+            pending.identity == identity && pending.started.elapsed() < CLOSING_TIMEOUT
         }) {
             return false;
         }
         self.closing.insert(
             key,
             ClosingSession {
-                pid: session.pid,
-                created_ms: session.created_ms,
+                identity,
                 started: Instant::now(),
             },
         );
         true
+    }
+
+    pub fn session_identity(&self, host: HostId, name: &str) -> Option<asd_proto::SessionIdentity> {
+        self.host(host)
+            .and_then(|host| host.sessions.iter().find(|session| session.name == name))
+            .map(SessionInfo::identity)
     }
 
     pub fn is_closing(&self, host: HostId, name: &str) -> bool {
@@ -275,8 +277,7 @@ impl Model {
         self.closing
             .get(&(host, name.to_string()))
             .is_some_and(|pending| {
-                pending.pid == session.pid
-                    && pending.created_ms == session.created_ms
+                pending.identity == session.identity()
                     && pending.started.elapsed() < CLOSING_TIMEOUT
             })
     }
@@ -425,6 +426,7 @@ mod tests {
     fn info(name: &str, created_ms: u64, clients: u32) -> SessionInfo {
         SessionInfo {
             name: name.to_string(),
+            instance_id: created_ms as u128,
             command: "sh".into(),
             title: String::new(),
             status_line: String::new(),
@@ -535,22 +537,27 @@ mod tests {
 
     #[test]
     fn closing_state_survives_a_stale_list_and_clears_when_the_session_is_gone() {
-        let identified = |name: &str, pid: u32, created_ms: u64| {
+        let identified = |name: &str, pid: u32, created_ms: u64, instance_id: u128| {
             let mut session = info(name, created_ms, 0);
             session.pid = pid;
+            session.instance_id = instance_id;
             session
         };
         let mut m = Model::with_local();
         m.set_sessions(
             LOCAL_ID,
-            vec![identified("web", 42, 100), identified("logs", 43, 101)],
+            vec![
+                identified("web", 42, 100, 1),
+                identified("logs", 43, 101, 2),
+            ],
         );
-        assert!(m.mark_closing(LOCAL_ID, "web"));
-        assert!(!m.mark_closing(LOCAL_ID, "web"));
+        let web_identity = asd_proto::SessionIdentity { instance_id: 1 };
+        assert!(m.mark_closing(LOCAL_ID, "web", web_identity));
+        assert!(!m.mark_closing(LOCAL_ID, "web", web_identity));
         assert!(m.is_closing(LOCAL_ID, "web"));
 
         let remote = m.add_remote(spec_id(17, "me", "remote", 22));
-        m.set_sessions(remote, vec![identified("web", 42, 100)]);
+        m.set_sessions(remote, vec![identified("web", 42, 100, 1)]);
         assert!(
             m.is_closing(LOCAL_ID, "web"),
             "another host's list must not clear a local pending close"
@@ -558,51 +565,71 @@ mod tests {
 
         m.set_sessions(
             LOCAL_ID,
-            vec![identified("web", 42, 100), identified("logs", 43, 101)],
+            vec![
+                identified("web", 42, 100, 1),
+                identified("logs", 43, 101, 2),
+            ],
         );
         assert!(m.is_closing(LOCAL_ID, "web"));
 
         m.set_sessions(
             LOCAL_ID,
-            vec![identified("api", 42, 100), identified("logs", 43, 101)],
+            vec![
+                identified("api", 42, 100, 1),
+                identified("logs", 43, 101, 2),
+            ],
         );
         assert!(
             m.is_closing(LOCAL_ID, "api"),
             "an external rename must carry the pending close by stable identity"
         );
 
-        m.set_sessions(LOCAL_ID, vec![identified("logs", 43, 101)]);
+        m.set_sessions(LOCAL_ID, vec![identified("logs", 43, 101, 2)]);
         assert!(!m.is_closing(LOCAL_ID, "api"));
 
         m.set_sessions(
             LOCAL_ID,
-            vec![identified("web", 44, 200), identified("logs", 43, 101)],
+            vec![
+                identified("web", 44, 200, 3),
+                identified("logs", 43, 101, 2),
+            ],
         );
-        assert!(m.mark_closing(LOCAL_ID, "web"));
         m.set_sessions(
             LOCAL_ID,
-            vec![identified("web", 45, 201), identified("logs", 43, 101)],
+            vec![
+                identified("web", 44, 200, 4),
+                identified("logs", 43, 101, 2),
+            ],
         );
+        assert!(m.mark_closing(
+            LOCAL_ID,
+            "web",
+            asd_proto::SessionIdentity { instance_id: 3 },
+        ));
         assert!(
             !m.is_closing(LOCAL_ID, "web"),
-            "a new same-name session must not inherit an old pending close"
+            "a confirmation for the old identity must not mark the replacement closing"
         );
 
-        assert!(m.mark_closing(LOCAL_ID, "logs"));
+        let logs_identity = asd_proto::SessionIdentity { instance_id: 2 };
+        assert!(m.mark_closing(LOCAL_ID, "logs", logs_identity));
         m.closing
             .get_mut(&(LOCAL_ID, "logs".to_string()))
             .unwrap()
             .started = Instant::now() - CLOSING_TIMEOUT;
         m.set_sessions(
             LOCAL_ID,
-            vec![identified("web", 45, 201), identified("logs", 43, 101)],
+            vec![
+                identified("web", 44, 200, 4),
+                identified("logs", 43, 101, 2),
+            ],
         );
         assert!(
             !m.is_closing(LOCAL_ID, "logs"),
             "a failed close must time out and allow another attempt"
         );
 
-        assert!(m.mark_closing(LOCAL_ID, "logs"));
+        assert!(m.mark_closing(LOCAL_ID, "logs", logs_identity));
         m.set_state(LOCAL_ID, HostState::Down("connection lost".to_string()));
         assert!(
             !m.is_closing(LOCAL_ID, "logs"),

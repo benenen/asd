@@ -14,7 +14,7 @@ use asd_proto::{
     code,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::time::timeout;
 
 const TICK: Duration = Duration::from_millis(50);
@@ -334,6 +334,88 @@ impl ProtoClient {
     }
 }
 
+struct ScriptedSocket {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl ScriptedSocket {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "asd-scripted-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asd.sock");
+        Self { dir, path }
+    }
+}
+
+impl Drop for ScriptedSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+async fn accept_cli(
+    listener: &UnixListener,
+) -> (
+    FrameReader<tokio::net::unix::OwnedReadHalf>,
+    FrameWriter<tokio::net::unix::OwnedWriteHalf>,
+) {
+    let (stream, _) = timeout(WAIT, listener.accept())
+        .await
+        .expect("CLI connect timeout")
+        .expect("CLI connect failed");
+    let (read, write) = stream.into_split();
+    let mut reader = FrameReader::new(read);
+    let mut writer = FrameWriter::new(write);
+    assert_eq!(
+        scripted_recv(&mut reader).await,
+        Some(Frame::Hello {
+            proto_version: PROTO_VERSION,
+            kind: ClientKind::Cli,
+        })
+    );
+    writer
+        .write_frame(&Frame::HelloAck {
+            proto_version: PROTO_VERSION,
+            daemon_version: "test".to_string(),
+        })
+        .await
+        .unwrap();
+    (reader, writer)
+}
+
+async fn scripted_recv(reader: &mut FrameReader<tokio::net::unix::OwnedReadHalf>) -> Option<Frame> {
+    timeout(WAIT, reader.read_frame())
+        .await
+        .expect("scripted frame timeout")
+        .expect("scripted frame read failed")
+}
+
+fn scripted_session(name: &str, instance_id: u128) -> asd_proto::SessionInfo {
+    asd_proto::SessionInfo {
+        name: name.to_string(),
+        instance_id,
+        command: "sh".to_string(),
+        title: String::new(),
+        status_line: String::new(),
+        created_ms: 100,
+        idle_ms: 0,
+        running: false,
+        state: asd_proto::AgentState::Unknown,
+        attached_clients: 0,
+        pid: 42,
+        cols: 80,
+        rows: 24,
+    }
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -554,6 +636,106 @@ async fn attached_color_query_is_daemon_only_and_answered_once() {
             "child did not receive exactly one reply: {observed:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn named_kill_sends_the_identity_from_its_list_snapshot() {
+    let socket = ScriptedSocket::new("named-kill-identity");
+    let listener = UnixListener::bind(&socket.path).unwrap();
+    let child = tokio::process::Command::new(cli_exe())
+        .arg("--socket")
+        .arg(&socket.path)
+        .args(["kill", "web"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut reader, mut writer) = accept_cli(&listener).await;
+
+    assert_eq!(scripted_recv(&mut reader).await, Some(Frame::ListSessions));
+    writer
+        .write_frame(&Frame::SessionList {
+            sessions: vec![scripted_session("web", 0x1234)],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        scripted_recv(&mut reader).await,
+        Some(Frame::Kill {
+            name: "web".to_string(),
+            identity: asd_proto::SessionIdentity {
+                instance_id: 0x1234,
+            },
+        })
+    );
+    assert_eq!(scripted_recv(&mut reader).await, Some(Frame::ListSessions));
+    writer
+        .write_frame(&Frame::SessionList { sessions: vec![] })
+        .await
+        .unwrap();
+
+    let output = timeout(WAIT, child.wait_with_output())
+        .await
+        .expect("CLI exit timeout")
+        .unwrap();
+    assert!(output.status.success(), "named kill failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "kill signalled: web"
+    );
+}
+
+#[tokio::test]
+async fn kill_all_treats_a_single_stale_snapshot_as_an_idempotent_race() {
+    let socket = ScriptedSocket::new("kill-all-stale");
+    let listener = UnixListener::bind(&socket.path).unwrap();
+    let child = tokio::process::Command::new(cli_exe())
+        .arg("--socket")
+        .arg(&socket.path)
+        .args(["kill", "--all"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut reader, mut writer) = accept_cli(&listener).await;
+
+    assert_eq!(scripted_recv(&mut reader).await, Some(Frame::ListSessions));
+    writer
+        .write_frame(&Frame::SessionList {
+            sessions: vec![scripted_session("web", 1)],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        scripted_recv(&mut reader).await,
+        Some(Frame::Kill {
+            name: "web".to_string(),
+            identity: asd_proto::SessionIdentity { instance_id: 1 },
+        })
+    );
+    writer
+        .write_frame(&Frame::Error {
+            code: code::STALE_SESSION,
+            msg: "session 'web' changed since it was selected".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(scripted_recv(&mut reader).await, Some(Frame::ListSessions));
+    writer
+        .write_frame(&Frame::SessionList {
+            sessions: vec![scripted_session("web", 2)],
+        })
+        .await
+        .unwrap();
+
+    let output = timeout(WAIT, child.wait_with_output())
+        .await
+        .expect("CLI exit timeout")
+        .unwrap();
+    assert!(output.status.success(), "kill --all failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("kill requested: web"), "stdout: {stdout}");
+    assert!(!stdout.contains("kill signalled"), "stdout: {stdout}");
 }
 
 /// The list/kill CLI surface + session lifecycle.

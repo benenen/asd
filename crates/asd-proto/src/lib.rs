@@ -41,7 +41,10 @@
 //! because by then the session has left the registry and no `SessionList` can
 //! carry it; v18 adds `SetStatusLine` and `SessionInfo.status_line`, one line a
 //! session sets about itself from the inside — the only progress channel that
-//! does not go through reading the screen.
+//! does not go through reading the screen; v19 adds the opaque
+//! `SessionInfo.instance_id` and carries it as [`SessionIdentity`] in `Kill`,
+//! so a delayed confirmation cannot terminate a newer session that reused the
+//! same name.
 
 mod codec;
 pub mod paths;
@@ -52,7 +55,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 18;
+pub const PROTO_VERSION: u32 = 19;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -136,6 +139,8 @@ pub mod code {
     pub const SESSION_EXITED: u32 = 6;
     /// Business frame sent before completing the handshake, or invalid frame order.
     pub const BAD_HANDSHAKE: u32 = 7;
+    /// The named session exists, but it is not the instance the caller observed.
+    pub const STALE_SESSION: u32 = 8;
     /// Daemon internal error (details in msg).
     pub const INTERNAL: u32 = 100;
 }
@@ -187,10 +192,22 @@ impl std::fmt::Display for SessionExit {
     }
 }
 
+/// Opaque identity of one live session instance.
+///
+/// The daemon generates a fresh value when it creates the session and treats
+/// a client-provided identity only as an assertion against its own Registry
+/// entry. It is never used as a process identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionIdentity {
+    pub instance_id: u128,
+}
+
 /// Metadata for a single session in `SessionList`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub name: String,
+    /// Opaque daemon-generated identity for this live session instance.
+    pub instance_id: u128,
     /// The command running in the session's terminal now — the pty's foreground
     /// process (e.g. `vim file`, `npm run dev`) — falling back to the spawn
     /// command (the `Create` cmd or the default shell) when it can't be
@@ -233,6 +250,14 @@ pub struct SessionInfo {
     pub pid: u32,
     pub cols: u16,
     pub rows: u16,
+}
+
+impl SessionInfo {
+    pub fn identity(&self) -> SessionIdentity {
+        SessionIdentity {
+            instance_id: self.instance_id,
+        }
+    }
 }
 
 /// How much of a session's history a [`Frame::Peek`] should include above the
@@ -332,6 +357,9 @@ pub enum Frame {
     /// and waiting for its `SessionList`; failures still use `Error`.
     Kill {
         name: String,
+        /// The exact live instance the caller confirmed. The daemon compares
+        /// this with its Registry entry before signaling the child.
+        identity: SessionIdentity,
     },
     /// client → daemon: rename session `name` to `new_name` (v7). Replies `Ack`
     /// on success, or `Error` (invalid/duplicate name, or no such session).

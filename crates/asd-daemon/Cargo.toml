@@ -10,6 +10,7 @@ license.workspace = true
 anyhow = { workspace = true }
 asd-proto = { workspace = true }
 asd-vt = { workspace = true }
+getrandom = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true }
 sysinfo = { version = "0.38.4", default-features = false, features = ["system", "network"] }

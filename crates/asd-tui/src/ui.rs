@@ -296,7 +296,7 @@ fn draw_modal(f: &mut Frame<'_>, modal: &Modal) -> Option<Position> {
     f.render_widget(block, m);
 
     match modal {
-        Modal::KillConfirm { target } => {
+        Modal::KillConfirm { target, .. } => {
             draw_kill_modal(f.buffer_mut(), inner, target);
             None
         }

@@ -3,7 +3,8 @@
 
 use asd_proto::{
     AgentState, ClientKind, Frame, FrameReader, FrameWriter, MAX_FRAME_LEN, ProtoError, Scrollback,
-    SessionExit, SessionInfo, TerminalAppearance, TerminalColor, decode_frame, encode_frame,
+    SessionExit, SessionIdentity, SessionInfo, TerminalAppearance, TerminalColor, decode_frame,
+    encode_frame,
 };
 
 /// Covers every frame kind in the current protocol. Add new frames here in
@@ -23,6 +24,7 @@ fn all_frames() -> Vec<Frame> {
             sessions: vec![
                 SessionInfo {
                     name: "s0".into(),
+                    instance_id: 0x1234,
                     command: "/bin/bash".into(),
                     title: "user@host: ~".into(),
                     status_line: String::new(),
@@ -37,6 +39,7 @@ fn all_frames() -> Vec<Frame> {
                 },
                 SessionInfo {
                     name: "work".into(),
+                    instance_id: 0x5678,
                     command: "htop".into(),
                     title: String::new(),
                     status_line: String::new(),
@@ -62,7 +65,12 @@ fn all_frames() -> Vec<Frame> {
             cwd: None,
         },
         Frame::Created { name: "s0".into() },
-        Frame::Kill { name: "s0".into() },
+        Frame::Kill {
+            name: "s0".into(),
+            identity: SessionIdentity {
+                instance_id: 0x1234,
+            },
+        },
         Frame::Rename {
             name: "s0".into(),
             new_name: "build".into(),
@@ -164,6 +172,7 @@ fn all_frames() -> Vec<Frame> {
         Frame::InspectReply {
             info: SessionInfo {
                 name: "work".into(),
+                instance_id: 0x5678,
                 command: "vim file".into(),
                 title: "vim".into(),
                 status_line: String::new(),
@@ -247,8 +256,8 @@ fn all_frames() -> Vec<Frame> {
 }
 
 #[test]
-fn protocol_version_covers_host_metrics() {
-    assert_eq!(asd_proto::PROTO_VERSION, 18);
+fn protocol_version_covers_kill_session_identity() {
+    assert_eq!(asd_proto::PROTO_VERSION, 19);
 }
 
 #[test]

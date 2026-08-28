@@ -6,8 +6,11 @@
 pub enum Modal {
     /// Rename `target` to the text being edited.
     Rename(RenameInput),
-    /// Confirm killing the session named `target`.
-    KillConfirm { target: String },
+    /// Confirm killing one exact live session instance.
+    KillConfirm {
+        target: String,
+        identity: asd_proto::SessionIdentity,
+    },
 }
 
 /// A single-line text input. Editing is by **character**, not byte, so multi-

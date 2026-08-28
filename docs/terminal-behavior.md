@@ -34,9 +34,10 @@ Names are display/routing state, not view identity. If an Attach races an
 external rename, the request carries the name the client observed and the
 daemon sends the canonical `ViewRenamed` before Snapshot. If the next
 `SessionList` reaches the TUI before that rename event, the actor identifies
-the same live session by `(pid, created_ms)`, retags its attach state, and emits
-the rename before forwarding the list. Duplicate or stale rename/revoke events
-must match both `view_id` and the expected old name before changing the view.
+the same live session by its daemon-generated opaque instance identity, retags
+its attach state, and emits the rename before forwarding the list. Duplicate
+or stale rename/revoke events must match both `view_id` and the expected old
+name before changing the view.
 
 These rules prevent three failure modes: revoking a replacement that reused an
 old name, dropping Output under the old label, and two TUI processes repeatedly

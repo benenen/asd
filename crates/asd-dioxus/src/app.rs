@@ -53,6 +53,7 @@ pub enum AppCmd {
     Kill {
         host: HostId,
         name: String,
+        identity: asd_proto::SessionIdentity,
     },
     Rename {
         host: HostId,
@@ -160,7 +161,7 @@ pub fn App() -> Element {
     // Destructive actions confirm before acting (both were one-click before):
     // killing a session pops a confirm overlay; deleting a saved connection
     // shows an inline confirm on that row (`Some(index)`).
-    let mut confirm_kill = use_signal(|| None::<(HostId, String)>);
+    let mut confirm_kill = use_signal(|| None::<(HostId, String, asd_proto::SessionIdentity)>);
     // Which saved connection (by stable id) is mid inline-delete confirm.
     let confirm_delete = use_signal(|| None::<u64>);
     // The session row (if any) whose name is being edited inline.
@@ -442,8 +443,9 @@ pub fn App() -> Element {
                             onclick: move |_| {
                                 if let Some((host, name)) = model.read().active.clone()
                                     && !model.read().is_closing(host, &name)
+                                    && let Some(identity) = model.read().session_identity(host, &name)
                                 {
-                                    confirm_kill.set(Some((host, name)));
+                                    confirm_kill.set(Some((host, name, identity)));
                                 }
                             },
                             "× kill"
@@ -467,7 +469,7 @@ pub fn App() -> Element {
             }
 
             // ── kill confirmation overlay ───────────────────────────
-            if let Some((host, name)) = confirm_kill.read().clone() {
+            if let Some((host, name, identity)) = confirm_kill.read().clone() {
                 {
                     let name_btn = name.clone();
                     let tx = tx.clone();
@@ -488,8 +490,12 @@ pub fn App() -> Element {
                                     button {
                                         class: "bar-btn danger",
                                         onclick: move |_| {
-                                            if model_kill.write().mark_closing(host, &name_btn) {
-                                                let _ = tx.send(AppCmd::Kill { host, name: name_btn.clone() });
+                                            if model_kill.write().mark_closing(host, &name_btn, identity) {
+                                                let _ = tx.send(AppCmd::Kill {
+                                                    host,
+                                                    name: name_btn.clone(),
+                                                    identity,
+                                                });
                                             }
                                             confirm_kill.set(None);
                                         },
@@ -523,7 +529,7 @@ fn host_group(
     tx: UnboundedSender<AppCmd>,
     mut model: Signal<Model>,
     _status: Signal<Status>,
-    mut confirm_kill: Signal<Option<(HostId, String)>>,
+    mut confirm_kill: Signal<Option<(HostId, String, asd_proto::SessionIdentity)>>,
     mut rename: Signal<Option<Rename>>,
 ) -> Element {
     let id = host.id;
@@ -648,6 +654,7 @@ fn host_group(
                     let mut select = select.clone();
                     let name_click = name.clone();
                     let name_kill = name.clone();
+                    let identity_kill = s.identity();
                     let name_dbl = name.clone();
                     let name_kbd = name.clone();
                     let closing = model.read().is_closing(id, &name);
@@ -752,7 +759,7 @@ fn host_group(
                                 disabled: closing,
                                 onclick: move |e| {
                                     e.stop_propagation();
-                                    confirm_kill.set(Some((id, name_kill.clone())));
+                                    confirm_kill.set(Some((id, name_kill.clone(), identity_kill)));
                                 },
                                 if closing { "…" } else { "×" }
                             }
@@ -1359,9 +1366,13 @@ fn route(
                 let _ = h.cmd_tx.send(HostCmd::Create);
             }
         }
-        AppCmd::Kill { host, name } => {
+        AppCmd::Kill {
+            host,
+            name,
+            identity,
+        } => {
             if let Some(h) = hosts.get(&host) {
-                let _ = h.cmd_tx.send(HostCmd::Kill { name });
+                let _ = h.cmd_tx.send(HostCmd::Kill { name, identity });
             }
         }
         AppCmd::Rename {

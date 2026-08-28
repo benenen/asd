@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::session::kill_child;
-use asd_proto::{SessionInfo, code, paths};
+use asd_proto::{SessionIdentity, SessionInfo, code, paths};
 use tracing::info;
 
 use crate::detect::Detector;
@@ -253,9 +253,15 @@ impl Registry {
         Ok(())
     }
 
-    pub fn kill(&self, name: &str) -> Result<(), (u32, String)> {
+    pub fn kill(&self, name: &str, identity: SessionIdentity) -> Result<(), (u32, String)> {
         match self.sessions.get(name) {
             Some(h) => {
+                if h.identity() != identity {
+                    return Err((
+                        code::STALE_SESSION,
+                        format!("session '{name}' changed since it was selected"),
+                    ));
+                }
                 let _ = h.tx.send(SessionMsg::Kill);
                 Ok(())
             }
@@ -320,6 +326,60 @@ impl Registry {
             sampled_age_ms: u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX),
             ..sample
         })
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn stale_opaque_identity_cannot_signal_the_current_session() {
+        let identity = SessionIdentity { instance_id: 7 };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let meta = Arc::new(crate::session::SessionMeta {
+            cols: std::sync::atomic::AtomicU16::new(80),
+            rows: std::sync::atomic::AtomicU16::new(24),
+            attached_clients: std::sync::atomic::AtomicU32::new(0),
+            child_pid: std::sync::atomic::AtomicU32::new(42),
+            alive: std::sync::atomic::AtomicBool::new(true),
+            pty_master_fd: std::sync::atomic::AtomicI32::new(-1),
+            title: Mutex::new(String::new()),
+            status_line: Mutex::new(String::new()),
+            state: Mutex::new(asd_proto::AgentState::Unknown),
+            last_output_ms: std::sync::atomic::AtomicU64::new(100),
+            name: Mutex::new("current".to_string()),
+        });
+        let handle = SessionHandle {
+            name: "current".to_string(),
+            identity,
+            command: "sh".to_string(),
+            spawn_command: None,
+            created_ms: 100,
+            tx,
+            meta,
+        };
+        let mut registry = Registry::new(
+            0,
+            std::env::temp_dir().join("unused-sessions.tsv"),
+            std::env::temp_dir().join("unused-asd.sock"),
+        );
+        registry.sessions.insert("current".to_string(), handle);
+
+        let error = registry
+            .kill("current", SessionIdentity { instance_id: 8 })
+            .unwrap_err();
+        assert_eq!(error.0, code::STALE_SESSION);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        registry.kill("current", identity).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(SessionMsg::Kill)
+        ));
     }
 }
 

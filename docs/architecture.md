@@ -135,8 +135,13 @@ daemon drops it, so EOF cannot report anything there — on Windows the child's
 exit is watched directly and reported to the session thread instead. On Unix,
 `Kill` sends SIGHUP and uses SIGKILL after two seconds if needed. A ConPTY
 child cannot receive an equivalent console signal from the daemon, so Windows
-uses TerminateProcess immediately. Daemon shutdown
-applies the same graceful-then-hard sequence before removing its endpoint.
+uses TerminateProcess immediately. Every wire `Kill` carries the opaque,
+daemon-generated instance identity from the caller's `SessionList`; under the
+Registry lock the daemon treats it only as an assertion against its own handle
+before signaling that handle. Client-provided data never reaches a platform
+process API, so pid reuse or wall-clock changes cannot make an old confirmation
+target a replacement. Daemon shutdown applies the same graceful-then-hard
+sequence before removing its endpoint.
 
 Live processes, terminal cells, and scrollback are not persisted. Session name,
 working directory, and the command the session was created with are. Registry

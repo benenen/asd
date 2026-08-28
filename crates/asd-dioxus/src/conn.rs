@@ -49,6 +49,7 @@ pub enum HostCmd {
     Create,
     Kill {
         name: String,
+        identity: asd_proto::SessionIdentity,
     },
     /// Rename session `name` to `new_name` (daemon validates + acks).
     Rename {
@@ -259,8 +260,8 @@ async fn drive(
                         return Err("create write failed".to_string());
                     }
                 }
-                Some(HostCmd::Kill { name }) => {
-                    if writer.write_frame(&Frame::Kill { name }).await.is_err() {
+                Some(HostCmd::Kill { name, identity }) => {
+                    if writer.write_frame(&Frame::Kill { name, identity }).await.is_err() {
                         return Err("kill write failed".to_string());
                     }
                     let _ = writer.write_frame(&Frame::ListSessions).await;

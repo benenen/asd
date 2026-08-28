@@ -158,8 +158,8 @@ pub async fn handle_conn(
                     Err((code, msg)) => reply(Frame::Error { code, msg }),
                 }
             }
-            Frame::Kill { name } => {
-                if let Err((code, msg)) = registry.lock().unwrap().kill(&name) {
+            Frame::Kill { name, identity } => {
+                if let Err((code, msg)) = registry.lock().unwrap().kill(&name, identity) {
                     reply(Frame::Error { code, msg });
                 }
             }

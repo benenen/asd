@@ -445,29 +445,27 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
         Cmd::Kill { name, all } => {
             let mut c = client::connect(&socket, ClientKind::Cli).await?;
             // clap's group guarantees exactly one of name / --all.
-            let names = match name {
-                Some(n) => vec![n],
-                None => {
-                    debug_assert!(all);
-                    c.writer.write_frame(&Frame::ListSessions).await?;
-                    match c.reader.read_frame().await? {
-                        Some(Frame::SessionList { sessions }) => {
-                            sessions.into_iter().map(|s| s.name).collect()
-                        }
-                        Some(Frame::Error { code, msg }) => {
-                            return Err(exit::daemon("kill", code, &msg));
-                        }
-                        other => bail!("unexpected reply: {other:?}"),
-                    }
+            debug_assert_eq!(name.is_none(), all);
+            c.writer.write_frame(&Frame::ListSessions).await?;
+            let sessions = match c.reader.read_frame().await? {
+                Some(Frame::SessionList { sessions }) => sessions,
+                Some(Frame::Error { code, msg }) => {
+                    return Err(exit::daemon("kill", code, &msg));
                 }
+                other => bail!("unexpected reply: {other:?}"),
             };
-            if names.is_empty() {
+            let targets = select_kill_targets(&sessions, name.as_deref())
+                .map_err(|msg| exit::daemon("kill", asd_proto::code::NO_SUCH_SESSION, &msg))?;
+            if targets.is_empty() {
                 println!("no sessions");
                 return Ok(());
             }
-            for n in &names {
+            for (name, identity) in &targets {
                 c.writer
-                    .write_frame(&Frame::Kill { name: n.clone() })
+                    .write_frame(&Frame::Kill {
+                        name: name.clone(),
+                        identity: *identity,
+                    })
                     .await?;
             }
             // Kill has no ack frame (spec §4): use a ListSessions to anchor
@@ -481,7 +479,11 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                     // died on its own in the meantime is the outcome we wanted,
                     // not a failure.
                     Some(Frame::Error { code, msg }) => {
-                        if code == asd_proto::code::NO_SUCH_SESSION && names.len() > 1 {
+                        if matches!(
+                            code,
+                            asd_proto::code::NO_SUCH_SESSION | asd_proto::code::STALE_SESSION
+                        ) && all
+                        {
                             continue;
                         }
                         return Err(exit::daemon("kill", code, &msg));
@@ -489,8 +491,12 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
                     other => bail!("unexpected reply: {other:?}"),
                 }
             }
-            for n in &names {
-                println!("kill signalled: {n}");
+            for (name, _) in &targets {
+                if all {
+                    println!("kill requested: {name}");
+                } else {
+                    println!("kill signalled: {name}");
+                }
             }
         }
         Cmd::Attach {
@@ -660,6 +666,23 @@ async fn session_exists(c: &mut client::Client, name: &str) -> anyhow::Result<bo
     }
 }
 
+fn select_kill_targets(
+    sessions: &[asd_proto::SessionInfo],
+    name: Option<&str>,
+) -> Result<Vec<(String, asd_proto::SessionIdentity)>, String> {
+    match name {
+        Some(name) => sessions
+            .iter()
+            .find(|session| session.name == name)
+            .map(|session| vec![(session.name.clone(), session.identity())])
+            .ok_or_else(|| format!("no such session '{name}'")),
+        None => Ok(sessions
+            .iter()
+            .map(|session| (session.name.clone(), session.identity()))
+            .collect()),
+    }
+}
+
 /// Header of the column that shows what a session says about itself.
 pub(crate) const SAYS_HEADER: &str = "SAYS";
 /// Widest the SAYS column may grow, in display columns. NAME..CREATED
@@ -752,10 +775,41 @@ pub(crate) fn format_age(created_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Cmd, SAYS_HEADER, TITLE_COL_MAX, clean_title, pad_cell, session_says, str_width,
-        title_col_width,
+        Args, Cmd, SAYS_HEADER, TITLE_COL_MAX, clean_title, pad_cell, select_kill_targets,
+        session_says, str_width, title_col_width,
     };
     use clap::Parser;
+
+    #[test]
+    fn named_kill_uses_the_identity_from_the_list_snapshot() {
+        let session =
+            |name: &str, pid: u32, created_ms: u64, instance_id: u128| asd_proto::SessionInfo {
+                name: name.to_string(),
+                instance_id,
+                command: "sh".to_string(),
+                title: String::new(),
+                status_line: String::new(),
+                created_ms,
+                idle_ms: 0,
+                running: false,
+                state: asd_proto::AgentState::Unknown,
+                attached_clients: 0,
+                pid,
+                cols: 80,
+                rows: 24,
+            };
+        let sessions = vec![session("web", 42, 100, 1), session("logs", 43, 101, 2)];
+
+        assert_eq!(
+            select_kill_targets(&sessions, Some("web")).unwrap(),
+            vec![(
+                "web".to_string(),
+                asd_proto::SessionIdentity { instance_id: 1 },
+            )]
+        );
+        assert!(select_kill_targets(&sessions, Some("missing")).is_err());
+        assert_eq!(select_kill_targets(&sessions, None).unwrap().len(), 2);
+    }
 
     #[test]
     fn peek_styles_is_a_json_only_public_cli_option() {
@@ -781,6 +835,7 @@ mod tests {
     fn what_a_session_says_prefers_its_own_words() {
         let mut info = asd_proto::SessionInfo {
             name: "s0".into(),
+            instance_id: 1,
             command: "sh".into(),
             title: "user@host: ~".into(),
             status_line: String::new(),

@@ -95,6 +95,7 @@ gix = { version = "0.87", default-features = false, features = [
 # C `onig` backend, which is what keeps the Windows GNU cross-check clean.
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 fuzzy-matcher = "0.3"
+getrandom = "0.4"
 portable-pty = "0.9"
 postcard = { version = "1", features = ["use-std"] }
 ratatui = "0.30.2"

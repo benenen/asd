@@ -92,7 +92,7 @@ fn draw_title(
     let is_self = app.self_session.as_deref() == Some(&session.name);
     let closing = app
         .closing_sessions
-        .contains(&session.name, session.pid, session.created_ms);
+        .contains(&session.name, session.identity());
     let row_bg = if selected {
         Style::new().bg(SELECT_BG)
     } else {
@@ -132,7 +132,7 @@ fn draw_detail(buf: &mut Buffer, area: Rect, app: &App, session: &asd_proto::Ses
     let is_self = app.self_session.as_deref() == Some(&session.name);
     let closing = app
         .closing_sessions
-        .contains(&session.name, session.pid, session.created_ms);
+        .contains(&session.name, session.identity());
     let row_bg = if app.active.as_deref() == Some(&session.name) {
         Style::new().bg(SELECT_BG)
     } else {
@@ -240,6 +240,7 @@ mod tests {
     fn info(state: asd_proto::AgentState, running: bool) -> asd_proto::SessionInfo {
         asd_proto::SessionInfo {
             name: "web".into(),
+            instance_id: 1,
             command: "claude".into(),
             title: "Refactor auth".into(),
             status_line: String::new(),
