@@ -54,6 +54,18 @@ pub enum Outcome {
     Copy(String),
 }
 
+/// What the detail pane has for the selected commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailState {
+    /// A request is outstanding.
+    Loading,
+    Ready(crate::git::diff::CommitDiff),
+    /// The diff failed; the message is shown in the pane.
+    Failed(String),
+    /// The worker thread is gone. The graph still works.
+    Unavailable,
+}
+
 /// The overlay: a repository, the rows loaded from it, and the view state.
 #[derive(Debug)]
 pub struct GitGraph {
@@ -70,6 +82,12 @@ pub struct GitGraph {
     /// Rows the last frame had room for, so paging keys know their step.
     viewport_rows: usize,
     error: Option<String>,
+    /// Computes diffs off the render thread. `None` when it failed to start.
+    worker: Option<crate::worker::DiffWorker>,
+    detail: DetailState,
+    /// Which commit the outstanding request (if any) is for. A reply whose id
+    /// does not match this is stale and must be discarded.
+    detail_for: Option<gix::ObjectId>,
 }
 
 impl GitGraph {
@@ -77,6 +95,10 @@ impl GitGraph {
     pub fn open(path: &Path) -> Result<Self, OpenError> {
         let repo = Repo::open(path)?;
         let decorations = repo.refs().map(group_refs).unwrap_or_default();
+        // A worker that cannot start leaves detail as `Unavailable` rather
+        // than failing the whole overlay: the graph is still useful without
+        // diffs.
+        let worker = crate::worker::DiffWorker::new(path).ok();
         let mut me = Self {
             repo,
             builder: GraphBuilder::new(),
@@ -87,9 +109,13 @@ impl GitGraph {
             first_row: 0,
             viewport_rows: 1,
             error: None,
+            worker,
+            detail: DetailState::Unavailable,
+            detail_for: None,
         };
         me.reload();
         me.load_more(PAGE_FIRST);
+        me.request_detail();
         Ok(me)
     }
 
@@ -105,10 +131,47 @@ impl GitGraph {
         self.selected
     }
 
-    /// Phase 1 has no background work. The method exists now so `asd-tui`'s
-    /// event loop is wired for the diff worker phase 2 adds.
+    /// Take everything the worker finished. Returns true when the frame needs
+    /// repainting.
     pub fn poll(&mut self) -> bool {
-        false
+        let Some(worker) = self.worker.as_mut() else {
+            return false;
+        };
+        let replies = worker.drain();
+        if !worker.is_alive() && !matches!(self.detail, DetailState::Unavailable) {
+            self.detail = DetailState::Unavailable;
+            return true;
+        }
+        let mut dirty = false;
+        for reply in replies {
+            dirty |= self.accept_reply(reply);
+        }
+        dirty
+    }
+
+    /// Apply one reply. A reply for a commit that is no longer selected is
+    /// dropped: on a large repository the selection moves faster than the
+    /// worker, and a late answer must not overwrite the current row's detail.
+    fn accept_reply(&mut self, reply: crate::worker::Reply) -> bool {
+        match reply {
+            crate::worker::Reply::Commit { id, result } => {
+                if self.detail_for != Some(id) {
+                    return false;
+                }
+                self.detail = match result {
+                    Ok(diff) => DetailState::Ready(diff),
+                    Err(msg) => DetailState::Failed(msg),
+                };
+                true
+            }
+            // File replies are handled in the task that adds the file view.
+            crate::worker::Reply::File { .. } => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accept_reply_for_test(&mut self, reply: crate::worker::Reply) -> bool {
+        self.accept_reply(reply)
     }
 
     /// Re-read the whole history from scratch.
@@ -177,6 +240,7 @@ impl GitGraph {
         } else if self.selected >= self.first_row + self.viewport_rows {
             self.first_row = self.selected + 1 - self.viewport_rows;
         }
+        self.request_detail();
         Outcome::Consumed
     }
 
@@ -187,6 +251,40 @@ impl GitGraph {
             .nodes()
             .get(self.selected)
             .and_then(|n| n.commit.as_ref())
+    }
+
+    /// The id of the selected row's commit, if that row is a commit rather
+    /// than a connector.
+    pub fn selected_id(&self) -> Option<gix::ObjectId> {
+        self.selected_commit().map(|c| c.id)
+    }
+
+    pub fn detail(&self) -> &DetailState {
+        &self.detail
+    }
+
+    /// Ask the worker for the selected commit's diff. Called whenever the
+    /// selection lands on a different commit.
+    fn request_detail(&mut self) {
+        let Some(id) = self.selected_id() else {
+            self.detail = DetailState::Ready(Default::default());
+            self.detail_for = None;
+            return;
+        };
+        if self.detail_for == Some(id) {
+            return; // Already asked for exactly this.
+        }
+        match self.worker.as_mut() {
+            Some(w) if w.is_alive() => {
+                w.request(crate::worker::Request::Commit(id));
+                self.detail_for = Some(id);
+                self.detail = DetailState::Loading;
+            }
+            _ => {
+                self.detail = DetailState::Unavailable;
+                self.detail_for = None;
+            }
+        }
     }
 
     /// Handle one key.
@@ -345,6 +443,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// A successful commit reply, for feeding `accept_reply_for_test` without
+    /// going through a real worker round trip.
+    fn asd_git_reply_commit(id: gix::ObjectId) -> crate::worker::Reply {
+        crate::worker::Reply::Commit {
+            id,
+            result: Ok(crate::git::diff::CommitDiff::default()),
+        }
+    }
+
     /// Every symbol in `area`, row by row, as one string.
     fn buffer_text(buf: &Buffer, area: Rect) -> String {
         (0..area.height)
@@ -437,9 +544,95 @@ mod tests {
     }
 
     #[test]
-    fn poll_reports_no_work_in_phase_one() {
+    fn poll_settles_to_false_once_the_initial_detail_has_arrived() {
+        // Opening now posts a request for the newly selected commit, so the
+        // very first poll may deliver it. Once that reply has landed and
+        // nothing else is outstanding, poll must go back to reporting no
+        // change.
         let (_fx, mut g) = graph_with(1, "state-poll");
-        assert!(!g.poll(), "no background work exists yet");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(g.detail(), DetailState::Loading) {
+            assert!(std::time::Instant::now() < deadline, "detail never arrived");
+            g.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !g.poll(),
+            "no background work is outstanding once the detail has settled"
+        );
+    }
+
+    #[test]
+    fn selecting_a_commit_asks_the_worker_and_poll_delivers_it() {
+        let fx = Fixture::new("state-detail");
+        std::fs::write(fx.path().join("a.txt"), "one\ntwo\n").unwrap();
+        fx.git(&["add", "a.txt"]);
+        fx.commit("first");
+
+        let mut g = GitGraph::open(fx.path()).expect("fixture opens");
+        // Opening selects the newest commit, which posts a request.
+        assert!(matches!(g.detail(), DetailState::Loading));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(g.detail(), DetailState::Loading) {
+            assert!(std::time::Instant::now() < deadline, "detail never arrived");
+            g.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        match g.detail() {
+            DetailState::Ready(d) => {
+                assert_eq!(d.files.len(), 1);
+                assert_eq!(d.files[0].path, "a.txt");
+            }
+            other => panic!("expected a ready detail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_reports_false_when_nothing_arrived() {
+        let fx = Fixture::new("state-poll-idle");
+        std::fs::write(fx.path().join("a.txt"), "one\n").unwrap();
+        fx.git(&["add", "a.txt"]);
+        fx.commit("first");
+
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        // Drain whatever the initial selection produced.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(g.detail(), DetailState::Loading) {
+            assert!(std::time::Instant::now() < deadline);
+            g.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !g.poll(),
+            "a second poll with no outstanding work reports no change"
+        );
+    }
+
+    #[test]
+    fn a_reply_for_a_commit_no_longer_selected_is_discarded() {
+        // Selection moves faster than the worker on a large repository; a late
+        // reply must not overwrite the detail of the row the user is now on.
+        let fx = Fixture::new("state-stale");
+        for i in 0..3 {
+            std::fs::write(fx.path().join("a.txt"), format!("{i}\n")).unwrap();
+            fx.git(&["add", "a.txt"]);
+            fx.commit(&format!("commit {i}"));
+        }
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        let newest = g.selected_id().expect("a commit is selected");
+
+        g.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let now_selected = g.selected_id().expect("still on a commit");
+        assert_ne!(newest, now_selected);
+
+        // Feed a reply for the OLD selection and confirm it is ignored.
+        g.accept_reply_for_test(asd_git_reply_commit(newest));
+        assert!(
+            matches!(g.detail(), DetailState::Loading),
+            "a stale reply must not become the current detail"
+        );
     }
 
     /// `Widget::render` is the call site Task 7's panic-safety argument rests
