@@ -6,6 +6,7 @@
 //! terminal state.
 
 pub mod git;
+pub mod search;
 pub mod state;
 pub mod ui;
 pub mod worker;
@@ -15,7 +16,8 @@ pub use git::diff::{CommitDiff, DiffLine, FileChange, FileDiff, FileStat, MAX_DI
 pub use git::graph::{CellType, GraphBuilder, GraphNode};
 pub use git::refs::{RefInfo, RefKind};
 pub use git::repo::{OpenError, Repo};
-pub use state::{DetailState, GitGraph, Outcome, PAGE_FIRST};
+pub use search::{Search, rank};
+pub use state::{DetailState, GitGraph, Mode, Outcome, PAGE_FIRST};
 pub use ui::colors::{LANE_COLORS, lane_color};
 pub use ui::layout::{LayoutMap, Pane, pane_at, split};
 pub use worker::{DiffWorker, Reply, Request};

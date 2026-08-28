@@ -9,3 +9,4 @@ pub mod file_list;
 pub mod graph_view;
 pub mod highlight;
 pub mod layout;
+pub mod search;

@@ -15,6 +15,7 @@ use crate::git::commit::CommitInfo;
 use crate::git::graph::GraphBuilder;
 use crate::git::refs::RefInfo;
 use crate::git::repo::{OpenError, Repo};
+use crate::search::Search;
 use crate::ui::graph_view::draw_rows;
 use crate::ui::layout::{LayoutMap, Pane};
 
@@ -85,6 +86,10 @@ pub enum Mode {
     Normal,
     /// One file's diff, filling the overlay.
     FileDiff,
+    /// The search dropdown, over the top of the graph pane. The three panes
+    /// are still drawn beneath it, still describing the commit that was
+    /// selected when `/` was pressed: `Esc` cancels back to exactly that.
+    Search,
 }
 
 /// What the file diff view has.
@@ -154,6 +159,10 @@ pub struct GitGraph {
     /// Rows the file diff view had room for in the last frame, so scrolling it
     /// can stop at the end of the diff. Zero until the first frame.
     file_diff_rows: usize,
+    /// The search dropdown's query and matches. Meaningful while `mode` is
+    /// [`Mode::Search`]; `/` replaces it with a fresh one, so the matches it
+    /// holds are never older than the keypress that opened the dropdown.
+    search: Search,
 }
 
 impl GitGraph {
@@ -189,6 +198,7 @@ impl GitGraph {
             file_diff_for: None,
             file_diff_scroll: 0,
             file_diff_rows: 0,
+            search: Search::default(),
         };
         me.reload();
         me.load_more(PAGE_FIRST);
@@ -574,12 +584,16 @@ impl GitGraph {
     /// must *not* be filtered: it is what makes holding `j` down keep
     /// scrolling.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
-        // The file diff view is a layer on top, not a fourth pane: while it is
-        // open every key belongs to it. Falling through to the pane keys would
-        // move the changed-files selection under a view the user cannot see it
-        // in, so closing the view would land them on a different file.
-        if self.mode == Mode::FileDiff {
-            return self.file_diff_key(key);
+        // The file diff view and the search dropdown are layers on top, not
+        // extra panes: while one is open every key belongs to it. Falling
+        // through to the pane keys would move the changed-files selection
+        // under a view the user cannot see it in, so closing the view would
+        // land them on a different file — and would make `j` a movement key
+        // in a text field rather than a letter.
+        match self.mode {
+            Mode::FileDiff => return self.file_diff_key(key),
+            Mode::Search => return self.search_key(key),
+            Mode::Normal => {}
         }
         let page = self.viewport_rows.max(1);
         // A half page still has to be at least one row: `viewport_rows` is 1
@@ -650,6 +664,18 @@ impl GitGraph {
                 None => Outcome::Consumed,
             },
             (KeyModifiers::NONE, KeyCode::Enter) => self.open_selected_file(),
+            // The modifier is not matched, for the same reason `@` above does
+            // not: `/` is a shifted key on several common layouts, and
+            // crossterm reports the modifier it was typed with.
+            (_, KeyCode::Char('/')) => {
+                self.mode = Mode::Search;
+                // A fresh query every time. Reusing the last one would open
+                // the dropdown on matches ranked against whatever the node
+                // list held then, which `R` or a paged-in page has since
+                // changed.
+                self.search = Search::default();
+                Outcome::Redraw
+            }
             (_, KeyCode::Char('q') | KeyCode::Esc) => Outcome::Dismiss,
             _ => Outcome::Consumed,
         }
@@ -708,6 +734,56 @@ impl GitGraph {
             }
         }
         Outcome::Redraw
+    }
+
+    /// Handle one key while the search dropdown is open.
+    ///
+    /// `Redraw` throughout rather than `Consumed`: the query, the match list
+    /// and the mode are all invisible to a host that asks whether
+    /// [`GitGraph::selected`] moved, and `Enter` on the row that was already
+    /// selected moves nothing while still closing the dropdown.
+    ///
+    /// Movement is the arrows and `Ctrl+j`/`Ctrl+k`, never bare `j`/`k`: this
+    /// is a text field, and a query cannot contain the two commonest letters
+    /// in "jk" if they steer the list instead of being typed into it.
+    fn search_key(&mut self, key: KeyEvent) -> Outcome {
+        match (key.modifiers, key.code) {
+            // Cancel. The graph selection is left exactly where `/` found it,
+            // which is the whole difference between `Esc` and `Enter` here.
+            (_, KeyCode::Esc) => {
+                self.mode = Mode::Normal;
+                Outcome::Redraw
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                self.mode = Mode::Normal;
+                // Through `select`, never by assigning `selected`: it is what
+                // clamps the row, pages in more history, keeps the row inside
+                // the viewport and asks the worker for the new commit's diff.
+                if let Some(row) = self.search.selected_row() {
+                    self.select(row);
+                }
+                Outcome::Redraw
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                self.search.backspace(self.builder.nodes());
+                Outcome::Redraw
+            }
+            (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
+                self.search.next();
+                Outcome::Redraw
+            }
+            (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
+                self.search.previous();
+                Outcome::Redraw
+            }
+            // Anything printable is query text, `q` included: dismissing the
+            // overlay on a letter would make half the alphabet untypeable.
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+                self.search.push(c, self.builder.nodes());
+                Outcome::Redraw
+            }
+            _ => Outcome::Consumed,
+        }
     }
 
     /// Handle one key while the file diff view is open.
@@ -782,6 +858,13 @@ impl GitGraph {
                 MouseEventKind::ScrollUp => self.scroll_file_diff(-WHEEL_ROWS),
                 _ => Outcome::Consumed,
             };
+        }
+        // The dropdown is modal too. `layout` still holds a live three-pane
+        // frame here, so routing by it would work — and would move the graph
+        // selection under the dropdown, which is exactly what `Esc` promises
+        // not to do. The wheel does nothing instead.
+        if self.mode == Mode::Search {
+            return Outcome::Consumed;
         }
         if let Some(pane) = crate::ui::layout::pane_at(&self.layout, ev.column, ev.row) {
             if matches!(ev.kind, MouseEventKind::Down(_)) {
@@ -879,6 +962,12 @@ impl Widget for &mut GitGraph {
                 None => "no commits yet".to_string(),
             };
             crate::ui::graph_view::draw_message(buf, inner, &msg);
+            // Still drawn with nothing to search: a mode whose only sign on
+            // screen is that keys stopped doing what they did is a trap, and
+            // `Esc` is the only way out of it.
+            if self.mode == Mode::Search {
+                crate::ui::search::draw_search(buf, inner, &self.search, self.builder.nodes());
+            }
             return;
         }
         let map = crate::ui::layout::split(inner);
@@ -911,6 +1000,11 @@ impl Widget for &mut GitGraph {
             self.file_scroll,
             self.focus == Pane::Files,
         );
+        // Last, and over the graph pane: it is a layer on top of the three
+        // panes rather than one of them, and the rows it lists are graph rows.
+        if self.mode == Mode::Search {
+            crate::ui::search::draw_search(buf, map.graph, &self.search, self.builder.nodes());
+        }
     }
 }
 
@@ -1248,8 +1342,25 @@ mod tests {
         let mut no_rows = GitGraph::open(empty_fx.path()).expect("an unborn repository opens");
         let (_err_fx, mut errored) = graph_with(1, "state-render-error");
         errored.error = Some("simulated read failure with a long message".to_string());
+        // The search dropdown is drawn over the graph pane, and also over the
+        // "no commits yet" message, so both branches of `render` are swept.
+        let (_search_fx, mut searching) = graph_with(3, "state-render-search");
+        searching.on_key(key(KeyCode::Char('/')));
+        for c in "commit".chars() {
+            searching.on_key(key(KeyCode::Char(c)));
+        }
+        let empty_search_fx = Fixture::new("state-render-search-empty");
+        let mut searching_empty =
+            GitGraph::open(empty_search_fx.path()).expect("an unborn repository opens");
+        searching_empty.on_key(key(KeyCode::Char('/')));
 
-        for graph in [&mut with_rows, &mut no_rows, &mut errored] {
+        for graph in [
+            &mut with_rows,
+            &mut no_rows,
+            &mut errored,
+            &mut searching,
+            &mut searching_empty,
+        ] {
             for &ox in &[0u16, 2] {
                 for &oy in &[0u16, 1] {
                     for width in 0..=10u16 {
@@ -1877,5 +1988,237 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- search (`/`) ----------------------------------------------------
+
+    /// Three commits with summaries no fuzzy query can confuse for each
+    /// other. Rows are newest first, so row 0 is `gamma` and row 2 `alpha`.
+    fn searchable(tag: &str) -> (Fixture, GitGraph) {
+        let fx = Fixture::new(tag);
+        fx.commit("alpha the first");
+        fx.commit("beta the second");
+        fx.commit("gamma the third");
+        let g = GitGraph::open(fx.path()).expect("fixture opens");
+        (fx, g)
+    }
+
+    /// Type `query` into an already-open dropdown.
+    fn type_query(g: &mut GitGraph, query: &str) {
+        for c in query.chars() {
+            assert_eq!(
+                g.on_key(key(KeyCode::Char(c))),
+                Outcome::Redraw,
+                "typing must ask for a repaint: the host cannot see the query \
+                 change by comparing selected()"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_opens_the_dropdown_and_esc_cancels_without_moving_the_selection() {
+        let (_fx, mut g) = searchable("state-search-esc");
+        assert_eq!(g.on_key(key(KeyCode::Char('j'))), Outcome::Consumed);
+        assert_eq!(g.selected(), 1, "start somewhere other than the top");
+
+        assert_eq!(g.on_key(key(KeyCode::Char('/'))), Outcome::Redraw);
+        assert_eq!(g.mode(), Mode::Search);
+        type_query(&mut g, "alpha");
+
+        assert_eq!(g.on_key(key(KeyCode::Esc)), Outcome::Redraw);
+        assert_eq!(
+            g.mode(),
+            Mode::Normal,
+            "Esc unwinds one layer, not the overlay"
+        );
+        assert_eq!(g.selected(), 1, "Esc must not move the selection");
+    }
+
+    #[test]
+    fn typing_narrows_the_matches_and_enter_jumps_to_the_match() {
+        let (_fx, mut g) = searchable("state-search-enter");
+        assert_eq!(g.selected(), 0, "gamma, the newest, starts selected");
+
+        g.on_key(key(KeyCode::Char('/')));
+        type_query(&mut g, "alpha");
+        assert_eq!(
+            g.search.matches(),
+            &[2],
+            "only the oldest commit matches `alpha`"
+        );
+
+        assert_eq!(g.on_key(key(KeyCode::Enter)), Outcome::Redraw);
+        assert_eq!(g.mode(), Mode::Normal, "Enter closes the dropdown");
+        assert_eq!(g.selected(), 2, "and lands on the match");
+    }
+
+    /// The author is part of the haystack, so a query naming one finds every
+    /// commit they wrote. The fixture gives all three the same author, which
+    /// is what makes this an assertion about the haystack rather than luck.
+    #[test]
+    fn a_query_can_name_the_author() {
+        let (_fx, mut g) = searchable("state-search-author");
+        g.on_key(key(KeyCode::Char('/')));
+        type_query(&mut g, "asd test");
+        assert_eq!(g.search.matches().len(), 3, "every commit has that author");
+    }
+
+    /// `q` closes the overlay in `Normal`. In the dropdown it is a letter, and
+    /// so is every other key that means something outside it.
+    #[test]
+    fn q_is_typed_into_the_query_rather_than_dismissing_the_overlay() {
+        let (_fx, mut g) = searchable("state-search-q");
+        g.on_key(key(KeyCode::Char('/')));
+        assert_eq!(g.on_key(key(KeyCode::Char('q'))), Outcome::Redraw);
+        assert_eq!(g.mode(), Mode::Search, "still searching");
+        assert_eq!(g.search.query(), "q");
+        // And `j` is a letter here too, not a movement key.
+        g.on_key(key(KeyCode::Char('j')));
+        assert_eq!(g.search.query(), "qj");
+        assert_eq!(g.selected(), 0, "nothing moved the graph");
+    }
+
+    #[test]
+    fn backspace_and_the_movement_keys_edit_and_walk_the_match_list() {
+        let (_fx, mut g) = searchable("state-search-edit");
+        g.on_key(key(KeyCode::Char('/')));
+        type_query(&mut g, "the");
+        assert_eq!(g.search.matches().len(), 3, "every summary contains `the`");
+        assert_eq!(g.search.selected(), Some(0));
+
+        assert_eq!(g.on_key(key(KeyCode::Down)), Outcome::Redraw);
+        assert_eq!(g.search.selected(), Some(1));
+        assert_eq!(
+            g.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Outcome::Redraw
+        );
+        assert_eq!(g.search.selected(), Some(2));
+        g.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(g.search.selected(), Some(1));
+        g.on_key(key(KeyCode::Up));
+        assert_eq!(g.search.selected(), Some(0));
+
+        assert_eq!(g.on_key(key(KeyCode::Backspace)), Outcome::Redraw);
+        assert_eq!(g.search.query(), "th");
+    }
+
+    #[test]
+    fn enter_with_nothing_matched_leaves_the_selection_where_it_was() {
+        let (_fx, mut g) = searchable("state-search-nomatch");
+        g.on_key(key(KeyCode::Char('j')));
+        assert_eq!(g.selected(), 1);
+        g.on_key(key(KeyCode::Char('/')));
+        type_query(&mut g, "zzzz");
+        assert!(g.search.matches().is_empty());
+        assert_eq!(g.on_key(key(KeyCode::Enter)), Outcome::Redraw);
+        assert_eq!(g.mode(), Mode::Normal);
+        assert_eq!(g.selected(), 1, "no match, no jump");
+    }
+
+    /// `Enter` must go through `select`, not assign `selected`: that is what
+    /// keeps the row inside the viewport and asks the worker for its diff.
+    /// Jumping to a row far below the visible window is what tells the two
+    /// apart — a bare assignment leaves `first_row` behind and the selection
+    /// off screen.
+    #[test]
+    fn enter_jumps_through_select_so_the_row_ends_up_in_the_viewport() {
+        let fx = Fixture::new("state-search-viewport");
+        fx.commit("needle the target");
+        for i in 0..40 {
+            fx.commit(&format!("filler {i}"));
+        }
+        let mut g = GitGraph::open(fx.path()).expect("fixture opens");
+        // A frame first, so `viewport_rows` is a real height rather than 1.
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let rows = g.viewport_rows;
+        assert!(
+            rows > 1 && rows < 40,
+            "the target must be off screen: {rows}"
+        );
+
+        g.on_key(key(KeyCode::Char('/')));
+        type_query(&mut g, "needle");
+        g.on_key(key(KeyCode::Enter));
+
+        assert_eq!(g.selected(), 40, "the oldest row, which is the needle");
+        assert!(
+            g.first_row <= g.selected() && g.selected() < g.first_row + rows,
+            "row {} is outside the viewport [{}, {})",
+            g.selected(),
+            g.first_row,
+            g.first_row + rows
+        );
+        assert_eq!(
+            g.detail_for,
+            g.selected_id(),
+            "select() asked the worker for the commit it landed on"
+        );
+    }
+
+    #[test]
+    fn the_dropdown_is_drawn_over_the_graph_pane() {
+        let (_fx, mut g) = searchable("state-search-draw");
+        let area = Rect::new(0, 0, 70, 24);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let before = buffer_text(&buf, area);
+        assert!(!before.contains("/alp"), "nothing drawn before `/`");
+
+        g.on_key(key(KeyCode::Char('/')));
+        type_query(&mut g, "alpha");
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let text = buffer_text(&buf, area);
+        assert!(text.contains("/alpha"), "the query is echoed: {text:?}");
+        assert!(
+            text.contains("Search"),
+            "the dropdown has its title: {text:?}"
+        );
+        assert!(
+            text.contains("alpha the first"),
+            "the match is listed: {text:?}"
+        );
+    }
+
+    /// The dropdown covers the top of the graph pane, so a wheel routed by
+    /// `layout` would move the selection underneath it — the one thing `Esc`
+    /// promises will not have happened.
+    #[test]
+    fn the_wheel_does_not_move_the_graph_while_the_dropdown_is_open() {
+        let (_fx, mut g) = searchable("state-search-wheel");
+        let area = Rect::new(0, 0, 70, 24);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let map = g.layout_for_test();
+        g.on_key(key(KeyCode::Char('/')));
+
+        let outcome = g.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: map.graph.x + 1,
+            row: map.graph.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(outcome, Outcome::Consumed);
+        assert_eq!(
+            g.selected(),
+            0,
+            "the graph did not scroll under the dropdown"
+        );
+        assert_eq!(g.mode(), Mode::Search);
+    }
+
+    /// Reopening starts from an empty query: the row indices in a stale match
+    /// list were ranked against a node list `R` may since have rebuilt.
+    #[test]
+    fn reopening_the_dropdown_starts_from_an_empty_query() {
+        let (_fx, mut g) = searchable("state-search-reopen");
+        g.on_key(key(KeyCode::Char('/')));
+        type_query(&mut g, "alpha");
+        g.on_key(key(KeyCode::Esc));
+        g.on_key(key(KeyCode::Char('/')));
+        assert_eq!(g.search.query(), "");
+        assert!(g.search.matches().is_empty());
     }
 }
