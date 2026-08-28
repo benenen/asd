@@ -108,8 +108,9 @@ impl Highlighter {
     /// Highlight one line of `path`, returning styled spans whose text
     /// concatenates back to the input exactly.
     ///
-    /// `text` is one line without its terminator. A path whose extension has
-    /// no known syntax yields the whole line in a single unstyled span.
+    /// `text` is one line without its terminator. The round-trip is checked,
+    /// not assumed: anything that would drop characters degrades to a single
+    /// unstyled span, which is also what a path with no known syntax gives.
     pub fn line(&mut self, path: &str, text: &str) -> Vec<(Style, String)> {
         let syntaxes = syntaxes();
         let Some(syntax) = syntax_for(syntaxes, path) else {
@@ -145,32 +146,80 @@ impl Highlighter {
             return vec![(Style::default(), text.to_string())];
         };
 
-        let mut spans: Vec<(Style, String)> = ranges
+        let spans = ranges
             .into_iter()
             .map(|(style, piece)| (convert(style), piece.to_string()))
             .collect();
-        // Take back the newline appended above. highlight_line partitions its
-        // input, so it is always the last byte of the last span.
-        if let Some((_, last)) = spans.last_mut()
-            && last.ends_with('\n')
-        {
-            last.pop();
+        match finish(spans, text) {
+            Some(spans) => spans,
+            None => {
+                // A truncated partition leaves the highlight state stranded
+                // mid-line while the parse state reached the end of it, so it
+                // is no longer usable for the rest of the file.
+                self.current = None;
+                vec![(Style::default(), text.to_string())]
+            }
         }
-        // Empty spans carry nothing and would only make callers loop further.
-        spans.retain(|(_, t)| !t.is_empty());
-        if spans.is_empty() {
-            spans.push((Style::default(), String::new()));
-        }
-        spans
     }
 }
 
-/// The syntax for a path's extension, if there is one. Files with no extension
-/// or an unknown one are not guessed at from their content: the diff view has
-/// only the lines it is asked about, not the file.
+/// Tidy syntect's ranges into spans, or refuse them.
+///
+/// Returns `None` when the spans do not reproduce `text`, which the caller
+/// must treat as "this line cannot be highlighted" rather than paint.
+///
+/// The check is not paranoia about arithmetic. `RangedHighlightIterator::next`
+/// ends the iteration early on a `ScopeStackOp::Restore` with an empty clear
+/// stack (`highlighter.rs`, the `.ok()?`) while `parse_line` still returns
+/// `Ok`, so the partition can come back covering only part of the line. Without
+/// this the trailing newline would simply not be found, no pop would happen,
+/// and a diff row would be painted with characters missing and nothing logged.
+///
+/// Comparing lengths is enough: the spans are always a prefix of the input, so
+/// equal lengths mean equal text.
+fn finish(mut spans: Vec<(Style, String)>, text: &str) -> Option<Vec<(Style, String)>> {
+    // Take back the newline `line` appended. highlight_line partitions its
+    // input, so it is the last byte of the last span.
+    if let Some((_, last)) = spans.last_mut()
+        && last.ends_with('\n')
+    {
+        last.pop();
+    }
+    // Empty spans carry nothing and would only make callers loop further.
+    spans.retain(|(_, t)| !t.is_empty());
+
+    let covered: usize = spans.iter().map(|(_, t)| t.len()).sum();
+    if covered != text.len() {
+        return None;
+    }
+    if spans.is_empty() {
+        spans.push((Style::default(), String::new()));
+    }
+    Some(spans)
+}
+
+/// The syntax for a path, by extension and then by whole file name.
+///
+/// syntect files whole names in the same `file_extensions` list as real
+/// extensions — `Makefile`, `Rakefile`, `Gemfile`, `Vagrantfile`, `.bashrc`,
+/// `config.ru` — and `Path::extension` returns `None` for every one of them,
+/// so the name is tried whenever the extension misses rather than only when
+/// there is no extension. That also picks up `config.ru`, whose extension
+/// (`ru`) is not registered but whose full name is.
+///
+/// Content is never sniffed: the diff view has only the lines it is asked
+/// about, not the file, so `find_syntax_by_first_line` has nothing to read.
 fn syntax_for<'a>(syntaxes: &'a SyntaxSet, path: &str) -> Option<&'a SyntaxReference> {
-    let ext = std::path::Path::new(path).extension()?.to_str()?;
-    syntaxes.find_syntax_by_extension(ext)
+    let path = std::path::Path::new(path);
+    let by_extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(|e| syntaxes.find_syntax_by_extension(e));
+    by_extension.or_else(|| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| syntaxes.find_syntax_by_extension(n))
+    })
 }
 
 /// syntect colours are RGBA; the terminal gets the RGB.
@@ -217,13 +266,66 @@ mod tests {
     }
 
     #[test]
-    fn a_path_with_no_extension_at_all_is_unstyled_rather_than_a_panic() {
+    fn a_path_with_no_syntax_at_all_is_unstyled_rather_than_a_panic() {
+        // Degenerate paths reach here from the diff worker, and the render
+        // thread paints every session, so none of these may panic.
         let mut h = Highlighter::new();
-        for path in ["Makefile", "LICENSE", "", "dir/", "."] {
+        for path in ["LICENSE", "", "dir/", ".", "..", "/", "notes.zzzz"] {
             let spans = h.line(path, "some text");
-            assert_eq!(spans.len(), 1, "{path} gave {spans:?}");
+            assert_eq!(spans.len(), 1, "{path:?} gave {spans:?}");
             assert_eq!(joined(&spans), "some text");
+            assert_eq!(spans[0].0, Style::default(), "{path:?} invented a colour");
         }
+    }
+
+    #[test]
+    fn a_file_known_by_name_rather_than_by_extension_is_still_highlighted() {
+        // syntect keeps whole file names in the same list as real extensions,
+        // and `Path::extension` is None for every one of them, so looking at
+        // the extension alone leaves these unstyled.
+        let mut h = Highlighter::new();
+        for (path, line) in [
+            ("Makefile", "CFLAGS = -O2"),
+            ("dir/Makefile", "CFLAGS = -O2"),
+            ("Gemfile", "gem \"rails\""),
+            (".bashrc", "export PATH=\"$HOME/bin\""),
+            // Extension present but unregistered; the name still resolves.
+            ("config.ru", "run Rails.application"),
+        ] {
+            h.reset();
+            let spans = h.line(path, line);
+            assert!(spans.len() > 1, "{path} was not highlighted: {spans:?}");
+            assert_eq!(joined(&spans), line, "round-trip failed for {path}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_partition_degrades_to_plain_text_rather_than_dropping_characters() {
+        // `RangedHighlightIterator::next` gives up early on a `Restore` with an
+        // empty clear stack while `parse_line` still returns `Ok`, which hands
+        // back a partition covering only part of the line. It cannot be
+        // provoked through this API with syntect's bundled syntaxes -- it was
+        // found by reading syntect, not by triggering it -- so the guard is
+        // exercised directly rather than through a manufactured input.
+        let short = vec![(Style::default(), "fn ma".to_string())];
+        assert_eq!(
+            finish(short, "fn main() {}"),
+            None,
+            "a short partition must be refused, not painted"
+        );
+
+        let whole = vec![
+            (Style::default(), "fn ".to_string()),
+            (Style::default(), "main() {}\n".to_string()),
+        ];
+        let kept = finish(whole, "fn main() {}").expect("a full partition is kept");
+        assert_eq!(joined(&kept), "fn main() {}");
+
+        // The empty line: nothing but the appended newline comes back.
+        let only_newline = vec![(Style::default(), "\n".to_string())];
+        let kept = finish(only_newline, "").expect("an empty line is not a truncation");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(joined(&kept), "");
     }
 
     #[test]
@@ -253,9 +355,10 @@ mod tests {
     }
 
     #[test]
-    fn no_span_is_ever_empty() {
+    fn only_an_empty_line_produces_an_empty_span() {
         // Task 10 walks these to place columns; an empty span is a wasted
-        // iteration and a zero-width write.
+        // iteration and a zero-width write. An empty line is the one case
+        // that has nothing else to return.
         let mut h = Highlighter::new();
         for line in ["", "fn main() {}", "   ", "let s = \"中文\";"] {
             let spans = h.line("a.rs", line);
