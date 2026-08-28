@@ -44,8 +44,18 @@ impl Fixture {
         &self.dir
     }
 
-    /// Run a git command, panicking with its stderr when it fails.
+    /// Run a git command, panicking with its stderr when it fails. The output
+    /// is trimmed, which is what a caller reading back an object id wants.
     pub(crate) fn git(&self, args: &[&str]) -> String {
+        self.git_raw(args).trim().to_string()
+    }
+
+    /// [`Fixture::git`] without the trim, for callers reading diff *text*.
+    ///
+    /// A trailing blank context line is a single space, and a leading one is a
+    /// space too: trimming deletes both, so an oracle built on the trimmed
+    /// form silently drops the very rows it exists to compare.
+    pub(crate) fn git_raw(&self, args: &[&str]) -> String {
         let stamp = 1_700_000_000 + self.clock.get();
         let date = format!("{stamp} +0000");
         let out = Command::new("git")
@@ -62,7 +72,7 @@ impl Fixture {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     /// An empty commit with `summary` as its message. Each commit advances the

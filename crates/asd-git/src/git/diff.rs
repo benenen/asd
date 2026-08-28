@@ -266,20 +266,42 @@ impl Repo {
                             return Ok(Action::Break(()));
                         }
                     };
-                    // A binary blob is not an error here: `prepare_diff`
-                    // succeeds and says so through its operation.
-                    if matches!(
-                        prep.operation,
-                        PrepareOperation::SourceOrDestinationIsBinary
-                    ) {
-                        found = Some(FileDiff::binary(path));
-                        return Ok(Action::Continue(()));
-                    }
+                    // `prepare_diff` reports both the binary case and the
+                    // algorithm to use, and both have to be read from here.
+                    //
+                    // A binary blob is not an error: `prepare_diff` succeeds
+                    // and says so through its operation.
+                    //
+                    // The algorithm matters just as much. `commit_diff` takes
+                    // its `+N -M` from `line_counts`, which reads the algorithm
+                    // out of this same field — the repository's own
+                    // `diff.algorithm`, defaulting to Myers. Naming a different
+                    // one here made the changed-files pane and this viewer
+                    // answer the same question two ways: a file could read
+                    // `+36 -28` in the pane and show 68 added lines once opened.
+                    let algorithm = match prep.operation {
+                        PrepareOperation::InternalDiff { algorithm } => algorithm,
+                        PrepareOperation::SourceOrDestinationIsBinary => {
+                            found = Some(FileDiff::binary(path));
+                            return Ok(Action::Continue(()));
+                        }
+                        // Disabled above, so gix never chooses it. Reported
+                        // rather than assumed away: nothing in this crate
+                        // panics, and a wrong assumption here would.
+                        PrepareOperation::ExternalCommand { .. } => {
+                            failure = Some(ReadError(
+                                "an external diff driver cannot be rendered with line numbers"
+                                    .to_string(),
+                            ));
+                            return Ok(Action::Break(()));
+                        }
+                    };
                     let input = prep.interned_input();
-                    let diff = gix::diff::blob::diff_with_slider_heuristics(
-                        gix::diff::blob::Algorithm::Histogram,
-                        &input,
-                    );
+                    // Slider heuristics move a hunk's boundary within a run of
+                    // equal lines; they change where a change is shown, never
+                    // how much of one there is. The totals still match
+                    // `line_counts`, which does not apply them.
+                    let diff = gix::diff::blob::diff_with_slider_heuristics(algorithm, &input);
                     found = Some(assemble(path, &input, diff.hunks(), context));
                     Ok(Action::Continue(()))
                 },
@@ -648,8 +670,12 @@ mod tests {
 
     /// The hunk bodies of `git diff -U{context}` across the last commit, with
     /// the headers dropped: the same shape `rendered` produces.
+    ///
+    /// `git_raw` rather than `git`: a blank context line is a lone space, and
+    /// the trimmed form would drop it off either end of the output while
+    /// `rendered` keeps it, turning a real disagreement into a pass.
     fn git_rendered(fx: &Fixture, path: &str, context: u32) -> Vec<String> {
-        let out = fx.git(&[
+        let out = fx.git_raw(&[
             "diff",
             &format!("-U{context}"),
             "HEAD~1",
@@ -671,7 +697,10 @@ mod tests {
     /// carrying its stale pre-change text.
     ///
     /// The expectation here is real `git diff -Un` output read back from the
-    /// fixture, not a written-down guess.
+    /// fixture, not a written-down guess. Twelve distinct lines have one
+    /// minimal alignment, so this fixture would agree with git whatever
+    /// algorithm either side used; the repetitive-file oracle below is what
+    /// pins the algorithm itself.
     #[test]
     fn hunks_close_together_render_exactly_like_git() {
         // (description, changed 1-based lines, context)
@@ -727,6 +756,133 @@ mod tests {
                     last_new = new;
                 }
             }
+        }
+    }
+
+    /// A deterministic file of repetitive, source-like lines.
+    ///
+    /// The token set is what real source repeats: a closing brace, a blank
+    /// line, an early return. Distinct lines have exactly one minimal
+    /// alignment, so every diff algorithm agrees on them; repeated lines are
+    /// where they part company.
+    fn repetitive(seed: u64, lines: usize) -> Vec<String> {
+        const TOKENS: [&str; 6] = [
+            "}",
+            "",
+            "    return;",
+            "    if (x) {",
+            "        y += 1;",
+            "    // step",
+        ];
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize
+        };
+        (0..lines)
+            .map(|_| TOKENS[next() % TOKENS.len()].to_string())
+            .collect()
+    }
+
+    /// Delete every third-ish line and insert a marker in its place, so the
+    /// two sides differ everywhere rather than in one block.
+    fn edited(seed: u64, before: &[String]) -> Vec<String> {
+        let mut state = seed.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(7);
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize
+        };
+        let mut out = Vec::with_capacity(before.len());
+        for line in before {
+            match next() % 10 {
+                0 => {}                                       // deleted
+                1 => out.push("        z -= 1;".to_string()), // replaced
+                2 => {
+                    out.push(line.clone());
+                    out.push("    // inserted".to_string());
+                }
+                _ => out.push(line.clone()),
+            }
+        }
+        out
+    }
+
+    /// The oracle above only proves anything for the fixture it runs on, and
+    /// twelve distinct lines is the fixture every diff algorithm agrees about.
+    ///
+    /// This one runs the same comparison over files that repeat themselves,
+    /// which is where Myers and Histogram produce genuinely different — both
+    /// valid, differently sized — diffs. It fails against a `file_diff` that
+    /// names its own algorithm instead of taking the repository's, which is
+    /// also the state in which the changed-files pane's `+N -M` (counted by
+    /// gix with `diff.algorithm`) disagrees with what this viewer draws.
+    #[test]
+    fn a_repetitive_file_renders_exactly_like_git() {
+        for seed in 1..=4u64 {
+            let before = repetitive(seed, 300);
+            let after = edited(seed, &before);
+            let before: String = before.iter().map(|l| format!("{l}\n")).collect();
+            let after: String = after.iter().map(|l| format!("{l}\n")).collect();
+
+            let fx = Fixture::new("filediff-repetitive");
+            write_commit(&fx, "a.txt", &before, "first");
+            let id = write_commit(&fx, "a.txt", &after, "edits");
+
+            let repo = Repo::open(fx.path()).unwrap();
+            let d = repo.file_diff(id.parse().unwrap(), "a.txt", 3).unwrap();
+
+            assert_eq!(
+                rendered(&d),
+                git_rendered(&fx, "a.txt", 3),
+                "seed {seed}: our diff of a repetitive file is not git's"
+            );
+        }
+    }
+
+    /// The two halves of one answer: the count the changed-files pane shows
+    /// and the lines the viewer draws must be the same diff.
+    ///
+    /// `commit_diff` reads the algorithm out of gix's configuration and
+    /// `file_diff` used to hardcode Histogram, so on a repetitive file the
+    /// pane said `+36 -28` and the viewer then painted 68 additions.
+    #[test]
+    fn the_pane_count_and_the_rendered_diff_agree() {
+        for seed in 1..=4u64 {
+            let before = repetitive(seed, 300);
+            let after = edited(seed, &before);
+            let before: String = before.iter().map(|l| format!("{l}\n")).collect();
+            let after: String = after.iter().map(|l| format!("{l}\n")).collect();
+
+            let fx = Fixture::new("filediff-agree");
+            write_commit(&fx, "a.txt", &before, "first");
+            let id = write_commit(&fx, "a.txt", &after, "edits");
+
+            let repo = Repo::open(fx.path()).unwrap();
+            let id: gix::ObjectId = id.parse().unwrap();
+            let stat = repo.commit_diff(id).unwrap();
+            let stat = stat.files.iter().find(|f| f.path == "a.txt").unwrap();
+            let d = repo.file_diff(id, "a.txt", 3).unwrap();
+            assert!(!d.truncated, "seed {seed}: the fixture must fit");
+
+            let added = d
+                .lines
+                .iter()
+                .filter(|l| matches!(l, DiffLine::Added { .. }))
+                .count();
+            let removed = d
+                .lines
+                .iter()
+                .filter(|l| matches!(l, DiffLine::Removed { .. }))
+                .count();
+            assert_eq!(
+                (added, removed),
+                (stat.insertions as usize, stat.removals as usize),
+                "seed {seed}: the pane counts and the viewer's lines disagree"
+            );
         }
     }
 
