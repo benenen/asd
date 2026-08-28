@@ -32,6 +32,9 @@ pub const PAGE_MORE: usize = 2000;
 const PAGE_MARGIN: usize = 200;
 /// Rows one wheel notch moves.
 const WHEEL_ROWS: isize = 3;
+/// Shown where a diff would be when the worker thread is gone. The graph still
+/// works without it, so this is a message rather than a failure of the overlay.
+const WORKER_GONE: &str = "diffs are unavailable";
 
 /// What `asd-tui` should do after handing over an event.
 ///
@@ -70,6 +73,31 @@ pub enum DetailState {
     Failed(String),
     /// The worker thread is gone. The graph still works.
     Unavailable,
+}
+
+/// Which layer of the overlay is on top.
+///
+/// The layers are a stack, not a set of independent flags: `q`/`Esc` pops one
+/// layer, and only the bottom one closes the overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// The three panes.
+    Normal,
+    /// One file's diff, filling the overlay.
+    FileDiff,
+}
+
+/// What the file diff view has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileDiffState {
+    /// No file has been opened yet. Only reachable in [`Mode::Normal`], where
+    /// nothing draws it.
+    Closed,
+    /// A request for this path is outstanding.
+    Loading(String),
+    /// The diff, with its lines already highlighted on the worker thread.
+    Ready(crate::worker::HighlightedDiff),
+    Failed(String),
 }
 
 /// The overlay: a repository, the rows loaded from it, and the view state.
@@ -111,6 +139,21 @@ pub struct GitGraph {
     file_selected: usize,
     /// Rows scrolled past in the changed-files pane.
     file_scroll: usize,
+    /// Which layer is on top: the three panes, or one file's diff.
+    mode: Mode,
+    /// The file diff view's content. Kept after the view is closed so
+    /// reopening the same file is instant.
+    file_diff: FileDiffState,
+    /// Which commit and path the outstanding file request is for. A reply for
+    /// anything else is stale and must be discarded, exactly as for `detail`:
+    /// there is no cancellation, so a request for a file the user has already
+    /// navigated away from still comes back.
+    file_diff_for: Option<(gix::ObjectId, String)>,
+    /// Lines scrolled past in the file diff view.
+    file_diff_scroll: usize,
+    /// Rows the file diff view had room for in the last frame, so scrolling it
+    /// can stop at the end of the diff. Zero until the first frame.
+    file_diff_rows: usize,
 }
 
 impl GitGraph {
@@ -141,6 +184,11 @@ impl GitGraph {
             focus: Pane::Graph,
             file_selected: 0,
             file_scroll: 0,
+            mode: Mode::Normal,
+            file_diff: FileDiffState::Closed,
+            file_diff_for: None,
+            file_diff_scroll: 0,
+            file_diff_rows: 0,
         };
         me.reload();
         me.load_more(PAGE_FIRST);
@@ -168,6 +216,17 @@ impl GitGraph {
     /// Which row of the changed-files pane is selected.
     pub fn file_selected(&self) -> usize {
         self.file_selected
+    }
+
+    /// Which layer of the overlay is on top.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// What the file diff view has. Meaningful while `mode` is
+    /// [`Mode::FileDiff`]; otherwise it is whatever was last opened.
+    pub fn file_diff(&self) -> &FileDiffState {
+        &self.file_diff
     }
 
     #[cfg(test)]
@@ -201,6 +260,13 @@ impl GitGraph {
             self.detail = DetailState::Unavailable;
             dirty = true;
         }
+        // The same backstop for the file view: a `Loading` that will never
+        // resolve would otherwise spin forever behind a dead worker.
+        if !alive && matches!(self.file_diff, FileDiffState::Loading(_)) {
+            self.file_diff = FileDiffState::Failed(WORKER_GONE.to_string());
+            self.file_diff_for = None;
+            dirty = true;
+        }
         dirty
     }
 
@@ -225,8 +291,24 @@ impl GitGraph {
                 }
                 true
             }
-            // File replies are handled in the task that adds the file view.
-            crate::worker::Reply::File { .. } => false,
+            crate::worker::Reply::File {
+                commit,
+                path,
+                result,
+            } => {
+                // Same staleness rule as the commit arm, on the pair that
+                // identifies the request: the user can close the view, move to
+                // another commit and open the same path again before the first
+                // answer lands.
+                if self.file_diff_for.as_ref() != Some(&(commit, path)) {
+                    return false;
+                }
+                self.file_diff = match result {
+                    Ok(highlighted) => FileDiffState::Ready(highlighted),
+                    Err(msg) => FileDiffState::Failed(msg),
+                };
+                true
+            }
         }
     }
 
@@ -470,6 +552,13 @@ impl GitGraph {
     /// must *not* be filtered: it is what makes holding `j` down keep
     /// scrolling.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
+        // The file diff view is a layer on top, not a fourth pane: while it is
+        // open every key belongs to it. Falling through to the pane keys would
+        // move the changed-files selection under a view the user cannot see it
+        // in, so closing the view would land them on a different file.
+        if self.mode == Mode::FileDiff {
+            return self.file_diff_key(key);
+        }
         let page = self.viewport_rows.max(1);
         // A half page still has to be at least one row: `viewport_rows` is 1
         // before the first frame and can be 1 in a three-row-tall overlay,
@@ -538,9 +627,123 @@ impl GitGraph {
                 Some(c) => Outcome::Copy(c.id.to_string()),
                 None => Outcome::Consumed,
             },
+            (KeyModifiers::NONE, KeyCode::Enter) => self.open_selected_file(),
             (_, KeyCode::Char('q') | KeyCode::Esc) => Outcome::Dismiss,
             _ => Outcome::Consumed,
         }
+    }
+
+    /// Open the changed-files pane's selected file in the file diff view.
+    ///
+    /// Only from that pane: `Enter` on the graph is about a commit, not a
+    /// file, and has no meaning here yet.
+    ///
+    /// The path asked for is [`crate::git::diff::FileStat::path`], which for a
+    /// rename is the *destination*: that is the name the file has in this
+    /// commit's tree, and the only one `file_diff` can find.
+    fn open_selected_file(&mut self) -> Outcome {
+        if self.focus != Pane::Files {
+            return Outcome::Consumed;
+        }
+        let Some(commit) = self.selected_id() else {
+            return Outcome::Consumed;
+        };
+        let DetailState::Ready(diff) = &self.detail else {
+            return Outcome::Consumed;
+        };
+        let Some(path) = diff.files.get(self.file_selected).map(|f| f.path.clone()) else {
+            return Outcome::Consumed;
+        };
+
+        self.mode = Mode::FileDiff;
+        self.file_diff_scroll = 0;
+        let want = (commit, path);
+        // Reopening the file already loaded (or already asked for) must not
+        // post a second request: there is no cancellation, so every duplicate
+        // is a whole file diff the worker computes and this then throws away.
+        // A previous *failure* is not reused — retrying is the only way back
+        // from a transient one.
+        let reuse = self.file_diff_for.as_ref() == Some(&want)
+            && matches!(
+                self.file_diff,
+                FileDiffState::Ready(_) | FileDiffState::Loading(_)
+            );
+        if reuse {
+            return Outcome::Redraw;
+        }
+        match self.worker.as_mut() {
+            Some(w) if w.is_alive() => {
+                w.request(crate::worker::Request::File {
+                    commit: want.0,
+                    path: want.1.clone(),
+                });
+                self.file_diff = FileDiffState::Loading(want.1.clone());
+                self.file_diff_for = Some(want);
+            }
+            _ => {
+                self.file_diff = FileDiffState::Failed(WORKER_GONE.to_string());
+                self.file_diff_for = None;
+            }
+        }
+        Outcome::Redraw
+    }
+
+    /// Handle one key while the file diff view is open.
+    ///
+    /// `Redraw` rather than `Consumed` wherever something moved: the host
+    /// repaints a key by default, but the mode change and the scroll offset
+    /// are both invisible to its `selected()` check, and this view is the
+    /// whole overlay.
+    fn file_diff_key(&mut self, key: KeyEvent) -> Outcome {
+        let page = self.file_diff_rows.max(1);
+        let half_page = (page / 2).max(1) as isize;
+        let page = page as isize;
+        match (key.modifiers, key.code) {
+            // Unwind one layer. The overlay itself stays open; only `q`/`Esc`
+            // in `Normal` closes it.
+            (_, KeyCode::Char('q') | KeyCode::Esc) => {
+                self.mode = Mode::Normal;
+                Outcome::Redraw
+            }
+            (KeyModifiers::NONE, KeyCode::Char('j') | KeyCode::Down) => self.scroll_file_diff(1),
+            (KeyModifiers::NONE, KeyCode::Char('k') | KeyCode::Up) => self.scroll_file_diff(-1),
+            (KeyModifiers::CONTROL, KeyCode::Char('d')) => self.scroll_file_diff(half_page),
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => self.scroll_file_diff(-half_page),
+            (KeyModifiers::NONE, KeyCode::PageDown) => self.scroll_file_diff(page),
+            (KeyModifiers::NONE, KeyCode::PageUp) => self.scroll_file_diff(-page),
+            (KeyModifiers::NONE, KeyCode::Char('g') | KeyCode::Home) => {
+                self.scroll_file_diff(isize::MIN)
+            }
+            (KeyModifiers::SHIFT, KeyCode::Char('G')) | (_, KeyCode::End) => {
+                self.scroll_file_diff(isize::MAX)
+            }
+            _ => Outcome::Consumed,
+        }
+    }
+
+    /// Scroll the file diff view by `delta` lines, clamped to the diff.
+    fn scroll_file_diff(&mut self, delta: isize) -> Outcome {
+        let total = match &self.file_diff {
+            FileDiffState::Ready(h) => h.diff.lines.len(),
+            _ => 0,
+        };
+        // The last screenful is the end: scrolling into blank space below the
+        // diff would take as many keys to come back from as it took to reach.
+        // Before the first frame there is no known height, and one row is the
+        // safe assumption — it clamps to the diff either way.
+        let visible = self.file_diff_rows.max(1);
+        let last = total.saturating_sub(visible);
+        let next = if delta < 0 {
+            self.file_diff_scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.file_diff_scroll.saturating_add(delta as usize)
+        }
+        .min(last);
+        if next == self.file_diff_scroll {
+            return Outcome::Consumed;
+        }
+        self.file_diff_scroll = next;
+        Outcome::Redraw
     }
 
     /// Handle one mouse event, routed by the pane it landed in.
@@ -549,6 +752,15 @@ impl GitGraph {
     /// `layout`: the host renders this widget at an absolute `Rect` and hands
     /// the event over unchanged.
     pub fn on_mouse(&mut self, ev: MouseEvent) -> Outcome {
+        // The file diff view covers the panes, so `layout` — which still holds
+        // the last three-pane frame — must not route anything while it is up.
+        if self.mode == Mode::FileDiff {
+            return match ev.kind {
+                MouseEventKind::ScrollDown => self.scroll_file_diff(WHEEL_ROWS),
+                MouseEventKind::ScrollUp => self.scroll_file_diff(-WHEEL_ROWS),
+                _ => Outcome::Consumed,
+            };
+        }
         if let Some(pane) = crate::ui::layout::pane_at(&self.layout, ev.column, ev.row) {
             if matches!(ev.kind, MouseEventKind::Down(_)) {
                 if self.focus == pane {
@@ -625,6 +837,19 @@ impl Widget for &mut GitGraph {
         }
         // Remember the viewport so paging keys know their step next time.
         self.viewport_rows = inner.height as usize;
+
+        if self.mode == Mode::FileDiff {
+            // The view is the whole overlay, and the pane layout below is not
+            // drawn at all — `layout` keeps the last three-pane frame, which is
+            // why `on_mouse` refuses to route by it in this mode.
+            self.file_diff_rows = crate::ui::file_diff::draw_file_diff(
+                buf,
+                inner,
+                &self.file_diff,
+                self.file_diff_scroll,
+            );
+            return;
+        }
 
         if self.row_count() == 0 {
             let msg = match self.error.as_deref() {
@@ -784,12 +1009,7 @@ mod tests {
         // nothing else is outstanding, poll must go back to reporting no
         // change.
         let (_fx, mut g) = graph_with(1, "state-poll");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(g.detail(), DetailState::Loading) {
-            assert!(std::time::Instant::now() < deadline, "detail never arrived");
-            g.poll();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        settle(&mut g);
         assert!(
             !g.poll(),
             "no background work is outstanding once the detail has settled"
@@ -807,12 +1027,7 @@ mod tests {
         // Opening selects the newest commit, which posts a request.
         assert!(matches!(g.detail(), DetailState::Loading));
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(g.detail(), DetailState::Loading) {
-            assert!(std::time::Instant::now() < deadline, "detail never arrived");
-            g.poll();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        settle(&mut g);
 
         match g.detail() {
             DetailState::Ready(d) => {
@@ -832,12 +1047,7 @@ mod tests {
 
         let mut g = GitGraph::open(fx.path()).unwrap();
         // Drain whatever the initial selection produced.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(g.detail(), DetailState::Loading) {
-            assert!(std::time::Instant::now() < deadline);
-            g.poll();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        settle(&mut g);
         assert!(
             !g.poll(),
             "a second poll with no outstanding work reports no change"
@@ -1059,6 +1269,32 @@ mod tests {
         assert!(text.contains("no commits yet"), "{text:?}");
     }
 
+    /// Poll until the selected commit's detail has arrived.
+    ///
+    /// The worker is a real thread, so tests wait on its answer rather than
+    /// sleeping a fixed amount and hoping.
+    fn settle(g: &mut GitGraph) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(g.detail(), DetailState::Loading) {
+            assert!(std::time::Instant::now() < deadline, "detail never arrived");
+            g.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Poll until the open file's diff has arrived.
+    fn settle_file(g: &mut GitGraph) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(g.file_diff(), FileDiffState::Loading(_)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "file diff never arrived"
+            );
+            g.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// A repository whose single commit touches `files` files, opened and
     /// polled until its detail has arrived.
     fn ready_graph(tag: &str, files: usize) -> (Fixture, GitGraph) {
@@ -1069,12 +1305,7 @@ mod tests {
         }
         fx.commit("first");
         let mut g = GitGraph::open(fx.path()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(g.detail(), DetailState::Loading) {
-            assert!(std::time::Instant::now() < deadline, "detail never arrived");
-            g.poll();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        settle(&mut g);
         (fx, g)
     }
 
@@ -1164,12 +1395,7 @@ mod tests {
         fx.commit("second");
 
         let mut g = GitGraph::open(fx.path()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(g.detail(), DetailState::Loading) {
-            assert!(std::time::Instant::now() < deadline);
-            g.poll();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        settle(&mut g);
         g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         g.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -1181,12 +1407,7 @@ mod tests {
         g.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(g.focus(), Pane::Graph);
         g.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(g.detail(), DetailState::Loading) {
-            assert!(std::time::Instant::now() < deadline);
-            g.poll();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        settle(&mut g);
         assert_eq!(
             g.file_selected(),
             0,
@@ -1291,5 +1512,275 @@ mod tests {
             g.row_count()
         );
         assert_eq!(g.selected(), g.row_count() - 1);
+    }
+
+    /// A repository whose second commit changes `a.txt`, opened and settled,
+    /// with focus already on the changed-files pane.
+    fn graph_on_a_file(tag: &str, first: &str, second: &str) -> (Fixture, GitGraph) {
+        let fx = Fixture::new(tag);
+        std::fs::write(fx.path().join("a.txt"), first).unwrap();
+        fx.git(&["add", "."]);
+        fx.commit("first");
+        std::fs::write(fx.path().join("a.txt"), second).unwrap();
+        fx.git(&["add", "."]);
+        fx.commit("second");
+
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        settle(&mut g);
+        g.on_key(key(KeyCode::Tab));
+        g.on_key(key(KeyCode::Tab));
+        assert_eq!(g.focus(), Pane::Files);
+        (fx, g)
+    }
+
+    /// A file reply, for feeding `accept_reply_for_test` without a real
+    /// worker round trip.
+    fn asd_git_reply_file(commit: gix::ObjectId, path: &str) -> crate::worker::Reply {
+        crate::worker::Reply::File {
+            commit,
+            path: path.to_string(),
+            result: Ok(crate::worker::HighlightedDiff {
+                diff: crate::git::diff::FileDiff {
+                    path: path.to_string(),
+                    lines: Vec::new(),
+                    binary: false,
+                    truncated: false,
+                },
+                spans: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn enter_on_a_file_opens_its_diff_and_esc_returns() {
+        let (_fx, mut g) = graph_on_a_file("mode-filediff", "1\n2\n3\n", "1\nTWO\n3\n");
+        assert_eq!(g.mode(), Mode::Normal);
+
+        assert!(matches!(g.on_key(key(KeyCode::Enter)), Outcome::Redraw));
+        assert_eq!(g.mode(), Mode::FileDiff, "Enter opens the selected file");
+
+        // Esc unwinds one layer, back to the list.
+        assert!(matches!(g.on_key(key(KeyCode::Esc)), Outcome::Redraw));
+        assert_eq!(g.mode(), Mode::Normal);
+
+        // And `q` unwinds the same one layer rather than closing the overlay.
+        g.on_key(key(KeyCode::Enter));
+        assert_eq!(g.mode(), Mode::FileDiff);
+        assert!(matches!(g.on_key(key(KeyCode::Char('q'))), Outcome::Redraw));
+        assert_eq!(g.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn esc_in_normal_mode_still_dismisses_the_overlay() {
+        let (_fx, mut g) = ready_graph("mode-dismiss", 1);
+        assert_eq!(g.mode(), Mode::Normal);
+        assert!(matches!(g.on_key(key(KeyCode::Esc)), Outcome::Dismiss));
+    }
+
+    #[test]
+    fn enter_outside_the_files_pane_opens_nothing() {
+        let (_fx, mut g) = ready_graph("mode-enter-graph", 1);
+        assert_eq!(g.focus(), Pane::Graph);
+        assert!(matches!(g.on_key(key(KeyCode::Enter)), Outcome::Consumed));
+        assert_eq!(g.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn the_file_diff_arrives_through_poll() {
+        let (_fx, mut g) = graph_on_a_file("mode-diffarrives", "1\n2\n3\n", "1\nTWO\n3\n");
+        g.on_key(key(KeyCode::Enter));
+        settle_file(&mut g);
+        match g.file_diff() {
+            FileDiffState::Ready(h) => {
+                assert_eq!(h.diff.path, "a.txt");
+                assert!(
+                    h.diff
+                        .lines
+                        .iter()
+                        .any(|l| matches!(l, crate::git::diff::DiffLine::Added { .. }))
+                );
+                assert_eq!(
+                    h.spans.len(),
+                    h.diff.lines.len(),
+                    "the worker highlighted every line before the view saw it"
+                );
+            }
+            other => panic!("expected a ready file diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_reply_for_another_request_is_discarded() {
+        // No cancellation: a reply for a file the user has navigated away from
+        // still arrives, and must not become the open file's diff.
+        let (_fx, mut g) = graph_on_a_file("mode-stale-file", "1\n2\n3\n", "1\nTWO\n3\n");
+        g.on_key(key(KeyCode::Enter));
+        let commit = g.selected_id().expect("a commit is selected");
+
+        assert!(
+            !g.accept_reply_for_test(asd_git_reply_file(commit, "other.txt")),
+            "another path is not this request"
+        );
+        assert!(matches!(g.file_diff(), FileDiffState::Loading(_)));
+
+        let other_commit = gix::ObjectId::null(gix::hash::Kind::Sha1);
+        assert!(
+            !g.accept_reply_for_test(asd_git_reply_file(other_commit, "a.txt")),
+            "the same path in another commit is not this request either"
+        );
+        assert!(matches!(g.file_diff(), FileDiffState::Loading(_)));
+
+        assert!(g.accept_reply_for_test(asd_git_reply_file(commit, "a.txt")));
+        assert!(matches!(g.file_diff(), FileDiffState::Ready(_)));
+    }
+
+    #[test]
+    fn keys_in_the_file_diff_view_do_not_reach_the_panes_underneath() {
+        // `j` here scrolls the diff. Letting it through would move the
+        // changed-files selection out of sight, so closing the view would land
+        // the reader on a file they never chose.
+        let fx = Fixture::new("mode-capture");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(fx.path().join(name), "1\n").unwrap();
+        }
+        fx.git(&["add", "."]);
+        fx.commit("first");
+
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        settle(&mut g);
+        g.on_key(key(KeyCode::Tab));
+        g.on_key(key(KeyCode::Tab));
+        g.on_key(key(KeyCode::Enter));
+        assert_eq!(g.mode(), Mode::FileDiff);
+
+        let before = g.file_selected();
+        let commit_row = g.selected();
+        for _ in 0..5 {
+            g.on_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(g.file_selected(), before, "the file list did not move");
+        assert_eq!(g.selected(), commit_row, "nor did the commit selection");
+
+        // And the same for the wheel, which routes by the last frame's pane
+        // rectangles — none of which are on screen now.
+        g.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(g.file_selected(), before);
+    }
+
+    #[test]
+    fn the_file_diff_view_scrolls_within_its_own_diff() {
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        let (_fx, mut g) = graph_on_a_file("mode-scroll", "line 1\n", &body);
+        g.on_key(key(KeyCode::Enter));
+        settle_file(&mut g);
+        let total = match g.file_diff() {
+            FileDiffState::Ready(h) => h.diff.lines.len(),
+            other => panic!("expected a ready file diff, got {other:?}"),
+        };
+        assert!(total > 20, "the fixture is longer than one screen: {total}");
+
+        // A frame first: the step and the end both come from the last one.
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let visible = g.file_diff_rows;
+        assert!(visible > 0, "the view had room");
+
+        assert!(matches!(g.on_key(key(KeyCode::Char('j'))), Outcome::Redraw));
+        assert_eq!(g.file_diff_scroll, 1);
+        g.on_key(key(KeyCode::Char('k')));
+        assert_eq!(g.file_diff_scroll, 0);
+        assert!(
+            matches!(g.on_key(key(KeyCode::Char('k'))), Outcome::Consumed),
+            "clamped away at the top"
+        );
+
+        g.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(
+            g.file_diff_scroll,
+            total - visible,
+            "the last screenful is the end"
+        );
+        g.on_key(key(KeyCode::Char('g')));
+        assert_eq!(g.file_diff_scroll, 0);
+    }
+
+    #[test]
+    fn reopening_the_same_file_reuses_the_diff_already_fetched() {
+        // There is no cancellation, so every duplicate request is a whole file
+        // diff computed and then thrown away.
+        let (_fx, mut g) = graph_on_a_file("mode-reopen", "1\n2\n3\n", "1\nTWO\n3\n");
+        g.on_key(key(KeyCode::Enter));
+        settle_file(&mut g);
+        assert!(matches!(g.file_diff(), FileDiffState::Ready(_)));
+
+        g.on_key(key(KeyCode::Esc));
+        g.on_key(key(KeyCode::Enter));
+        assert_eq!(g.mode(), Mode::FileDiff);
+        assert!(
+            matches!(g.file_diff(), FileDiffState::Ready(_)),
+            "the diff already in hand is shown rather than fetched again"
+        );
+    }
+
+    #[test]
+    fn the_file_diff_view_replaces_the_three_panes() {
+        let (_fx, mut g) = graph_on_a_file("mode-render", "1\nold\n3\n", "1\nnew\n3\n");
+        g.on_key(key(KeyCode::Enter));
+        settle_file(&mut g);
+
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let text = buffer_text(&buf, area);
+        assert!(
+            text.contains("a.txt"),
+            "the file's name is the title: {text:?}"
+        );
+        assert!(
+            text.contains("new"),
+            "and its added line is drawn: {text:?}"
+        );
+        assert!(
+            !text.contains("Changed Files"),
+            "the panes underneath are not drawn: {text:?}"
+        );
+
+        // Back to Normal, the panes return.
+        g.on_key(key(KeyCode::Esc));
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        assert!(buffer_text(&buf, area).contains("Changed Files"));
+    }
+
+    #[test]
+    fn rendering_the_file_diff_view_at_any_size_does_not_panic() {
+        // `render` clamps its area and `draw_file_diff` clamps every write,
+        // but the mode is a second path through the same thread that paints
+        // every open session, so it gets the same sweep.
+        let (_fx, mut g) = graph_on_a_file("mode-render-sweep", "1\n2\n3\n", "1\nTWO\n3\n");
+        g.on_key(key(KeyCode::Enter));
+        settle_file(&mut g);
+        for &ox in &[0u16, 2] {
+            for &oy in &[0u16, 1] {
+                for width in 0..=12u16 {
+                    for height in 0..=6u16 {
+                        let area = Rect::new(ox, oy, width, height);
+                        let mut buf = Buffer::empty(Rect::new(
+                            0,
+                            0,
+                            ox.saturating_add(width),
+                            oy.saturating_add(height),
+                        ));
+                        (&mut g).render(area, &mut buf);
+                    }
+                }
+            }
+        }
     }
 }

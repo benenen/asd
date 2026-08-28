@@ -122,3 +122,24 @@ windows-sys = { version = "0.61", features = [
 
 [profile.release]
 lto = "thin"
+
+# syntect highlights a file diff's lines on asd-git's worker thread, and an
+# unoptimised regex engine is the same shape of cliff as the Zig-side one
+# `.cargo/config.toml` documents. Measured here over 600 lines of Rust in a
+# `dev` build: 2.33 ms per line with none of these optimised, and 265 us with
+# all four — a whole file diff going from seconds to a blink.
+#
+# All four are needed. syntect alone is 2.08 ms (11 %): the time is in
+# fancy-regex and the `regex-automata` engine under it, and in `regex-syntax`,
+# which compiles a syntax definition's patterns the first time they match.
+# Optimising every dependency instead measures the same 267 us, so this stays
+# the narrow list; the workspace's own crates are untouched and still
+# debuggable.
+[profile.dev.package.syntect]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3

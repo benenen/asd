@@ -10,11 +10,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
-use crate::git::diff::{CommitDiff, FileDiff};
+use ratatui::style::Style;
+
+use crate::git::diff::{CommitDiff, DiffLine, FileDiff};
 use crate::git::repo::{OpenError, Repo};
+use crate::ui::highlight::Highlighter;
 
 /// How many unchanged lines a file diff keeps around each change.
 pub const DIFF_CONTEXT: u32 = 3;
+
+/// How many of a file diff's lines are syntax-highlighted.
+///
+/// Highlighting is ~141 us per line in a release build, so the
+/// [`crate::git::diff::MAX_DIFF_LINES`] ceiling of 20 000 would be nearly
+/// three seconds of worker time before the view could show anything. Past this
+/// many lines the rest of the diff is carried unstyled — still numbered, still
+/// readable, just not coloured.
+pub const MAX_HIGHLIGHT_LINES: usize = 5_000;
 
 /// Work for the diff thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,8 +48,29 @@ pub enum Reply {
     File {
         commit: gix::ObjectId,
         path: String,
-        result: Result<FileDiff, String>,
+        result: Result<HighlightedDiff, String>,
     },
+}
+
+/// One file's diff with its lines already syntax-highlighted.
+///
+/// The styles are computed here, on the worker thread, and never in the view:
+/// highlighting is ~141 us per line, so a 60-line screenful is 23 ms, and
+/// `asd ui` paints every open session from the thread that draws this. Paying
+/// it per frame would freeze all of them for as long as the viewer is open.
+///
+/// This is why the type lives at the crate root rather than in `git/`: it
+/// carries `ratatui::style::Style`, and `git/` stays ratatui-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlightedDiff {
+    pub diff: FileDiff,
+    /// Spans for `diff.lines`, in the same order and by the same index. Each
+    /// line's spans concatenate back to that line's text.
+    ///
+    /// Shorter than `diff.lines` when the diff ran past
+    /// [`MAX_HIGHLIGHT_LINES`], and empty for a binary diff. A line with no
+    /// entry is painted unstyled, so the view must index this with `get`.
+    pub spans: Vec<Vec<(Style, String)>>,
 }
 
 /// Owns the thread. Dropping it closes the request channel, which is how the
@@ -153,6 +186,14 @@ impl DiffWorker {
 
 /// The thread body. Returns when the request channel closes.
 fn serve(repo: Repo, work: &Receiver<Request>, replies: &Sender<Reply>) {
+    // One highlighter per side of the diff. Added lines are the new file's and
+    // removed lines are the old file's, so a single parse state would feed the
+    // two files' tokens to each other — a removed `/*` would colour the added
+    // lines after it as a comment. Both are built here rather than per request
+    // so the syntax and theme dumps are deserialised once, off the render
+    // thread, before the first file is ever asked for.
+    let mut new_side = Highlighter::new();
+    let mut old_side = Highlighter::new();
     while let Ok(req) = work.recv() {
         let reply = match req {
             Request::Commit(id) => Reply::Commit {
@@ -163,7 +204,8 @@ fn serve(repo: Repo, work: &Receiver<Request>, replies: &Sender<Reply>) {
                 commit,
                 result: repo
                     .file_diff(commit, &path, DIFF_CONTEXT)
-                    .map_err(|e| e.to_string()),
+                    .map_err(|e| e.to_string())
+                    .map(|diff| highlight(diff, &mut new_side, &mut old_side)),
                 path,
             },
         };
@@ -171,6 +213,35 @@ fn serve(repo: Repo, work: &Receiver<Request>, replies: &Sender<Reply>) {
             return; // The owner is gone.
         }
     }
+}
+
+/// Highlight a whole file diff once, here, so the view never has to.
+///
+/// A context line belongs to both files, so it is fed to both highlighters —
+/// the new side's colours are the ones shown, and the old side's call is what
+/// keeps its parse state in step for the removed lines that follow.
+fn highlight(
+    diff: FileDiff,
+    new_side: &mut Highlighter,
+    old_side: &mut Highlighter,
+) -> HighlightedDiff {
+    // A new file starts a new parse: syntect carries state across lines, and
+    // the previous file's state would otherwise colour this one's first lines.
+    new_side.reset();
+    old_side.reset();
+    let mut spans = Vec::with_capacity(diff.lines.len().min(MAX_HIGHLIGHT_LINES));
+    for line in diff.lines.iter().take(MAX_HIGHLIGHT_LINES) {
+        spans.push(match line {
+            DiffLine::Context { text, .. } => {
+                let shown = new_side.line(&diff.path, text);
+                let _ = old_side.line(&diff.path, text);
+                shown
+            }
+            DiffLine::Added { text, .. } => new_side.line(&diff.path, text),
+            DiffLine::Removed { text, .. } => old_side.line(&diff.path, text),
+        });
+    }
+    HighlightedDiff { diff, spans }
 }
 
 #[cfg(test)]
@@ -240,11 +311,136 @@ mod tests {
         match reply {
             Reply::File { path, result, .. } => {
                 assert_eq!(path, "a.txt");
-                let d = result.expect("diff computed");
-                assert!(!d.lines.is_empty());
+                let h = result.expect("diff computed");
+                assert!(!h.diff.lines.is_empty());
+                assert_eq!(
+                    h.spans.len(),
+                    h.diff.lines.len(),
+                    "every line comes back with its spans"
+                );
+                for (line, spans) in h.diff.lines.iter().zip(&h.spans) {
+                    let text = match line {
+                        DiffLine::Context { text, .. }
+                        | DiffLine::Added { text, .. }
+                        | DiffLine::Removed { text, .. } => text,
+                    };
+                    let joined: String = spans.iter().map(|(_, t)| t.as_str()).collect();
+                    assert_eq!(&joined, text, "spans must reproduce their line");
+                }
             }
             other => panic!("expected a file reply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_source_file_comes_back_already_highlighted() {
+        // The render thread must never call the highlighter: ~141 us per line
+        // is 23 ms for one screenful, on the thread that paints every open
+        // session. The worker is where that cost is paid, so the reply has to
+        // carry real colours rather than a promise of them.
+        let fx = Fixture::new("worker-highlight");
+        write_commit(&fx, "a.rs", "fn main() {}\n", "first");
+        let id: gix::ObjectId = write_commit(
+            &fx,
+            "a.rs",
+            "fn main() { let x = 1; }\nstruct S;\n",
+            "second",
+        )
+        .parse()
+        .unwrap();
+
+        let mut w = DiffWorker::new(fx.path()).unwrap();
+        w.request(Request::File {
+            commit: id,
+            path: "a.rs".into(),
+        });
+        let reply = wait_for(|| w.drain().into_iter().next());
+        let Reply::File { result, .. } = reply else {
+            panic!("expected a file reply");
+        };
+        let h = result.expect("diff computed");
+        let added = h
+            .diff
+            .lines
+            .iter()
+            .position(|l| matches!(l, DiffLine::Added { .. }))
+            .expect("the second commit added a line");
+        let spans = &h.spans[added];
+        assert!(
+            spans.len() > 1,
+            "a Rust line must be split into several spans, got {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|(s, _)| s.fg.is_some()),
+            "and must carry colours: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn the_two_sides_of_a_diff_are_highlighted_independently() {
+        // A removed line that opens a block comment belongs to the OLD file.
+        // With one shared parse state the added lines after it are painted as
+        // if they were inside that comment.
+        let fx = Fixture::new("worker-two-sides");
+        write_commit(&fx, "a.rs", "/* still open\nlet a = 1;\n", "first");
+        let id: gix::ObjectId = write_commit(&fx, "a.rs", "let b = 2;\nlet a = 1;\n", "second")
+            .parse()
+            .unwrap();
+
+        let mut w = DiffWorker::new(fx.path()).unwrap();
+        w.request(Request::File {
+            commit: id,
+            path: "a.rs".into(),
+        });
+        let reply = wait_for(|| w.drain().into_iter().next());
+        let Reply::File { result, .. } = reply else {
+            panic!("expected a file reply");
+        };
+        let h = result.expect("diff computed");
+
+        let mut fresh = Highlighter::new();
+        let added = h
+            .diff
+            .lines
+            .iter()
+            .zip(&h.spans)
+            .find_map(|(l, s)| match l {
+                DiffLine::Added { text, .. } => Some((text, s)),
+                _ => None,
+            })
+            .expect("the second commit added a line");
+        let (text, spans) = added;
+        assert_eq!(
+            spans,
+            &fresh.line("a.rs", text),
+            "an added line must be coloured as the new file's, not as the \
+             continuation of a comment only the old file opened"
+        );
+    }
+
+    #[test]
+    fn a_diff_longer_than_the_highlight_limit_keeps_its_lines() {
+        // The cap bounds the worker's own latency, not the diff: the lines
+        // past it are still delivered, just without spans, and the view paints
+        // them from their own text.
+        let lines: Vec<DiffLine> = (0..MAX_HIGHLIGHT_LINES + 10)
+            .map(|i| DiffLine::Added {
+                new: i as u32 + 1,
+                text: format!("line {i}"),
+            })
+            .collect();
+        let want = lines.len();
+        // An extension with no syntax keeps this cheap: the highlighter
+        // short-circuits to one unstyled span per line.
+        let diff = FileDiff {
+            path: "a.zzzz".to_string(),
+            lines,
+            binary: false,
+            truncated: false,
+        };
+        let h = highlight(diff, &mut Highlighter::new(), &mut Highlighter::new());
+        assert_eq!(h.diff.lines.len(), want);
+        assert_eq!(h.spans.len(), MAX_HIGHLIGHT_LINES);
     }
 
     #[test]
