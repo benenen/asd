@@ -90,6 +90,10 @@ pub enum Mode {
     /// are still drawn beneath it, still describing the commit that was
     /// selected when `/` was pressed: `Esc` cancels back to exactly that.
     Search,
+    /// The key-table popup, over the whole overlay. Only reachable from
+    /// `Normal` (`?`), and every key — not just `q`/`Esc` — returns to it, so
+    /// there is no way to get stuck behind a help screen.
+    Help,
 }
 
 /// What the file diff view has.
@@ -163,6 +167,13 @@ pub struct GitGraph {
     /// [`Mode::Search`]; `/` replaces it with a fresh one, so the matches it
     /// holds are never older than the keypress that opened the dropdown.
     search: Search,
+    /// Whether `o` currently draws remote-branch decorations. `self.decorations`
+    /// is built once at open (and on `R`) and is never rebuilt to reflect this;
+    /// it is filtered against at render time instead, so toggling it costs
+    /// nothing beyond the redraw every key already causes.
+    show_remotes: bool,
+    /// Whether `t` currently draws tag decorations. See `show_remotes`.
+    show_tags: bool,
 }
 
 impl GitGraph {
@@ -199,6 +210,8 @@ impl GitGraph {
             file_diff_scroll: 0,
             file_diff_rows: 0,
             search: Search::default(),
+            show_remotes: true,
+            show_tags: true,
         };
         me.reload();
         me.load_more(PAGE_FIRST);
@@ -237,6 +250,61 @@ impl GitGraph {
     /// [`Mode::FileDiff`]; otherwise it is whatever was last opened.
     pub fn file_diff(&self) -> &FileDiffState {
         &self.file_diff
+    }
+
+    /// Whether `o` currently draws remote-branch decorations.
+    pub fn show_remotes(&self) -> bool {
+        self.show_remotes
+    }
+
+    /// Whether `t` currently draws tag decorations.
+    pub fn show_tags(&self) -> bool {
+        self.show_tags
+    }
+
+    /// The refs pointing at row `index`, if any survive the current toggles.
+    ///
+    /// A commit whose only decorations are, say, remote branches answers
+    /// `None` while `o` has them hidden: this is what keeps `[`/`]` from
+    /// landing on a row that looks like any other, with nothing on screen to
+    /// say why it was worth stopping at.
+    pub fn decorations_at(&self, index: usize) -> Option<&[RefInfo]> {
+        let id = self.builder.nodes().get(index)?.commit.as_ref()?.id;
+        let refs = self.decorations.get(&id)?;
+        refs.iter()
+            .any(|r| r.kind.visible(self.show_remotes, self.show_tags))
+            .then_some(refs.as_slice())
+    }
+
+    /// The next row from `self.selected`, moving down when `forward` and up
+    /// otherwise, that carries a decoration surviving the current toggles.
+    /// Stops at either end of the graph rather than wrapping.
+    fn jump_decorated(&mut self, forward: bool) -> Outcome {
+        let n = self.row_count();
+        if n == 0 {
+            return Outcome::Consumed;
+        }
+        let mut i = self.selected;
+        for _ in 0..n {
+            i = if forward {
+                if i + 1 >= n {
+                    return Outcome::Consumed;
+                } else {
+                    i + 1
+                }
+            } else if i == 0 {
+                return Outcome::Consumed;
+            } else {
+                i - 1
+            };
+            if self.decorations_at(i).is_some() {
+                // Through `select`, never by assigning `selected`: it is what
+                // clamps the row, keeps it inside the viewport and asks the
+                // worker for the new commit's diff.
+                return self.select(i);
+            }
+        }
+        Outcome::Consumed
     }
 
     #[cfg(test)]
@@ -593,6 +661,13 @@ impl GitGraph {
         match self.mode {
             Mode::FileDiff => return self.file_diff_key(key),
             Mode::Search => return self.search_key(key),
+            // No key table of its own: every key, not only `q`/`Esc`, unwinds
+            // it. A reader who does not yet know the keys should not have to
+            // guess one just to get past the screen that would teach them.
+            Mode::Help => {
+                self.mode = Mode::Normal;
+                return Outcome::Redraw;
+            }
             Mode::Normal => {}
         }
         let page = self.viewport_rows.max(1);
@@ -674,6 +749,23 @@ impl GitGraph {
                 // list held then, which `R` or a paged-in page has since
                 // changed.
                 self.search = Search::default();
+                Outcome::Redraw
+            }
+            (KeyModifiers::NONE, KeyCode::Char(']')) => self.jump_decorated(true),
+            (KeyModifiers::NONE, KeyCode::Char('[')) => self.jump_decorated(false),
+            (KeyModifiers::NONE, KeyCode::Char('o')) => {
+                self.show_remotes = !self.show_remotes;
+                Outcome::Consumed
+            }
+            (KeyModifiers::NONE, KeyCode::Char('t')) => {
+                self.show_tags = !self.show_tags;
+                Outcome::Consumed
+            }
+            // The modifier is not matched: `?` is `Shift+/` on the layout
+            // most terminals report from, the same reason `/` above does not
+            // match on modifier either.
+            (_, KeyCode::Char('?')) => {
+                self.mode = Mode::Help;
                 Outcome::Redraw
             }
             (_, KeyCode::Char('q') | KeyCode::Esc) => Outcome::Dismiss,
@@ -974,6 +1066,12 @@ impl Widget for &mut GitGraph {
                     self.pending.len(),
                 );
             }
+            // Same reasoning: `?` must open something even over an empty or
+            // unreadable repository, or the only way out of `Mode::Help`
+            // would be a key the reader still does not know.
+            if self.mode == Mode::Help {
+                crate::ui::help::draw_help(buf, inner);
+            }
             return;
         }
         let map = crate::ui::layout::split(inner);
@@ -984,6 +1082,10 @@ impl Widget for &mut GitGraph {
             map.graph,
             self.builder.nodes(),
             &self.decorations,
+            crate::ui::graph_view::RefToggles {
+                show_remotes: self.show_remotes,
+                show_tags: self.show_tags,
+            },
             self.first_row,
             self.selected,
         );
@@ -1019,6 +1121,12 @@ impl Widget for &mut GitGraph {
                 // taken yet — the rows `rank` could not see.
                 self.pending.len(),
             );
+        }
+        // Last of all, and over the whole overlay rather than one pane: help
+        // describes every pane at once, so it centres in `inner`, not
+        // `map.graph`.
+        if self.mode == Mode::Help {
+            crate::ui::help::draw_help(buf, inner);
         }
     }
 }
@@ -1368,6 +1476,14 @@ mod tests {
         let mut searching_empty =
             GitGraph::open(empty_search_fx.path()).expect("an unborn repository opens");
         searching_empty.on_key(key(KeyCode::Char('/')));
+        // The help popup is drawn over both branches of `render` too: the
+        // three panes, and the "no commits yet" message.
+        let (_help_fx, mut helping) = graph_with(3, "state-render-help");
+        helping.on_key(key(KeyCode::Char('?')));
+        let empty_help_fx = Fixture::new("state-render-help-empty");
+        let mut helping_empty =
+            GitGraph::open(empty_help_fx.path()).expect("an unborn repository opens");
+        helping_empty.on_key(key(KeyCode::Char('?')));
 
         for graph in [
             &mut with_rows,
@@ -1375,6 +1491,8 @@ mod tests {
             &mut errored,
             &mut searching,
             &mut searching_empty,
+            &mut helping,
+            &mut helping_empty,
         ] {
             for &ox in &[0u16, 2] {
                 for &oy in &[0u16, 1] {
@@ -2283,5 +2401,192 @@ mod tests {
         g.on_key(key(KeyCode::Char('/')));
         assert_eq!(g.search.query(), "");
         assert!(g.search.matches().is_empty());
+    }
+
+    // ---- decorated-row jumping (`[`/`]`), ref toggles (`o`/`t`), help (`?`) --
+
+    #[test]
+    fn bracket_keys_jump_between_decorated_rows() {
+        let fx = Fixture::new("keys-branch-jump");
+        std::fs::write(fx.path().join("a.txt"), "1\n").unwrap();
+        fx.git(&["add", "."]);
+        fx.commit("first");
+        fx.tag("v1");
+        fx.commit("second");
+        fx.commit("third");
+
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        settle(&mut g);
+        let start = g.selected();
+
+        g.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        let after = g.selected();
+        assert!(after > start, "] moves down to the next decorated row");
+        assert!(
+            g.decorations_at(after).is_some(),
+            "the row it landed on carries a ref"
+        );
+
+        g.on_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert_eq!(g.selected(), start, "[ comes back");
+    }
+
+    /// `]`/`[` must not wrap: past either end of the graph they stop rather
+    /// than cycling back to the other side.
+    #[test]
+    fn bracket_keys_stop_at_the_ends_rather_than_wrapping() {
+        let fx = Fixture::new("keys-branch-jump-ends");
+        fx.commit("oldest"); // row 2, tagged below
+        fx.commit("middle"); // row 1, undecorated: what actually has to be jumped over
+        fx.commit("newest"); // row 0, decorated too: `main` always points at HEAD
+
+        // Tag the oldest commit specifically, so `middle` is the one row with
+        // no decoration at all — the row a jump actually has to skip over,
+        // rather than every row happening to carry one.
+        let oldest = fx.git(&["rev-parse", "HEAD~2"]);
+        fx.git(&["tag", "v1", &oldest]);
+
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        settle(&mut g);
+        assert_eq!(g.row_count(), 3);
+        // Row 0 (`newest`, on `main`) is already decorated, so the real
+        // exercise is row 1 (`middle`), which is not: `]` has to skip past it
+        // to land on row 2.
+        assert!(g.decorations_at(0).is_some());
+        assert!(g.decorations_at(1).is_none(), "middle carries no ref");
+
+        assert_eq!(g.on_key(key(KeyCode::Char(']'))), Outcome::Consumed);
+        assert_eq!(g.selected(), 2, "] skipped the undecorated middle row");
+
+        // Already at the last row in the graph: another `]` must not wrap
+        // back around to row 0.
+        g.on_key(key(KeyCode::Char(']')));
+        assert_eq!(g.selected(), 2, "] does not wrap past the last row");
+
+        g.on_key(key(KeyCode::Char('[')));
+        assert_eq!(g.selected(), 0, "[ skipped back over the middle row");
+        g.on_key(key(KeyCode::Char('[')));
+        assert_eq!(g.selected(), 0, "[ does not wrap past the first row");
+    }
+
+    /// Connector rows and the synthetic uncommitted row both have
+    /// `commit: None`, so neither can carry a decoration; a jump must skip
+    /// straight past them to the next real, decorated commit.
+    #[test]
+    fn bracket_keys_skip_rows_that_cannot_carry_a_decoration() {
+        let fx = Fixture::new("keys-branch-jump-uncommitted");
+        fx.commit("first");
+        fx.tag("v1");
+        fx.commit("second");
+        std::fs::write(fx.path().join("dirty.txt"), "x\n").unwrap();
+
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        settle(&mut g);
+        // Row 0 is the synthetic uncommitted row, which has no commit at all
+        // and so cannot be mistaken for a decorated one.
+        assert_eq!(g.decorations_at(0), None);
+
+        g.on_key(key(KeyCode::Char(']')));
+        assert!(
+            g.decorations_at(g.selected()).is_some(),
+            "landed on the tagged commit, not the uncommitted row"
+        );
+    }
+
+    #[test]
+    fn o_and_t_toggle_which_refs_are_drawn() {
+        let (_fx, mut g) = ready_graph("keys-toggles", 1);
+        assert!(g.show_remotes());
+        assert!(g.show_tags());
+        g.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(!g.show_remotes());
+        g.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(!g.show_tags());
+    }
+
+    /// `o`/`t` filter `self.decorations` at render time rather than
+    /// rebuilding it, so this checks the render output actually changes
+    /// rather than just the two booleans `GitGraph` exposes.
+    #[test]
+    fn toggling_off_a_kind_of_ref_removes_it_from_the_rendered_graph() {
+        let fx = Fixture::new("keys-toggles-render");
+        fx.commit("first");
+        fx.tag("v1");
+        let first = fx.git(&["rev-parse", "HEAD"]);
+        fx.git(&["update-ref", "refs/remotes/origin/main", &first]);
+
+        let mut g = GitGraph::open(fx.path()).unwrap();
+        settle(&mut g);
+
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let before = buffer_text(&buf, area);
+        assert!(before.contains("(v1)"), "{before:?}");
+        assert!(before.contains("[origin/main]"), "{before:?}");
+
+        g.on_key(key(KeyCode::Char('t')));
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let tags_off = buffer_text(&buf, area);
+        assert!(!tags_off.contains("v1"), "{tags_off:?}");
+        assert!(
+            tags_off.contains("[origin/main]"),
+            "o was not toggled: {tags_off:?}"
+        );
+
+        g.on_key(key(KeyCode::Char('o')));
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let both_off = buffer_text(&buf, area);
+        assert!(!both_off.contains("v1"), "{both_off:?}");
+        assert!(!both_off.contains("origin/main"), "{both_off:?}");
+    }
+
+    #[test]
+    fn question_mark_opens_help_and_any_key_closes_it() {
+        let (_fx, mut g) = ready_graph("keys-help", 1);
+        g.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(g.mode(), Mode::Help);
+        g.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(g.mode(), Mode::Normal, "Esc closes help without dismissing");
+    }
+
+    /// "Any key" means any key, not only `Esc`: a letter that means something
+    /// entirely different in `Normal` mode must still just close the popup
+    /// here, and must not also be acted on as that other thing.
+    #[test]
+    fn a_letter_key_also_closes_help_without_acting_on_its_normal_meaning() {
+        let (_fx, mut g) = ready_graph("keys-help-any-key", 1);
+        let before = g.selected();
+        g.on_key(key(KeyCode::Char('?')));
+        assert_eq!(g.mode(), Mode::Help);
+
+        // `j` would move the selection in `Normal`; here it must only close
+        // the popup.
+        g.on_key(key(KeyCode::Char('j')));
+        assert_eq!(g.mode(), Mode::Normal);
+        assert_eq!(before, g.selected(), "j did not move the selection");
+    }
+
+    #[test]
+    fn the_help_popup_is_drawn_over_the_three_panes() {
+        let (_fx, mut g) = ready_graph("keys-help-draw", 1);
+        let area = Rect::new(0, 0, 70, 24);
+        g.on_key(key(KeyCode::Char('?')));
+        let mut buf = Buffer::empty(area);
+        (&mut g).render(area, &mut buf);
+        let text = buffer_text(&buf, area);
+        assert!(text.contains("Help"), "the popup has its title: {text:?}");
+        // The popup is centred in the *whole* three-pane area, tall enough
+        // that it may well cover the smaller detail/files panes underneath
+        // entirely at this size — but the graph pane's own first row sits
+        // above the popup's top edge, so the commit it lists (and the
+        // decoration on it, since `ready_graph`'s fixture commit sits on the
+        // default `main` branch) must still be there.
+        assert!(
+            text.contains("first") && text.contains("[main]"),
+            "the graph pane underneath is still drawn above the popup: {text:?}"
+        );
     }
 }

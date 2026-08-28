@@ -68,10 +68,16 @@ fn cell_color(cell: CellType) -> Color {
     }
 }
 
-/// `[main]`, `[origin/main]`, `(v1.2)` — the decorations for one commit.
-fn decoration_text(refs: &[RefInfo]) -> String {
+/// `[main]`, `[origin/main]`, `(v1.2)` — the decorations for one commit that
+/// survive the `o`/`t` toggles. A ref hidden by a toggle is skipped rather
+/// than rebuilding `decorations` itself, so flipping a toggle costs nothing
+/// beyond the redraw it always causes.
+fn decoration_text(refs: &[RefInfo], show_remotes: bool, show_tags: bool) -> String {
     let mut out = String::new();
     for r in refs {
+        if !r.kind.visible(show_remotes, show_tags) {
+            continue;
+        }
         let piece = match r.kind {
             RefKind::LocalBranch | RefKind::RemoteBranch => format!("[{}] ", r.name),
             RefKind::Tag => format!("({}) ", r.name),
@@ -132,12 +138,25 @@ pub fn draw_message(buf: &mut Buffer, area: Rect, text: &str) {
     put(buf, area, x, y, text, Style::default().fg(Color::DarkGray));
 }
 
+/// The `o`/`t` toggles, bundled into one argument rather than two bare
+/// `bool`s so `draw_rows` stays under clippy's argument-count lint.
+#[derive(Debug, Clone, Copy)]
+pub struct RefToggles {
+    pub show_remotes: bool,
+    pub show_tags: bool,
+}
+
 /// Paint `nodes[first_row..]` into `area`, highlighting `selected`.
+///
+/// `toggles` is the `o`/`t` state: a decoration whose kind is currently
+/// hidden is left out of the row it would have appeared on, without touching
+/// `decorations` itself.
 pub fn draw_rows(
     buf: &mut Buffer,
     area: Rect,
     nodes: &[GraphNode],
     decorations: &HashMap<gix::ObjectId, Vec<RefInfo>>,
+    toggles: RefToggles,
     first_row: usize,
     selected: usize,
 ) {
@@ -205,7 +224,7 @@ pub fn draw_rows(
                 area,
                 x,
                 y,
-                &decoration_text(refs),
+                &decoration_text(refs, toggles.show_remotes, toggles.show_tags),
                 base.fg(lane_color(node.color_index))
                     .add_modifier(Modifier::BOLD),
             );
@@ -272,12 +291,100 @@ mod tests {
         assert_eq!(cell_glyph(CellType::TeeUp(0, 0)), '┴');
     }
 
+    /// `o`/`t` are wired to `draw_rows` itself, not just to the booleans
+    /// `GitGraph` exposes: a hidden kind must not reach the buffer at all, and
+    /// a local branch must survive both toggles off, since only `o` and `t`
+    /// can hide anything.
+    #[test]
+    fn the_toggles_hide_only_their_own_kind_of_decoration() {
+        let commit_id = gix::ObjectId::empty_blob(gix::hash::Kind::Sha1);
+        let mut row = node("hello world", 0, vec![CellType::Commit(0)]);
+        row.commit.as_mut().unwrap().id = commit_id;
+        let nodes = vec![row];
+
+        let mut decorations = HashMap::new();
+        decorations.insert(
+            commit_id,
+            vec![
+                RefInfo {
+                    name: "main".to_string(),
+                    target: commit_id,
+                    kind: RefKind::LocalBranch,
+                },
+                RefInfo {
+                    name: "origin/main".to_string(),
+                    target: commit_id,
+                    kind: RefKind::RemoteBranch,
+                },
+                RefInfo {
+                    name: "v1".to_string(),
+                    target: commit_id,
+                    kind: RefKind::Tag,
+                },
+            ],
+        );
+        let area = Rect::new(0, 0, 60, 3);
+
+        let text = |show_remotes, show_tags| {
+            let mut buf = Buffer::empty(area);
+            draw_rows(
+                &mut buf,
+                area,
+                &nodes,
+                &decorations,
+                RefToggles {
+                    show_remotes,
+                    show_tags,
+                },
+                0,
+                0,
+            );
+            (0..area.width)
+                .map(|x| buf[(x, 0)].symbol().to_string())
+                .collect::<String>()
+        };
+
+        let both = text(true, true);
+        assert!(both.contains("[main]"), "{both:?}");
+        assert!(both.contains("[origin/main]"), "{both:?}");
+        assert!(both.contains("(v1)"), "{both:?}");
+
+        let no_remotes = text(false, true);
+        assert!(no_remotes.contains("[main]"), "{no_remotes:?}");
+        assert!(!no_remotes.contains("origin/main"), "{no_remotes:?}");
+        assert!(no_remotes.contains("(v1)"), "{no_remotes:?}");
+
+        let no_tags = text(true, false);
+        assert!(no_tags.contains("[main]"), "{no_tags:?}");
+        assert!(no_tags.contains("[origin/main]"), "{no_tags:?}");
+        assert!(!no_tags.contains("v1"), "{no_tags:?}");
+
+        let neither = text(false, false);
+        assert!(
+            neither.contains("[main]"),
+            "a local branch survives both toggles off: {neither:?}"
+        );
+        assert!(!neither.contains("origin/main"), "{neither:?}");
+        assert!(!neither.contains("v1"), "{neither:?}");
+    }
+
     #[test]
     fn draws_the_marker_and_the_summary() {
         let nodes = vec![node("hello world", 0, vec![CellType::Commit(0)])];
         let area = Rect::new(0, 0, 40, 3);
         let mut buf = Buffer::empty(area);
-        draw_rows(&mut buf, area, &nodes, &Default::default(), 0, 0);
+        draw_rows(
+            &mut buf,
+            area,
+            &nodes,
+            &Default::default(),
+            RefToggles {
+                show_remotes: true,
+                show_tags: true,
+            },
+            0,
+            0,
+        );
 
         let row: String = (0..40)
             .map(|x| buf[(x, 0)].symbol().to_string())
@@ -302,7 +409,18 @@ mod tests {
         let nodes = vec![uncommitted_row];
         let area = Rect::new(0, 0, 40, 3);
         let mut buf = Buffer::empty(area);
-        draw_rows(&mut buf, area, &nodes, &Default::default(), 0, 0);
+        draw_rows(
+            &mut buf,
+            area,
+            &nodes,
+            &Default::default(),
+            RefToggles {
+                show_remotes: true,
+                show_tags: true,
+            },
+            0,
+            0,
+        );
 
         let row: String = (0..40)
             .map(|x| buf[(x, 0)].symbol().to_string())
@@ -323,7 +441,18 @@ mod tests {
         let nodes = vec![node("deep", 0, cells)];
         let area = Rect::new(0, 0, 10, 1);
         let mut buf = Buffer::empty(area);
-        draw_rows(&mut buf, area, &nodes, &Default::default(), 0, 0);
+        draw_rows(
+            &mut buf,
+            area,
+            &nodes,
+            &Default::default(),
+            RefToggles {
+                show_remotes: true,
+                show_tags: true,
+            },
+            0,
+            0,
+        );
         // Reaching here without a panic is the assertion.
         assert_eq!(buf.area().width, 10);
     }
@@ -333,7 +462,18 @@ mod tests {
         let nodes = vec![node("only", 0, vec![CellType::Commit(0)])];
         let area = Rect::new(0, 0, 20, 4);
         let mut buf = Buffer::empty(area);
-        draw_rows(&mut buf, area, &nodes, &Default::default(), 99, 99);
+        draw_rows(
+            &mut buf,
+            area,
+            &nodes,
+            &Default::default(),
+            RefToggles {
+                show_remotes: true,
+                show_tags: true,
+            },
+            99,
+            99,
+        );
         let row: String = (0..20)
             .map(|x| buf[(x, 0)].symbol().to_string())
             .collect::<Vec<_>>()
@@ -346,7 +486,18 @@ mod tests {
         let nodes = vec![node("only", 0, vec![CellType::Commit(0)])];
         let area = Rect::new(0, 0, 0, 0);
         let mut buf = Buffer::empty(Rect::new(0, 0, 10, 2));
-        draw_rows(&mut buf, area, &nodes, &Default::default(), 0, 0);
+        draw_rows(
+            &mut buf,
+            area,
+            &nodes,
+            &Default::default(),
+            RefToggles {
+                show_remotes: true,
+                show_tags: true,
+            },
+            0,
+            0,
+        );
         assert_eq!(buf[(0, 0)].symbol(), " ");
     }
 
@@ -469,9 +620,42 @@ mod tests {
                         // Also try selecting a row and scrolling, both in and
                         // out of range, since those are the other inputs
                         // that shift index arithmetic around.
-                        draw_rows(&mut buf, area, &nodes, &decorations, 0, 0);
-                        draw_rows(&mut buf, area, &nodes, &decorations, 1, 2);
-                        draw_rows(&mut buf, area, &nodes, &decorations, 50, 50);
+                        draw_rows(
+                            &mut buf,
+                            area,
+                            &nodes,
+                            &decorations,
+                            RefToggles {
+                                show_remotes: true,
+                                show_tags: true,
+                            },
+                            0,
+                            0,
+                        );
+                        draw_rows(
+                            &mut buf,
+                            area,
+                            &nodes,
+                            &decorations,
+                            RefToggles {
+                                show_remotes: true,
+                                show_tags: true,
+                            },
+                            1,
+                            2,
+                        );
+                        draw_rows(
+                            &mut buf,
+                            area,
+                            &nodes,
+                            &decorations,
+                            RefToggles {
+                                show_remotes: true,
+                                show_tags: true,
+                            },
+                            50,
+                            50,
+                        );
                     }
                 }
             }

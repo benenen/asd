@@ -10,6 +10,22 @@ pub enum RefKind {
     Tag,
 }
 
+impl RefKind {
+    /// Whether a ref of this kind is drawn under the `o`/`t` toggles.
+    ///
+    /// Local branches are always shown; `o` hides remote branches and `t`
+    /// hides tags. Shared between the graph row renderer and
+    /// `GitGraph::decorations_at` so the two never disagree about what
+    /// counts as "currently visible".
+    pub fn visible(self, show_remotes: bool, show_tags: bool) -> bool {
+        match self {
+            RefKind::LocalBranch => true,
+            RefKind::RemoteBranch => show_remotes,
+            RefKind::Tag => show_tags,
+        }
+    }
+}
+
 /// One decoration. `name` is the short form (`main`, `origin/main`, `v1.2`),
 /// which is what a graph row has room to print.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,5 +178,19 @@ mod tests {
             first,
             "an annotated tag must resolve to the commit, not the tag object"
         );
+    }
+
+    #[test]
+    fn local_branches_are_never_hidden_by_the_toggles() {
+        assert!(RefKind::LocalBranch.visible(false, false));
+        assert!(RefKind::LocalBranch.visible(true, true));
+    }
+
+    #[test]
+    fn remote_branches_and_tags_follow_their_own_toggle() {
+        assert!(RefKind::RemoteBranch.visible(true, false));
+        assert!(!RefKind::RemoteBranch.visible(false, true));
+        assert!(RefKind::Tag.visible(false, true));
+        assert!(!RefKind::Tag.visible(true, false));
     }
 }

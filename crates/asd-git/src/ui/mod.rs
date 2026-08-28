@@ -7,6 +7,7 @@ pub mod commit_detail;
 pub mod file_diff;
 pub mod file_list;
 pub mod graph_view;
+pub mod help;
 pub mod highlight;
 pub mod layout;
 pub mod search;
