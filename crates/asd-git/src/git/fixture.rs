@@ -37,6 +37,14 @@ impl Fixture {
         fx.git(&["config", "user.name", "asd test"]);
         fx.git(&["config", "user.email", "test@example.invalid"]);
         fx.git(&["config", "commit.gpgsign", "false"]);
+        // Pin the diff algorithm in the repository's own config, which is the one
+        // place both halves of a diff oracle read. `git_raw` isolates the
+        // shelled-out git from the host (`HOME`, `GIT_CONFIG_NOSYSTEM`), but
+        // `Repo::open` goes through `gix::discover`, which still picks up the
+        // developer's real `~/.gitconfig`. Without this line a machine with a
+        // global `diff.algorithm` fails the comparison for a reason that has
+        // nothing to do with the code under test.
+        fx.git(&["config", "diff.algorithm", "myers"]);
         fx
     }
 
