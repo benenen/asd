@@ -135,7 +135,12 @@ jobs:
         run: |
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          # /O overrides the script's OutputDir, which Inno resolves relative to
+          # the .iss file — without this the installer lands in deploy\windows
+          # and the upload step, which looks in the workspace root, finds
+          # nothing.
           & $iscc `
+            "/O$env:GITHUB_WORKSPACE" `
             "/DAppVersion=${{ steps.cfg.outputs.version }}" `
             "/DPayloadDir=${{ steps.stage.outputs.dir }}" `
             "/DOutputBase=${{ steps.cfg.outputs.name }}-setup" `
