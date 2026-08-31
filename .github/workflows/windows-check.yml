@@ -99,7 +99,7 @@ jobs:
       - name: Build
         run: cargo build --locked ${{ matrix.features }}
 
-  # Unit tests plus the portable integration tests. tests/e2e.rs is excluded by
+  # Unit tests plus the portable integration tests. tests/e2e/ is excluded by
   # excluding the root package: it drives the daemon over UnixStream and signals
   # children with libc::kill, with no cfg gating, so it does not even compile
   # here. That leaves the Windows daemon without end-to-end coverage — worth

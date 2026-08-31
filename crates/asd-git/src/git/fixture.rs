@@ -2,7 +2,8 @@
 //!
 //! Shelling out rather than writing objects with gix keeps the write-side
 //! feature set out of this crate: phase 1 only reads. The temp-directory shape
-//! matches `tests/e2e.rs`, which is why this crate does not pull in `tempfile`.
+//! matches `tests/e2e/common.rs`, which is why this crate does not pull in
+//! `tempfile`.
 
 #![cfg(test)]
 
