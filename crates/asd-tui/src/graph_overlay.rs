@@ -225,6 +225,7 @@ mod tests {
         let socket = std::env::temp_dir().join(format!("asd-no-daemon-{}", std::process::id()));
         let conn = Conn::spawn(socket.clone(), 1, ev_tx.clone());
         App {
+            wheel: crate::WheelCoalescer::default(),
             socket,
             conn,
             ev_rx,

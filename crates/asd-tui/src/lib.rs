@@ -49,8 +49,16 @@ use modal::{Modal, RenameInput, validate_rename};
 const SCROLLBACK: usize = 10_000;
 /// Wheel scroll step in lines.
 const WHEEL_STEP: usize = 3;
-/// Wheel scroll step in sidebar sessions.
-const SIDEBAR_WHEEL_STEP: usize = 1;
+/// Quiet between wheel events that ends a "burst". macOS momentum scrolling
+/// streams reports at sub-frame intervals after the fingers lift; a gap this
+/// large is a deliberate pause, so the next event starts a fresh burst with
+/// the per-burst cap renewed.
+const WHEEL_DEBOUNCE: Duration = Duration::from_millis(40);
+/// Maximum lines a single wheel burst may scroll before a quiet gap is
+/// required. Bounds the momentum tail a trackpad leaves behind once the
+/// fingers stop: without it the pane (and a mouse-tracking session) keeps
+/// scrolling through the whole decaying tail.
+const WHEEL_BURST_CAP: isize = 16;
 /// Longest the pane defers a repaint while a program holds a synchronized-output
 /// (`?2026`) update open, bounding a lost `?2026l` (matches typical terminals).
 const SYNC_MAX: Duration = Duration::from_millis(150);
@@ -485,7 +493,91 @@ fn take_kill_confirmation(
         .then_some(Cmd::Kill { name, identity })
 }
 
+/// Where a coalesced wheel burst is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelTarget {
+    /// Forward one SGR mouse report per applied line to the session that is
+    /// tracking the mouse.
+    Session,
+    /// Scroll the local pane scrollback.
+    Pane,
+    /// Scroll the local sidebar list.
+    Sidebar,
+}
+
+/// Coalesces the wheel-event stream into bounded bursts.
+///
+/// macOS turns a trackpad/magic-mouse gesture into a stream of precise scroll
+/// reports — one per accumulated line — followed by a decaying momentum tail
+/// that keeps arriving after the fingers lift. Crossterm only exposes each
+/// report as a [`MouseEventKind::ScrollUp`]/[`ScrollDown`], with no phase or
+/// delta, so the TUI cannot tell a deliberate scroll from the tail. Instead
+/// every continuous run of same-target, same-direction reports separated by
+/// less than [`WHEEL_DEBOUNCE`] is treated as one gesture, capped at
+/// [`WHEEL_BURST_CAP`] applied lines. The first report of a pane burst keeps
+/// the discrete-wheel [`WHEEL_STEP`] (one notch is one isolated report);
+/// every later report is one line, matching the terminal's own "one report
+/// per line" normalization instead of multiplying the tail.
+#[derive(Clone, Copy, Default)]
+struct WheelCoalescer {
+    /// Signed lines already applied in the current burst.
+    applied: isize,
+    /// Target of the current burst; `None` when idle.
+    target: Option<WheelTarget>,
+    /// When the burst's last wheel event arrived.
+    last: Option<Instant>,
+}
+
+impl WheelCoalescer {
+    /// Grant lines for one wheel event of direction `dir` (`1` = ScrollUp,
+    /// `-1` = ScrollDown), returning the signed lines the caller should
+    /// apply, or `None` once the burst is saturated — a momentum tail is then
+    /// dropped until a quiet gap starts a fresh burst.
+    fn take(&mut self, target: WheelTarget, dir: isize, now: Instant) -> Option<isize> {
+        let fresh = match (self.target, self.last) {
+            (Some(t), Some(last)) => {
+                t != target
+                    || now.duration_since(last) >= WHEEL_DEBOUNCE
+                    || (self.applied != 0 && self.applied.signum() != dir)
+            }
+            _ => true,
+        };
+        if fresh {
+            self.target = Some(target);
+            self.applied = 0;
+        }
+        self.last = Some(now);
+        if self.applied.abs() >= WHEEL_BURST_CAP {
+            return None;
+        }
+        let weight = if fresh && target == WheelTarget::Pane {
+            WHEEL_STEP as isize
+        } else {
+            1
+        };
+        let room = WHEEL_BURST_CAP - self.applied.abs();
+        let lines = weight.min(room);
+        self.applied += dir * lines;
+        Some(dir * lines)
+    }
+}
+
+/// The scroll direction of a mouse kind: `Some(1)` for ScrollUp, `Some(-1)`
+/// for ScrollDown, `None` for anything that is not a wheel scroll.
+fn wheel_dir(kind: MouseEventKind) -> Option<isize> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(1),
+        MouseEventKind::ScrollDown => Some(-1),
+        _ => None,
+    }
+}
+
 pub(crate) struct App {
+    /// Coalesces wheel events into bounded bursts so a macOS momentum tail
+    /// cannot keep the pane (or a mouse-tracking session) scrolling long
+    /// after the fingers lift.
+    wheel: WheelCoalescer,
+
     socket: PathBuf,
     conn: Conn,
     ev_rx: Receiver<ConnectionEvent>,
@@ -824,6 +916,7 @@ fn event_loop(
     let (keymap, keymap_complaint) = config::keymap(&asd_proto::paths::config_path());
 
     let mut app = App {
+        wheel: WheelCoalescer::default(),
         socket,
         conn,
         ev_rx,
@@ -1874,13 +1967,26 @@ impl App {
             if let Some(modes) = modes
                 && modes.iter().any(|&x| x == 1006 || x == 1015 || x == 1016)
             {
-                if let Some(report) = encode_sgr_mouse(
-                    m.kind,
-                    m.modifiers,
-                    m.column - pane.left(),
-                    m.row - pane.top(),
-                    &modes,
-                ) {
+                // A wheel gesture and its momentum tail arrive as a stream of
+                // reports; bounding the burst stops the session scrolling on
+                // after the fingers lift. Clicks, drags and moves pass
+                // through untouched.
+                let forward = match wheel_dir(m.kind) {
+                    None => true,
+                    Some(dir) => self
+                        .wheel
+                        .take(WheelTarget::Session, dir, Instant::now())
+                        .is_some(),
+                };
+                if forward
+                    && let Some(report) = encode_sgr_mouse(
+                        m.kind,
+                        m.modifiers,
+                        m.column - pane.left(),
+                        m.row - pane.top(),
+                        &modes,
+                    )
+                {
                     self.send(Cmd::Input(report));
                 }
                 // The session owns the mouse in the live view: don't also
@@ -1889,16 +1995,27 @@ impl App {
             }
         }
         match m.kind {
-            MouseEventKind::ScrollUp => match wheel_target {
-                ui::WheelTarget::Sidebar => self.scroll_sidebar_by(-(SIDEBAR_WHEEL_STEP as isize)),
-                ui::WheelTarget::Pane => self.scroll_by(WHEEL_STEP as isize),
-                ui::WheelTarget::None => {}
-            },
-            MouseEventKind::ScrollDown => match wheel_target {
-                ui::WheelTarget::Sidebar => self.scroll_sidebar_by(SIDEBAR_WHEEL_STEP as isize),
-                ui::WheelTarget::Pane => self.scroll_by(-(WHEEL_STEP as isize)),
-                ui::WheelTarget::None => {}
-            },
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let dir: isize = if matches!(m.kind, MouseEventKind::ScrollUp) {
+                    1
+                } else {
+                    -1
+                };
+                let now = Instant::now();
+                match wheel_target {
+                    ui::WheelTarget::Sidebar => {
+                        if let Some(lines) = self.wheel.take(WheelTarget::Sidebar, dir, now) {
+                            self.scroll_sidebar_by(-lines);
+                        }
+                    }
+                    ui::WheelTarget::Pane => {
+                        if let Some(lines) = self.wheel.take(WheelTarget::Pane, dir, now) {
+                            self.scroll_by(lines);
+                        }
+                    }
+                    ui::WheelTarget::None => {}
+                }
+            }
             // Grabbing the divider begins a live sidebar resize (consumed by the
             // TUI — never a selection). Left button only: right/middle clicks
             // must not select, kill, or start a drag-selection.
@@ -2714,6 +2831,104 @@ mod tests {
                 &[1003, 1006]
             ),
             Some(b"\x1b[<35;2;2M".to_vec())
+        );
+    }
+
+    fn after_debounce(t: Instant) -> Instant {
+        t + WHEEL_DEBOUNCE + Duration::from_millis(1)
+    }
+
+    #[test]
+    fn wheel_burst_first_report_keeps_the_discrete_step() {
+        let mut w = WheelCoalescer::default();
+        let t0 = Instant::now();
+        // The first report of a pane burst is a discrete wheel notch: it
+        // keeps WHEEL_STEP. A later report in the same burst is one line.
+        assert_eq!(w.take(WheelTarget::Pane, 1, t0), Some(WHEEL_STEP as isize));
+        assert_eq!(
+            w.take(WheelTarget::Pane, 1, t0 + Duration::from_millis(10)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn wheel_burst_is_capped_until_a_quiet_gap() {
+        let mut w = WheelCoalescer::default();
+        let t0 = Instant::now();
+        // Session reports are one line each; the burst is capped so a
+        // momentum tail cannot keep scrolling after the fingers lift.
+        let mut applied = 0isize;
+        let mut last_recv = t0;
+        for i in 0..(WHEEL_BURST_CAP + 10) {
+            last_recv = t0 + Duration::from_millis((i * 5) as u64);
+            let step = w.take(WheelTarget::Session, 1, last_recv);
+            match step {
+                Some(1) => applied += 1,
+                Some(other) => panic!("expected one line per report, got {other}"),
+                None => {}
+            }
+        }
+        assert_eq!(applied, WHEEL_BURST_CAP);
+        // The dense tail after the cap is dropped; it still counts as
+        // activity, so the quiet gap is measured from it.
+        assert!(
+            w.take(
+                WheelTarget::Session,
+                1,
+                last_recv + Duration::from_millis(5)
+            )
+            .is_none()
+        );
+        // A quiet gap after the last received event starts a fresh burst
+        // with the cap renewed.
+        assert_eq!(
+            w.take(
+                WheelTarget::Session,
+                1,
+                after_debounce(last_recv + Duration::from_millis(5))
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn wheel_burst_resets_on_direction_flip() {
+        let mut w = WheelCoalescer::default();
+        let t0 = Instant::now();
+        assert_eq!(w.take(WheelTarget::Pane, 1, t0), Some(WHEEL_STEP as isize));
+        assert_eq!(
+            w.take(WheelTarget::Pane, 1, t0 + Duration::from_millis(10)),
+            Some(1)
+        );
+        // Reversing direction starts a fresh burst (and the new first report
+        // keeps the discrete step).
+        assert_eq!(
+            w.take(WheelTarget::Pane, -1, t0 + Duration::from_millis(20)),
+            Some(-(WHEEL_STEP as isize))
+        );
+    }
+
+    #[test]
+    fn wheel_burst_resets_on_target_change() {
+        let mut w = WheelCoalescer::default();
+        let t0 = Instant::now();
+        assert_eq!(w.take(WheelTarget::Pane, 1, t0), Some(WHEEL_STEP as isize));
+        // Moving from the pane to the sidebar starts a fresh burst; the
+        // sidebar scrolls one line per report.
+        assert_eq!(
+            w.take(WheelTarget::Sidebar, -1, t0 + Duration::from_millis(10)),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn wheel_burst_resets_after_a_quiet_gap() {
+        let mut w = WheelCoalescer::default();
+        let t0 = Instant::now();
+        assert_eq!(w.take(WheelTarget::Pane, 1, t0), Some(WHEEL_STEP as isize));
+        assert_eq!(
+            w.take(WheelTarget::Pane, 1, after_debounce(t0)),
+            Some(WHEEL_STEP as isize)
         );
     }
 }
