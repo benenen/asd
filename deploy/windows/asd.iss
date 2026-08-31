@@ -88,8 +88,12 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
 const
   EnvKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
 
-{ True when {app} is not already a PATH entry. Compared with separators on both
-  sides so "C:\Program Files\asd" does not match "C:\Program Files\asdx". }
+// True when {app} is not already a PATH entry. Compared with separators on both
+// sides so "C:\Program Files\asd" does not match "C:\Program Files\asdx".
+//
+// Line comments, not the `{ ... }` form: Pascal comments do not nest, so an
+// Inno constant like {app} inside one closes it early and the rest of the
+// sentence is compiled as code.
 function NeedsAddPath(Param: string): Boolean;
 var
   OrigPath: string;
@@ -102,10 +106,10 @@ begin
   Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
 end;
 
-{ Uninstall leaves no stale PATH entry behind. The list is split on ';' and
-  rebuilt without our entry, rather than cut out by index — that way first,
-  last and only-entry all fall out correctly, and every other entry is written
-  back exactly as it was. }
+// Uninstall leaves no stale PATH entry behind. The list is split on ';' and
+// rebuilt without our entry, rather than cut out by index — that way first,
+// last and only-entry all fall out correctly, and every other entry is written
+// back exactly as it was.
 procedure RemoveFromPath(Param: string);
 var
   OrigPath, NewPath, Item: string;
