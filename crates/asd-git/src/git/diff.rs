@@ -905,6 +905,9 @@ mod tests {
             .join(&blob[..2])
             .join(&blob[2..]);
         assert!(obj.exists(), "{} should be a loose object", obj.display());
+        // Git stores loose objects read-only. Replace the directory entry so
+        // this fixture also works for unprivileged CI users without chmod.
+        std::fs::remove_file(&obj).unwrap();
         std::fs::write(&obj, b"not a git object at all").unwrap();
     }
 
