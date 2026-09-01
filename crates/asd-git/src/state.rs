@@ -2826,7 +2826,7 @@ mod tests {
         (&mut g).render(area, &mut buf);
         let before = buffer_text(&buf, area);
         assert!(before.contains("(v1)"), "{before:?}");
-        assert!(before.contains("[origin/main]"), "{before:?}");
+        assert!(before.contains(" origin/main "), "{before:?}");
 
         g.on_key(key(KeyCode::Char('t')));
         let mut buf = Buffer::empty(area);
@@ -2834,7 +2834,7 @@ mod tests {
         let tags_off = buffer_text(&buf, area);
         assert!(!tags_off.contains("v1"), "{tags_off:?}");
         assert!(
-            tags_off.contains("[origin/main]"),
+            tags_off.contains(" origin/main "),
             "o was not toggled: {tags_off:?}"
         );
 
@@ -2888,7 +2888,7 @@ mod tests {
         // decoration on it, since `ready_graph`'s fixture commit sits on the
         // default `main` branch) must still be there.
         assert!(
-            text.contains("first") && text.contains("[main]"),
+            text.contains("first") && text.contains(" main "),
             "the graph pane underneath is still drawn above the popup: {text:?}"
         );
     }

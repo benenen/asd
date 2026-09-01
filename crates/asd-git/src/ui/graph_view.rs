@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 
 use crate::git::graph::{CellType, GraphNode};
 use crate::git::refs::{RefInfo, RefKind};
-use crate::ui::colors::lane_color;
+use crate::ui::colors::{branch_label_colors, lane_color};
 
 /// Columns between the graph and the summary text.
 const GAP: u16 = 1;
@@ -68,23 +68,82 @@ fn cell_color(cell: CellType) -> Color {
     }
 }
 
-/// `[main]`, `[origin/main]`, `(v1.2)` — the decorations for one commit that
-/// survive the `o`/`t` toggles. A ref hidden by a toggle is skipped rather
-/// than rebuilding `decorations` itself, so flipping a toggle costs nothing
-/// beyond the redraw it always causes.
-fn decoration_text(refs: &[RefInfo], show_remotes: bool, show_tags: bool) -> String {
-    let mut out = String::new();
-    for r in refs {
-        if !r.kind.visible(show_remotes, show_tags) {
+/// Whether a graph cell has a horizontal stroke leaving its left or right
+/// edge. The spacer column between two logical lanes is painted when either
+/// neighbour reaches into it: commits are endpoints with no direction of their
+/// own, while the branch cell beside them carries the connecting stroke.
+fn connects_left(cell: CellType) -> bool {
+    matches!(
+        cell,
+        CellType::Horizontal(_)
+            | CellType::HorizontalPipe(..)
+            | CellType::BranchLeft(_)
+            | CellType::MergeLeft(_)
+            | CellType::TeeLeft(_)
+            | CellType::TeeDown(..)
+            | CellType::TeeUp(..)
+    )
+}
+
+fn connects_right(cell: CellType) -> bool {
+    matches!(
+        cell,
+        CellType::Horizontal(_)
+            | CellType::HorizontalPipe(..)
+            | CellType::BranchRight(_)
+            | CellType::TeeRight(_)
+            | CellType::TeeDown(..)
+            | CellType::TeeUp(..)
+    )
+}
+
+/// Paint the decorations that survive the `o`/`t` toggles. Branches are
+/// independent labels whose stable colour comes from the full ref name; tags
+/// retain the lighter parenthesised treatment so the two concepts do not rely
+/// on colour alone.
+fn draw_decorations(
+    buf: &mut Buffer,
+    area: Rect,
+    position: (u16, u16),
+    refs: &[RefInfo],
+    toggles: RefToggles,
+    base: Style,
+    tag_color: Color,
+) -> u16 {
+    let (mut x, y) = position;
+    for reference in refs {
+        if !reference
+            .kind
+            .visible(toggles.show_remotes, toggles.show_tags)
+        {
             continue;
         }
-        let piece = match r.kind {
-            RefKind::LocalBranch | RefKind::RemoteBranch => format!("[{}] ", r.name),
-            RefKind::Tag => format!("({}) ", r.name),
-        };
-        out.push_str(&piece);
+        match reference.kind {
+            RefKind::LocalBranch | RefKind::RemoteBranch => {
+                let (foreground, background) = branch_label_colors(&reference.name);
+                let mut style = Style::default()
+                    .fg(foreground)
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD);
+                if base.add_modifier.contains(Modifier::REVERSED) {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                x = put(buf, area, x, y, &format!(" {} ", reference.name), style);
+                x = put(buf, area, x, y, " ", base);
+            }
+            RefKind::Tag => {
+                x = put(
+                    buf,
+                    area,
+                    x,
+                    y,
+                    &format!("({}) ", reference.name),
+                    base.fg(tag_color).add_modifier(Modifier::BOLD),
+                );
+            }
+        }
     }
-    out
+    x
 }
 
 /// Write `text` at `(x, y)`, stopping at `area`'s right edge. Returns the
@@ -166,15 +225,14 @@ pub(crate) fn draw_rows(
     let bottom = area.y.saturating_add(area.height);
     let right = area.x.saturating_add(area.width);
 
-    // The graph occupies as many columns as the widest visible row, capped so
-    // the summary always has room.
+    // Each logical lane gets a glyph column and, except after the last lane, a
+    // connector column. Work backwards from the physical one-third-width
+    // budget so only complete lanes are admitted and the summary keeps room.
     let visible = nodes.iter().skip(first_row).take(area.height as usize);
-    let graph_w = visible
-        .clone()
-        .map(|n| n.cells.len())
-        .max()
-        .unwrap_or(0)
-        .min((area.width / 3) as usize) as u16;
+    let widest = visible.clone().map(|n| n.cells.len()).max().unwrap_or(0);
+    let graph_budget = (area.width / 3) as usize;
+    let graph_lanes = widest.min(graph_budget.saturating_add(1) / 2);
+    let graph_w = graph_lanes.saturating_mul(2).saturating_sub(1) as u16;
 
     for (row, node) in visible.enumerate() {
         let y = area.y.saturating_add(row as u16);
@@ -188,15 +246,38 @@ pub(crate) fn draw_rows(
             Style::default()
         };
 
-        // Graph cells, truncated to the graph column budget.
-        for (col, cell) in node.cells.iter().take(graph_w as usize).enumerate() {
-            let x = area.x.saturating_add(col as u16);
+        // Logical cells occupy every other terminal column. The column between
+        // them extends horizontal runs, making adjacent lanes readable as
+        // `●─╮` / `├─╯` instead of visually compressed `●╮` / `├╯`.
+        for col in 0..graph_lanes {
+            let cell = node.cells.get(col).copied().unwrap_or(CellType::Empty);
+            let x = area.x.saturating_add((col as u16).saturating_mul(2));
             if x >= right {
                 break;
             }
             buf[(x, y)]
-                .set_symbol(&cell_glyph(*cell).to_string())
-                .set_style(base.fg(cell_color(*cell)));
+                .set_symbol(&cell_glyph(cell).to_string())
+                .set_style(base.fg(cell_color(cell)));
+
+            if col + 1 >= graph_lanes {
+                continue;
+            }
+            let next = node.cells.get(col + 1).copied().unwrap_or(CellType::Empty);
+            if !connects_right(cell) && !connects_left(next) {
+                continue;
+            }
+            let connector_x = x.saturating_add(1);
+            if connector_x >= right {
+                continue;
+            }
+            let color = if connects_right(cell) {
+                cell_color(cell)
+            } else {
+                cell_color(next)
+            };
+            buf[(connector_x, y)]
+                .set_symbol("─")
+                .set_style(base.fg(color));
         }
 
         let Some(commit) = node.commit.as_ref() else {
@@ -218,23 +299,24 @@ pub(crate) fn draw_rows(
         };
 
         let mut x = area.x.saturating_add(graph_w).saturating_add(GAP);
-        if let Some(refs) = decorations.get(&commit.id) {
-            x = put(
-                buf,
-                area,
-                x,
-                y,
-                &decoration_text(refs, toggles.show_remotes, toggles.show_tags),
-                base.fg(lane_color(node.color_index))
-                    .add_modifier(Modifier::BOLD),
-            );
-        }
-        // Leave room for the hash column so the summary cannot run into it.
-        let summary_area = Rect {
+        // Decorations and summaries stop before the fixed hash column. The hash
+        // is painted last, but labels must not leave their background under it.
+        let content_area = Rect {
             width: area.width.saturating_sub(HASH_W),
             ..area
         };
-        put(buf, summary_area, x, y, &commit.summary, base);
+        if let Some(refs) = decorations.get(&commit.id) {
+            x = draw_decorations(
+                buf,
+                content_area,
+                (x, y),
+                refs,
+                toggles,
+                base,
+                lane_color(node.color_index),
+            );
+        }
+        put(buf, content_area, x, y, &commit.summary, base);
 
         let hash = commit.id.to_string();
         // Clamped to `area.x`: on an area narrower than the hash column this
@@ -291,6 +373,168 @@ mod tests {
         assert_eq!(cell_glyph(CellType::TeeUp(0, 0)), '┴');
     }
 
+    #[test]
+    fn adjacent_lanes_have_a_visible_connector_span() {
+        let nodes = vec![node(
+            "fork",
+            1,
+            vec![CellType::Pipe(0), CellType::BranchLeft(1)],
+        )];
+        let area = Rect::new(0, 0, 30, 1);
+        let mut buf = Buffer::empty(area);
+        draw_rows(
+            &mut buf,
+            area,
+            &nodes,
+            &Default::default(),
+            RefToggles {
+                show_remotes: true,
+                show_tags: true,
+            },
+            0,
+            0,
+        );
+
+        let row: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            row.starts_with("│─╮ fork"),
+            "a connector column makes the edge traceable: {row:?}"
+        );
+        assert_eq!(
+            buf[(1, 0)].style().fg,
+            Some(lane_color(1)),
+            "the connector keeps the branch run's colour"
+        );
+    }
+
+    #[test]
+    fn branch_names_are_independent_coloured_labels() {
+        let commit_id = gix::ObjectId::empty_blob(gix::hash::Kind::Sha1);
+        let mut row = node("summary", 0, vec![CellType::Commit(0)]);
+        row.commit.as_mut().unwrap().id = commit_id;
+        let nodes = vec![row];
+        let mut decorations = HashMap::new();
+        decorations.insert(
+            commit_id,
+            vec![
+                RefInfo {
+                    name: "main".to_string(),
+                    target: commit_id,
+                    kind: RefKind::LocalBranch,
+                },
+                RefInfo {
+                    name: "origin/main".to_string(),
+                    target: commit_id,
+                    kind: RefKind::RemoteBranch,
+                },
+                RefInfo {
+                    name: "v1".to_string(),
+                    target: commit_id,
+                    kind: RefKind::Tag,
+                },
+            ],
+        );
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        draw_rows(
+            &mut buf,
+            area,
+            &nodes,
+            &decorations,
+            RefToggles {
+                show_remotes: true,
+                show_tags: true,
+            },
+            0,
+            0,
+        );
+
+        let text: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            !text.contains("[main]"),
+            "background replaces brackets: {text:?}"
+        );
+        let main_x = text.find("main").expect("local branch is visible") as u16;
+        let remote_x = text.find("origin/main").expect("remote branch is visible") as u16;
+        let tag_x = text.find("v1").expect("tag is visible") as u16;
+        let main = buf[(main_x, 0)].style();
+        let remote = buf[(remote_x, 0)].style();
+        let tag = buf[(tag_x, 0)].style();
+        assert!(main.bg.is_some(), "local branch has a background: {main:?}");
+        assert!(
+            remote.bg.is_some(),
+            "remote branch has a background: {remote:?}"
+        );
+        assert_ne!(
+            main.bg, remote.bg,
+            "different branch names get different colours"
+        );
+        assert!(
+            !main.add_modifier.contains(Modifier::REVERSED)
+                && !remote.add_modifier.contains(Modifier::REVERSED),
+            "selected-row reversal must not replace branch colours"
+        );
+        assert!(
+            main.add_modifier.contains(Modifier::UNDERLINED)
+                && remote.add_modifier.contains(Modifier::UNDERLINED),
+            "branch labels carry the selected row through an underline"
+        );
+        assert!(
+            buf[(0, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "the rest of the selected row remains reversed"
+        );
+        assert!(
+            matches!(tag.bg, None | Some(Color::Reset)),
+            "tags keep their non-branch treatment: {tag:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_branch_label_never_paints_under_the_hash() {
+        let commit_id = gix::ObjectId::empty_blob(gix::hash::Kind::Sha1);
+        let mut row = node("summary", 0, vec![CellType::Commit(0)]);
+        row.commit.as_mut().unwrap().id = commit_id;
+        let nodes = vec![row];
+        let mut decorations = HashMap::new();
+        decorations.insert(
+            commit_id,
+            vec![RefInfo {
+                name: "feature/a-very-long-branch-name".to_string(),
+                target: commit_id,
+                kind: RefKind::LocalBranch,
+            }],
+        );
+        let area = Rect::new(0, 0, 30, 1);
+        let mut buf = Buffer::empty(area);
+        draw_rows(
+            &mut buf,
+            area,
+            &nodes,
+            &decorations,
+            RefToggles {
+                show_remotes: true,
+                show_tags: true,
+            },
+            0,
+            usize::MAX,
+        );
+
+        let hash = commit_id.to_string();
+        let hash = &hash[..7];
+        let hash_x = area.width - 7;
+        let drawn: String = (hash_x..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(drawn, hash, "the fixed hash column stays visible");
+        for x in hash_x..area.width {
+            assert!(
+                matches!(buf[(x, 0)].style().bg, None | Some(Color::Reset)),
+                "branch background reached the hash at column {x}"
+            );
+        }
+    }
+
     /// `o`/`t` are wired to `draw_rows` itself, not just to the booleans
     /// `GitGraph` exposes: a hidden kind must not reach the buffer at all, and
     /// a local branch must survive both toggles off, since only `o` and `t`
@@ -345,23 +589,23 @@ mod tests {
         };
 
         let both = text(true, true);
-        assert!(both.contains("[main]"), "{both:?}");
-        assert!(both.contains("[origin/main]"), "{both:?}");
+        assert!(both.contains(" main "), "{both:?}");
+        assert!(both.contains(" origin/main "), "{both:?}");
         assert!(both.contains("(v1)"), "{both:?}");
 
         let no_remotes = text(false, true);
-        assert!(no_remotes.contains("[main]"), "{no_remotes:?}");
+        assert!(no_remotes.contains(" main "), "{no_remotes:?}");
         assert!(!no_remotes.contains("origin/main"), "{no_remotes:?}");
         assert!(no_remotes.contains("(v1)"), "{no_remotes:?}");
 
         let no_tags = text(true, false);
-        assert!(no_tags.contains("[main]"), "{no_tags:?}");
-        assert!(no_tags.contains("[origin/main]"), "{no_tags:?}");
+        assert!(no_tags.contains(" main "), "{no_tags:?}");
+        assert!(no_tags.contains(" origin/main "), "{no_tags:?}");
         assert!(!no_tags.contains("v1"), "{no_tags:?}");
 
         let neither = text(false, false);
         assert!(
-            neither.contains("[main]"),
+            neither.contains(" main "),
             "a local branch survives both toggles off: {neither:?}"
         );
         assert!(!neither.contains("origin/main"), "{neither:?}");
@@ -454,8 +698,8 @@ mod tests {
         draw_rows(&mut buf, area, &nodes, &Default::default(), toggles, 0, 0);
         let row: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(
-            row.starts_with("││││││││││ deep"),
-            "ten columns of graph — a third of thirty — then the summary: {row:?}"
+            row.starts_with("│ │ │ │ │ deep"),
+            "five complete lanes use nine of the ten budgeted columns: {row:?}"
         );
 
         // The degenerate end of the same behaviour: an area with barely room
@@ -465,8 +709,8 @@ mod tests {
         draw_rows(&mut buf, narrow, &nodes, &Default::default(), toggles, 0, 0);
         let row: String = (0..narrow.width).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(
-            row.starts_with("│││"),
-            "three columns of graph — a third of ten: {row:?}"
+            row.starts_with("│ │"),
+            "two complete lanes use the three-column graph budget: {row:?}"
         );
     }
 
