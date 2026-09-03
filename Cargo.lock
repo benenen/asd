@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "asd"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "asd-cli",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "asd-cli"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "asd-client",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "asd-client"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "asd-proto",
  "libc",
@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "asd-daemon"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "asd-proto",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "asd-dioxus"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "asd-client",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "asd-git"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "fuzzy-matcher",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "asd-proto"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "postcard",
  "serde",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "asd-tui"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "asd-client",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "asd-vt"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "libghostty-vt",
 ]
