@@ -181,11 +181,30 @@ impl App {
     /// Route a mouse event to the overlay. Returns true when the overlay
     /// consumed it, so the caller stops.
     pub(crate) fn on_git_graph_mouse(&mut self, m: crate::MouseEvent) -> bool {
-        let Some(graph) = self.git_graph.as_mut() else {
+        self.on_git_graph_mouse_at(m, std::time::Instant::now())
+    }
+
+    fn on_git_graph_mouse_at(&mut self, m: crate::MouseEvent, now: std::time::Instant) -> bool {
+        let Some(graph) = self.git_graph.as_ref() else {
             return false;
         };
+        let direction = crate::wheel_dir(m.kind);
+        if direction.is_some() && !graph.accepts_mouse_wheel() {
+            return true;
+        }
+        let wheel_rows = match direction {
+            Some(direction) => match self
+                .wheel
+                .take(crate::WheelTarget::GitGraph, direction, now)
+            {
+                Some(rows) => rows.unsigned_abs(),
+                None => return true,
+            },
+            None => crate::WHEEL_STEP,
+        };
+        let graph = self.git_graph.as_mut().expect("checked above");
         let before = graph.selected();
-        let outcome = graph.on_mouse(m);
+        let outcome = graph.on_mouse_with_wheel_rows(m, wheel_rows);
         // Crossterm's mouse capture enables 1002/1003, so a motion report
         // arrives on every mouse move and the overlay answers `Consumed`
         // without doing anything. Dirtying the frame for each would repaint
@@ -300,6 +319,10 @@ mod tests {
 
     impl ScratchRepo {
         fn new(tag: &str) -> Self {
+            Self::with_commits(tag, 3)
+        }
+
+        fn with_commits(tag: &str, commits: usize) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "asd-tui-overlay-{tag}-{}-{}",
                 std::process::id(),
@@ -314,7 +337,7 @@ mod tests {
             me.git(&["config", "user.name", "asd test"]);
             me.git(&["config", "user.email", "test@example.invalid"]);
             me.git(&["config", "commit.gpgsign", "false"]);
-            for i in 0..3 {
+            for i in 0..commits {
                 let message = format!("commit {i}");
                 me.git(&["commit", "--quiet", "--allow-empty", "-m", &message]);
             }
@@ -356,6 +379,16 @@ mod tests {
         tag: &str,
     ) -> (ScratchRepo, App, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
         let repo = ScratchRepo::new(tag);
+        let (mut app, cmds) = app_watching_commands();
+        app.git_graph = Some(GitGraph::open(repo.path()).expect("a fresh repository opens"));
+        (repo, app, cmds)
+    }
+
+    fn app_with_overlay_commits(
+        tag: &str,
+        commits: usize,
+    ) -> (ScratchRepo, App, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
+        let repo = ScratchRepo::with_commits(tag, commits);
         let (mut app, cmds) = app_watching_commands();
         app.git_graph = Some(GitGraph::open(repo.path()).expect("a fresh repository opens"));
         (repo, app, cmds)
@@ -477,6 +510,82 @@ mod tests {
             "and it does not silently un-scroll the hidden pane either"
         );
         assert!(app.git_graph.is_some(), "the overlay stays open");
+    }
+
+    #[test]
+    fn git_graph_wheel_distance_depends_on_elapsed_time_not_report_count() {
+        let (_dense_repo, mut dense, _dense_cmds) = app_with_overlay_commits("wheel-dense", 20);
+        let (_sparse_repo, mut sparse, _sparse_cmds) = app_with_overlay_commits("wheel-sparse", 20);
+        let started = std::time::Instant::now();
+        let wheel = crate::MouseEvent {
+            kind: crate::MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: crate::KeyModifiers::NONE,
+        };
+
+        for offset in [0, 5, 10, 15, 20, 25, 30] {
+            assert!(
+                dense.on_git_graph_mouse_at(
+                    wheel,
+                    started + std::time::Duration::from_millis(offset),
+                )
+            );
+        }
+        for offset in [0, 15, 30] {
+            assert!(
+                sparse.on_git_graph_mouse_at(
+                    wheel,
+                    started + std::time::Duration::from_millis(offset),
+                )
+            );
+        }
+
+        assert_eq!(dense.git_graph.as_ref().unwrap().selected(), 8);
+        assert_eq!(sparse.git_graph.as_ref().unwrap().selected(), 8);
+    }
+
+    #[test]
+    fn ignored_graph_layers_do_not_spend_the_next_wheel_burst() {
+        let (_repo, mut app, _cmds) = app_with_overlay_commits("wheel-search", 20);
+        let started = std::time::Instant::now();
+        let wheel = crate::MouseEvent {
+            kind: crate::MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: crate::KeyModifiers::NONE,
+        };
+
+        assert!(app.on_git_graph_key(CtKey::new(KeyCode::Char('/'), KeyModifiers::NONE,)));
+        assert!(app.on_git_graph_mouse_at(wheel, started));
+        assert_eq!(app.git_graph.as_ref().unwrap().selected(), 0);
+
+        assert!(app.on_git_graph_key(CtKey::new(KeyCode::Esc, KeyModifiers::NONE,)));
+        assert!(app.on_git_graph_mouse_at(wheel, started + std::time::Duration::from_millis(5),));
+        assert_eq!(app.git_graph.as_ref().unwrap().selected(), 3);
+    }
+
+    #[test]
+    fn dense_graph_reports_do_not_restart_a_saturated_burst() {
+        let (_repo, mut app, _cmds) = app_with_overlay_commits("wheel-cap", 80);
+        let started = std::time::Instant::now();
+        let wheel = crate::MouseEvent {
+            kind: crate::MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: crate::KeyModifiers::NONE,
+        };
+
+        for offset in (0..=410).step_by(5).chain(std::iter::once(414)) {
+            assert!(
+                app.on_git_graph_mouse_at(
+                    wheel,
+                    started + std::time::Duration::from_millis(offset),
+                )
+            );
+        }
+
+        assert_eq!(app.git_graph.as_ref().unwrap().selected(), 64);
     }
 
     #[test]

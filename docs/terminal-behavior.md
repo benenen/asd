@@ -116,6 +116,16 @@ tracking and encoding modes (`9`, `1000`, `1002`, `1003`, `1005`, `1006`,
 `1015`, `1016`) to the host and forward reports unchanged. Host and PTY
 coordinates are 1:1, so translating them would be incorrect.
 
+`asd ui` receives wheel input from crossterm as direction-only reports; the
+host's original wheel magnitude is no longer available. Local pane and Git
+Graph scrolling therefore use elapsed time rather than report count: the first
+report moves three rows immediately, a continuing burst earns 180 rows per
+second, and a 40 ms quiet gap starts a new burst. Pane and Git Graph bursts stop
+at 64 rows. The sidebar uses the same clock with one item immediately, 20 items
+per second, and a 16-item cap. This normalization is strictly client-local: a
+mouse-tracking session still receives every re-encoded report one-for-one
+without the local rate or cap.
+
 Bracketed paste (`2004`) follows the application's current mode:
 
 - `asd attach` mirrors mode 2004 so the host adds bracket markers and forwards

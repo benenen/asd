@@ -32,7 +32,7 @@ pub const PAGE_MORE: usize = 2000;
 /// How close the selection may get to the tail before more is loaded.
 const PAGE_MARGIN: usize = 200;
 /// Rows one wheel notch moves.
-const WHEEL_ROWS: isize = 3;
+const WHEEL_ROWS: usize = 3;
 /// Shown where a diff would be when the worker thread is gone. The graph still
 /// works without it, so this is a message rather than a failure of the overlay.
 const WORKER_GONE: &str = "diffs are unavailable";
@@ -251,6 +251,11 @@ impl GitGraph {
     /// Which layer of the overlay is on top.
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Whether a wheel event may move the currently visible layer.
+    pub fn accepts_mouse_wheel(&self) -> bool {
+        !matches!(self.mode, Mode::Search | Mode::Help)
     }
 
     /// What the file diff view has. Meaningful while `mode` is
@@ -949,12 +954,21 @@ impl GitGraph {
     /// `layout`: the host renders this widget at an absolute `Rect` and hands
     /// the event over unchanged.
     pub fn on_mouse(&mut self, ev: MouseEvent) -> Outcome {
+        self.on_mouse_with_wheel_rows(ev, WHEEL_ROWS)
+    }
+
+    /// Handle one mouse event with a host-normalized wheel distance.
+    ///
+    /// A zero distance consumes wheel input without moving anything. Non-wheel
+    /// mouse events ignore `wheel_rows`.
+    pub fn on_mouse_with_wheel_rows(&mut self, ev: MouseEvent, wheel_rows: usize) -> Outcome {
+        let wheel_rows = wheel_rows.min(isize::MAX as usize) as isize;
         // The file diff view covers the panes, so `layout` — which still holds
         // the last three-pane frame — must not route anything while it is up.
         if self.mode == Mode::FileDiff {
             return match ev.kind {
-                MouseEventKind::ScrollDown => self.scroll_file_diff(WHEEL_ROWS),
-                MouseEventKind::ScrollUp => self.scroll_file_diff(-WHEEL_ROWS),
+                MouseEventKind::ScrollDown => self.scroll_file_diff(wheel_rows),
+                MouseEventKind::ScrollUp => self.scroll_file_diff(-wheel_rows),
                 _ => Outcome::Consumed,
             };
         }
@@ -980,8 +994,8 @@ impl GitGraph {
             // one — that is what a reader expects from a wheel. The focus
             // itself is left alone.
             return match ev.kind {
-                MouseEventKind::ScrollDown => self.move_pane(pane, WHEEL_ROWS),
-                MouseEventKind::ScrollUp => self.move_pane(pane, -WHEEL_ROWS),
+                MouseEventKind::ScrollDown => self.move_pane(pane, wheel_rows),
+                MouseEventKind::ScrollUp => self.move_pane(pane, -wheel_rows),
                 // Mouse capture reports motion continuously. Answering
                 // `Consumed` without moving anything is what stops the host
                 // repainting the overlay per report.
@@ -992,8 +1006,8 @@ impl GitGraph {
         // first frame not yet drawn. Fall back to the focused pane so the
         // wheel still does what `j`/`k` would.
         match ev.kind {
-            MouseEventKind::ScrollDown => self.move_focused(WHEEL_ROWS),
-            MouseEventKind::ScrollUp => self.move_focused(-WHEEL_ROWS),
+            MouseEventKind::ScrollDown => self.move_focused(wheel_rows),
+            MouseEventKind::ScrollUp => self.move_focused(-wheel_rows),
             _ => Outcome::Consumed,
         }
     }

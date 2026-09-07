@@ -49,16 +49,19 @@ use modal::{Modal, RenameInput, validate_rename};
 const SCROLLBACK: usize = 10_000;
 /// Wheel scroll step in lines.
 const WHEEL_STEP: usize = 3;
+/// Sustained local pane/graph scroll rate after the first discrete step.
+const WHEEL_PANE_ROWS_PER_SECOND: u128 = 180;
+/// Sustained local sidebar scroll rate after the first session.
+const WHEEL_SIDEBAR_ITEMS_PER_SECOND: u128 = 20;
 /// Quiet between wheel events that ends a "burst". macOS momentum scrolling
 /// streams reports at sub-frame intervals after the fingers lift; a gap this
 /// large is a deliberate pause, so the next event starts a fresh burst with
 /// the per-burst cap renewed.
 const WHEEL_DEBOUNCE: Duration = Duration::from_millis(40);
-/// Maximum lines a single wheel burst may scroll before a quiet gap is
-/// required. Bounds the momentum tail a trackpad leaves behind once the
-/// fingers stop: without it the local pane or sidebar keeps scrolling through
-/// the whole decaying tail.
-const WHEEL_BURST_CAP: isize = 16;
+/// Maximum rows a pane or Git Graph burst may scroll before a quiet gap.
+const WHEEL_PANE_BURST_CAP: isize = 64;
+/// Maximum sessions a sidebar burst may scroll before a quiet gap.
+const WHEEL_SIDEBAR_BURST_CAP: isize = 16;
 /// Longest the pane defers a repaint while a program holds a synchronized-output
 /// (`?2026`) update open, bounding a lost `?2026l` (matches typical terminals).
 const SYNC_MAX: Duration = Duration::from_millis(150);
@@ -501,6 +504,8 @@ enum WheelTarget {
     Session,
     /// Scroll the local pane scrollback.
     Pane,
+    /// Scroll the Git Graph overlay with the pane's row profile.
+    GitGraph,
     /// Scroll the local sidebar list.
     Sidebar,
 }
@@ -513,13 +518,13 @@ enum WheelTarget {
 /// report as a [`MouseEventKind::ScrollUp`]/[`ScrollDown`], with no phase or
 /// delta, so the TUI cannot tell a deliberate scroll from the tail. Instead
 /// every continuous run of same-target, same-direction local reports separated
-/// by less than [`WHEEL_DEBOUNCE`] is treated as one gesture, capped at
-/// [`WHEEL_BURST_CAP`] applied lines. A mouse-tracking session remains the
-/// authority for its wheel stream, so its reports pass through unchanged. The
-/// first report of a pane burst keeps the discrete-wheel [`WHEEL_STEP`] (one
-/// notch is one isolated report); every later report is one line, matching the
-/// terminal's own "one report per line" normalization instead of multiplying
-/// the tail.
+/// by less than [`WHEEL_DEBOUNCE`] is treated as one gesture. The first report
+/// applies a discrete step immediately; later reports advance a time-based
+/// budget, so terminals that emit different report counts over the same period
+/// still travel the same distance. Pane/graph and sidebar gestures have
+/// separate caps because their units have very different visual sizes. A
+/// mouse-tracking session remains the authority for its wheel stream, so its
+/// reports pass through unchanged.
 #[derive(Clone, Copy, Default)]
 struct WheelCoalescer {
     /// Signed lines already applied in the current burst.
@@ -528,6 +533,8 @@ struct WheelCoalescer {
     target: Option<WheelTarget>,
     /// When the burst's last wheel event arrived.
     last: Option<Instant>,
+    /// When the current local burst began.
+    started: Option<Instant>,
 }
 
 impl WheelCoalescer {
@@ -542,6 +549,7 @@ impl WheelCoalescer {
             self.applied = 0;
             self.target = Some(target);
             self.last = Some(now);
+            self.started = None;
             return Some(dir);
         }
         let fresh = match (self.target, self.last) {
@@ -555,20 +563,33 @@ impl WheelCoalescer {
         if fresh {
             self.target = Some(target);
             self.applied = 0;
+            self.started = Some(now);
         }
         self.last = Some(now);
-        if self.applied.abs() >= WHEEL_BURST_CAP {
+        let (initial, units_per_second, burst_cap) = match target {
+            WheelTarget::Pane | WheelTarget::GitGraph => (
+                WHEEL_STEP as isize,
+                WHEEL_PANE_ROWS_PER_SECOND,
+                WHEEL_PANE_BURST_CAP,
+            ),
+            WheelTarget::Sidebar => (1, WHEEL_SIDEBAR_ITEMS_PER_SECOND, WHEEL_SIDEBAR_BURST_CAP),
+            WheelTarget::Session => unreachable!("session reports return above"),
+        };
+        if self.applied.abs() >= burst_cap {
             return None;
         }
-        let weight = if fresh && target == WheelTarget::Pane {
-            WHEEL_STEP as isize
-        } else {
-            1
-        };
-        let room = WHEEL_BURST_CAP - self.applied.abs();
-        let lines = weight.min(room);
-        self.applied += dir * lines;
-        Some(dir * lines)
+        let elapsed_ms = now
+            .saturating_duration_since(self.started.unwrap_or(now))
+            .as_millis();
+        let paced =
+            (elapsed_ms * units_per_second / 1_000).min((burst_cap - initial) as u128) as isize;
+        let desired = initial + paced;
+        let granted = desired - self.applied.abs();
+        if granted <= 0 {
+            return None;
+        }
+        self.applied += dir * granted;
+        Some(dir * granted)
     }
 }
 
@@ -2846,15 +2867,64 @@ mod tests {
         t + WHEEL_DEBOUNCE + Duration::from_millis(1)
     }
 
+    fn wheel_total(target: WheelTarget, offsets_ms: &[u64]) -> isize {
+        let mut wheel = WheelCoalescer::default();
+        let started = Instant::now();
+        offsets_ms
+            .iter()
+            .filter_map(|offset| wheel.take(target, 1, started + Duration::from_millis(*offset)))
+            .sum()
+    }
+
+    #[test]
+    fn pane_wheel_distance_depends_on_elapsed_time_not_report_count() {
+        let dense = wheel_total(WheelTarget::Pane, &[0, 5, 10, 15, 20, 25, 30]);
+        let sparse = wheel_total(WheelTarget::Pane, &[0, 15, 30]);
+
+        assert_eq!(dense, 8);
+        assert_eq!(sparse, 8);
+    }
+
+    #[test]
+    fn pane_wheel_caps_an_uninterrupted_414ms_gesture_at_64_rows() {
+        // The live Windows Terminal trace ran for 414 ms without a quiet gap.
+        // Exact report count does not matter once the stream is this dense.
+        let offsets = (0..=410)
+            .step_by(5)
+            .chain(std::iter::once(414))
+            .collect::<Vec<_>>();
+
+        assert_eq!(wheel_total(WheelTarget::Pane, &offsets), 64);
+    }
+
+    #[test]
+    fn sidebar_wheel_distance_depends_on_elapsed_time_not_report_count() {
+        let dense = wheel_total(
+            WheelTarget::Sidebar,
+            &[
+                0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100,
+            ],
+        );
+        let sparse = wheel_total(WheelTarget::Sidebar, &[0, 25, 50, 75, 100]);
+
+        assert_eq!(dense, 3);
+        assert_eq!(sparse, 3);
+    }
+
     #[test]
     fn wheel_burst_first_report_keeps_the_discrete_step() {
         let mut w = WheelCoalescer::default();
         let t0 = Instant::now();
         // The first report of a pane burst is a discrete wheel notch: it
-        // keeps WHEEL_STEP. A later report in the same burst is one line.
+        // keeps WHEEL_STEP. Later reports only grant rows as wall time earns
+        // them, independent of how densely the host terminal emits reports.
         assert_eq!(w.take(WheelTarget::Pane, 1, t0), Some(WHEEL_STEP as isize));
         assert_eq!(
-            w.take(WheelTarget::Pane, 1, t0 + Duration::from_millis(10)),
+            w.take(WheelTarget::Pane, 1, t0 + Duration::from_millis(5)),
+            None
+        );
+        assert_eq!(
+            w.take(WheelTarget::Pane, 1, t0 + Duration::from_millis(6)),
             Some(1)
         );
     }
@@ -2863,20 +2933,20 @@ mod tests {
     fn wheel_burst_is_capped_until_a_quiet_gap() {
         let mut w = WheelCoalescer::default();
         let t0 = Instant::now();
-        // Sidebar reports are one line each; the burst is capped so a
-        // momentum tail cannot keep scrolling after the fingers lift.
+        // Keep reports close enough to remain one burst, but long enough for
+        // the time budget to reach the cap.
         let mut applied = 0isize;
         let mut last_recv = t0;
-        for i in 0..(WHEEL_BURST_CAP + 10) {
-            last_recv = t0 + Duration::from_millis((i * 5) as u64);
+        for i in 0..=40 {
+            last_recv = t0 + Duration::from_millis(i * 25);
             let step = w.take(WheelTarget::Sidebar, 1, last_recv);
             match step {
                 Some(1) => applied += 1,
-                Some(other) => panic!("expected one line per report, got {other}"),
+                Some(other) => panic!("expected one item at a time, got {other}"),
                 None => {}
             }
         }
-        assert_eq!(applied, WHEEL_BURST_CAP);
+        assert_eq!(applied, WHEEL_SIDEBAR_BURST_CAP);
         // The dense tail after the cap is dropped; it still counts as
         // activity, so the quiet gap is measured from it.
         assert!(
@@ -2905,7 +2975,7 @@ mod tests {
         let t0 = Instant::now();
         // A mouse-tracking session owns the wheel, so every report must reach
         // it unchanged even when they arrive inside one dense gesture.
-        for i in 0..(WHEEL_BURST_CAP + 10) {
+        for i in 0..74 {
             assert_eq!(
                 w.take(
                     WheelTarget::Session,
@@ -2924,7 +2994,7 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(w.take(WheelTarget::Pane, 1, t0), Some(WHEEL_STEP as isize));
         assert_eq!(
-            w.take(WheelTarget::Pane, 1, t0 + Duration::from_millis(10)),
+            w.take(WheelTarget::Pane, 1, t0 + Duration::from_millis(6)),
             Some(1)
         );
         // Reversing direction starts a fresh burst (and the new first report
