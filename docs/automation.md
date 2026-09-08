@@ -369,6 +369,11 @@ retained session are rejected. A successful hook returns only after durable
 persistence; invalid, stale, or failed writes exit non-zero without changing
 in-memory resume metadata.
 
+If a write fails after replacing the file, disk contents can temporarily differ
+from the accepted in-memory metadata. The daemon marks persistence dirty and
+reconciles it on the next successful sweep or shutdown; a failed hook does not
+promise that the filesystem replacement was rolled back.
+
 Restart starts a fresh shell and stages `codex resume ID` or
 `claude --resume ID` without Enter. `--run-restored-commands` opts into execution
 of the same validated command. Duplicate saved claims select the newest daemon

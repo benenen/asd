@@ -64,10 +64,15 @@ cargo check -p asd-dioxus --target x86_64-pc-windows-gnu
 ```
 
 This checks that the Windows adapter remains behind `asd-dioxus/src/platform/`.
-It needs a usable MinGW C toolchain for native dependencies; if that local
-toolchain is unavailable, do not call GUI coverage passed. Require the native
-Windows full-GUI CI result instead. A successful cross-compile still does not
-prove that Windows displayed a notification; keep the adapter's behavioral
+It needs a usable MinGW C toolchain for native dependencies. Zig 0.15.x can
+also provide the C compiler and archiver: a local compiler wrapper must map
+cc-rs's `--target=x86_64-pc-windows-gnu` to Zig's
+`--target=x86_64-windows-gnu`. Set the target-specific `CC` and `AR` environment
+variables to those wrappers. With aws-lc-sys 0.42, systems without NASM can use
+`AWS_LC_SYS_PREBUILT_NASM=1` to select the dependency's bundled assembly objects.
+Keep these overrides local to the check command. If neither local toolchain
+works, require the native Windows full-GUI CI result. A successful cross-compile
+still does not prove that Windows displayed a notification; keep the adapter's behavioral
 tests and a real-machine smoke in the evidence.
 
 ## Session identity, persistence, and foreground proof

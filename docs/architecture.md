@@ -248,7 +248,11 @@ otherwise execute without the final Enter keypress.
 Validated Codex/Claude lifecycle hooks replace only the staged command with
 `codex resume ID` or `claude --resume ID`; the original command stays separate.
 Hook acknowledgement follows the durable commit, with in-memory metadata
-unchanged on failure. Start must agree with the actual foreground executable
+unchanged on failure. A directory-sync error after atomic replacement can leave
+the rejected candidate on disk temporarily; the store is marked dirty and the
+next successful persistence sweep or shutdown rewrites accepted in-memory
+state. This is retry reconciliation, not an atomic rollback guarantee.
+Start must agree with the actual foreground executable
 and unflattened argv, never the display command (which may unwrap shell source).
 Only platforms without process lookup may fall back to a conservative single
 recorded invocation without shell operators, substitutions, or controls. A
