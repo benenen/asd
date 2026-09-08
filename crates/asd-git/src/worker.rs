@@ -33,14 +33,33 @@ pub(crate) const MAX_HIGHLIGHT_LINES: usize = 5_000;
 pub(crate) enum Request {
     /// The changed-file list and totals for one commit.
     Commit(gix::ObjectId),
+    Working(u64),
+    WorkingFile {
+        generation: u64,
+        path: String,
+        stage: crate::git::working::WorktreeStage,
+    },
     /// One file's diff within one commit.
-    File { commit: gix::ObjectId, path: String },
+    File {
+        commit: gix::ObjectId,
+        path: String,
+    },
 }
 
 /// A finished computation. Errors are carried as text because they cross a
 /// thread boundary and are only ever shown to the user.
 #[derive(Debug)]
 pub(crate) enum Reply {
+    Working {
+        generation: u64,
+        result: Result<CommitDiff, String>,
+    },
+    WorkingFile {
+        generation: u64,
+        path: String,
+        stage: crate::git::working::WorktreeStage,
+        result: Result<HighlightedDiff, String>,
+    },
     Commit {
         id: gix::ObjectId,
         result: Result<CommitDiff, String>,
@@ -229,6 +248,23 @@ fn serve(repo: Repo, work: &Receiver<Request>, replies: &Sender<Reply>) {
     let mut old_side = Highlighter::new();
     while let Ok(req) = work.recv() {
         let reply = match req {
+            Request::Working(generation) => Reply::Working {
+                generation,
+                result: repo.working_diff().map_err(|e| e.to_string()),
+            },
+            Request::WorkingFile {
+                generation,
+                path,
+                stage,
+            } => Reply::WorkingFile {
+                generation,
+                stage,
+                result: repo
+                    .working_file_diff(&path, stage, DIFF_CONTEXT)
+                    .map_err(|e| e.to_string())
+                    .map(|diff| highlight(diff, &mut new_side, &mut old_side)),
+                path,
+            },
             Request::Commit(id) => Reply::Commit {
                 id,
                 result: repo.commit_diff(id).map_err(|e| e.to_string()),

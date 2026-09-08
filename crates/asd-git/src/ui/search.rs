@@ -223,6 +223,7 @@ mod tests {
             commit: Some(CommitInfo {
                 id: gix::ObjectId::empty_blob(gix::hash::Kind::Sha1),
                 parents: Vec::new(),
+                body: String::new(),
                 summary: summary.into(),
                 author: author.into(),
                 time: 0,

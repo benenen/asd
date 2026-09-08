@@ -361,3 +361,15 @@ fn review_shortcut_is_discoverable_and_never_types_v() {
         KeyResolution::PassThrough
     );
 }
+
+#[test]
+fn files_shortcut_is_discoverable_and_configurable() {
+    let mut map = Keymap::default();
+    assert!(KeyAction::from_config_name("toggle_files").is_some());
+    map.resolve(&press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert!(map.current_hint().text.contains("files"));
+    assert_ne!(
+        map.resolve(&press(KeyCode::Char('f'), KeyModifiers::NONE)),
+        KeyResolution::PassThrough
+    );
+}

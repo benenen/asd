@@ -102,6 +102,39 @@ impl Repo {
                 },
             }
         })?;
+        // A read-only viewer must not run clean/process helpers from attributes.
+        // These overrides affect this handle only; no config is written to disk.
+        let drivers: Vec<_> = inner
+            .config_snapshot()
+            .plumbing()
+            .sections_by_name("filter")
+            .into_iter()
+            .flatten()
+            .filter_map(|section| section.header().subsection_name().map(ToOwned::to_owned))
+            .collect();
+        let overrides: Vec<_> = drivers
+            .iter()
+            .flat_map(|driver| {
+                [
+                    format!("filter.{driver}.clean="),
+                    format!("filter.{driver}.process="),
+                    format!("filter.{driver}.required=false"),
+                ]
+            })
+            .collect();
+        if !overrides.is_empty() {
+            let mut config = inner.config_snapshot_mut();
+            config
+                .append_config(overrides, gix::config::Source::Api)
+                .map_err(|source| OpenError::Io {
+                    path: path.to_path_buf(),
+                    source: Box::new(source),
+                })?;
+            config.commit().map_err(|source| OpenError::Io {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            })?;
+        }
         inner.object_cache_size_if_unset(OBJECT_CACHE_BYTES);
         let workdir = inner
             .workdir()
@@ -196,6 +229,10 @@ impl Repo {
                 id: info.id,
                 parents: info.parent_ids.iter().copied().collect(),
                 summary: message.summary().to_string(),
+                body: message
+                    .body
+                    .map(|body| crate::git::commit::body_text(body.as_ref()))
+                    .unwrap_or_default(),
                 author: author.name.to_string(),
                 time,
             })

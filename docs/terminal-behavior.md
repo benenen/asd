@@ -237,3 +237,26 @@ The tradeoff is deliberate: preserving the host buffer avoids the flash and
 does not discard its alternate-screen state, while accepting that an
 auto-detected click target can lag. There is no VT sequence that directly
 commands Windows Terminal to refresh only its URL regex cache.
+
+## TUI workspace and Git browsing
+
+`Ctrl+A f` opens a daemon-backed read-only file list for the selected session.
+Its modal owns keyboard, mouse, and paste until closed, so directory navigation
+cannot type into the hidden PTY. Directory requests carry session identity and
+request generation; results for a replaced session or superseded request are
+ignored. Workspace root changes require an explicit refresh at the new root.
+
+The Git overlay (`Ctrl+A g`) uses one continuous selection background across a
+row, including graph lanes, label padding, and empty trailing cells. Foreground
+lane/ref colors remain legible without fragmenting that background.
+
+Selecting the synthetic uncommitted row displays working-tree files, including
+staged, unstaged, and untracked changes. Staged and unstaged versions of one path
+remain separate review targets. This view is read-only and must not invoke
+repository-configured clean/process filters or external diff helpers.
+
+Commit details retain the message body and trailers. The pane renders CommonMark
+headings, emphasis, lists, quotes, links, and code blocks as styled terminal text;
+HTML and links remain inert and images are not fetched. Text wraps by grapheme
+and display-cell width, and scrolling counts the wrapped rows. Bodies above
+64 KiB carry a visible truncation notice to bound retained per-commit text.

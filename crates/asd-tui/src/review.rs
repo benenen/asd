@@ -54,6 +54,8 @@ impl Review {
 
 impl App {
     pub(crate) fn toggle_review(&mut self) {
+        self.close_files();
+        self.git_graph = None;
         if self.review.take().is_some() {
             self.dirty = true;
             return;

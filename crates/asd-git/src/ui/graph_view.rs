@@ -15,6 +15,7 @@ use crate::git::refs::{RefInfo, RefKind};
 use crate::ui::colors::{branch_label_colors, lane_color};
 
 /// Columns between the graph and the summary text.
+pub(crate) const SELECTED_BG: Color = Color::Rgb(0x30, 0x3D, 0x52);
 const GAP: u16 = 1;
 /// Width of the abbreviated hash column on the right, plus its leading space.
 const HASH_W: u16 = 8;
@@ -125,8 +126,20 @@ fn draw_decorations(
                     .fg(foreground)
                     .bg(background)
                     .add_modifier(Modifier::BOLD);
-                if base.add_modifier.contains(Modifier::REVERSED) {
-                    style = style.add_modifier(Modifier::UNDERLINED);
+                if base.bg == Some(SELECTED_BG) {
+                    // Pastel branch colours remain readable on the selection fill.
+                    let foreground = match background {
+                        Color::Rgb(r, g, b) => Color::Rgb(
+                            ((u16::from(r) + 510) / 3) as u8,
+                            ((u16::from(g) + 510) / 3) as u8,
+                            ((u16::from(b) + 510) / 3) as u8,
+                        ),
+                        other => other,
+                    };
+                    style = style
+                        .bg(SELECTED_BG)
+                        .fg(foreground)
+                        .add_modifier(Modifier::UNDERLINED);
                 }
                 x = put(buf, area, x, y, &format!(" {} ", reference.name), style);
                 x = put(buf, area, x, y, " ", base);
@@ -241,10 +254,12 @@ pub(crate) fn draw_rows(
         }
         let index = first_row + row;
         let base = if index == selected {
-            Style::default().add_modifier(Modifier::REVERSED)
+            Style::default().bg(SELECTED_BG)
         } else {
             Style::default()
         };
+
+        buf.set_style(Rect::new(area.x, y, area.width, 1), base);
 
         // Logical cells occupy every other terminal column. The column between
         // them extends horizontal runs, making adjacent lanes readable as
@@ -346,6 +361,7 @@ mod tests {
             commit: Some(CommitInfo {
                 id: gix::ObjectId::empty_blob(gix::hash::Kind::Sha1),
                 parents: Vec::new(),
+                body: String::new(),
                 summary: summary.to_string(),
                 author: "asd test".into(),
                 time: 1_700_000_000,
@@ -354,6 +370,38 @@ mod tests {
             color_index: 0,
             cells,
             uncommitted: None,
+        }
+    }
+
+    #[test]
+    fn selected_row_background_spans_lanes_gaps_and_trailing_space() {
+        let area = Rect::new(0, 0, 70, 2);
+        let mut buf = Buffer::empty(area);
+        let nodes = [node(
+            "short",
+            0,
+            vec![CellType::Commit(0), CellType::Empty, CellType::Pipe(2)],
+        )];
+        draw_rows(
+            &mut buf,
+            area,
+            &nodes,
+            &HashMap::new(),
+            RefToggles {
+                show_remotes: true,
+                show_tags: true,
+            },
+            0,
+            0,
+        );
+        let background = buf[(0, 0)].bg;
+        assert_ne!(
+            background,
+            Color::Reset,
+            "selection needs one explicit background"
+        );
+        for x in 0..area.width {
+            assert_eq!(buf[(x, 0)].bg, background, "gap at {x}");
         }
     }
 
@@ -466,9 +514,11 @@ mod tests {
             "remote branch has a background: {remote:?}"
         );
         assert_ne!(
-            main.bg, remote.bg,
-            "different branch names get different colours"
+            main.fg, remote.fg,
+            "selected branch names keep distinct foreground colours"
         );
+        assert_eq!(main.bg, Some(SELECTED_BG));
+        assert_eq!(remote.bg, Some(SELECTED_BG));
         assert!(
             !main.add_modifier.contains(Modifier::REVERSED)
                 && !remote.add_modifier.contains(Modifier::REVERSED),
@@ -479,15 +529,13 @@ mod tests {
                 && remote.add_modifier.contains(Modifier::UNDERLINED),
             "branch labels carry the selected row through an underline"
         );
-        assert!(
-            buf[(0, 0)]
-                .style()
-                .add_modifier
-                .contains(Modifier::REVERSED),
-            "the rest of the selected row remains reversed"
+        assert_eq!(
+            buf[(0, 0)].bg,
+            SELECTED_BG,
+            "the selected row has one continuous background"
         );
         assert!(
-            matches!(tag.bg, None | Some(Color::Reset)),
+            tag.bg == Some(SELECTED_BG),
             "tags keep their non-branch treatment: {tag:?}"
         );
     }
@@ -789,6 +837,7 @@ mod tests {
             commit: Some(CommitInfo {
                 id: commit_id,
                 parents: Vec::new(),
+                body: String::new(),
                 summary: "a summary far longer than any area under test in this sweep loop"
                     .to_string(),
                 author: "asd test".into(),

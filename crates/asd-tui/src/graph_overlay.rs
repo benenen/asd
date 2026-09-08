@@ -77,6 +77,8 @@ impl App {
 
     /// `Ctrl+A g`: open the overlay for the focused session, or close it.
     pub(crate) fn toggle_git_graph(&mut self) {
+        self.close_files();
+        self.review = None;
         if self.git_graph.is_some() {
             self.git_graph = None;
             self.dirty = true;
@@ -278,6 +280,8 @@ pub(crate) mod tests {
             git_graph: None,
             review: None,
             review_request: 0,
+            files: None,
+            files_request: 0,
             git_graph_follow_pending: false,
             keymap: crate::keymap::Keymap::default(),
             now_ms: 0,

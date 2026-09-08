@@ -267,6 +267,7 @@ action key. The most common defaults are:
 | Create / rename / kill | `Ctrl+A c` / `Ctrl+A r` / `Ctrl+A x` |
 | Hide sidebar / status bar | `Ctrl+A b` / `Ctrl+A s` |
 | Open Git Graph | `Ctrl+A g` |
+| Browse workspace files | `Ctrl+A f` |
 | Reconnect | `Ctrl+A R` |
 | Page through scrollback | `Shift+PageUp` / `Shift+PageDown` |
 | Send a literal `Ctrl+A` | `Ctrl+A Ctrl+A` |
@@ -493,3 +494,25 @@ so they can include edits made by other processes.
 Use **Ctrl+A v** in the TUI or **Task / View changes** on a GUI session row to
 review a session, including one that just completed. The GUI also edits the task
 association. See [task and review semantics](docs/automation.md#session-tasks-and-change-review).
+
+### Browse the current workspace
+
+Press **Ctrl+A f** in `asd ui` to browse the selected session's workspace.
+The daemon lists the associated task directory, or the session's current
+directory when no task is linked; a Git repository is not required.
+
+Use arrows or `j`/`k` to select, Enter to enter a directory, Backspace to return
+toward the workspace root, `r` to refresh, and Esc/`q` to close. Files, hidden
+entries, and symlinks are shown; symlinks are not traversed. This is a read-only
+list: it does not open editors, modify files, or send input to the session.
+Directory results are bounded; partial listings are explicitly labeled.
+
+The shortcut is configurable via `toggle_files` in `[keys.prefix]`. Paths
+are resolved on the daemon host, including when the TUI runs over SSH.
+
+In Git Graph (`Ctrl+A g`), select the uncommitted row to inspect staged,
+unstaged, and untracked files. Use Shift+R to refresh Git state. Enter on a changed file opens its diff. Commit
+rows show the full message body in the detail pane with Markdown styling; use
+Tab to focus that pane and scroll to read longer messages. Exceptionally large
+bodies are capped at 64 KiB with a visible notice. Viewing details never executes
+HTML, opens links, or downloads images.

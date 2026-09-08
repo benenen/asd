@@ -219,3 +219,7 @@ pub(crate) fn read_cwd(pid: u32) -> Option<PathBuf> {
 pub(crate) fn pty_master_fd(master: &(dyn portable_pty::MasterPty + Send)) -> i32 {
     master.as_raw_fd().unwrap_or(-1)
 }
+
+#[cfg(test)]
+#[path = "workspace_tests.rs"]
+mod workspace_tests;

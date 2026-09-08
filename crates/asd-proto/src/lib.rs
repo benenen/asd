@@ -47,7 +47,8 @@
 //! same name; v20 adds agent-operation frames and includes the exact live
 //! [`SessionIdentity`] in each `Snapshot`, so a client can converge its view
 //! and later output on the same session instance; v21 adds durable task
-//! associations and daemon-side worktree review frames.
+//! associations and daemon-side worktree review frames; v22 adds bounded
+//! daemon-side workspace directory listings.
 
 mod codec;
 pub mod paths;
@@ -58,7 +59,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 21;
+pub const PROTO_VERSION: u32 = 22;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -832,6 +833,18 @@ pub enum Frame {
         identity: SessionIdentity,
         task: Option<SessionTask>,
     },
+    /// List a relative directory inside the associated workspace or live cwd.
+    ListWorkspaceFiles {
+        identity: SessionIdentity,
+        path: String,
+    },
+    WorkspaceFiles {
+        identity: SessionIdentity,
+        root: String,
+        path: String,
+        entries: Vec<WorkspaceEntry>,
+        truncated: bool,
+    },
     /// Read changes in the associated worktree, or the daemon-side live cwd.
     GetSessionReview {
         identity: SessionIdentity,
@@ -845,6 +858,22 @@ pub enum Frame {
         diff: String,
         truncated: bool,
     },
+}
+
+/// A workspace entry name is an exact UTF-8 path component, not display text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    pub kind: WorkspaceEntryKind,
+}
+
+/// Symlinks are listed but cannot be navigated through workspace requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceEntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
 }
 
 /// Protocol-layer error.

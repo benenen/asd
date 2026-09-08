@@ -416,3 +416,21 @@ completed sessions. The GUI's session row offers **Task / View changes**, includ
 Done rows. The GUI form can save or clear the association. These actions open the
 same daemon-side review, so remote paths are never interpreted on the client.
 Native desktop notification action buttons are not added by this feature.
+
+## Workspace file browsing
+
+The TUI file overlay requests `ListWorkspaceFiles` for an exact session identity
+and a workspace-relative path. The daemon derives the root from the durable
+task directory or live session cwd. Listing is independent of PTY attachment,
+terminal dimensions, and Git state. It performs no terminal input or file writes.
+
+The response includes root, relative directory, entry names/types, and an explicit
+partial-list flag. Directories sort first, followed by name; hidden files are
+included. Absolute paths, parent traversal, and symlink traversal are rejected.
+The browser stays inside its workspace root and does not launch a file editor.
+
+Filesystem IO runs away from the UI thread and registry lock. UI request
+generations and session identities prevent an old listing from replacing a newer
+view; switching/disconnecting closes the panel. Keyboard, mouse, and paste remain
+inside the overlay while it is open. A changed workspace root requires reopening
+the browser rather than silently reinterpreting nested navigation.

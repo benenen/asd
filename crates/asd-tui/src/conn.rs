@@ -49,6 +49,12 @@ pub enum Cmd {
         identity: asd_proto::SessionIdentity,
         request: u64,
     },
+    Files {
+        identity: asd_proto::SessionIdentity,
+        request: u64,
+        path: String,
+    },
+    CancelFiles,
     /// Disconnect and end the actor.
     Shutdown,
 }
@@ -56,6 +62,11 @@ pub enum Cmd {
 /// Events the actor sends toward the TUI thread.
 #[derive(Debug)]
 pub enum Ev {
+    Files {
+        identity: asd_proto::SessionIdentity,
+        request: u64,
+        result: Result<Box<Frame>, String>,
+    },
     Review {
         identity: asd_proto::SessionIdentity,
         request: u64,
@@ -187,6 +198,7 @@ async fn drive(
     let mut at = Attach::default();
     let mut next_view_id = 1u64;
     let mut listed_sessions = Vec::new();
+    let mut files_fetch = tokio::task::JoinSet::new();
     let mut review_fetch: Option<tokio::task::JoinHandle<()>> = None;
 
     let (feed_tx, mut feed_rx) = unbounded_channel();
@@ -351,6 +363,16 @@ async fn drive(
                     if writer.write_frame(&Frame::Rename { name, new_name }).await.is_err() {
                         return Err("rename write failed".to_string());
                     }
+                }
+                Some(Cmd::CancelFiles) => { files_fetch.shutdown().await; }
+                Some(Cmd::Files { identity, request, path }) => {
+                    files_fetch.shutdown().await;
+                    let socket = socket.to_path_buf();
+                    let sink = ev_tx.clone();
+                    files_fetch.spawn(async move {
+                        let result = crate::files::fetch(&socket, identity, path).await.map(Box::new);
+                        let _ = sink.send(Ev::Files { identity, request, result });
+                    });
                 }
                 Some(Cmd::Review { identity, request }) => {
                     let socket = socket.to_path_buf();

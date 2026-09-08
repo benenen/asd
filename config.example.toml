@@ -84,6 +84,7 @@ run_restored_commands = false
 # toggle_status = ["s"]
 # Open the git graph overlay for the focused session's repository.
 # toggle_git_graph = ["g"]
+# toggle_files = ["f"]
 # reconnect = ["R"]
 # quit = ["q"]
 # cancel_prefix = ["Esc"]

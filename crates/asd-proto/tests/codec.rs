@@ -470,6 +470,28 @@ fn all_frames() -> Vec<Frame> {
             identity: SessionIdentity { instance_id: 42 },
             task: None,
         },
+        Frame::ListWorkspaceFiles {
+            identity: SessionIdentity { instance_id: 42 },
+            path: "src".into(),
+        },
+        Frame::WorkspaceFiles {
+            identity: SessionIdentity { instance_id: 42 },
+            root: "/srv/project".into(),
+            path: "".into(),
+            entries: [
+                asd_proto::WorkspaceEntryKind::Directory,
+                asd_proto::WorkspaceEntryKind::File,
+                asd_proto::WorkspaceEntryKind::Symlink,
+                asd_proto::WorkspaceEntryKind::Other,
+            ]
+            .into_iter()
+            .map(|kind| asd_proto::WorkspaceEntry {
+                name: "entry".into(),
+                kind,
+            })
+            .collect(),
+            truncated: true,
+        },
         Frame::GetSessionReview {
             identity: SessionIdentity { instance_id: 42 },
         },
@@ -486,8 +508,8 @@ fn all_frames() -> Vec<Frame> {
 }
 
 #[test]
-fn protocol_version_covers_session_task_review() {
-    assert_eq!(asd_proto::PROTO_VERSION, 21);
+fn protocol_version_covers_workspace_files() {
+    assert_eq!(asd_proto::PROTO_VERSION, 22);
 }
 
 #[test]

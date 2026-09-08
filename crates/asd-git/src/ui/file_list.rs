@@ -4,7 +4,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::git::diff::{FileChange, FileStat};
@@ -97,7 +97,6 @@ pub(crate) fn draw_files(
     // not, and reserving a fixed width for the counts (as a first version of
     // this did) starved the path of columns it needed on exactly the areas
     // this module's own tests exercise.
-    let path_w = (inner.width as usize).saturating_sub(3);
 
     for (row, (index, file)) in files
         .iter()
@@ -108,18 +107,20 @@ pub(crate) fn draw_files(
     {
         let y = inner.y + row as u16;
         let base = if index == selected && focused {
-            Style::default().add_modifier(Modifier::REVERSED)
+            Style::default().bg(crate::ui::graph_view::SELECTED_BG)
         } else {
             Style::default()
         };
-        let x = put(
-            buf,
-            inner,
-            inner.x,
-            y,
-            &format!("{}  ", marker(&file.change)),
-            base,
+        buf.set_style(Rect::new(inner.x, y, inner.width, 1), base);
+        let prefix = format!(
+            "{}{}  ",
+            file.stage
+                .map(|stage| format!("[{}] ", stage.label()))
+                .unwrap_or_default(),
+            marker(&file.change)
         );
+        let path_w = (inner.width as usize).saturating_sub(prefix.len());
+        let x = put(buf, inner, inner.x, y, &prefix, base);
         let x = put(buf, inner, x, y, &fit_path(&file.path, path_w), base);
         // Each piece is written in sequence, taking the previous `put`'s
         // returned column as its own start: that is the shape the rest of
@@ -177,6 +178,7 @@ mod tests {
         FileStat {
             path: path.into(),
             change,
+            stage: None,
             insertions: ins,
             removals: rem,
             binary: false,

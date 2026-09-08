@@ -20,15 +20,38 @@ pub struct CommitInfo {
     /// Every parent, first parent first. A merge has two or more.
     pub parents: Vec<gix::ObjectId>,
     pub summary: String,
+    /// Full message body, including trailers; oversized bodies carry a truncation notice.
+    pub body: String,
     pub author: String,
     /// Commit time, seconds since the Unix epoch.
     pub time: i64,
+}
+
+/// Bound retained message text while preserving ordinary commit bodies verbatim.
+pub(crate) fn body_text(bytes: &[u8]) -> String {
+    const LIMIT: usize = 64 * 1024;
+    let mut text = String::from_utf8_lossy(&bytes[..bytes.len().min(LIMIT)]).into_owned();
+    if bytes.len() > LIMIT {
+        text.push_str("\n\n[Commit body truncated at 64 KiB]");
+    }
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use crate::git::fixture::Fixture;
     use crate::git::repo::Repo;
+
+    #[test]
+    fn oversized_body_has_a_visible_limit_notice() {
+        let body = super::body_text(&vec![b'x'; 64 * 1024 + 1]);
+        assert!(body.ends_with("[Commit body truncated at 64 KiB]"));
+        assert!(body.len() < 65 * 1024);
+        assert_eq!(
+            super::body_text(b"details\n\nSigned-off-by: Test"),
+            "details\n\nSigned-off-by: Test"
+        );
+    }
 
     #[test]
     fn walks_a_linear_history_newest_first() {

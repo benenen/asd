@@ -19,6 +19,8 @@ use tokio::time::timeout;
 
 #[path = "e2e/session_task.rs"]
 mod session_task;
+#[path = "e2e/workspace_files.rs"]
+mod workspace_files;
 
 const TICK: Duration = Duration::from_millis(50);
 const WAIT: Duration = Duration::from_secs(10);

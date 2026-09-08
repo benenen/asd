@@ -11,3 +11,5 @@ pub mod help;
 pub mod highlight;
 pub mod layout;
 pub mod search;
+
+pub(crate) mod markdown;

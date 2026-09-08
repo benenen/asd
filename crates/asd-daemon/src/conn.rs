@@ -375,6 +375,27 @@ pub async fn handle_conn(
                     Err((code, msg)) => reply(Frame::Error { code, msg }),
                 }
             }
+            Frame::ListWorkspaceFiles { identity, path } => {
+                let target = registry.lock().unwrap().review_target(identity);
+                let frame = match target {
+                    Ok((_, directory)) => {
+                        let result = crate::workspace::collect(identity, directory, path).await;
+                        if registry.lock().unwrap().by_identity(identity).is_none() {
+                            Frame::Error {
+                                code: code::STALE_SESSION,
+                                msg: "session exited while listing workspace files".into(),
+                            }
+                        } else {
+                            result.unwrap_or_else(|msg| Frame::Error {
+                                code: code::REVIEW_FAILED,
+                                msg,
+                            })
+                        }
+                    }
+                    Err((code, msg)) => Frame::Error { code, msg },
+                };
+                reply(frame);
+            }
             Frame::GetSessionReview { identity } => {
                 let target = registry.lock().unwrap().review_target(identity);
                 let frame = match target {

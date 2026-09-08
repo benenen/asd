@@ -45,6 +45,7 @@ use ratatui::crossterm::execute;
 
 mod config;
 mod conn;
+mod files;
 mod graph_overlay;
 mod key;
 mod keymap;
@@ -702,6 +703,8 @@ pub(crate) struct App {
     pub git_graph: Option<asd_git::GitGraph>,
     review: Option<review::Review>,
     review_request: u64,
+    files: Option<files::Files>,
+    files_request: u64,
     /// A follow the next session list has to finish. `Ev::Created` selects the
     /// new session before the list carrying its pid arrives, so the overlay has
     /// no directory to resolve yet — and `self.active` is already set by then,
@@ -997,6 +1000,8 @@ fn event_loop(
         git_graph: None,
         review: None,
         review_request: 0,
+        files: None,
+        files_request: 0,
         git_graph_follow_pending: false,
         keymap,
         now_ms: now_ms(),
@@ -1407,6 +1412,7 @@ impl App {
                 self.parked.remove(0);
             }
         }
+        self.close_files();
         self.review = None;
         self.active = Some(name.clone());
         self.active_identity = None;
@@ -1515,6 +1521,7 @@ impl App {
                 self.notice = None;
             }
             Ev::Down(reason) => {
+                self.close_files();
                 self.review = None;
                 if let Some(identity) = self.active_identity {
                     self.attention.tracker.view_left(identity);
@@ -1577,6 +1584,7 @@ impl App {
                 }
                 self.sessions = list;
                 self.reconcile_review();
+                self.reconcile_files();
                 self.clamp_sidebar_scroll();
                 self.follow_session_size();
                 // The attached session vanished (killed elsewhere): fall back
@@ -1613,6 +1621,11 @@ impl App {
                     self.follow_git_graph();
                 }
             }
+            Ev::Files {
+                identity,
+                request,
+                result,
+            } => self.receive_files(identity, request, result.map(|frame| *frame)),
             Ev::Review {
                 identity,
                 request,
@@ -1770,7 +1783,11 @@ impl App {
             self.dirty = true;
             return;
         }
-        if self.modal.is_some() || self.git_graph.is_some() || self.review.is_some() {
+        if self.modal.is_some()
+            || self.git_graph.is_some()
+            || self.review.is_some()
+            || self.files.is_some()
+        {
             return;
         }
         if self.scroll != 0 {
@@ -1787,6 +1804,9 @@ impl App {
 
     fn on_key(&mut self, k: CtKey) {
         self.dirty = true;
+        if self.on_files_key(k) {
+            return;
+        }
         if self.on_review_key(k) {
             return;
         }
@@ -1872,6 +1892,7 @@ impl App {
             KeyAction::CancelPrefix => {}
             KeyAction::ToggleGitGraph => self.toggle_git_graph(),
             KeyAction::Review => self.toggle_review(),
+            KeyAction::ToggleFiles => self.toggle_files(),
         }
     }
 
@@ -2021,6 +2042,9 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent, size: ratatui::layout::Size) {
+        if self.on_files_mouse(m) {
+            return;
+        }
         if self.on_review_mouse(m) {
             return;
         }

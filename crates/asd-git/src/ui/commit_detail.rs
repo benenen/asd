@@ -1,29 +1,14 @@
-//! The commit detail pane: who wrote this commit, when, how much it changed,
-//! and its summary line.
-//!
-//! The summary line, and only that. [`CommitInfo::summary`] comes from gix's
-//! `message.summary()`, which folds everything up to the first blank line into
-//! one line, so a commit *body* is not shown here — nor anywhere else in the
-//! overlay. Carrying it is a later phase's feature; what this doc must not do
-//! is promise "its message" and leave the reader hunting for the rest.
-//!
-//! One consequence is worth knowing before wondering whether the scroll is
-//! broken: the pane is six rows for any commit, which is shorter than any
-//! realistic pane, so `Tab` to it followed by `j`/`k`/`Ctrl+d` clamps to a
-//! no-op every time. The scroll is wired and correct; it has nothing to
-//! scroll until there is a body to put in it.
-//!
-//! Every index is clamped to `area` before use. This runs on `asd ui`'s render
-//! thread, where an out-of-bounds write blanks every session's display.
+//! Commit metadata and a scrollable CommonMark message body.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Widget};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::git::commit::CommitInfo;
 use crate::state::DetailState;
-use crate::ui::graph_view::put;
+use crate::ui::markdown;
 
 /// Render the pane, including its border.
 ///
@@ -85,27 +70,27 @@ pub(crate) fn draw_detail(
         }
     }
     rows.push((String::new(), plain));
-    // `summary` is one line by construction, as the module doc explains, so
-    // this runs exactly once. It stays a loop because that is what keeps the
-    // pane correct — rather than painting an escaped newline across a row —
-    // on the day a later phase carries the commit body on `CommitInfo`.
-    for line in commit.summary.lines() {
-        rows.push((
-            line.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+    rows.push((
+        commit.summary.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    let mut content: Vec<Line<'static>> = rows
+        .into_iter()
+        .map(|(text, style)| Line::from(Span::styled(text, style)))
+        .collect();
+    if !commit.body.is_empty() {
+        content.push(Line::default());
+        content.extend(markdown::lines(&commit.body));
     }
-
-    for (i, (text, style)) in rows
-        .iter()
+    let wrapped = markdown::wrap(content, inner.width);
+    let count = wrapped.len();
+    let visible: Vec<_> = wrapped
+        .into_iter()
         .skip(scroll)
-        .take(inner.height as usize)
-        .enumerate()
-    {
-        let y = inner.y + i as u16;
-        put(buf, inner, inner.x, y, text, *style);
-    }
-    rows.len()
+        .take(usize::from(inner.height))
+        .collect();
+    Paragraph::new(visible).render(inner, buf);
+    count
 }
 
 /// `YYYY-MM-DD HH:MM` in the host's local time, similar to the status bar's
@@ -129,6 +114,7 @@ mod tests {
         CommitInfo {
             id: gix::ObjectId::empty_blob(gix::hash::Kind::Sha1),
             parents: Vec::new(),
+            body: String::new(),
             summary: "a short summary".into(),
             author: "asd test".into(),
             time: 1_700_000_000,
@@ -144,6 +130,50 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn full_commit_body_is_shown_as_markdown_and_can_scroll() {
+        let fx = crate::git::fixture::Fixture::new("markdown-body");
+        fx.commit("Subject\n\n## Details\n\n- **Important** change\n- `inline_code` and &lt;tag&gt;\n\n> quoted text\n\n```rust\nlet value = 42;\n```\n\nSigned-off-by: Test User");
+        let repo = crate::git::repo::Repo::open(fx.path()).unwrap();
+        let commit = repo.walk().unwrap().next().unwrap().unwrap();
+        let area = Rect::new(0, 0, 60, 24);
+        let mut buf = Buffer::empty(area);
+        let rows = draw_detail(
+            &mut buf,
+            area,
+            Some(&commit),
+            &DetailState::Loading,
+            0,
+            true,
+        );
+        let text = text_of(&buf, area);
+        assert!(text.contains("Important"), "body is missing: {text}");
+        assert!(text.contains("let value = 42;"));
+        assert!(text.contains("<tag>"));
+        assert!(!text.contains("**Important**"));
+        assert!(!text.contains("## Details"));
+        assert!(rows > 6);
+        let small = Rect::new(0, 0, 28, 6);
+        let mut tail = Buffer::empty(small);
+        let small_rows = draw_detail(
+            &mut tail,
+            small,
+            Some(&commit),
+            &DetailState::Loading,
+            0,
+            true,
+        );
+        draw_detail(
+            &mut tail,
+            small,
+            Some(&commit),
+            &DetailState::Loading,
+            small_rows.saturating_sub(4),
+            true,
+        );
+        assert!(text_of(&tail, small).contains("Test User"));
     }
 
     #[test]
@@ -193,6 +223,7 @@ mod tests {
         let diff = crate::git::diff::CommitDiff {
             files: vec![crate::git::diff::FileStat {
                 path: "a.txt".into(),
+                stage: None,
                 change: crate::git::diff::FileChange::Modified,
                 insertions: 3,
                 removals: 1,

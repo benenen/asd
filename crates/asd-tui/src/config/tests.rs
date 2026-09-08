@@ -201,3 +201,15 @@ fn a_missing_file_is_not_a_complaint() {
     let (_, complaint) = keymap(Path::new("/nonexistent/asd/does-not-exist.toml"));
     assert_eq!(complaint, None);
 }
+
+#[test]
+fn files_binding_override_updates_routing_and_hint() {
+    let (mut map, complaint) = from_text("[keys.prefix]\ntoggle_files = [\"F\"]\n");
+    assert!(complaint.is_none(), "{complaint:?}");
+    map.resolve(&press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert!(map.current_hint().text.contains("F files"));
+    assert_eq!(
+        map.resolve(&press(KeyCode::Char('F'), KeyModifiers::SHIFT)),
+        KeyResolution::Action(KeyAction::ToggleFiles)
+    );
+}

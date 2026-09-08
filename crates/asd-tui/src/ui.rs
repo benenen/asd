@@ -203,6 +203,11 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
         draw_git_graph(f, app);
     }
 
+    if let Some(files) = &app.files {
+        files.draw(f);
+        app.cursor_tail = None;
+    }
+
     if let Some(review) = &app.review {
         review.draw(f);
         app.cursor_tail = None;
@@ -218,7 +223,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
 fn draw_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let selection = app.sel_viewport();
     let modal_open = app.modal.is_some();
-    let overlay_open = app.git_graph.is_some() || app.review.is_some();
+    let overlay_open = app.git_graph.is_some() || app.review.is_some() || app.files.is_some();
     if let Some(snapshot) = app.snapshot() {
         pane::render(f.buffer_mut(), area, &snapshot, selection);
         // Anchor the OS input-method (IME) popup and TUI programs like codex/vim

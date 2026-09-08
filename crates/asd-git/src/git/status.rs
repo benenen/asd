@@ -23,6 +23,9 @@ impl Repo {
             .gix()
             .status(gix::progress::Discard)
             .map_err(|e| ReadError::from_err("opening status", e))?
+            .untracked_files(gix::status::UntrackedFiles::Files)
+            .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
+            .index_worktree_rewrites(None)
             .index_worktree_submodules(gix::status::Submodule::AsConfigured { check_dirty: false })
             .into_iter(None)
             .map_err(|e| ReadError::from_err("starting status", e))?;

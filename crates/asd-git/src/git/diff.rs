@@ -27,6 +27,8 @@ pub enum FileChange {
 pub struct FileStat {
     pub path: String,
     pub change: FileChange,
+    /// Working-tree comparison layer; None for commits or inert unreadable paths.
+    pub stage: Option<super::working::WorktreeStage>,
     /// Lines added. Always 0 for a binary file.
     pub insertions: u32,
     /// Lines removed. Always 0 for a binary file.
@@ -117,6 +119,7 @@ impl Repo {
                     let mut stat = FileStat {
                         path,
                         change: kind,
+                        stage: None,
                         insertions: 0,
                         removals: 0,
                         binary: false,
@@ -185,7 +188,7 @@ pub struct FileDiff {
 
 impl FileDiff {
     /// A diff of a blob that cannot be read as text.
-    fn binary(path: &str) -> Self {
+    pub(super) fn binary(path: &str) -> Self {
         Self {
             path: path.to_string(),
             lines: Vec::new(),
@@ -330,7 +333,7 @@ impl Repo {
 
 /// Turn hunks and the interned files into numbered rows with `context`
 /// unchanged lines around each change.
-fn assemble(
+pub(super) fn assemble(
     path: &str,
     input: &gix::diff::blob::InternedInput<&[u8]>,
     hunks: impl Iterator<Item = gix::diff::blob::Hunk>,

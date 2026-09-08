@@ -22,6 +22,7 @@ mod server;
 mod session;
 mod store;
 pub mod waiters;
+mod workspace;
 
 pub use store::read_cwd;
 

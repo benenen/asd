@@ -9,6 +9,8 @@ license.workspace = true
 # on no other asd crate. crossterm is reached only through `ratatui::crossterm`
 # so the binary cannot end up with two versions of it.
 [dependencies]
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-segmentation = "1"
 chrono = { workspace = true }
 fuzzy-matcher = { workspace = true }
 gix = { workspace = true }

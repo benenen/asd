@@ -111,6 +111,15 @@ pub enum FileDiffState {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffTarget {
+    Commit(gix::ObjectId),
+    Working {
+        generation: u64,
+        stage: Option<crate::git::working::WorktreeStage>,
+    },
+}
+
 /// The overlay: a repository, the rows loaded from it, and the view state.
 #[derive(Debug)]
 pub struct GitGraph {
@@ -132,7 +141,8 @@ pub struct GitGraph {
     detail: DetailState,
     /// Which commit the outstanding request (if any) is for. A reply whose id
     /// does not match this is stale and must be discarded.
-    detail_for: Option<gix::ObjectId>,
+    detail_for: Option<DiffTarget>,
+    working_generation: u64,
     /// The three panes' rectangles from the last frame, so a mouse event can
     /// be routed to the pane it landed in. Empty until the first render.
     layout: LayoutMap,
@@ -159,7 +169,7 @@ pub struct GitGraph {
     /// anything else is stale and must be discarded, exactly as for `detail`:
     /// there is no cancellation, so a request for a file the user has already
     /// navigated away from still comes back.
-    file_diff_for: Option<(gix::ObjectId, String)>,
+    file_diff_for: Option<(DiffTarget, String)>,
     /// Lines scrolled past in the file diff view.
     file_diff_scroll: usize,
     /// Rows the file diff view had room for in the last frame, so scrolling it
@@ -200,6 +210,7 @@ impl GitGraph {
             worker,
             detail: DetailState::Unavailable,
             detail_for: None,
+            working_generation: 0,
             layout: LayoutMap::default(),
             detail_scroll: 0,
             detail_rows: 0,
@@ -365,8 +376,48 @@ impl GitGraph {
     /// worker, and a late answer must not overwrite the current row's detail.
     fn accept_reply(&mut self, reply: crate::worker::Reply) -> bool {
         match reply {
+            crate::worker::Reply::Working { generation, result } => {
+                if self.detail_for
+                    != Some(DiffTarget::Working {
+                        generation,
+                        stage: None,
+                    })
+                {
+                    return false;
+                }
+                self.detail = match result {
+                    Ok(diff) => DetailState::Ready(diff),
+                    Err(msg) => DetailState::Failed(msg),
+                };
+                self.file_selected = 0;
+                self.file_scroll = 0;
+                true
+            }
+            crate::worker::Reply::WorkingFile {
+                generation,
+                path,
+                stage,
+                result,
+            } => {
+                if self.file_diff_for.as_ref()
+                    != Some(&(
+                        DiffTarget::Working {
+                            generation,
+                            stage: Some(stage),
+                        },
+                        path,
+                    ))
+                {
+                    return false;
+                }
+                self.file_diff = match result {
+                    Ok(diff) => FileDiffState::Ready(diff),
+                    Err(msg) => FileDiffState::Failed(msg),
+                };
+                true
+            }
             crate::worker::Reply::Commit { id, result } => {
-                if self.detail_for != Some(id) {
+                if self.detail_for != Some(DiffTarget::Commit(id)) {
                     return false;
                 }
                 self.detail = match result {
@@ -390,7 +441,7 @@ impl GitGraph {
                 // identifies the request: the user can close the view, move to
                 // another commit and open the same path again before the first
                 // answer lands.
-                if self.file_diff_for.as_ref() != Some(&(commit, path)) {
+                if self.file_diff_for.as_ref() != Some(&(DiffTarget::Commit(commit), path)) {
                     return false;
                 }
                 self.file_diff = match result {
@@ -426,6 +477,10 @@ impl GitGraph {
     /// worth failing the reload over, so it is folded into "no known
     /// uncommitted changes" like the decorations lookup in `open`.
     fn reload(&mut self) {
+        self.working_generation = self.working_generation.wrapping_add(1);
+        self.detail_for = None;
+        self.file_diff_for = None;
+        self.file_diff = FileDiffState::Closed;
         self.builder = GraphBuilder::new();
         if let Ok(count) = self.repo.working_changes()
             && count > 0
@@ -629,18 +684,35 @@ impl GitGraph {
     /// Ask the worker for the selected commit's diff. Called whenever the
     /// selection lands on a different commit.
     fn request_detail(&mut self) {
-        let Some(id) = self.selected_id() else {
+        let target = if let Some(id) = self.selected_id() {
+            DiffTarget::Commit(id)
+        } else if self
+            .builder
+            .nodes()
+            .get(self.selected)
+            .is_some_and(|node| node.uncommitted.is_some())
+        {
+            DiffTarget::Working {
+                generation: self.working_generation,
+                stage: None,
+            }
+        } else {
             self.detail = DetailState::Ready(Default::default());
             self.detail_for = None;
             return;
         };
-        if self.detail_for == Some(id) {
-            return; // Already asked for exactly this.
+        if self.detail_for == Some(target) {
+            return;
         }
         match self.worker.as_mut() {
-            Some(w) if w.is_alive() => {
-                w.request(crate::worker::Request::Commit(id));
-                self.detail_for = Some(id);
+            Some(worker) if worker.is_alive() => {
+                worker.request(match target {
+                    DiffTarget::Commit(id) => crate::worker::Request::Commit(id),
+                    DiffTarget::Working { generation, .. } => {
+                        crate::worker::Request::Working(generation)
+                    }
+                });
+                self.detail_for = Some(target);
                 self.detail = DetailState::Loading;
             }
             _ => {
@@ -797,19 +869,27 @@ impl GitGraph {
         if self.focus != Pane::Files {
             return Outcome::Consumed;
         }
-        let Some(commit) = self.selected_id() else {
-            return Outcome::Consumed;
-        };
         let DetailState::Ready(diff) = &self.detail else {
             return Outcome::Consumed;
         };
-        let Some(path) = diff.files.get(self.file_selected).map(|f| f.path.clone()) else {
+        let Some(file) = diff.files.get(self.file_selected) else {
+            return Outcome::Consumed;
+        };
+        let path = file.path.clone();
+        let target = if let Some(id) = self.selected_id() {
+            DiffTarget::Commit(id)
+        } else if let Some(stage) = file.stage {
+            DiffTarget::Working {
+                generation: self.working_generation,
+                stage: Some(stage),
+            }
+        } else {
             return Outcome::Consumed;
         };
 
         self.mode = Mode::FileDiff;
         self.file_diff_scroll = 0;
-        let want = (commit, path);
+        let want = (target, path);
         // Reopening the file already loaded (or already asked for) must not
         // post a second request: there is no cancellation, so every duplicate
         // is a whole file diff the worker computes and this then throws away.
@@ -825,9 +905,20 @@ impl GitGraph {
         }
         match self.worker.as_mut() {
             Some(w) if w.is_alive() => {
-                w.request(crate::worker::Request::File {
-                    commit: want.0,
-                    path: want.1.clone(),
+                w.request(match want.0 {
+                    DiffTarget::Commit(commit) => crate::worker::Request::File {
+                        commit,
+                        path: want.1.clone(),
+                    },
+                    DiffTarget::Working {
+                        generation,
+                        stage: Some(stage),
+                    } => crate::worker::Request::WorkingFile {
+                        generation,
+                        stage,
+                        path: want.1.clone(),
+                    },
+                    DiffTarget::Working { stage: None, .. } => return Outcome::Consumed,
                 });
                 self.file_diff = FileDiffState::Loading(want.1.clone());
                 self.file_diff_for = Some(want);
@@ -1192,6 +1283,65 @@ mod tests {
     }
 
     #[test]
+    fn dirty_worktree_populates_files_and_opens_an_untracked_diff() {
+        let fx = Fixture::new("state-worktree-files");
+        std::fs::write(fx.path().join("base.txt"), "base\n").unwrap();
+        fx.git(&["add", "."]);
+        fx.commit("base");
+        std::fs::write(fx.path().join("base.txt"), "staged\n").unwrap();
+        fx.git(&["add", "."]);
+        std::fs::write(fx.path().join("base.txt"), "unstaged\n").unwrap();
+        std::fs::create_dir(fx.path().join("nested")).unwrap();
+        std::fs::write(fx.path().join("nested/new.txt"), "new file\n").unwrap();
+        let mut graph = GitGraph::open(fx.path()).unwrap();
+        assert_eq!(graph.selected_id(), None);
+        settle(&mut graph);
+        let DetailState::Ready(diff) = graph.detail() else {
+            panic!("working detail failed: {:?}", graph.detail())
+        };
+        assert_eq!(
+            diff.files.len(),
+            3,
+            "staged, unstaged, and untracked entries"
+        );
+        let index = diff
+            .files
+            .iter()
+            .position(|file| file.path == "nested/new.txt")
+            .unwrap();
+        graph.focus = Pane::Files;
+        graph.file_selected = index;
+        graph.on_key(key(KeyCode::Enter));
+        settle_file(&mut graph);
+        let FileDiffState::Ready(file) = graph.file_diff() else {
+            panic!("working file did not load")
+        };
+        assert!(file.diff.lines.iter().any(|line| matches!(line, crate::git::diff::DiffLine::Added { text, .. } if text.contains("new file"))));
+    }
+
+    #[test]
+    fn refresh_rejects_stale_worktree_reply_and_loads_current_files() {
+        let fx = Fixture::new("state-working-refresh");
+        std::fs::write(fx.path().join("old.txt"), "old\n").unwrap();
+        let mut graph = GitGraph::open(fx.path()).unwrap();
+        settle(&mut graph);
+        let old_generation = graph.working_generation;
+        std::fs::remove_file(fx.path().join("old.txt")).unwrap();
+        std::fs::write(fx.path().join("new.txt"), "new\n").unwrap();
+        graph.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert!(!graph.accept_reply_for_test(crate::worker::Reply::Working {
+            generation: old_generation,
+            result: Ok(Default::default())
+        }));
+        settle(&mut graph);
+        let DetailState::Ready(diff) = graph.detail() else {
+            panic!("working detail failed")
+        };
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].path, "new.txt");
+    }
+
+    #[test]
     fn opens_with_the_newest_commit_selected() {
         let (_fx, g) = graph_with(3, "state-open");
         assert_eq!(g.selected(), 0);
@@ -1212,11 +1362,7 @@ mod tests {
         let mut g = GitGraph::open(fx.path()).expect("fixture opens");
         assert_eq!(g.row_count(), 3, "two commits plus the synthetic row");
         assert_eq!(g.selected(), 0, "the synthetic row is selected first");
-        assert_eq!(
-            g.selected_id(),
-            None,
-            "the synthetic row has no commit, so no diff request is made"
-        );
+        assert_eq!(g.selected_id(), None, "the synthetic row has no commit id");
 
         let area = Rect::new(0, 0, 60, 10);
         let mut buf = Buffer::empty(area);
@@ -1258,22 +1404,23 @@ mod tests {
         assert_eq!(g.selected_id(), None);
         assert_eq!(
             g.detail(),
-            &DetailState::Ready(Default::default()),
-            "an empty detail, not the commit's"
+            &DetailState::Loading,
+            "working tree detail is requested"
         );
         assert!(
             !g.accept_reply_for_test(asd_git_reply_commit(id)),
             "a reply for the commit left behind must not land on this row"
         );
 
-        // And the panes say so rather than describing the commit below.
+        settle(&mut g);
+        // The panes now describe working files instead of the commit below.
         let area = Rect::new(0, 0, 70, 24);
         let mut buf = Buffer::empty(area);
         (&mut g).render(area, &mut buf);
         let text = buffer_text(&buf, area);
         assert!(
-            text.contains("no files changed"),
-            "the files pane is empty for a non-commit row: {text:?}"
+            text.contains("dirty.txt"),
+            "the files pane shows working files for the synthetic row: {text:?}"
         );
     }
 
@@ -2449,7 +2596,7 @@ mod tests {
         );
         assert_eq!(
             g.detail_for,
-            g.selected_id(),
+            g.selected_id().map(DiffTarget::Commit),
             "select() asked the worker for the commit it landed on"
         );
     }
@@ -2572,6 +2719,7 @@ mod tests {
             .map(|summary| CommitInfo {
                 id: gix::ObjectId::empty_blob(gix::hash::Kind::Sha1),
                 parents: Vec::new(),
+                body: String::new(),
                 summary: (*summary).into(),
                 author: "asd test".into(),
                 time: 0,
