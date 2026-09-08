@@ -15,7 +15,7 @@ use dioxus::prelude::*;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::bridge::{BRIDGE_JS, JsMessage};
-use crate::conn::{self, HostCmd, HostHandle, UiEvent};
+use crate::conn::{self, ConnectionEvent, HostCmd, HostHandle, UiEvent};
 use crate::model::{
     HostId, HostKind, HostState, LOCAL_ID, Model, RemoteSpec, is_host_key_issue, short_age,
     short_cmd, short_reason,
@@ -1077,6 +1077,31 @@ fn connection_form(
 
 // ── supervisor ────────────────────────────────────────────────────────
 
+#[derive(Clone)]
+struct PendingSnapshot {
+    token: u64,
+    host: HostId,
+    generation: u64,
+    selection: u64,
+    name: String,
+    identity: asd_proto::SessionIdentity,
+}
+
+fn take_snapshot_ack(
+    pending: &mut Option<PendingSnapshot>,
+    token: u64,
+    hosts: &HashMap<HostId, HostHandle>,
+    model: &Model,
+) -> Option<PendingSnapshot> {
+    if pending.as_ref()?.token != token {
+        return None;
+    }
+    let receipt = pending.take()?;
+    (receipt.selection == model.selection_version()
+        && current_generation(receipt.host, receipt.generation, hosts, model))
+    .then_some(receipt)
+}
+
 /// The supervisor loop: owns the JS bridge, the host actors, and folds every
 /// event into the app signals. Runs inside the app coroutine for the lifetime
 /// of the window.
@@ -1102,7 +1127,7 @@ async fn supervisor(
         }
     });
 
-    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<ConnectionEvent>();
     let mut hosts: HashMap<HostId, HostHandle> = HashMap::new();
     // Remembered so a Down host can be respawned on Reconnect.
     let mut kinds: HashMap<HostId, HostKind> = HashMap::new();
@@ -1111,7 +1136,7 @@ async fn supervisor(
     // populated the terminal, even when a name is reused after a fast restart.
     let mut active_identity: Option<(HostId, asd_proto::SessionIdentity)> = None;
     let mut snapshot_token = 0u64;
-    let mut pending_snapshot: Option<(u64, HostId, String, asd_proto::SessionIdentity)> = None;
+    let mut pending_snapshot: Option<PendingSnapshot> = None;
     let mut bridge_ready = false;
     // A session picked before the JS bridge was ready (auto-select on the
     // first local list): attached once the bridge reports in.
@@ -1142,19 +1167,22 @@ async fn supervisor(
                 match serde_json::from_value::<JsMessage>(val) {
                     Ok(JsMessage::Focus) => { model.write().set_focused(desktop.window.is_focused()); }
                     Ok(JsMessage::SnapshotRendered { token }) => {
-                        if pending_snapshot.as_ref().is_some_and(|(pending, ..)| *pending == token)
-                            && let Some((_, host, name, identity)) = pending_snapshot.take() {
+                        let receipt = take_snapshot_ack(&mut pending_snapshot, token, &hosts, &model.read());
+                        if let Some(receipt) = receipt {
                             model.write().set_focused(desktop.window.is_focused());
-                            model.write().snapshot_converged(host, &name, identity);
+                            model.write().snapshot_converged(receipt.host, &receipt.name, receipt.identity);
                         }
                     }
                     Ok(JsMessage::Status { msg }) => {
                         tracing::info!("bridge: {msg}");
+                        let rebuilding = model.read().active.clone();
                         // The JS side rebuilt a wedged terminal: re-attach the
                         // active session so a fresh Snapshot repopulates it.
                         if msg.contains("terminal recreated")
-                            && let Some((host, name)) = model.read().active.clone()
+                            && let Some((host, name)) = rebuilding
                         {
+                            pending_snapshot = None;
+                            model.write().leave_view();
                             let (cols, rows) = *grid.read();
                             route(
                                 AppCmd::SetActive { host, name, cols, rows },
@@ -1195,12 +1223,18 @@ async fn supervisor(
                 match &cmd {
                     AppCmd::Create { .. } => pending_create = true,
                     AppCmd::SetActive { .. } => { pending_create = false; pending_snapshot = None; model.write().leave_view(); },
+                    AppCmd::RemoveHost { id } | AppCmd::Reconnect { id } => {
+                        if pending_snapshot.as_ref().is_some_and(|receipt| receipt.host == *id) { pending_snapshot = None; }
+                        if active_identity.is_some_and(|(host, _)| host == *id) { active_identity = None; model.write().leave_view(); }
+                    }
                     _ => {}
                 }
                 route(cmd, &ui_tx, &mut hosts, &mut kinds, &mut active);
             }
             ev = ui_rx.recv() => {
                 let Some(ev) = ev else { break };
+                let generation = ev.generation;
+                let Some(ev) = current_ui_event(ev, &hosts, &model.read()) else { continue };
                 let ev = if let UiEvent::Events { host, cursor, change } = ev {
                     let new_epoch = model.read().attention.get(&host).and_then(|endpoint| endpoint.tracker.epoch()).is_some_and(|epoch| epoch != cursor.daemon_epoch);
                     if new_epoch && active_identity.is_some_and(|(selected, _)| selected == host) {
@@ -1303,7 +1337,7 @@ async fn supervisor(
                         if snapshot {
                             active_identity = Some((host, identity));
                             snapshot_token += 1;
-                            pending_snapshot = Some((snapshot_token, host, name.clone(), identity));
+                            pending_snapshot = Some(PendingSnapshot { token: snapshot_token, host, generation, selection: model.read().selection_version(), name: name.clone(), identity });
                         } else if active_identity != Some((host, identity)) {
                             continue;
                         }
@@ -1356,7 +1390,7 @@ async fn supervisor(
 /// Route one app command to the right host actor.
 fn route(
     cmd: AppCmd,
-    ui_tx: &UnboundedSender<UiEvent>,
+    ui_tx: &UnboundedSender<ConnectionEvent>,
     hosts: &mut HashMap<HostId, HostHandle>,
     kinds: &mut HashMap<HostId, HostKind>,
     active: &mut Option<HostId>,
@@ -1444,22 +1478,211 @@ fn route(
 fn spawn_host(
     id: HostId,
     kind: HostKind,
-    ui_tx: &UnboundedSender<UiEvent>,
+    ui_tx: &UnboundedSender<ConnectionEvent>,
     hosts: &mut HashMap<HostId, HostHandle>,
     kinds: &mut HashMap<HostId, HostKind>,
 ) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<HostCmd>();
+    static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let ev = ui_tx.clone();
     kinds.insert(id, kind.clone());
     // On the bg runtime: the actor's event transport (and russh) need a
     // runtime that keeps running while the window is idle.
-    bg().spawn(conn::run_host(id, kind, cmd_rx, ev));
-    hosts.insert(id, HostHandle { cmd_tx });
+    bg().spawn(conn::run_host(id, generation, kind, cmd_rx, ev));
+    hosts.insert(id, HostHandle { cmd_tx, generation });
+}
+
+fn current_generation(
+    host: HostId,
+    generation: u64,
+    hosts: &HashMap<HostId, HostHandle>,
+    model: &Model,
+) -> bool {
+    model.host(host).is_some()
+        && hosts
+            .get(&host)
+            .is_some_and(|actor| actor.generation == generation)
+}
+
+/// Filter before any model, lease, render, or notification mutation.
+fn current_ui_event(
+    event: ConnectionEvent,
+    hosts: &HashMap<HostId, HostHandle>,
+    model: &Model,
+) -> Option<UiEvent> {
+    current_generation(event.event.host(), event.generation, hosts, model).then_some(event.event)
 }
 
 #[cfg(test)]
 mod tests {
     use super::Utf8Accumulator;
+
+    #[test]
+    fn render_ack_rejects_superseded_token_selection_and_actor() {
+        use super::*;
+        let (cmd_tx, _) = mpsc::unbounded_channel();
+        let mut hosts = HashMap::from([(
+            LOCAL_ID,
+            HostHandle {
+                generation: 2,
+                cmd_tx,
+            },
+        )]);
+        let mut model = Model::with_local();
+        model.select(LOCAL_ID, "a".into());
+        let receipt = PendingSnapshot {
+            token: 1,
+            host: LOCAL_ID,
+            generation: 2,
+            selection: model.selection_version(),
+            name: "a".into(),
+            identity: asd_proto::SessionIdentity { instance_id: 1 },
+        };
+        let mut pending = Some(receipt.clone());
+        assert!(take_snapshot_ack(&mut pending, 0, &hosts, &model).is_none());
+        assert!(pending.is_some());
+        assert!(take_snapshot_ack(&mut pending, 1, &hosts, &model).is_some());
+        pending = Some(receipt.clone());
+        model.select(LOCAL_ID, "b".into());
+        model.select(LOCAL_ID, "a".into());
+        assert!(take_snapshot_ack(&mut pending, 1, &hosts, &model).is_none());
+        pending = Some(PendingSnapshot {
+            selection: model.selection_version(),
+            ..receipt
+        });
+        hosts.get_mut(&LOCAL_ID).unwrap().generation = 3;
+        assert!(take_snapshot_ack(&mut pending, 1, &hosts, &model).is_none());
+    }
+
+    #[test]
+    fn retired_host_and_old_generation_events_are_inert() {
+        use super::*;
+        use crate::conn::ConnectionEvent;
+        use asd_client::events::EventFeedChange;
+        let (cmd_tx, _) = mpsc::unbounded_channel();
+        let hosts = HashMap::from([(
+            LOCAL_ID,
+            HostHandle {
+                generation: 2,
+                cmd_tx,
+            },
+        )]);
+        let mut model = Model::with_local();
+        let cursor = asd_proto::EventCursor {
+            daemon_epoch: [1; 16],
+            sequence: 0,
+        };
+        let events = vec![
+            UiEvent::Events {
+                host: LOCAL_ID,
+                cursor,
+                change: EventFeedChange::Changed {
+                    sessions: vec![],
+                    event: asd_proto::SessionEvent::Updated {
+                        identity: asd_proto::SessionIdentity { instance_id: 1 },
+                        cause: asd_proto::SessionUpdateCause::ScreenDetection,
+                        patch: asd_proto::SessionUpdatePatch {
+                            state: Some(asd_proto::AgentState::Blocked),
+                            command: None,
+                            title: None,
+                            status_line: None,
+                            idle_ms: None,
+                            running: None,
+                            attached_clients: None,
+                            pid: None,
+                            cols: None,
+                            rows: None,
+                        },
+                    },
+                },
+            },
+            UiEvent::Sessions {
+                host: LOCAL_ID,
+                sessions: vec![],
+            },
+            UiEvent::Events {
+                host: LOCAL_ID,
+                cursor,
+                change: EventFeedChange::Reset {
+                    sessions: vec![],
+                    notification_lease: true,
+                },
+            },
+            UiEvent::Events {
+                host: LOCAL_ID,
+                cursor,
+                change: EventFeedChange::NotificationLease(true),
+            },
+            UiEvent::State {
+                host: LOCAL_ID,
+                state: HostState::Down("retired".into()),
+            },
+            UiEvent::Bytes {
+                host: LOCAL_ID,
+                name: "agent".into(),
+                identity: asd_proto::SessionIdentity { instance_id: 1 },
+                data: vec![7],
+                snapshot: true,
+            },
+            UiEvent::Created {
+                host: LOCAL_ID,
+                name: "old".into(),
+            },
+            UiEvent::SessionEnded {
+                host: LOCAL_ID,
+                name: "old".into(),
+                msg: "retired".into(),
+            },
+        ];
+        let before = model.clone();
+        for event in &events {
+            assert!(
+                current_ui_event(
+                    ConnectionEvent {
+                        generation: 1,
+                        event: event.clone()
+                    },
+                    &hosts,
+                    &model
+                )
+                .is_none()
+            );
+            assert!(
+                current_ui_event(
+                    ConnectionEvent {
+                        generation: 2,
+                        event: event.clone()
+                    },
+                    &hosts,
+                    &model
+                )
+                .is_some()
+            );
+        }
+        model.hosts.clear();
+        for event in events {
+            let retired = ConnectionEvent {
+                generation: 2,
+                event,
+            };
+            if let Some(UiEvent::Events {
+                host,
+                cursor,
+                change,
+            }) = current_ui_event(retired, &hosts, &model)
+            {
+                let effects = model
+                    .attention
+                    .entry(host)
+                    .or_default()
+                    .accept(cursor, &change);
+                assert!(effects.is_empty(), "retired actor must not notify");
+            }
+        }
+        assert!(model.attention.is_empty());
+        assert_eq!(model.active, before.active);
+    }
 
     #[test]
     fn utf8_accumulator_reassembles_split_multibyte_characters() {

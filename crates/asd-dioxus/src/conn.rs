@@ -94,14 +94,55 @@ pub enum UiEvent {
     },
 }
 
+impl UiEvent {
+    pub fn host(&self) -> HostId {
+        match self {
+            Self::Events { host, .. }
+            | Self::State { host, .. }
+            | Self::Sessions { host, .. }
+            | Self::Created { host, .. }
+            | Self::Bytes { host, .. }
+            | Self::SessionEnded { host, .. } => *host,
+        }
+    }
+}
+
+/// Every actor message, including connect failures, belongs to one generation.
+#[derive(Debug, Clone)]
+pub struct ConnectionEvent {
+    pub generation: u64,
+    pub event: UiEvent,
+}
+
+struct EventSink {
+    generation: u64,
+    tx: UnboundedSender<ConnectionEvent>,
+}
+
+impl EventSink {
+    fn send(&self, event: UiEvent) -> bool {
+        self.tx
+            .send(ConnectionEvent {
+                generation: self.generation,
+                event,
+            })
+            .is_ok()
+    }
+}
+
 /// Task entry point for one host: establish the transport and drive the
 /// connection to completion. A failure is reported as a `Down` state.
 pub async fn run_host(
     id: HostId,
+    generation: u64,
     kind: HostKind,
     cmd_rx: UnboundedReceiver<HostCmd>,
-    ev_tx: UnboundedSender<UiEvent>,
+    ev_tx: UnboundedSender<ConnectionEvent>,
 ) {
+    let ev_tx = EventSink {
+        generation,
+        tx: ev_tx,
+    };
     let opened = match &kind {
         HostKind::Local => crate::platform::connect_local().await,
         HostKind::Ssh(spec) => crate::ssh::open(spec).await,
@@ -149,7 +190,7 @@ async fn drive(
     reader: BoxRead,
     writer: BoxWrite,
     mut cmd_rx: UnboundedReceiver<HostCmd>,
-    ev_tx: &UnboundedSender<UiEvent>,
+    ev_tx: &EventSink,
     mut feed_rx: UnboundedReceiver<(asd_proto::EventCursor, asd_client::events::EventFeedChange)>,
 ) -> Result<(), String> {
     let mut reader = FrameReader::new(reader);
@@ -166,21 +207,34 @@ async fn drive(
 
     // Attach state machine (shared with asd-tui; see asd_client::attach::Attach).
     let mut at = Attach::default();
+    let mut listed_sessions: Vec<asd_proto::SessionInfo> = Vec::new();
+    let mut requested_name = None;
 
     loop {
         tokio::select! {
             Some((cursor, change)) = feed_rx.recv() => {
                 if let asd_client::events::EventFeedChange::Reset { sessions, .. }
-                    | asd_client::events::EventFeedChange::Changed { sessions, .. } = &change
-                    && let Some(attached) = at.on_output()
-                    && let Some(info) = sessions.iter().find(|s| s.identity() == attached.identity) {
-                    at.on_rename(&attached.name, &info.name);
+                    | asd_client::events::EventFeedChange::Changed { sessions, .. } = &change {
+                    let identity = at.on_output().map(|attached| attached.identity)
+                        .or_else(|| listed_sessions.iter().find(|s| Some(s.name.as_str()) == at.showing()).map(asd_proto::SessionInfo::identity));
+                    if let Some(info) = sessions.iter().find(|s| Some(s.identity()) == identity)
+                        && let Some(previous) = at.showing().map(str::to_owned) {
+                        at.on_rename(&previous, &info.name);
+                    }
+                    listed_sessions = sessions.clone();
                 }
                 let _ = ev_tx.send(UiEvent::Events { host: id, cursor, change });
             }
             frame = reader.read_frame() => match frame {
                 Ok(Some(Frame::Snapshot { identity, vt: dump })) => {
-                    if let Some(attached) = at.on_snapshot(identity) {
+                    if let Some(mut attached) = at.on_snapshot(identity) {
+                        // The accepted Snapshot resolves a pending attach's exact
+                        // identity, even when rename/replacement crossed sockets.
+                        let canonical = listed_sessions.iter().find(|s| s.identity() == identity)
+                            .map(|s| s.name.clone()).or_else(|| requested_name.clone())
+                            .unwrap_or_else(|| attached.name.clone());
+                        at.on_rename(&attached.name, &canonical);
+                        attached.name = canonical;
                         let _ = ev_tx.send(UiEvent::Bytes {
                             host: id,
                             name: attached.name,
@@ -239,6 +293,7 @@ async fn drive(
             },
             cmd = cmd_rx.recv() => match cmd {
                 Some(HostCmd::Attach { name, cols, rows }) => {
+                    requested_name = Some(name.clone());
                     if at.begin(name.clone()) {
                         let _ = writer.write_frame(&Frame::Detach).await;
                     }
@@ -301,6 +356,7 @@ async fn drive(
 /// A supervisor-side handle to one running host actor.
 pub struct HostHandle {
     pub cmd_tx: UnboundedSender<HostCmd>,
+    pub generation: u64,
 }
 
 #[cfg(test)]
@@ -309,6 +365,20 @@ mod tests {
 
     #[tokio::test]
     async fn control_ignores_stale_lists_and_event_rename_retags_output() {
+        check_rename_convergence(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn pending_attach_rename_retags_snapshot_and_output() {
+        check_rename_convergence(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn pending_rename_preserves_superseded_snapshot_count() {
+        check_rename_convergence(true, true).await;
+    }
+
+    async fn check_rename_convergence(pending: bool, superseded: bool) {
         use asd_client::events::EventFeedChange;
         use std::time::Duration;
         let (client, server) = tokio::io::duplex(8192);
@@ -318,6 +388,10 @@ mod tests {
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let (feed_tx, feed_rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = tokio::spawn(async move {
+            let ev_tx = EventSink {
+                generation: 1,
+                tx: ev_tx,
+            };
             drive(0, Box::new(cr), Box::new(cw), cmd_rx, &ev_tx, feed_rx).await
         });
         let mut reader = FrameReader::new(sr);
@@ -337,12 +411,25 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            ev_rx.recv().await,
+            ev_rx.recv().await.map(|event| event.event),
             Some(UiEvent::State {
                 state: HostState::Up,
                 ..
             })
         ));
+        if superseded {
+            cmd_tx
+                .send(HostCmd::Attach {
+                    name: "superseded".into(),
+                    cols: 80,
+                    rows: 24,
+                })
+                .unwrap();
+            assert!(matches!(
+                reader.read_frame().await.unwrap(),
+                Some(Frame::Attach { .. })
+            ));
+        }
         cmd_tx
             .send(HostCmd::Attach {
                 name: "old".into(),
@@ -350,22 +437,30 @@ mod tests {
                 rows: 24,
             })
             .unwrap();
+        if superseded {
+            assert!(matches!(
+                reader.read_frame().await.unwrap(),
+                Some(Frame::Detach)
+            ));
+        }
         assert!(matches!(
             reader.read_frame().await.unwrap(),
             Some(Frame::Attach { .. })
         ));
         let identity = asd_proto::SessionIdentity { instance_id: 1 };
-        writer
-            .write_frame(&Frame::Snapshot {
-                identity,
-                vt: b"snapshot".to_vec(),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            ev_rx.recv().await,
-            Some(UiEvent::Bytes { snapshot: true, .. })
-        ));
+        if !pending {
+            writer
+                .write_frame(&Frame::Snapshot {
+                    identity,
+                    vt: b"snapshot".to_vec(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                ev_rx.recv().await.map(|event| event.event),
+                Some(UiEvent::Bytes { snapshot: true, .. })
+            ));
+        }
         let info = asd_proto::SessionInfo {
             name: "renamed".into(),
             instance_id: 1,
@@ -387,13 +482,40 @@ mod tests {
                     daemon_epoch: [1; 16],
                     sequence: 1,
                 },
-                EventFeedChange::Reset {
-                    sessions: vec![info],
-                    notification_lease: true,
+                EventFeedChange::Changed {
+                    sessions: vec![info.clone()],
+                    event: asd_proto::SessionEvent::Renamed {
+                        old_name: "old".into(),
+                        info,
+                    },
                 },
             ))
             .unwrap();
-        assert!(matches!(ev_rx.recv().await, Some(UiEvent::Events { .. })));
+        assert!(matches!(
+            ev_rx.recv().await.map(|event| event.event),
+            Some(UiEvent::Events { .. })
+        ));
+        if pending {
+            if superseded {
+                writer
+                    .write_frame(&Frame::Snapshot {
+                        identity: asd_proto::SessionIdentity { instance_id: 2 },
+                        vt: b"stale".to_vec(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            writer
+                .write_frame(&Frame::Snapshot {
+                    identity,
+                    vt: b"snapshot".to_vec(),
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(ev_rx.recv().await.map(|event| event.event), Some(UiEvent::Bytes { name, identity: id, snapshot: true, .. }) if name == "renamed" && id == identity)
+            );
+        }
         writer
             .write_frame(&Frame::SessionList { sessions: vec![] })
             .await
@@ -405,7 +527,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(ev_rx.recv().await, Some(UiEvent::Bytes { name, identity: id, snapshot: false, .. }) if name == "renamed" && id == identity)
+            matches!(ev_rx.recv().await.map(|event| event.event), Some(UiEvent::Bytes { name, identity: id, snapshot: false, .. }) if name == "renamed" && id == identity)
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(40), ev_rx.recv())

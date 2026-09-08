@@ -119,6 +119,7 @@ pub struct Model {
     pub attention: HashMap<HostId, asd_client::attention::AttentionEndpoint>,
     viewed: Option<(HostId, asd_proto::SessionIdentity)>,
     focused: bool,
+    selection_version: u64,
     /// Kill requests that have been sent but are still present in the most
     /// recent list for their host.
     closing: HashMap<(HostId, String), ClosingSession>,
@@ -139,6 +140,7 @@ impl Model {
             attention: HashMap::new(),
             viewed: None,
             focused: false,
+            selection_version: 0,
             closing: HashMap::new(),
             next_id: 1,
         }
@@ -257,10 +259,15 @@ impl Model {
     }
 
     pub fn select(&mut self, host: HostId, name: String) {
+        self.selection_version += 1;
         if !self.is_active(host, &name) {
             self.leave_view();
         }
         self.active = Some((host, name));
+    }
+
+    pub fn selection_version(&self) -> u64 {
+        self.selection_version
     }
 
     pub fn leave_view(&mut self) {
@@ -294,7 +301,12 @@ impl Model {
         name: &str,
         identity: asd_proto::SessionIdentity,
     ) {
-        if !self.is_active(host, name) {
+        let exact_selected = self.active.as_ref().is_some_and(|(selected, canonical)| {
+            *selected == host && self.session_identity(host, canonical) == Some(identity)
+        });
+        let awaiting_registration =
+            self.is_active(host, name) && self.session_identity(host, name).is_none();
+        if !exact_selected && !awaiting_registration {
             return;
         }
         self.leave_view();
@@ -513,6 +525,15 @@ mod tests {
 
     #[test]
     fn only_exact_rendered_focused_snapshot_marks_seen_and_focus_loss_rearms() {
+        check_rendered_snapshot(false);
+    }
+
+    #[test]
+    fn rename_before_render_ack_preserves_exact_identity_seen() {
+        check_rendered_snapshot(true);
+    }
+
+    fn check_rendered_snapshot(rename_before_ack: bool) {
         use asd_client::attention::AttentionKind;
         use asd_client::events::EventFeedChange;
         use asd_proto::{
@@ -557,6 +578,11 @@ mod tests {
             .unwrap()
             .accept(cursor(1), &event(AgentState::Blocked));
         model.select(LOCAL_ID, s.name.clone());
+        if rename_before_ack {
+            let mut renamed = s.clone();
+            renamed.name = "canonical".into();
+            model.set_sessions(LOCAL_ID, vec![renamed]);
+        }
         assert_eq!(
             model.unread(LOCAL_ID, s.identity()),
             Some(AttentionKind::NeedsAttention)

@@ -41,6 +41,11 @@ messages through `notification.rs` and `platform::notify`; desktop failures are
 logged without clearing unread state. Initial/reset snapshots and lease grants
 never replay old notifications.
 
+All actor messages are generation-tagged and rejected before mutation after
+host removal or reconnect. Snapshot rendering receipts bind the actor generation
+and selection revision, while canonical names are resolved by exact identity;
+rename during attach or between rendering and acknowledgement preserves Seen.
+
 The local platform stream is a Unix socket on Linux/macOS and a named pipe on
 Windows. Saved connections use `asd_proto::paths::data_dir()`, so their exact
 path follows the platform contract rather than a hard-coded Unix location.

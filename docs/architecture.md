@@ -158,6 +158,13 @@ and dispatches native notifications through its platform adapter. Only bounded,
 sanitized host/session metadata and the attention state enter native messages.
 Notification failure is logged without undoing unread state.
 
+GUI actor messages carry a monotonically allocated connection generation.
+The supervisor rejects messages for missing hosts or retired generations before
+mutating projection, lease, render, or notification state. Renderer receipts also
+bind the actor generation and selection revision, so a late acknowledgement
+cannot mark a superseded A-to-B-to-A view Seen. Rename resolves the canonical
+name by exact identity both while attach is pending and after Snapshot rendering.
+
 ## Session membership
 
 Ordinary CLI attach and desktop GUI connections are shared: all may view and
