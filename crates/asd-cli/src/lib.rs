@@ -10,6 +10,7 @@ mod card;
 mod client;
 mod control;
 mod exit;
+mod image_paste;
 mod platform;
 mod render;
 mod styled_peek;
@@ -56,6 +57,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: agent::Command,
     },
+    /// Prepare a small image as a Base64 decode command to paste into a remote POSIX shell.
+    ImagePaste(image_paste::ImagePasteArgs),
     /// List all sessions
     List {
         /// Emit a JSON array instead of the table (`[]` when there are none)
@@ -394,6 +397,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
     };
     match cmd {
         Cmd::Agent { cmd } => agent::run(&socket, cmd).await?,
+        Cmd::ImagePaste(args) => image_paste::run(args)?,
         Cmd::List { json } => {
             let mut c = client::connect(&socket, ClientKind::Cli).await?;
             c.writer.write_frame(&Frame::ListSessions).await?;

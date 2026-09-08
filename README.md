@@ -516,3 +516,35 @@ rows show the full message body in the detail pane with Markdown styling; use
 Tab to focus that pane and scroll to read longer messages. Exceptionally large
 bodies are capped at 64 KiB with a visible notice. Viewing details never executes
 HTML, opens links, or downloads images.
+### Paste an image decode command into a remote shell
+
+Run this on the computer that can read the image or owns the screenshot clipboard:
+
+```bash
+asd image-paste screenshot.png --copy
+asd image-paste --clipboard --copy
+asd image-paste screenshot.png --directory /remote/worktree > image-command.txt
+```
+
+Paste the generated text at a **POSIX shell prompt** on the destination machine,
+then press Enter manually. Python 3 decodes the image, verifies its size and
+SHA-256, creates a unique `asd-image-*` file in the selected directory (the remote
+shell's current directory by default), and prints its absolute path. Give that
+path to the agent afterward. The generator never executes the command or sends
+anything to a session. An agent input box, PowerShell, cmd.exe, and fish are not
+supported destinations for this generated shell syntax.
+
+Files up to 1 MiB with PNG/JPEG/GIF/WebP signatures are supported; the original
+bytes are preserved. This is transport validation, not a full image decoder.
+Clipboard screenshots are PNG. On Linux, clipboard mode needs `wl-clipboard`
+(Wayland) or `xclip` (X11); macOS needs `pngpaste` to read screenshots and uses
+`pbcopy` to copy text; Windows uses the system Windows PowerShell STA clipboard
+APIs. A remote SSH process cannot read your computer's clipboard.
+
+The command has no trailing newline, so its final heredoc delimiter waits for
+manual submission when pasted intact. Terminal clipboard/paste size limits still
+apply; use smaller images when necessary and confirm behavior on your terminal.
+Use `--copy` or the generated file contents directly: copying terminal screen
+output can introduce wrapping or lose bytes. The remote directory must already
+exist and be writable. No files are overwritten, no upload protocol is added,
+and normal `asd ui` text paste behavior is unchanged.

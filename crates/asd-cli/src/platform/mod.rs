@@ -27,6 +27,16 @@ use std::path::Path;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
+mod clipboard;
+#[cfg(unix)]
+#[path = "clipboard_unix.rs"]
+mod clipboard_imp;
+#[cfg(windows)]
+#[path = "clipboard_win.rs"]
+mod clipboard_imp;
+
+pub(crate) use clipboard_imp::{copy_clipboard_text, read_clipboard_image};
+
 #[cfg(unix)]
 #[path = "unix.rs"]
 mod imp;

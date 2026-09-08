@@ -10,6 +10,7 @@ being changed.
 | [`architecture.md`](architecture.md) | Crate dependencies, daemon/session ownership, transports, lifecycle, persistence, paths, or configuration loading |
 | [`terminal-behavior.md`](terminal-behavior.md) | Attach/TUI rendering, ownership, snapshots, modes, selection, paste, resize, or Windows Terminal behavior |
 | [`automation.md`](automation.md) | `send`, `peek`, `wait`, `follow`, `card`, activity detection, or non-attached clients |
+| [`tui-file-upload-design.md`](tui-file-upload-design.md) | Proposed TUI upload flow, terminal drag/drop limits, source-file locality, and platform validation (not implemented) |
 | [`cross-platform-development.md`](cross-platform-development.md) | Platform code, cross-compilation, filesystem semantics, CI, or release smoke checks |
 
 Two nearby sources remain authoritative instead of being copied here:
