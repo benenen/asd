@@ -112,8 +112,13 @@ state facts, emitting only changes. Idle deadlines run without followers;
 foreground metadata also refreshes once per second when quiet. Detector reload
 publishes the reclassified state with its own cause before acknowledging the
 generation. Status-line writes publish under Registry serialization before Ack.
-The hub reads only the atomic last-output timestamp for current snapshot ages;
-PTY batches do not enqueue timestamp commands. It never locks Registry or VT.
+Snapshot activity is explicitly sampled at snapshot time: the hub reads the
+atomic last-output timestamp once, computes `idle_ms`, and derives `running`
+from that same age using `IDLE_SETTLE_MS`. These two activity fields are the
+exception to cursor-exact projection; lifecycle, names, and detected state
+still describe the accepted events through the snapshot cursor. Sampling does
+not allocate a cursor. PTY batches do not enqueue timestamp commands, and the
+hub never locks Registry or VT.
 
 Snapshot/replay selection and live receiver installation share one actor turn.
 Event connections write start/replay before consuming the bounded live queue,

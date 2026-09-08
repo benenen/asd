@@ -229,6 +229,7 @@ impl SessionEventHub {
                         meta.last_output_ms
                             .load(std::sync::atomic::Ordering::Relaxed),
                     );
+                    info.running = info.idle_ms < asd_proto::IDLE_SETTLE_MS;
                 }
                 info
             })
@@ -403,6 +404,15 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_refreshes_output_age_without_allocating_event_cursors() {
+        check_sampled_activity(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_refreshes_running_after_quiet_projection_receives_output() {
+        check_sampled_activity(false, true).await;
+    }
+
+    async fn check_sampled_activity(projected_running: bool, sampled_running: bool) {
         use std::sync::{
             Mutex,
             atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU64, Ordering},
@@ -421,19 +431,28 @@ mod tests {
             last_output_ms: AtomicU64::new(crate::session::now_ms().saturating_sub(5000)),
             name: Mutex::new("s1".into()),
         });
-        hub.track_activity(info(1).identity(), Arc::clone(&meta));
-        hub.publish(CommittedSessionUpdate::Registered(info(1)));
-        let first = hub.subscribe(None, ClientKind::Cli, false).await.unwrap();
-        assert!(
-            matches!(first.start, Frame::EventStreamStarted { ref sessions, .. } if sessions[0].idle_ms >= 5000)
-        );
-        meta.last_output_ms
-            .store(crate::session::now_ms(), Ordering::Relaxed);
-        let second = hub.subscribe(None, ClientKind::Cli, false).await.unwrap();
-        started(&second.start, 1, true);
-        assert!(
-            matches!(second.start, Frame::EventStreamStarted { sessions, .. } if sessions[0].idle_ms < 1000)
-        );
+        let mut registered = info(1);
+        registered.state = AgentState::Working;
+        registered.running = projected_running;
+        registered.idle_ms = if projected_running { 0 } else { 5000 };
+        hub.track_activity(registered.identity(), Arc::clone(&meta));
+        hub.publish(CommittedSessionUpdate::Registered(registered));
+        if sampled_running {
+            meta.last_output_ms
+                .store(crate::session::now_ms(), Ordering::Relaxed);
+        }
+        let snapshot = hub.subscribe(None, ClientKind::Cli, false).await.unwrap();
+        started(&snapshot.start, 1, true);
+        let Frame::EventStreamStarted { sessions, .. } = snapshot.start else {
+            panic!("missing snapshot");
+        };
+        if sampled_running {
+            assert!(sessions[0].idle_ms < asd_proto::IDLE_SETTLE_MS);
+        } else {
+            assert!(sessions[0].idle_ms >= 5000);
+        }
+        assert_eq!(sessions[0].running, sampled_running);
+        assert_eq!(sessions[0].state, AgentState::Working);
     }
 
     #[tokio::test]

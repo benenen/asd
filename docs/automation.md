@@ -115,8 +115,12 @@ queued prefix, allowing the client to reconnect and replay or reset.
 
 Events carry registration, identity-keyed name-free patches, canonical rename,
 and exit. Activity emits only started/settled edges, not every output batch.
-Snapshot `idle_ms` reads the latest output timestamp without consuming cursor
-space. State changes caused by manifest reload carry `DetectorReload`, distinct
+Snapshot activity fields are sampled together: `idle_ms` reads the latest
+output timestamp and `running` is derived from that same age with
+`IDLE_SETTLE_MS`, without consuming cursor space. This sampled activity pair is
+the exception to cursor-exact projection; lifecycle, names, and detected state
+remain exact through the snapshot cursor. Idle waits use the fresh `idle_ms`.
+State changes caused by manifest reload carry `DetectorReload`, distinct
 from screen-driven changes. `asd-client::events::EventFeed` checks epoch and
 strict consecutive cursors before applying events; consumers use its accepted
 `last_cursor()` with the returned change.
