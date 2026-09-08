@@ -13,6 +13,7 @@ pub mod agent_resume;
 mod config;
 mod conn;
 mod detect;
+pub mod event_hub;
 mod metrics;
 mod platform;
 mod registry;

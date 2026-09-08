@@ -123,7 +123,7 @@ pub async fn handle_conn(
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ConnItem>();
     let queued = Arc::new(AtomicUsize::new(0));
 
-    let write_task = {
+    let mut write_task = {
         let queued = Arc::clone(&queued);
         tokio::spawn(async move {
             while let Some(item) = out_rx.recv().await {
@@ -137,6 +137,22 @@ pub async fn handle_conn(
                         }
                     }
                     ConnItem::Close => break,
+                    ConnItem::Events(mut subscription) => {
+                        if writer.write_frame(&subscription.start).await.is_err() {
+                            break;
+                        }
+                        for frame in &subscription.replay {
+                            if writer.write_frame(frame).await.is_err() {
+                                return;
+                            }
+                        }
+                        while let Some(frame) = subscription.live.recv().await {
+                            if writer.write_frame(&frame).await.is_err() {
+                                return;
+                            }
+                        }
+                        break;
+                    }
                 }
             }
             // The writer drops as the task ends → half-closes the write side,
@@ -151,6 +167,7 @@ pub async fn handle_conn(
     // the session thread.
     let mut following: Option<Attached> = None;
     let mut screen_wait_tasks = tokio::task::JoinSet::new();
+    let mut event_only = false;
     loop {
         while screen_wait_tasks.try_join_next().is_some() {}
         let frame = match reader.read_frame().await {
@@ -168,6 +185,39 @@ pub async fn handle_conn(
         };
 
         match frame {
+            Frame::SubscribeEvents {
+                after,
+                wants_notifications,
+            } => {
+                let publisher = registry.lock().unwrap().events.clone();
+                let Ok(subscription) = publisher
+                    .subscribe(after, client_kind, wants_notifications)
+                    .await
+                else {
+                    break;
+                };
+                // Event subscriptions never retain attachment/follow membership.
+                if let Some(a) = attached.take() {
+                    let _ = a.session_tx.send(SessionMsg::Detach {
+                        client_id: a.client_id,
+                    });
+                }
+                if let Some(f) = following.take() {
+                    let _ = f.session_tx.send(SessionMsg::Unfollow {
+                        client_id: f.client_id,
+                    });
+                }
+                screen_wait_tasks.shutdown().await;
+                let _ = out_tx.send(ConnItem::Events(Box::new(subscription)));
+                event_only = true;
+                // The read is canceled only when this dedicated connection ends.
+                // Socket EOF must release leases even when no events arrive.
+                tokio::select! {
+                    _ = reader.read_frame() => { write_task.abort(); let _ = (&mut write_task).await; }
+                    _ = &mut write_task => {}
+                }
+                break;
+            }
             Frame::AgentExplain { name } => {
                 let handle = registry.lock().unwrap().get(&name);
                 match handle {
@@ -352,10 +402,21 @@ pub async fn handle_conn(
                 // one session to tax the whole daemon. Keep the first
                 // `MAX_STATUS_LINE` bytes and drop the rest.
                 let line = truncate_on_char_boundary(line, MAX_STATUS_LINE);
-                match registry.lock().unwrap().get(&name) {
+                let reg = registry.lock().unwrap();
+                match reg.get(&name) {
                     Some(handle) => {
-                        if let Ok(mut current) = handle.meta.status_line.lock() {
-                            *current = line;
+                        if let Ok(mut current) = handle.meta.status_line.lock()
+                            && *current != line
+                        {
+                            *current = line.clone();
+                            let mut patch = crate::event_hub::empty_patch();
+                            patch.status_line = Some(line);
+                            reg.events
+                                .publish(crate::event_hub::CommittedSessionUpdate::Updated {
+                                    identity: handle.identity(),
+                                    patch,
+                                    cause: asd_proto::SessionUpdateCause::StatusLineChanged,
+                                });
                         }
                         reply(Frame::Ack);
                     }
@@ -604,8 +665,10 @@ pub async fn handle_conn(
             client_id: f.client_id,
         });
     }
-    let _ = out_tx.send(ConnItem::Close);
-    let _ = write_task.await;
+    if !event_only {
+        let _ = out_tx.send(ConnItem::Close);
+        let _ = write_task.await;
+    }
 }
 
 #[cfg(test)]

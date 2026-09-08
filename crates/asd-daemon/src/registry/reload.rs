@@ -119,7 +119,7 @@ mod tests {
             crate::store::SessionStore::open(dir.join("sessions.json"), dir.join("sessions.tsv"))
                 .unwrap()
                 .store;
-        let mut reg = Registry::new(0, store, Vec::new(), dir.join("asd.sock"));
+        let mut reg = Registry::new(0, store, Vec::new(), dir.join("asd.sock")).unwrap();
         reg.detectors = DetectorStore::load(dir.join("agents"));
         reg.context.detector = reg.detectors.snapshot();
         (Arc::new(Mutex::new(reg)), dir)

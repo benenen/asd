@@ -217,6 +217,7 @@ version = "0.1.14"
 dependencies = [
  "anyhow",
  "asd-cli",
+ "asd-client",
  "asd-dioxus",
  "asd-proto",
  "libc",

@@ -66,8 +66,13 @@ succeed with a zero timeout; otherwise the nearest deadline wakes the session.
 CLI success remains exit 0, timeout exit 4, and missing session exit 3 with the
 same wording in every wait mode.
 
-`wait --idle` and `wait --until` poll session metadata. `follow` subscribes once
-and receives Output and activity status in a single ordered stream.
+`wait --idle` and `wait --until` subscribe to session events, resolve the initial
+name to an identity in the opening snapshot, and follow that identity across
+renames. A dropped connection resumes from the last accepted cursor; an invalid
+cursor forces a reset. Reconnection retains the original timeout deadline and
+never switches to a same-name replacement. All four wait modes are polling-free.
+`follow` subscribes separately and receives Output and activity status in a
+single ordered stream.
 
 Followers are stored separately from attached clients. They receive no
 Snapshot, do not contribute to `attached_clients`, do not affect PTY size, and
@@ -75,12 +80,12 @@ cannot send attached-client operations. A new follower first receives current
 status; each later PTY batch produces Output followed by current status.
 
 The transition to idle occurs because no bytes arrive. Computing `running`
-immediately after a PTY batch always yields true, so a session with followers
-must use `recv_timeout` for the remaining settle interval while idle has not
+immediately after a PTY batch always yields true, so every session uses
+`recv_timeout` for the remaining settle interval while idle has not
 yet been announced. On timeout it emits `running: false`; an `idle_announced`
 guard prevents duplicate notifications and busy loops. The receive timeout is
-the earliest follow-idle, deferred detection, or screen-wait deadline. With no
-pending deadlines, the session returns to an ordinary blocking receive.
+the earliest idle, deferred detection, screen-wait, or one-second foreground
+metadata refresh deadline. Idle events therefore work even with no followers.
 
 Session exit sends both `FollowStatus { running: false }` and the session-exited
 error. Default follow may stop on the status transition; `--forever` ignores
@@ -93,6 +98,33 @@ left the registry and no `list` can report it. `follow --json` puts it on the
 terminal `exit` event as `code` and `signal`; the session-exited error names it
 in prose for whoever is only reading messages, `asd attach` included. A signal
 name is the platform's wording (`Hangup`, `Killed`), not a `SIG*` constant.
+
+## Sequenced session events
+
+`SubscribeEvents { after, wants_notifications }` dedicates a handshaken
+connection to metadata events. It receives `EventStreamStarted`, optional
+replay, then live `SessionEvent` frames. This connection does not attach,
+follow PTY output, negotiate size, or take a viewer slot.
+
+Cursors contain a random daemon-process epoch and monotonically increasing
+sequence. An absent, foreign, expired, or future cursor receives a sorted full
+snapshot with `reset: true`. A recoverable cursor receives `reset: false`, an
+empty sessions vector, and every event after that cursor. Replay retains 512
+events; the live queue holds 64 frames. Overflow closes after its contiguous
+queued prefix, allowing the client to reconnect and replay or reset.
+
+Events carry registration, identity-keyed name-free patches, canonical rename,
+and exit. Activity emits only started/settled edges, not every output batch.
+Snapshot `idle_ms` reads the latest output timestamp without consuming cursor
+space. State changes caused by manifest reload carry `DetectorReload`, distinct
+from screen-driven changes. `asd-client::events::EventFeed` checks epoch and
+strict consecutive cursors before applying events; consumers use its accepted
+`last_cursor()` with the returned change.
+
+Only handshaken GUI and TUI clients can request notification leases. Each class
+has at most one holder; CLI/proxy requests receive no lease. Dropping a
+subscription or closing its socket transfers the lease to the oldest waiting
+subscriber of that class, including while the daemon is otherwise quiet.
 
 ## Modelled follow output
 

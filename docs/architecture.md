@@ -91,6 +91,41 @@ receive the version-mismatch error and disconnect. Frame definitions, the
 current version, and the complete version history live in
 [`asd-proto/src/lib.rs`](../crates/asd-proto/src/lib.rs).
 
+## Session event ownership
+
+`asd-daemon::event_hub` runs one single-writer actor per Registry. It owns the
+random process epoch, cursor, identity-keyed projection, 512-event replay ring,
+exit tombstones, bounded 64-frame subscriber queues, and independent GUI/TUI
+notification leases. The actor consumes only committed metadata and subscription
+commands. It terminates when its publishers and subscriptions are dropped.
+
+Registry inserts a new handle and enqueues registration before releasing its
+session thread's registration gate. Registry also owns canonical names: rename
+is enqueued after map/name agreement, while exit finds and removes the exact
+identity under the Registry lock before publication. An old exit cannot remove
+a replacement, even if a rename occurred after the thread read its old name.
+Owner-thread patches never carry names; actor-side rename preserves already
+ordered owner facts. Tombstones reject late updates and re-registration.
+
+The session compares activity, foreground/title, attachment/size, and detected
+state facts, emitting only changes. Idle deadlines run without followers;
+foreground metadata also refreshes once per second when quiet. Detector reload
+publishes the reclassified state with its own cause before acknowledging the
+generation. Status-line writes publish under Registry serialization before Ack.
+The hub reads only the atomic last-output timestamp for current snapshot ages;
+PTY batches do not enqueue timestamp commands. It never locks Registry or VT.
+
+Snapshot/replay selection and live receiver installation share one actor turn.
+Event connections write start/replay before consuming the bounded live queue,
+without copying live events into the normal unbounded outbound queue. A parallel
+socket read detects EOF and drops the subscription even without event traffic.
+Queue overflow closes after the contiguous prefix rather than skipping events.
+
+`asd-client::events::EventFeed` validates strict epoch/sequence ordering before
+mutation and exposes sorted identity-keyed projections and the accepted cursor.
+A replay start retains the local projection; a reset replaces it. CLI idle/state
+waits retain their target identity and original deadline across reconnects.
+
 ## Session membership
 
 Ordinary CLI attach and desktop GUI connections are shared: all may view and

@@ -37,6 +37,7 @@ const SCRIPT_ENTER_DELAY: std::time::Duration = std::time::Duration::from_millis
 #[derive(Debug)]
 pub enum ConnItem {
     Frame(Box<Frame>),
+    Events(Box<crate::event_hub::EventSubscription>),
     /// Forced disconnect (emitted by the sink on flow-control overflow or
     /// session death).
     Close,
@@ -352,7 +353,7 @@ impl SessionHandle {
 
 /// Current Unix-epoch time in milliseconds (0 if the clock is before the
 /// epoch, which never happens in practice).
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -554,6 +555,7 @@ fn proc_command(_pid: libc::pid_t) -> Option<String> {
 /// growing tail of parameters through `spawn_session` into the session thread.
 #[derive(Clone)]
 pub struct SessionContext {
+    pub events: crate::event_hub::EventPublisher,
     /// The listener this daemon serves, exported to the child as `$ASD_SOCKET`.
     pub socket: std::path::PathBuf,
     /// Generation captured under the Registry lock when this session is spawned.
@@ -572,7 +574,7 @@ pub fn spawn_session(
     scrollback: usize,
     context: SessionContext,
     registry: Arc<Mutex<Registry>>,
-) -> anyhow::Result<SessionHandle> {
+) -> anyhow::Result<(SessionHandle, mpsc::Sender<()>)> {
     let mut instance_bytes = [0u8; 16];
     getrandom::fill(&mut instance_bytes)?;
     let identity = SessionIdentity {
@@ -670,29 +672,36 @@ pub fn spawn_session(
     // ending the session gets (a no-op where the pty reports EOF by itself).
     crate::platform::watch_child_exit(child_pid, &name, tx.clone());
 
-    // Session thread: exclusive owner of the Terminal and the pty master
+    let handle = SessionHandle {
+        name: name.clone(),
+        identity,
+        command,
+        spawn_command: cmd,
+        created_ms,
+        tx,
+        meta: Arc::clone(&meta),
+    };
+    let mut facts = SessionFacts::new(handle.clone(), context.events.clone());
+    let (registered, registration) = mpsc::channel();
+    // Session thread: exclusive owner of the Terminal and the pty master.
+    // Registry publishes registration before opening this gate.
     {
         let name = name.clone();
         let meta = Arc::clone(&meta);
         std::thread::Builder::new()
             .name(format!("session-{name}"))
             .spawn(move || {
+                if registration.recv().is_err() {
+                    return;
+                }
                 session_thread(
                     name, identity, rx, master, pty_writer, child, cols, rows, scrollback, context,
-                    meta, registry,
+                    meta, registry, &mut facts,
                 );
             })?;
     }
 
-    Ok(SessionHandle {
-        name,
-        identity,
-        command,
-        spawn_command: cmd,
-        created_ms,
-        tx,
-        meta,
-    })
+    Ok((handle, registered))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -709,6 +718,7 @@ fn session_thread(
     context: SessionContext,
     meta: Arc<SessionMeta>,
     registry: Arc<Mutex<Registry>>,
+    facts: &mut SessionFacts,
 ) {
     let mut vt = GhosttyVt::new(cols, rows, scrollback);
     let mut detector = context.detector;
@@ -737,10 +747,11 @@ fn session_thread(
     info!(session = %name, pid = meta.child_pid.load(Ordering::Relaxed), "session started");
 
     loop {
+        facts.publish(asd_proto::SessionUpdateCause::ScreenDetection);
         screen_waiters.expire(std::time::Instant::now());
-        // Follow idle, deferred detection, and screen-wait expiration each
-        // contribute a deadline. Block without a timer when none is pending.
-        let until_idle = (!followers.is_empty() && !idle_announced).then(|| {
+        // Idle, deferred detection, screen waits, and foreground metadata each
+        // contribute a deadline independently of subscriber presence.
+        let until_idle = (!idle_announced).then(|| {
             let idle_ms = now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed));
             IDLE_SETTLE_MS.saturating_sub(idle_ms).max(1)
         });
@@ -760,6 +771,8 @@ fn session_thread(
             .map(std::time::Duration::from_millis)
             .into_iter()
             .chain(until_waiter)
+            // Foreground process metadata may change without any PTY output.
+            .chain(Some(std::time::Duration::from_secs(1)))
             .min();
         let msg = match deadline {
             None => match rx.recv() {
@@ -776,7 +789,7 @@ fn session_thread(
                         last_detect_ms = now_ms();
                         detect_pending = false;
                     }
-                    if !followers.is_empty() && !idle_announced {
+                    if !idle_announced {
                         idle_announced = notify_followers(&mut followers, &meta);
                     }
                     continue;
@@ -802,6 +815,7 @@ fn session_thread(
                     update_agent_state(&detector.detector, &mut vt, &meta);
                     last_detect_ms = now_ms();
                     detect_pending = false;
+                    facts.publish(asd_proto::SessionUpdateCause::DetectorReload);
                 }
                 // A newer installed generation also satisfies an older barrier.
                 let _ = ack.send(detector.generation);
@@ -1204,14 +1218,8 @@ fn session_thread(
     });
     meta.alive.store(false, Ordering::Relaxed);
     meta.child_pid.store(0, Ordering::Relaxed);
-    // Remove by the current name — a rename may have changed the map key since
-    // spawn (the canonical name lives in `meta`).
-    let current = meta
-        .name
-        .lock()
-        .map(|n| n.clone())
-        .unwrap_or_else(|_| name.clone());
-    registry.lock().unwrap().remove(&current);
+    // Registry resolves the final name and removes this exact instance together.
+    registry.lock().unwrap().remove(identity, exit.clone());
     for c in clients.drain(..) {
         c.send(Frame::Error {
             code: code::SESSION_EXITED,
@@ -1241,6 +1249,77 @@ fn session_thread(
     }
     meta.attached_clients.store(0, Ordering::Relaxed);
     info!(session = %name, %exit, "session ended");
+}
+
+/// Compare committed owner-thread facts; output timestamps are shared separately
+/// so an already-active PTY never floods the event command queue or replay ring.
+struct SessionFacts {
+    handle: SessionHandle,
+    previous: asd_proto::SessionInfo,
+    events: crate::event_hub::EventPublisher,
+}
+
+impl SessionFacts {
+    fn new(handle: SessionHandle, events: crate::event_hub::EventPublisher) -> Self {
+        let previous = handle.info();
+        Self {
+            handle,
+            previous,
+            events,
+        }
+    }
+
+    fn publish(&mut self, state_cause: asd_proto::SessionUpdateCause) {
+        use crate::event_hub::{CommittedSessionUpdate, empty_patch};
+        use asd_proto::SessionUpdateCause as Cause;
+        let current = self.handle.info();
+        let old = &self.previous;
+        let mut patches = Vec::new();
+        if old.running != current.running {
+            let mut patch = empty_patch();
+            patch.running = Some(current.running);
+            patch.idle_ms = Some(current.idle_ms);
+            patches.push((
+                patch,
+                if current.running {
+                    Cause::ActivityStarted
+                } else {
+                    Cause::ActivitySettled
+                },
+            ));
+        }
+        if old.command != current.command || old.title != current.title || old.pid != current.pid {
+            let mut patch = empty_patch();
+            patch.command = (old.command != current.command).then(|| current.command.clone());
+            patch.title = (old.title != current.title).then(|| current.title.clone());
+            patch.pid = (old.pid != current.pid).then_some(current.pid);
+            patches.push((patch, Cause::ForegroundChanged));
+        }
+        if old.attached_clients != current.attached_clients
+            || old.cols != current.cols
+            || old.rows != current.rows
+        {
+            let mut patch = empty_patch();
+            patch.attached_clients = (old.attached_clients != current.attached_clients)
+                .then_some(current.attached_clients);
+            patch.cols = (old.cols != current.cols).then_some(current.cols);
+            patch.rows = (old.rows != current.rows).then_some(current.rows);
+            patches.push((patch, Cause::AttachmentChanged));
+        }
+        if old.state != current.state {
+            let mut patch = empty_patch();
+            patch.state = Some(current.state);
+            patches.push((patch, state_cause));
+        }
+        for (patch, cause) in patches {
+            self.events.publish(CommittedSessionUpdate::Updated {
+                identity: self.handle.identity(),
+                patch,
+                cause,
+            });
+        }
+        self.previous = current;
+    }
 }
 
 fn merge_terminal_appearance(

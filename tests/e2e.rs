@@ -19,7 +19,500 @@ use tokio::time::timeout;
 
 const TICK: Duration = Duration::from_millis(50);
 const WAIT: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+async fn session_events_order_replay_rename_idle_and_exit_without_attachment() {
+    let daemon = Daemon::start("session-events");
+    let mut events = ProtoClient::connect(&daemon.socket).await;
+    events
+        .send(Frame::SubscribeEvents {
+            after: None,
+            wants_notifications: false,
+        })
+        .await;
+    let initial = events.recv().await;
+    assert!(
+        matches!(initial, Frame::EventStreamStarted { reset: true, .. }),
+        "{initial:?}"
+    );
+    let mut feed = asd_client::events::EventFeed::default();
+    feed.start(initial).unwrap();
+    let created = daemon
+        .cli()
+        .args([
+            "new",
+            "event-old",
+            "--cmd",
+            "printf 'event-ready\\n'; read line",
+        ])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    let mut identity = None;
+    let replay_after;
+    loop {
+        let frame = events.recv().await;
+        feed.apply(frame.clone()).unwrap();
+        if let Frame::SessionEvent {
+            event: asd_proto::SessionEvent::Registered { ref info },
+            ..
+        } = frame
+        {
+            identity = Some(info.identity());
+        }
+        if matches!(
+            frame,
+            Frame::SessionEvent {
+                event: asd_proto::SessionEvent::Updated {
+                    cause: asd_proto::SessionUpdateCause::ActivitySettled,
+                    ..
+                },
+                ..
+            }
+        ) {
+            replay_after = feed.last_cursor();
+            break;
+        }
+    }
+    let identity = identity.unwrap();
+    assert_eq!(feed.sessions()[0].attached_clients, 0);
+    assert_eq!((feed.sessions()[0].cols, feed.sessions()[0].rows), (80, 24));
+    let renamed = daemon
+        .cli()
+        .args(["rename", "event-old", "event-new"])
+        .output()
+        .unwrap();
+    assert!(renamed.status.success(), "{renamed:?}");
+    loop {
+        let frame = events.recv().await;
+        let renamed = matches!(
+            frame,
+            Frame::SessionEvent {
+                event: asd_proto::SessionEvent::Renamed { .. },
+                ..
+            }
+        );
+        feed.apply(frame).unwrap();
+        if renamed {
+            break;
+        }
+    }
+    assert_eq!(feed.sessions()[0].name, "event-new");
+    assert_eq!(feed.sessions()[0].identity(), identity);
+    let mut replay = ProtoClient::connect(&daemon.socket).await;
+    replay
+        .send(Frame::SubscribeEvents {
+            after: replay_after,
+            wants_notifications: false,
+        })
+        .await;
+    assert!(
+        matches!(replay.recv().await, Frame::EventStreamStarted { reset: false, cursor, .. } if Some(cursor) == replay_after)
+    );
+    assert!(
+        matches!(replay.recv().await, Frame::SessionEvent { cursor, event: asd_proto::SessionEvent::Renamed { .. } } if cursor.sequence == replay_after.unwrap().sequence + 1)
+    );
+    let sent = daemon
+        .cli()
+        .args(["send", "event-new", "--text", "finish", "--enter"])
+        .output()
+        .unwrap();
+    assert!(sent.status.success(), "{sent:?}");
+    loop {
+        let frame = events.recv().await;
+        let exited = matches!(frame, Frame::SessionEvent { event: asd_proto::SessionEvent::Exited { identity: id, .. }, .. } if id == identity);
+        feed.apply(frame).unwrap();
+        if exited {
+            break;
+        }
+    }
+    assert!(feed.sessions().is_empty());
+}
 static PTSNAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[tokio::test]
+async fn event_notification_lease_transfers_on_quiet_socket_eof() {
+    let daemon = Daemon::start("event-lease-eof");
+    let mut gui = ProtoClient::connect_kind(&daemon.socket, ClientKind::Gui).await;
+    let mut waiting = ProtoClient::connect_kind(&daemon.socket, ClientKind::Gui).await;
+    let mut tui = ProtoClient::connect_kind(&daemon.socket, ClientKind::Tui).await;
+    let mut cli = ProtoClient::connect_kind(&daemon.socket, ClientKind::Cli).await;
+    for (client, granted) in [
+        (&mut gui, true),
+        (&mut waiting, false),
+        (&mut tui, true),
+        (&mut cli, false),
+    ] {
+        client
+            .send(Frame::SubscribeEvents {
+                after: None,
+                wants_notifications: true,
+            })
+            .await;
+        assert!(
+            matches!(client.recv().await, Frame::EventStreamStarted { notification_lease, .. } if notification_lease == granted)
+        );
+    }
+    drop(gui);
+    assert_eq!(
+        waiting.recv().await,
+        Frame::NotificationLeaseChanged { granted: true }
+    );
+}
+
+#[tokio::test]
+async fn session_events_slow_socket_closes_contiguously_and_recovers_by_reset() {
+    let daemon = Daemon::start("event-slow-socket");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "slow", "--cmd", "read line"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        daemon
+            .cli()
+            .args(["wait", "slow", "--idle", "--timeout", "5s"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut events = ProtoClient::connect(&daemon.socket).await;
+    events
+        .send(Frame::SubscribeEvents {
+            after: None,
+            wants_notifications: false,
+        })
+        .await;
+    let mut feed = asd_client::events::EventFeed::default();
+    feed.start(events.recv().await).unwrap();
+    let mut control = ProtoClient::connect(&daemon.socket).await;
+    for index in 0..2048 {
+        control
+            .send(Frame::SetStatusLine {
+                name: "slow".into(),
+                line: format!("{index:04}{}", "x".repeat(508)),
+            })
+            .await;
+        assert_eq!(control.recv().await, Frame::Ack);
+    }
+    let mut received = 0;
+    while let Some(frame) = timeout(WAIT, events.reader.read_frame())
+        .await
+        .expect("overflow must close the stream")
+        .unwrap()
+    {
+        feed.apply(frame).unwrap();
+        received += 1;
+    }
+    assert!(
+        (64..2048).contains(&received),
+        "received {received} events before overflow close"
+    );
+    let after = feed.last_cursor();
+    let mut recovery = ProtoClient::connect(&daemon.socket).await;
+    recovery
+        .send(Frame::SubscribeEvents {
+            after,
+            wants_notifications: false,
+        })
+        .await;
+    let start = recovery.recv().await;
+    assert!(
+        matches!(start, Frame::EventStreamStarted { reset: true, .. }),
+        "{start:?}"
+    );
+    feed.start(start).unwrap();
+    assert!(feed.sessions()[0].status_line.starts_with("2047"));
+    assert_eq!(feed.sessions()[0].attached_clients, 0);
+    assert_eq!((feed.sessions()[0].cols, feed.sessions()[0].rows), (80, 24));
+}
+
+fn event_wait_info(id: u128) -> asd_proto::SessionInfo {
+    asd_proto::SessionInfo {
+        name: "target".into(),
+        instance_id: id,
+        command: "codex".into(),
+        title: String::new(),
+        status_line: String::new(),
+        created_ms: 0,
+        idle_ms: 0,
+        running: true,
+        state: asd_proto::AgentState::Working,
+        attached_clients: 0,
+        pid: 1,
+        cols: 80,
+        rows: 24,
+    }
+}
+
+#[tokio::test]
+async fn event_wait_reset_never_switches_to_same_name_replacement() {
+    let socket = ScriptedSocket::new("event-wait-replacement");
+    let listener = UnixListener::bind(&socket.path).unwrap();
+    let child = tokio::process::Command::new(cli_exe())
+        .arg("--socket")
+        .arg(&socket.path)
+        .args(["wait", "target", "--until", "idle", "--timeout", "5s"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let cursor = asd_proto::EventCursor {
+        daemon_epoch: [4; 16],
+        sequence: 1,
+    };
+    let (mut reader, mut writer) = accept_cli(&listener).await;
+    assert_eq!(
+        scripted_recv(&mut reader).await,
+        Some(Frame::SubscribeEvents {
+            after: None,
+            wants_notifications: false
+        })
+    );
+    writer
+        .write_frame(&Frame::EventStreamStarted {
+            cursor,
+            sessions: vec![event_wait_info(1)],
+            reset: true,
+            notification_lease: false,
+        })
+        .await
+        .unwrap();
+    drop(reader);
+    drop(writer);
+    let (mut reader, mut writer) = accept_cli(&listener).await;
+    assert_eq!(
+        scripted_recv(&mut reader).await,
+        Some(Frame::SubscribeEvents {
+            after: Some(cursor),
+            wants_notifications: false
+        })
+    );
+    let mut replacement = event_wait_info(2);
+    replacement.state = asd_proto::AgentState::Idle;
+    writer
+        .write_frame(&Frame::EventStreamStarted {
+            cursor: asd_proto::EventCursor {
+                sequence: 3,
+                ..cursor
+            },
+            sessions: vec![replacement],
+            reset: true,
+            notification_lease: false,
+        })
+        .await
+        .unwrap();
+    let output = timeout(WAIT, child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("session 'target' exited"),
+        "{output:?}"
+    );
+}
+
+#[tokio::test]
+async fn event_wait_invalid_cursor_forces_reset_without_extending_deadline() {
+    let socket = ScriptedSocket::new("event-wait-invalid-cursor");
+    let listener = UnixListener::bind(&socket.path).unwrap();
+    let start = std::time::Instant::now();
+    let child = tokio::process::Command::new(cli_exe())
+        .arg("--socket")
+        .arg(&socket.path)
+        .args(["wait", "target", "--until", "idle", "--timeout", "700ms"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let cursor = asd_proto::EventCursor {
+        daemon_epoch: [4; 16],
+        sequence: 1,
+    };
+    let (mut reader, mut writer) = accept_cli(&listener).await;
+    assert_eq!(
+        scripted_recv(&mut reader).await,
+        Some(Frame::SubscribeEvents {
+            after: None,
+            wants_notifications: false
+        })
+    );
+    writer
+        .write_frame(&Frame::EventStreamStarted {
+            cursor,
+            sessions: vec![event_wait_info(1)],
+            reset: true,
+            notification_lease: false,
+        })
+        .await
+        .unwrap();
+    writer
+        .write_frame(&Frame::SessionEvent {
+            cursor: asd_proto::EventCursor {
+                sequence: 3,
+                ..cursor
+            },
+            event: asd_proto::SessionEvent::Registered {
+                info: event_wait_info(2),
+            },
+        })
+        .await
+        .unwrap();
+    let (mut next_reader, mut next_writer) = accept_cli(&listener).await;
+    assert_eq!(
+        scripted_recv(&mut next_reader).await,
+        Some(Frame::SubscribeEvents {
+            after: None,
+            wants_notifications: false
+        })
+    );
+    next_writer
+        .write_frame(&Frame::EventStreamStarted {
+            cursor: asd_proto::EventCursor {
+                sequence: 5,
+                ..cursor
+            },
+            sessions: vec![event_wait_info(1)],
+            reset: true,
+            notification_lease: false,
+        })
+        .await
+        .unwrap();
+    let output = timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(
+        scripted_recv(&mut next_reader).await,
+        None,
+        "healthy event waits must not send polling requests"
+    );
+}
+
+#[tokio::test]
+async fn event_wait_reconnects_with_cursor_and_follows_identity_through_rename() {
+    let socket = ScriptedSocket::new("event-wait-reconnect");
+    let listener = UnixListener::bind(&socket.path).unwrap();
+    let child = tokio::process::Command::new(cli_exe())
+        .arg("--socket")
+        .arg(&socket.path)
+        .args(["wait", "before", "--until", "idle", "--timeout", "5s"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (mut reader, mut writer) = accept_cli(&listener).await;
+    assert_eq!(
+        scripted_recv(&mut reader).await,
+        Some(Frame::SubscribeEvents {
+            after: None,
+            wants_notifications: false
+        })
+    );
+    let mut info = asd_proto::SessionInfo {
+        name: "before".into(),
+        instance_id: 42,
+        command: "codex".into(),
+        title: String::new(),
+        status_line: String::new(),
+        created_ms: 0,
+        idle_ms: 0,
+        running: true,
+        state: asd_proto::AgentState::Working,
+        attached_clients: 0,
+        pid: 1,
+        cols: 80,
+        rows: 24,
+    };
+    let cursor = asd_proto::EventCursor {
+        daemon_epoch: [3; 16],
+        sequence: 10,
+    };
+    writer
+        .write_frame(&Frame::EventStreamStarted {
+            cursor,
+            sessions: vec![info.clone()],
+            reset: true,
+            notification_lease: false,
+        })
+        .await
+        .unwrap();
+    drop(reader);
+    drop(writer);
+    let (mut reader, mut writer) = accept_cli(&listener).await;
+    assert_eq!(
+        scripted_recv(&mut reader).await,
+        Some(Frame::SubscribeEvents {
+            after: Some(cursor),
+            wants_notifications: false
+        })
+    );
+    writer
+        .write_frame(&Frame::EventStreamStarted {
+            cursor,
+            sessions: vec![],
+            reset: false,
+            notification_lease: false,
+        })
+        .await
+        .unwrap();
+    info.name = "after".into();
+    writer
+        .write_frame(&Frame::SessionEvent {
+            cursor: asd_proto::EventCursor {
+                sequence: 11,
+                ..cursor
+            },
+            event: asd_proto::SessionEvent::Renamed {
+                old_name: "before".into(),
+                info: info.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    let patch = asd_proto::SessionUpdatePatch {
+        command: None,
+        title: None,
+        status_line: None,
+        idle_ms: None,
+        running: None,
+        state: Some(asd_proto::AgentState::Idle),
+        attached_clients: None,
+        pid: None,
+        cols: None,
+        rows: None,
+    };
+    writer
+        .write_frame(&Frame::SessionEvent {
+            cursor: asd_proto::EventCursor {
+                sequence: 12,
+                ..cursor
+            },
+            event: asd_proto::SessionEvent::Updated {
+                identity: info.identity(),
+                patch,
+                cause: asd_proto::SessionUpdateCause::ScreenDetection,
+            },
+        })
+        .await
+        .unwrap();
+    let output = timeout(WAIT, child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
 
 fn cli_exe() -> &'static str {
     env!("CARGO_BIN_EXE_asd")
@@ -69,6 +562,15 @@ async fn agent_reload_reclassifies_quiet_sessions_and_explain_reads_the_owner_vt
     let override_dir = daemon.dir.join("config/asd/agents");
     std::fs::create_dir_all(&override_dir).unwrap();
     let path = override_dir.join("codex.toml");
+    let mut events = ProtoClient::connect(&daemon.socket).await;
+    events
+        .send(Frame::SubscribeEvents {
+            after: None,
+            wants_notifications: false,
+        })
+        .await;
+    let mut feed = asd_client::events::EventFeed::default();
+    feed.start(events.recv().await).unwrap();
     std::fs::write(&path, "id = 'codex'\n[[rules]]\nid = 'quiet_override'\nstate = 'blocked'\nregion = 'whole_screen'\ncontains = ['Esc to interrupt']\n").unwrap();
     let reload = || {
         let output = daemon
@@ -81,6 +583,19 @@ async fn agent_reload_reclassifies_quiet_sessions_and_explain_reads_the_owner_vt
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
     };
     let installed = reload();
+    loop {
+        let frame = events.recv().await;
+        feed.apply(frame.clone()).unwrap();
+        if let Frame::SessionEvent {
+            event: asd_proto::SessionEvent::Updated { patch, cause, .. },
+            ..
+        } = frame
+            && patch.state == Some(asd_proto::AgentState::Blocked)
+        {
+            assert_eq!(cause, asd_proto::SessionUpdateCause::DetectorReload);
+            break;
+        }
+    }
     assert_eq!(installed["pending_identities"], serde_json::json!([]));
     assert_eq!(
         installed["generation"].as_u64(),

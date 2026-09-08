@@ -18,6 +18,7 @@ const DEFAULT_SIZE: (u16, u16) = (80, 24);
 mod reload;
 
 pub struct Registry {
+    pub events: crate::event_hub::EventPublisher,
     detectors: DetectorStore,
     reload_gate: Arc<tokio::sync::Mutex<()>>,
     sessions: HashMap<String, SessionHandle>,
@@ -57,9 +58,11 @@ impl Registry {
         store: crate::store::SessionStore,
         unrestored: Vec<crate::store::SessionState>,
         socket_path: PathBuf,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let detectors = DetectorStore::load(paths::agents_dir());
-        Self {
+        let events = crate::event_hub::EventPublisher::new()?;
+        Ok(Self {
+            events: events.clone(),
             sessions: HashMap::new(),
             agent_records: HashMap::new(),
             next_auto: 0,
@@ -69,13 +72,14 @@ impl Registry {
             context: SessionContext {
                 socket: socket_path,
                 detector: detectors.snapshot(),
+                events,
             },
             detectors,
             reload_gate: Arc::new(tokio::sync::Mutex::new(())),
             persist_frozen: false,
             last_persisted: Vec::new(),
             host_metrics: None,
-        }
+        })
     }
 
     /// Create a session. `name` defaults to auto-assignment; `cmd` defaults
@@ -158,7 +162,7 @@ impl Registry {
 
         let scrollback = reg.scrollback_lines;
         let context = reg.context.clone();
-        let mut handle = spawn_session(
+        let (mut handle, registered) = spawn_session(
             name.clone(),
             run,
             cwd,
@@ -179,7 +183,13 @@ impl Registry {
         {
             reg.agent_records.insert(handle.identity(), record);
         }
+        let info = handle.info();
+        reg.events
+            .track_activity(handle.identity(), Arc::clone(&handle.meta));
         reg.sessions.insert(name.clone(), handle);
+        reg.events
+            .publish(crate::event_hub::CommittedSessionUpdate::Registered(info));
+        let _ = registered.send(());
         // A successful explicit create replaces a retained failed restore.
         // Only restoration may transfer authoritative conversation metadata.
         if !restoring {
@@ -411,10 +421,22 @@ impl Registry {
     /// Callback at the session thread's endpoint: deregister and re-persist (so a
     /// killed or self-exited session drops off the list). A no-op on the file
     /// during shutdown, where `persist_frozen` is set.
-    pub fn remove(&mut self, name: &str) {
-        if let Some(handle) = self.sessions.remove(name) {
-            self.agent_records.remove(&handle.identity());
-        }
+    pub fn remove(&mut self, identity: SessionIdentity, exit: asd_proto::SessionExit) {
+        let Some(name) = self
+            .sessions
+            .iter()
+            .find_map(|(name, handle)| (handle.identity() == identity).then(|| name.clone()))
+        else {
+            return;
+        };
+        self.sessions.remove(&name);
+        self.agent_records.remove(&identity);
+        self.events
+            .publish(crate::event_hub::CommittedSessionUpdate::Exited {
+                identity,
+                last_name: name,
+                exit,
+            });
         self.persist();
     }
 
@@ -447,7 +469,13 @@ impl Registry {
             old_name: old.to_string(),
             new_name: new.to_string(),
         });
+        let info = handle.info();
         self.sessions.insert(new.to_string(), handle);
+        self.events
+            .publish(crate::event_hub::CommittedSessionUpdate::Renamed {
+                old_name: old.into(),
+                info,
+            });
         self.persist();
         info!(from = %old, to = %new, "session renamed");
         Ok(())
@@ -571,7 +599,8 @@ mod identity_tests {
             store,
             Vec::new(),
             std::env::temp_dir().join("unused-asd.sock"),
-        );
+        )
+        .unwrap();
         registry.sessions.insert("current".to_string(), handle);
 
         let error = registry
@@ -709,6 +738,23 @@ mod identity_tests {
             .unwrap();
         registry.clear_agent(identity).unwrap();
         assert!(registry.snapshot()[0].agent_resume.is_none());
+        registry.rename("current", "renamed").unwrap();
+        let exit = asd_proto::SessionExit {
+            code: 0,
+            signal: None,
+        };
+        registry.remove(SessionIdentity { instance_id: 8 }, exit.clone());
+        assert_eq!(
+            registry.list().len(),
+            1,
+            "an old exit cannot remove a replacement"
+        );
+        // Exit resolves the name only after taking the Registry lock.
+        registry.remove(identity, exit);
+        assert!(
+            registry.list().is_empty(),
+            "exit must resolve the identity under the Registry lock"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -737,7 +783,9 @@ mod windows_tests {
             crate::store::SessionStore::open(dir.join("sessions.json"), dir.join("sessions.tsv"))
                 .unwrap()
                 .store;
-        let registry = Arc::new(Mutex::new(Registry::new(0, store, Vec::new(), pipe)));
+        let registry = Arc::new(Mutex::new(
+            Registry::new(0, store, Vec::new(), pipe).unwrap(),
+        ));
 
         Registry::create(&registry, Some("doomed".to_string()), None, None).unwrap();
         let handle = registry.lock().unwrap().get("doomed").unwrap();

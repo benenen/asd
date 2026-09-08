@@ -121,7 +121,7 @@ pub(super) async fn serve(socket_path: PathBuf, force_run_commands: bool) -> any
         store,
         restore_states.clone(),
         socket_path.clone(),
-    )));
+    )?));
 
     // Restore the persisted session list on every startup (fresh boot, crash
     // recovery, or `asd restart`): recreate each saved session as a fresh shell
