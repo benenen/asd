@@ -313,10 +313,15 @@ table. Copy [`config.example.toml`](config.example.toml) for the complete,
 commented set of options.
 
 Agent-detection rules can be replaced per agent under `agents/` beside
-`config.toml`. See
+`config.toml`. Run `asd agent reload [--json]` to apply edits without restarting
+the daemon, and `asd agent explain NAME [--json]` to inspect the live screen's
+classification, matching evidence, and detector generation. Invalid edits keep
+the previous valid rules; removing an override restores the built-in rules.
+Reload exits 1 if sessions are still pending after five seconds and prints
+their identities; the new rules remain active. See
 [Agent state](docs/architecture.md#agent-state) for the rule ownership model.
 
-Configuration is read once at startup. Reopen `asd ui` after changing `[keys]`.
+`config.toml` is read once at startup. Reopen `asd ui` after changing `[keys]`.
 Changing `[session]` requires a daemon restart, so read the warning below first.
 
 ## Persistence, upgrades, and restart

@@ -168,6 +168,33 @@ pub async fn handle_conn(
         };
 
         match frame {
+            Frame::AgentExplain { name } => {
+                let handle = registry.lock().unwrap().get(&name);
+                match handle {
+                    Some(handle) => {
+                        let sink = ClientSink::new(conn_id, out_tx.clone(), Arc::clone(&queued));
+                        if handle.tx.send(SessionMsg::AgentExplain { sink }).is_err() {
+                            reply(Frame::Error {
+                                code: code::SESSION_EXITED,
+                                msg: format!("session '{name}' exited"),
+                            });
+                        }
+                    }
+                    None => reply(Frame::Error {
+                        code: code::NO_SUCH_SESSION,
+                        msg: format!("no such session '{name}'"),
+                    }),
+                }
+            }
+            Frame::ReloadAgentManifests => {
+                match Registry::reload_detectors(registry.clone()).await {
+                    Ok(report) => reply(report),
+                    Err(error) => reply(Frame::Error {
+                        code: code::INTERNAL,
+                        msg: format!("manifest reload failed: {error}"),
+                    }),
+                }
+            }
             Frame::WaitForScreen {
                 name,
                 matcher,

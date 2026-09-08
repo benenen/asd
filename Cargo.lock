@@ -220,6 +220,7 @@ dependencies = [
  "asd-dioxus",
  "asd-proto",
  "libc",
+ "serde_json",
  "tokio",
 ]
 

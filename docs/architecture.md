@@ -212,6 +212,30 @@ against captured screens in `crates/asd-daemon/src/detect/fixtures/`; the
 ignored `captured_screen` test runs them against a screen captured from a live
 session, which is how a manifest gets widened.
 
+`DetectorStore` retains immutable `(generation, Arc<Detector>)` snapshots and
+valid overrides by source path and manifest id. Reload scans and parses on a
+blocking worker outside the Registry lock. Invalid edits retain that file's
+last valid override; deletion restores the embedded rules (or an earlier
+override for that id). Files are applied in sorted path order. Unsupported
+engine versions are invalid overrides and also retain the last usable rules.
+
+A reload gate serializes preparation and installation; generation checks also
+reject stale candidates. Installation swaps the snapshot and captures current
+session handles under the Registry lock. The worker then releases that lock
+and queues `DetectorReloaded` messages, even if the requesting connection was
+cancelled. New sessions inherit the installed generation. Existing sessions
+ignore older or duplicate generations, reclassify their own current VT on a
+new generation without waiting for output, and acknowledge after applying it.
+The five-second barrier reports still-live unacknowledged identities without
+rolling back the installed rules.
+
+`AgentExplain` is evaluated by the owning session thread against its current VT
+and detector generation. Compact detection and structured explanation use the
+same predicate evaluator. Reports list candidate and selected manifests and
+every selected-manifest rule in descending priority order, with stable
+file-order ties. Matched evidence preserves screen text and non-matches report
+the first failed condition. Explain does not attach, resize, or feed the PTY.
+
 ## Paths and configuration
 
 All daemon/client endpoint resolution lives in `asd_proto::paths` so both ends
@@ -225,7 +249,8 @@ use exactly the same contract.
 - Unix data defaults to `~/.local/share/asd`; Windows data defaults to
   `%LOCALAPPDATA%\asd`.
 - User agent-detection manifests live in `<config_dir>/agents/*.toml`, beside
-  but distinct from `config.toml`. Read once at daemon startup, like the config.
+  but distinct from `config.toml`. Read at daemon startup and on
+  `asd agent reload`; the daemon never writes this directory.
 - Each session's child process is spawned with `ASD_SESSION` (its name at spawn
   time), `ASD_SESSION_ID` (opaque, rename-stable identity, new on restore), and
   `ASD_SOCKET` (the listener the hosting daemon actually serves, which

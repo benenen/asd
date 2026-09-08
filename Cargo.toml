@@ -40,6 +40,7 @@ asd-cli = { workspace = true }
 asd-dioxus = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 asd-proto = { workspace = true }
 libc = { workspace = true }
 tokio = { workspace = true }

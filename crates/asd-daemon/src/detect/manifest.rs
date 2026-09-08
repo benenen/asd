@@ -24,7 +24,7 @@ use super::AgentState;
 pub const ENGINE_VERSION: u32 = 1;
 
 /// One agent's rule set.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     /// Agent identity, matched against the session's foreground command.
     pub id: String,
@@ -55,7 +55,7 @@ impl Manifest {
 
 /// One rule: a state claim about a region of the screen, guarded by a
 /// predicate and ranked by priority.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Rule {
     /// Stable name, used in tests and in the daemon's trace output. Never
     /// matched against anything.
@@ -117,6 +117,16 @@ impl TryFrom<String> for Region {
     }
 }
 
+impl std::fmt::Display for Region {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OscTitle => f.write_str("osc_title"),
+            Self::WholeScreen => f.write_str("whole_screen"),
+            Self::BottomNonEmptyLines(n) => write!(f, "bottom_non_empty_lines({n})"),
+        }
+    }
+}
+
 /// An inclusive range of scalar values, written as hex: `"2800-28ff"`, or
 /// `"2733"` for a single one. Spinner glyphs are what this exists for — they
 /// are a *class* of characters an agent cycles through, so listing them
@@ -162,7 +172,7 @@ impl TryFrom<String> for CharRange {
 /// That last part is deliberate: a rule whose conditions were all dropped (or
 /// misspelled, since unknown keys are ignored) would otherwise match every
 /// screen and, at a high priority, pin every session to one state.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Predicate {
     /// Every string appears somewhere in the region.
@@ -191,36 +201,65 @@ impl Predicate {
     /// region, rather than once per predicate). Match strings are lowercased at
     /// the same point, so a manifest is written in whatever case reads best.
     pub fn matches(&self, region: &RegionText) -> bool {
+        self.evaluate(region).is_ok()
+    }
+
+    /// Return the matching source-line indexes, or the first failed condition.
+    /// Both compact detection and explanation use this evaluator.
+    pub(super) fn evaluate(&self, region: &RegionText) -> Result<Vec<usize>, String> {
         if self.is_empty() {
-            return false;
+            return Err("empty predicate".into());
         }
-        if !self
-            .contains
-            .iter()
-            .all(|needle| region.joined.contains(&needle.to_lowercase()))
-        {
-            return false;
+        let mut evidence = Vec::new();
+        for needle in &self.contains {
+            let folded = needle.to_lowercase();
+            if !region.joined.contains(&folded) {
+                return Err(format!("missing contains: {needle}"));
+            }
+            if folded.contains('\n') {
+                evidence.extend(0..region.lines.len());
+            } else {
+                evidence.extend(
+                    region
+                        .lines
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, line)| line.contains(&folded).then_some(i)),
+                );
+            }
         }
-        if !self
-            .line
-            .iter()
-            .all(|line| region.lines.iter().any(|text| line.matches(text)))
-        {
-            return false;
+        for predicate in &self.line {
+            let matching: Vec<_> = region
+                .lines
+                .iter()
+                .enumerate()
+                .filter_map(|(i, line)| predicate.matches(line).then_some(i))
+                .collect();
+            if matching.is_empty() {
+                return Err(format!("no line matches: {predicate:?}"));
+            }
+            evidence.extend(matching);
         }
-        if !self.any.is_empty() && !self.any.iter().any(|p| p.matches(region)) {
-            return false;
+        if !self.any.is_empty() {
+            let matching = self
+                .any
+                .iter()
+                .find_map(|predicate| predicate.evaluate(region).ok())
+                .ok_or_else(|| "no any alternative matched".to_string())?;
+            evidence.extend(matching);
         }
         if self.not.iter().any(|p| p.matches(region)) {
-            return false;
+            return Err("excluded by not predicate".into());
         }
-        true
+        evidence.sort_unstable();
+        evidence.dedup();
+        Ok(evidence)
     }
 }
 
 /// Conditions on one line. All present fields must hold on the *same* line; an
 /// empty one matches nothing, for the same reason an empty [`Predicate`] does.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct LinePredicate {
     /// The line, ignoring leading whitespace, starts with one of these.

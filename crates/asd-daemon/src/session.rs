@@ -18,7 +18,7 @@ use asd_proto::{
     TerminalColor, code,
 };
 
-use crate::detect::Detector;
+use crate::detect::{Detector, DetectorSnapshot};
 use asd_vt::{ColorQueryFilter, GhosttyVt, Rgb, VtBackend};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tracing::{debug, info, warn};
@@ -124,6 +124,16 @@ fn attach_view_rename(
 
 /// Messages sent to the session thread.
 pub enum SessionMsg {
+    /// Evaluate the VT on its owner thread, ordered with output and reloads.
+    AgentExplain {
+        sink: ClientSink,
+    },
+    /// Install a newer immutable generation and acknowledge after reclassification.
+    DetectorReloaded {
+        generation: u64,
+        detector: Arc<Detector>,
+        ack: tokio::sync::oneshot::Sender<u64>,
+    },
     /// The matcher is compiled before entering the terminal owner thread.
     WaitForScreen {
         matcher: CompiledMatcher,
@@ -546,8 +556,8 @@ fn proc_command(_pid: libc::pid_t) -> Option<String> {
 pub struct SessionContext {
     /// The listener this daemon serves, exported to the child as `$ASD_SOCKET`.
     pub socket: std::path::PathBuf,
-    /// Agent-detection rules, loaded once and shared by every session.
-    pub detector: Arc<Detector>,
+    /// Generation captured under the Registry lock when this session is spawned.
+    pub detector: DetectorSnapshot,
 }
 
 /// Create the pty, start the child process, and launch the session thread
@@ -701,6 +711,7 @@ fn session_thread(
     registry: Arc<Mutex<Registry>>,
 ) {
     let mut vt = GhosttyVt::new(cols, rows, scrollback);
+    let mut detector = context.detector;
     let mut client_output_filter = ColorQueryFilter::default();
     let mut terminal_appearance = TerminalAppearance::default();
     let mut clients: Vec<ClientSink> = Vec::new();
@@ -761,7 +772,7 @@ fn session_thread(
                     if detect_pending
                         && now_ms().saturating_sub(last_detect_ms) >= DETECT_INTERVAL_MS
                     {
-                        update_agent_state(&context.detector, &mut vt, &meta);
+                        update_agent_state(&detector.detector, &mut vt, &meta);
                         last_detect_ms = now_ms();
                         detect_pending = false;
                     }
@@ -774,6 +785,27 @@ fn session_thread(
             },
         };
         match msg {
+            SessionMsg::AgentExplain { sink } => {
+                sink.send(Frame::AgentExplainReply {
+                    report: explain_agent_state(&detector, &mut vt, &meta),
+                });
+            }
+            SessionMsg::DetectorReloaded {
+                generation,
+                detector: newer,
+                ack,
+            } => {
+                if detector.apply(DetectorSnapshot {
+                    generation,
+                    detector: newer,
+                }) {
+                    update_agent_state(&detector.detector, &mut vt, &meta);
+                    last_detect_ms = now_ms();
+                    detect_pending = false;
+                }
+                // A newer installed generation also satisfies an older barrier.
+                let _ = ack.send(detector.generation);
+            }
             SessionMsg::WaitForScreen {
                 matcher,
                 deadline,
@@ -837,7 +869,7 @@ fn session_thread(
                 // every DETECT_INTERVAL_MS; anything sooner is owed until the
                 // loop's deadline comes round.
                 if now_ms().saturating_sub(last_detect_ms) >= DETECT_INTERVAL_MS {
-                    update_agent_state(&context.detector, &mut vt, &meta);
+                    update_agent_state(&detector.detector, &mut vt, &meta);
                     last_detect_ms = now_ms();
                     detect_pending = false;
                 } else {
@@ -1340,7 +1372,7 @@ fn screen_lines(vt: &mut GhosttyVt, rows: u16) -> Vec<String> {
         .collect()
 }
 
-/// Re-read the screen and publish what the program on it is doing.
+/// Explain the current screen with the session's installed detector generation.
 ///
 /// Runs on the session thread, which exclusively owns the terminal model, so
 /// the screen it reads is never a half-drawn frame observed from outside. The
@@ -1348,6 +1380,25 @@ fn screen_lines(vt: &mut GhosttyVt, rows: u16) -> Vec<String> {
 /// remembered: a session's occupant changes when a program is started or
 /// exits, and a stale agent id would keep applying one agent's rules to
 /// another's screen.
+fn explain_agent_state(
+    detector: &DetectorSnapshot,
+    vt: &mut GhosttyVt,
+    meta: &SessionMeta,
+) -> asd_proto::DetectionReport {
+    let command =
+        foreground_command(meta.pty_master_fd.load(Ordering::Relaxed)).unwrap_or_default();
+    let title = vt.title();
+    let lines = screen_lines(vt, meta.rows.load(Ordering::Relaxed));
+    detector.detector.explain(
+        detector.generation,
+        &command,
+        &crate::detect::Screen {
+            title: &title,
+            lines: &lines,
+        },
+    )
+}
+
 fn update_agent_state(detector: &Detector, vt: &mut GhosttyVt, meta: &SessionMeta) {
     let command =
         foreground_command(meta.pty_master_fd.load(Ordering::Relaxed)).unwrap_or_default();

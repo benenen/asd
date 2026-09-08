@@ -21,15 +21,19 @@
 //! capture checked into `fixtures/` rather than carried over on trust.
 
 mod manifest;
+mod report;
+mod store;
 
+#[cfg(test)]
 use std::path::Path;
 
-use tracing::{info, warn};
+use tracing::warn;
 
 /// The state vocabulary is the protocol's: the daemon is the only thing that
 /// may set it, and every client reads the same enum off the wire.
 pub use asd_proto::AgentState;
 pub use manifest::{ENGINE_VERSION, Manifest, Region, RegionText, Rule};
+pub use store::{DetectorSnapshot, DetectorStore, PreparedDetectorReload};
 
 /// Rule sets shipped with the binary. A user file of the same `id` replaces
 /// the embedded one wholesale — merging two rule sets by priority would make
@@ -78,15 +82,23 @@ pub struct Detector {
 }
 
 impl Detector {
-    /// The embedded rule sets, with any file in `overrides` replacing the
-    /// embedded manifest of the same `id`. A missing directory is not an
-    /// error — it is the normal case.
-    ///
-    /// A file that fails to parse is skipped with a warning and the embedded
-    /// copy stands. Detection is a display nicety; a typo in a hand-edited
-    /// rule file must never keep the daemon from serving sessions.
+    /// Load immutable rules; live daemon reloads retain a DetectorStore.
+    #[cfg(test)]
     pub fn load(overrides: Option<&Path>) -> Self {
-        let mut manifests: Vec<Manifest> = EMBEDDED
+        match overrides {
+            Some(dir) => Self {
+                manifests: DetectorStore::load(dir.to_owned())
+                    .snapshot()
+                    .detector
+                    .manifests
+                    .clone(),
+            },
+            None => Self::embedded(),
+        }
+    }
+
+    fn embedded() -> Self {
+        let manifests = EMBEDDED
             .iter()
             .filter_map(|text| match toml::from_str::<Manifest>(text) {
                 Ok(m) => Some(m),
@@ -99,36 +111,6 @@ impl Detector {
                 }
             })
             .collect();
-
-        if let Some(dir) = overrides {
-            for text in read_manifest_dir(dir) {
-                match toml::from_str::<Manifest>(&text) {
-                    Ok(m) => {
-                        info!(
-                            agent = %m.id,
-                            version = %m.version,
-                            "agent manifest loaded from the config directory"
-                        );
-                        manifests.retain(|existing| existing.id != m.id);
-                        manifests.push(m);
-                    }
-                    Err(e) => warn!(error = %e, "agent manifest is invalid; keeping the built-in"),
-                }
-            }
-        }
-
-        manifests.retain(|m| {
-            let ok = m.min_engine_version <= ENGINE_VERSION;
-            if !ok {
-                warn!(
-                    agent = %m.id,
-                    wants = m.min_engine_version,
-                    have = ENGINE_VERSION,
-                    "agent manifest needs a newer detection engine; skipping"
-                );
-            }
-            ok
-        });
 
         Self { manifests }
     }
@@ -148,29 +130,7 @@ impl Detector {
     /// The winning rule. Highest priority wins; ties go to the earlier rule in
     /// the file.
     pub(crate) fn matching_rule(&self, command: &str, screen: &Screen<'_>) -> Option<&Rule> {
-        let id = agent_id(command)?;
-        let manifest = self.manifests.iter().find(|m| m.matches_agent(&id))?;
-
-        // One region is usually read by several rules; lowercasing it once per
-        // distinct region keeps a screenful of rules to a handful of passes.
-        let mut cache: Vec<(Region, RegionText)> = Vec::new();
-        let mut best: Option<&Rule> = None;
-        for rule in &manifest.rules {
-            if best.is_some_and(|b| b.priority >= rule.priority) {
-                continue;
-            }
-            let text = match cache.iter().position(|(r, _)| *r == rule.region) {
-                Some(i) => &cache[i].1,
-                None => {
-                    cache.push((rule.region, RegionText::new(screen.region(rule.region))));
-                    &cache.last().expect("just pushed").1
-                }
-            };
-            if rule.predicate.matches(text) {
-                best = Some(rule);
-            }
-        }
-        best
+        self.evaluate(command, screen, |_, _, _, _| {}).1
     }
 }
 
@@ -205,30 +165,6 @@ fn basename(word: &str) -> Option<String> {
     let base = word.rsplit(['/', '\\']).next().unwrap_or(word);
     let base = base.strip_suffix(".exe").unwrap_or(base);
     (!base.is_empty()).then(|| base.to_lowercase())
-}
-
-/// Every `*.toml` in `dir`, sorted by name so two files claiming one `id`
-/// resolve the same way on every start. Unreadable entries are skipped.
-fn read_manifest_dir(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut paths: Vec<_> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "toml"))
-        .collect();
-    paths.sort();
-    paths
-        .iter()
-        .filter_map(|p| match std::fs::read_to_string(p) {
-            Ok(text) => Some(text),
-            Err(e) => {
-                warn!(path = %p.display(), error = %e, "reading agent manifest failed");
-                None
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

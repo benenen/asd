@@ -8,6 +8,189 @@
 
 use super::*;
 
+#[test]
+fn session_snapshot_rejects_older_and_duplicate_generations() {
+    let mut current = DetectorSnapshot {
+        generation: 4,
+        detector: std::sync::Arc::new(Detector {
+            manifests: Vec::new(),
+        }),
+    };
+    for generation in [3, 4] {
+        assert!(!current.apply(DetectorSnapshot {
+            generation,
+            detector: std::sync::Arc::new(Detector::load(None))
+        }));
+    }
+    let (title, lines) = fixture("codex-working");
+    let screen = Screen {
+        title: &title,
+        lines: &lines,
+    };
+    assert_eq!(
+        current.detector.detect("codex", &screen).0,
+        AgentState::Unknown
+    );
+    assert!(current.apply(DetectorSnapshot {
+        generation: 5,
+        detector: std::sync::Arc::new(Detector::load(None))
+    }));
+    assert_eq!(current.generation, 5);
+    assert_eq!(
+        current.detector.detect("codex", &screen).0,
+        AgentState::Working
+    );
+}
+
+#[test]
+fn invalid_new_override_diagnostic_identifies_the_unsupported_manifest() {
+    let dir = temp_dir("diagnostic-id");
+    let store = DetectorStore::load(dir.clone());
+    std::fs::write(
+        dir.join("new.toml"),
+        "id = 'codex'\nmin_engine_version = 99",
+    )
+    .unwrap();
+    let prepared = store.reload_candidate();
+    assert_eq!(
+        prepared.diagnostics[0].manifest_id.as_deref(),
+        Some("codex")
+    );
+    assert!(!prepared.diagnostics[0].retained_previous);
+    assert!(prepared.diagnostics[0].message.contains("engine 99"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn reload_retains_invalid_edits_and_deletion_restores_embedded_rules() {
+    let dir = temp_dir("reload");
+    let path = dir.join("codex.toml");
+    let mut store = DetectorStore::load(dir.clone());
+    let original = store.snapshot();
+    let (title, lines) = fixture("codex-working");
+    let screen = Screen {
+        title: &title,
+        lines: &lines,
+    };
+    assert_eq!(
+        original.detector.detect("codex", &screen).0,
+        AgentState::Working
+    );
+    std::fs::write(&path, "id = 'codex'\n[[rules]]\nid = 'override'\nstate = 'blocked'\nregion = 'whole_screen'\ncontains = ['Esc to interrupt']\n").unwrap();
+    let prepared = store.reload_candidate();
+    assert_eq!(store.snapshot().generation, original.generation);
+    let replaced = store.install(prepared);
+    assert_eq!(replaced.generation, original.generation + 1);
+    assert_eq!(
+        replaced.detector.detect("codex", &screen).0,
+        AgentState::Blocked
+    );
+    assert_eq!(
+        original.detector.detect("codex", &screen).0,
+        AgentState::Working
+    );
+    std::fs::write(&path, "id = 'renamed'\n[[rules]\n").unwrap();
+    let prepared = store.reload_candidate();
+    assert_eq!(prepared.diagnostics.len(), 1);
+    assert!(prepared.diagnostics[0].retained_previous);
+    assert_eq!(
+        prepared.diagnostics[0].manifest_id.as_deref(),
+        Some("codex")
+    );
+    assert_eq!(prepared.diagnostics[0].path, path.to_string_lossy());
+    assert_eq!(
+        store.install(prepared).detector.detect("codex", &screen).0,
+        AgentState::Blocked
+    );
+    std::fs::remove_file(path).unwrap();
+    let prepared = store.reload_candidate();
+    assert_eq!(
+        store.install(prepared).detector.detect("codex", &screen).0,
+        AgentState::Working
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn stale_reload_candidates_cannot_replace_newer_committed_rules() {
+    let dir = temp_dir("stale-reload");
+    let mut store = DetectorStore::load(dir.clone());
+    let stale = store.reload_candidate();
+    std::fs::write(dir.join("codex.toml"), "id = 'codex'\nrules = []").unwrap();
+    let fresh = store.reload_candidate();
+    let installed = store.install(fresh);
+    let after_stale = store.install(stale);
+    assert_eq!(after_stale.generation, installed.generation);
+    let (title, lines) = fixture("codex-working");
+    assert_eq!(
+        after_stale
+            .detector
+            .detect(
+                "codex",
+                &Screen {
+                    title: &title,
+                    lines: &lines
+                }
+            )
+            .0,
+        AgentState::Unknown
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn explain_reports_fixture_evidence_and_each_rule_in_priority_order() {
+    let detector = Detector::load(None);
+    let (title, lines) = fixture("codex-working");
+    let report = detector.explain(
+        7,
+        "node /opt/bin/codex",
+        &Screen {
+            title: &title,
+            lines: &lines,
+        },
+    );
+    assert_eq!(report.generation, 7);
+    assert_eq!(report.foreground_command, "node /opt/bin/codex");
+    assert_eq!(report.candidate_manifest_ids, ["codex"]);
+    assert_eq!(report.selected_manifest_id.as_deref(), Some("codex"));
+    assert_eq!(report.state, AgentState::Working);
+    assert_eq!(
+        report
+            .rules
+            .iter()
+            .map(|r| r.rule_id.as_str())
+            .collect::<Vec<_>>(),
+        ["turn_in_progress", "approval_prompt", "composer_ready"]
+    );
+    let winner = &report.rules[0];
+    assert_eq!(winner.manifest_id, "codex");
+    assert_eq!(winner.region, "bottom_non_empty_lines(12)");
+    assert_eq!(winner.priority, 970);
+    assert!(winner.matched);
+    assert_eq!(winner.evidence, ["  Esc to interrupt"]);
+    assert_eq!(winner.reason, None);
+    assert!(!report.rules[1].matched);
+    assert_eq!(
+        report.rules[1].reason.as_deref(),
+        Some("missing contains: esc to cancel")
+    );
+    assert!(report.rules[1].evidence.is_empty());
+    assert_eq!(
+        detector
+            .explain(
+                7,
+                "sh",
+                &Screen {
+                    title: &title,
+                    lines: &lines
+                }
+            )
+            .selected_manifest_id,
+        None
+    );
+}
+
 /// The shipped fixtures. Adding a screen here (and a case below) is how a new
 /// rule earns its place.
 const FIXTURES: &[(&str, &str)] = &[
@@ -402,11 +585,9 @@ fn a_manifest_needing_a_newer_engine_is_skipped() {
     )
     .unwrap();
 
-    // The override replaces the embedded claude manifest, then loses to the
-    // engine check — so claude has no rules at all rather than the built-in
-    // ones plus a file the engine cannot fully read.
+    // An unsupported override is invalid and must not erase usable built-ins.
     let detector = Detector::load(Some(&dir));
-    assert!(!detector.manifests.iter().any(|m| m.id == "claude"));
+    assert!(detector.manifests.iter().any(|m| m.id == "claude"));
     assert!(detector.manifests.iter().any(|m| m.id == "codex"));
     std::fs::remove_dir_all(&dir).ok();
 }

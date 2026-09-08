@@ -208,6 +208,29 @@ without detection rules — falls back to the activity rule `list` uses to print
 "idle": no bytes for the settle interval. `--until` overrides the whole thing
 and waits for exactly one state.
 
+## Agent detection diagnostics
+
+`asd agent explain NAME [--json]` requests an explanation from the session's
+own terminal thread. JSON is the protocol `DetectionReport` object, including
+`foreground_command`, `candidate_manifest_ids`, `selected_manifest_id`,
+`state`, all evaluated `rules`, and `generation`. Each rule includes its
+manifest and rule identifiers, priority, state, region, match result, evidence,
+and non-match reason. Text output renders those same fields.
+
+`asd agent reload [--json]` rereads the daemon's manifest directory. Valid
+overrides replace rules wholesale; invalid edits retain the previous valid
+override and report a diagnostic. Deleting an override returns to the embedded
+rules. Existing quiet sessions immediately reevaluate their current screen.
+Neither command needs `ASD_SESSION_ID` or an attachment.
+
+Reload JSON is an object with `generation`, `diagnostics`, and
+`pending_identities`. The installed generation stays active even when some
+session threads have not acknowledged within five seconds. Empty pending
+identities means exit 0; a non-empty list is printed before exit 1. Delayed
+session threads still apply their queued generation unless they have already
+applied a newer one. Invalid-file diagnostics alone do not imply a partial
+session barrier or failure exit status.
+
 ## Authoritative agent resume hooks
 
 Configure the agent's lifecycle hooks explicitly to invoke these commands;

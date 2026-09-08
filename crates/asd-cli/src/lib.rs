@@ -40,7 +40,7 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Agent lifecycle reporting and resume metadata.
+    /// Agent detection diagnostics, lifecycle reporting, and resume metadata.
     Agent {
         #[command(subcommand)]
         cmd: agent::Command,

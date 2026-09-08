@@ -1,4 +1,4 @@
-//! Lifecycle hooks report typed metadata without interpolating stdin into a shell.
+//! Agent detection diagnostics and typed, authoritative lifecycle hooks.
 
 use anyhow::{Context, bail};
 use asd_proto::{AgentHookAction, AgentKind, ClientKind, Frame, SessionIdentity};
@@ -13,6 +13,17 @@ pub enum Phase {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Explain the live session screen using the daemon's current rules.
+    Explain {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reload agent manifests and wait up to five seconds for existing sessions.
+    Reload {
+        #[arg(long)]
+        json: bool,
+    },
     /// Read an authoritative agent lifecycle payload from stdin.
     Hook { kind: AgentKind, phase: Phase },
     /// Remove resume metadata for the exact session hosting this command.
@@ -58,6 +69,15 @@ fn parse_hook(
 }
 
 pub async fn run(socket: &std::path::Path, command: Command) -> anyhow::Result<()> {
+    let command = match command {
+        Command::Explain { name, json } => {
+            return diagnostics(socket, Frame::AgentExplain { name }, json).await;
+        }
+        Command::Reload { json } => {
+            return diagnostics(socket, Frame::ReloadAgentManifests, json).await;
+        }
+        hook => hook,
+    };
     let identity: SessionIdentity = std::env::var("ASD_SESSION_ID")
         .context("ASD_SESSION_ID is required; run inside an asd session")?
         .parse()
@@ -87,6 +107,9 @@ pub async fn run(socket: &std::path::Path, command: Command) -> anyhow::Result<(
             Frame::ClearAgentSession { identity },
             Frame::AgentSessionCleared,
         ),
+        Command::Explain { .. } | Command::Reload { .. } => {
+            unreachable!("diagnostics handled above")
+        }
     };
     let mut client = crate::client::connect(socket, ClientKind::Cli).await?;
     client.writer.write_frame(&frame).await?;
@@ -94,6 +117,90 @@ pub async fn run(socket: &std::path::Path, command: Command) -> anyhow::Result<(
         Some(reply) if reply == expected => Ok(()),
         Some(Frame::Error { code, msg }) => bail!("agent report rejected ({code}): {msg}"),
         _ => bail!("daemon closed or returned an unexpected agent acknowledgement"),
+    }
+}
+
+async fn diagnostics(socket: &std::path::Path, request: Frame, json: bool) -> anyhow::Result<()> {
+    let mut client = crate::client::connect(socket, ClientKind::Cli).await?;
+    client.writer.write_frame(&request).await?;
+    let reply = client
+        .reader
+        .read_frame()
+        .await?
+        .context("daemon closed before agent diagnostics reply")?;
+    match (request, reply) {
+        (Frame::AgentExplain { .. }, Frame::AgentExplainReply { report }) => {
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!(
+                    "command: {:?}\nstate: {}\ngeneration: {}",
+                    report.foreground_command, report.state, report.generation
+                );
+                println!(
+                    "candidates: {}\nselected: {}",
+                    report.candidate_manifest_ids.join(", "),
+                    report.selected_manifest_id.as_deref().unwrap_or("none")
+                );
+                for rule in report.rules {
+                    println!(
+                        "{} / {}: {} priority={} region={} matched={}",
+                        rule.manifest_id,
+                        rule.rule_id,
+                        rule.state,
+                        rule.priority,
+                        rule.region,
+                        rule.matched
+                    );
+                    for evidence in rule.evidence {
+                        println!("  evidence: {evidence:?}");
+                    }
+                    if let Some(reason) = rule.reason {
+                        println!("  reason: {reason}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        (
+            Frame::ReloadAgentManifests,
+            Frame::AgentManifestsReloaded {
+                generation,
+                diagnostics,
+                pending_identities,
+            },
+        ) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "generation": generation, "diagnostics": diagnostics, "pending_identities": pending_identities })
+                );
+            } else {
+                println!(
+                    "detector generation {generation} active; {} sessions pending",
+                    pending_identities.len()
+                );
+                for diagnostic in &diagnostics {
+                    println!(
+                        "{}: {} (retained previous: {})",
+                        diagnostic.path, diagnostic.message, diagnostic.retained_previous
+                    );
+                }
+                for identity in &pending_identities {
+                    println!("pending: {identity}");
+                }
+            }
+            if !pending_identities.is_empty() {
+                bail!(
+                    "detector generation {generation} is active; some sessions have not acknowledged it"
+                );
+            }
+            Ok(())
+        }
+        (_, Frame::Error { code, msg }) => {
+            Err(crate::exit::daemon("agent diagnostics", code, &msg))
+        }
+        _ => bail!("daemon returned an unexpected agent diagnostics reply"),
     }
 }
 

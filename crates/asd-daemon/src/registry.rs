@@ -8,14 +8,18 @@ use crate::session::kill_child;
 use asd_proto::{SessionIdentity, SessionInfo, code, paths};
 use tracing::info;
 
-use crate::detect::Detector;
+use crate::detect::DetectorStore;
 use crate::session::{SessionContext, SessionHandle, SessionMsg, spawn_session};
 
 /// Default terminal size for a create without dimensions (immediately
 /// overridden by the client's size on attach).
 const DEFAULT_SIZE: (u16, u16) = (80, 24);
 
+mod reload;
+
 pub struct Registry {
+    detectors: DetectorStore,
+    reload_gate: Arc<tokio::sync::Mutex<()>>,
     sessions: HashMap<String, SessionHandle>,
     agent_records: HashMap<SessionIdentity, crate::agent_resume::AgentResumeRecord>,
     /// Auto-naming counter for `s0`, `s1`, ... — monotonically increasing
@@ -54,6 +58,7 @@ impl Registry {
         unrestored: Vec<crate::store::SessionState>,
         socket_path: PathBuf,
     ) -> Self {
+        let detectors = DetectorStore::load(paths::agents_dir());
         Self {
             sessions: HashMap::new(),
             agent_records: HashMap::new(),
@@ -63,11 +68,10 @@ impl Registry {
             unrestored,
             context: SessionContext {
                 socket: socket_path,
-                // Loaded once per daemon: the rules are the same for every
-                // session, and re-reading the config directory per spawn would
-                // let two sessions started minutes apart disagree.
-                detector: Arc::new(Detector::load(Some(&paths::agents_dir()))),
+                detector: detectors.snapshot(),
             },
+            detectors,
+            reload_gate: Arc::new(tokio::sync::Mutex::new(())),
             persist_frozen: false,
             last_persisted: Vec::new(),
             host_metrics: None,

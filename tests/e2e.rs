@@ -25,6 +25,97 @@ fn cli_exe() -> &'static str {
     env!("CARGO_BIN_EXE_asd")
 }
 
+#[tokio::test]
+async fn agent_reload_reclassifies_quiet_sessions_and_explain_reads_the_owner_vt() {
+    let daemon = Daemon::start("detector-reload");
+    let fake = daemon.dir.join("codex");
+    std::fs::copy("/bin/sh", &fake).unwrap();
+    let script = format!(
+        "exec {} -c 'printf \"Esc to interrupt\\r\\n\"; read answer'",
+        fake.display()
+    );
+    let created = daemon
+        .cli()
+        .args(["new", "quiet", "--cmd", &script])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    let ready = daemon
+        .cli()
+        .args([
+            "wait",
+            "quiet",
+            "--text",
+            "Esc to interrupt",
+            "--timeout",
+            "5s",
+        ])
+        .output()
+        .unwrap();
+    assert!(ready.status.success(), "{ready:?}");
+    let explain = || {
+        let output = daemon
+            .cli()
+            .env_remove("ASD_SESSION_ID")
+            .args(["agent", "explain", "quiet", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let before = explain();
+    assert_eq!(before["state"], "working");
+    assert_eq!(before["selected_manifest_id"], "codex");
+    let override_dir = daemon.dir.join("config/asd/agents");
+    std::fs::create_dir_all(&override_dir).unwrap();
+    let path = override_dir.join("codex.toml");
+    std::fs::write(&path, "id = 'codex'\n[[rules]]\nid = 'quiet_override'\nstate = 'blocked'\nregion = 'whole_screen'\ncontains = ['Esc to interrupt']\n").unwrap();
+    let reload = || {
+        let output = daemon
+            .cli()
+            .env_remove("ASD_SESSION_ID")
+            .args(["agent", "reload", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let installed = reload();
+    assert_eq!(installed["pending_identities"], serde_json::json!([]));
+    assert_eq!(
+        installed["generation"].as_u64(),
+        before["generation"].as_u64().map(|g| g + 1)
+    );
+    let after = explain();
+    assert_eq!(after["generation"], installed["generation"]);
+    assert_eq!(after["state"], "blocked");
+    assert_eq!(after["rules"][0]["rule_id"], "quiet_override");
+    let inspect = daemon
+        .cli()
+        .args(["inspect", "quiet", "--json"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&inspect.stdout).contains(r#""status":"blocked""#));
+    std::fs::write(&path, "invalid TOML").unwrap();
+    let invalid = reload();
+    assert_eq!(invalid["diagnostics"][0]["retained_previous"], true);
+    assert_eq!(explain()["state"], "blocked");
+    std::fs::remove_file(path).unwrap();
+    let reverted = reload();
+    assert_eq!(explain()["state"], "working");
+    assert_eq!(explain()["generation"], reverted["generation"]);
+    let text = daemon
+        .cli()
+        .args(["agent", "explain", "quiet"])
+        .output()
+        .unwrap();
+    assert!(text.status.success(), "{text:?}");
+    assert!(String::from_utf8_lossy(&text.stdout).contains("turn_in_progress"));
+    let text = daemon.cli().args(["agent", "reload"]).output().unwrap();
+    assert!(text.status.success(), "{text:?}");
+    assert!(String::from_utf8_lossy(&text.stdout).contains("generation"));
+}
+
 fn agent_hook(
     daemon: &Daemon,
     identity: &str,
@@ -49,6 +140,56 @@ fn agent_hook(
         .write_all(payload.as_bytes())
         .unwrap();
     child.wait_with_output().unwrap()
+}
+
+#[tokio::test]
+async fn agent_reload_partial_reply_is_printed_and_exits_one() {
+    for json in [false, true] {
+        let socket = ScriptedSocket::new("partial-agent-reload");
+        let listener = UnixListener::bind(&socket.path).unwrap();
+        let mut command = tokio::process::Command::new(cli_exe());
+        command
+            .arg("--socket")
+            .arg(&socket.path)
+            .args(["agent", "reload"])
+            .env_remove("ASD_SESSION_ID");
+        if json {
+            command.arg("--json");
+        }
+        let child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut reader, mut writer) = accept_cli(&listener).await;
+        assert_eq!(
+            scripted_recv(&mut reader).await,
+            Some(Frame::ReloadAgentManifests)
+        );
+        writer
+            .write_frame(&Frame::AgentManifestsReloaded {
+                generation: 9,
+                diagnostics: Vec::new(),
+                pending_identities: vec![asd_proto::SessionIdentity { instance_id: 42 }],
+            })
+            .await
+            .unwrap();
+        let output = timeout(WAIT, child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        if json {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["generation"], 9);
+            assert_eq!(value["pending_identities"].as_array().unwrap().len(), 1);
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("generation 9 active; 1 sessions pending")
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -450,6 +591,7 @@ impl Daemon {
             .arg("--socket")
             .arg(&socket)
             .env("XDG_DATA_HOME", dir.join("data"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
             .env(
                 "PATH",
                 format!(
@@ -483,6 +625,7 @@ impl Daemon {
         // sessions.json, mirroring production where the daemon and CLI share the
         // shell's XDG_DATA_HOME.
         cmd.env("XDG_DATA_HOME", self.dir.join("data"));
+        cmd.env("XDG_CONFIG_HOME", self.dir.join("config"));
         cmd
     }
 
