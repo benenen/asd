@@ -539,18 +539,12 @@ pub struct SessionContext {
 /// would otherwise leave its children resolving the default path, so an `asd`
 /// command run *inside* a session would address a different daemon than the one
 /// hosting it.
-fn set_session_env(
-    builder: &mut CommandBuilder,
-    name: &str,
-    identity: SessionIdentity,
-    socket: &std::path::Path,
-) {
+fn set_session_env(builder: &mut CommandBuilder, name: &str, socket: &std::path::Path) {
     builder.env("TERM", "xterm-256color");
     // Which session a process runs inside (tmux's $TMUX idea): render clients
     // check it to refuse attaching the session that hosts them — attaching
     // yourself is a render feedback loop that floods the pty.
     builder.env("ASD_SESSION", name);
-    builder.env("ASD_SESSION_ID", identity.to_string());
     builder.env("ASD_SOCKET", socket);
 }
 
@@ -595,7 +589,7 @@ pub fn spawn_session(
         }
         None => CommandBuilder::new_default_prog(), // $SHELL
     };
-    set_session_env(&mut builder, &name, identity, &context.socket);
+    set_session_env(&mut builder, &name, &context.socket);
     // Working directory: the requested one (a restart workspace restore) when it
     // still exists, else the process default ($HOME). A stale/missing dir must
     // not fail the spawn — fall back rather than error.
@@ -1689,27 +1683,21 @@ mod scripting_tests {
 mod session_env_tests {
     use super::*;
 
-    /// The child is told which daemon owns it, so `asd` run inside a session
-    /// reaches that daemon even when it listens somewhere non-default.
+    /// The child is told which session and daemon own it, so `asd` run inside
+    /// a session reaches that daemon even when it listens somewhere non-default.
     #[test]
-    fn session_env_carries_the_daemons_own_socket() {
+    fn session_env_contains_only_the_existing_session_contract() {
         let mut builder = CommandBuilder::new("/bin/sh");
 
         set_session_env(
             &mut builder,
             "web",
-            SessionIdentity {
-                instance_id: 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF,
-            },
             std::path::Path::new("/custom/asd.sock"),
         );
 
         assert_eq!(builder.get_env("ASD_SESSION").unwrap(), "web");
-        assert_eq!(
-            builder.get_env("ASD_SESSION_ID").unwrap(),
-            "0123456789abcdef0123456789abcdef"
-        );
         assert_eq!(builder.get_env("ASD_SOCKET").unwrap(), "/custom/asd.sock");
         assert_eq!(builder.get_env("TERM").unwrap(), "xterm-256color");
+        assert_eq!(builder.get_env("ASD_SESSION_ID"), None);
     }
 }
