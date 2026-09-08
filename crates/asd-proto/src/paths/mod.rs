@@ -34,12 +34,13 @@ pub fn is_valid_session_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Path of the persisted session list: `<data_dir>/sessions.tsv`. The daemon
-/// rewrites it on every session create/rename/kill and restores from it on every
-/// startup. Lives in the (persistent) data directory, keyed by it — a single
-/// daemon per data directory. Read-write daemon state, distinct from the
-/// read-only user `config.toml`.
-pub fn session_list_path() -> PathBuf {
+/// Path of the authoritative persisted session store: `<data_dir>/sessions.json`.
+pub fn session_store_path() -> PathBuf {
+    data_dir().join("sessions.json")
+}
+
+/// Path of the pre-versioned session list, used only for one-way migration.
+pub fn legacy_session_list_path() -> PathBuf {
     data_dir().join("sessions.tsv")
 }
 
@@ -68,8 +69,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_list_path_is_sessions_tsv_in_data_dir() {
-        let p = session_list_path();
+    fn session_store_path_is_sessions_json_in_data_dir() {
+        let p = session_store_path();
+        assert_eq!(
+            p.file_name().unwrap(),
+            std::ffi::OsStr::new("sessions.json")
+        );
+        assert_eq!(p.parent().unwrap(), data_dir());
+    }
+
+    #[test]
+    fn legacy_session_list_path_is_sessions_tsv_in_data_dir() {
+        let p = legacy_session_list_path();
         assert_eq!(p.file_name().unwrap(), std::ffi::OsStr::new("sessions.tsv"));
         assert_eq!(p.parent().unwrap(), data_dir());
     }

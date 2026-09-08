@@ -264,11 +264,14 @@ dependencies = [
  "nix 0.30.1",
  "portable-pty",
  "serde",
+ "serde_json",
  "sysinfo",
+ "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

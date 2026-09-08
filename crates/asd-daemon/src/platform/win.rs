@@ -13,6 +13,69 @@ use crate::conn;
 use crate::registry::Registry;
 use crate::session::SessionMsg;
 
+/// Create a unique sibling temporary file. Windows does not expose Unix file
+/// modes, but `create_new` prevents another process from claiming this name.
+pub(crate) fn create_private_temp(destination: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let name = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    for _ in 0..128 {
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate unique session-store temporary file",
+    ))
+}
+
+/// Replace the destination through the Windows native replacement operation.
+pub(crate) fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Windows replacement with `MOVEFILE_WRITE_THROUGH` is the available
+/// directory-entry durability boundary for this store.
+pub(crate) fn sync_parent(_destination: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 // ---- Listener ---------------------------------------------------------------
 
 pub(crate) async fn serve_connections(

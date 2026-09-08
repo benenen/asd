@@ -7,12 +7,13 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
 use asd_proto::paths;
 use tracing::{info, warn};
 
 use crate::config;
 use crate::registry::Registry;
-use crate::store;
+use crate::store::{SessionStore, StoreLoad};
 
 /// How often the persisted session list re-reads each session's live cwd.
 const CWD_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
@@ -98,10 +99,21 @@ fn stage_restored_command(
 /// [`stage_restored_command`].
 pub(super) async fn serve(socket_path: PathBuf, force_run_commands: bool) -> anyhow::Result<()> {
     let config = config::Config::load(&paths::config_path());
-    let persist_path = paths::session_list_path();
+    let store_path = paths::session_store_path();
+    let legacy_path = paths::legacy_session_list_path();
+    let StoreLoad {
+        store,
+        sessions: restore_states,
+        diagnostics,
+    } = SessionStore::open(store_path.clone(), legacy_path)
+        .with_context(|| format!("opening session store {}", store_path.display()))?;
+    for diagnostic in diagnostics {
+        warn!(%diagnostic, "session-store migration warning");
+    }
     let registry = Arc::new(Mutex::new(Registry::new(
         config.scrollback_lines,
-        persist_path.clone(),
+        store,
+        restore_states.clone(),
         socket_path.clone(),
     )));
 
@@ -110,10 +122,11 @@ pub(super) async fn serve(socket_path: PathBuf, force_run_commands: bool) -> any
     // `cd`'d to its saved cwd, with the command it was created with typed at
     // that shell's prompt but not run. Each create re-persists the file.
     let run_commands = force_run_commands || config.run_restored_commands;
-    for st in store::read(&persist_path) {
+    for st in restore_states {
         match Registry::restore(&registry, st.name.clone(), st.command.clone(), st.cwd) {
             Ok(name) => {
                 info!(session = %st.name, staged = st.command.is_some(), "session restored");
+                registry.lock().unwrap().mark_restored(&st.name);
                 if let Some(command) = st.command {
                     stage_restored_command(Arc::clone(&registry), name, command, run_commands);
                 }
@@ -121,10 +134,8 @@ pub(super) async fn serve(socket_path: PathBuf, force_run_commands: bool) -> any
             Err((code, msg)) => warn!(session = %st.name, code, %msg, "restore failed"),
         }
     }
-    // Compact the file down to what actually came back. Each successful restore
-    // above already re-persists, but a boot where every entry failed to restore
-    // (e.g. a stale hand-edited file) would otherwise leave the bad entries on
-    // disk and retry them forever — this one write drops them.
+    // Recommit the union of live and failed-to-restore records. A failed record
+    // stays durable for a future retry instead of being compacted away.
     registry.lock().unwrap().persist();
 
     spawn_cwd_refresh(Arc::clone(&registry));

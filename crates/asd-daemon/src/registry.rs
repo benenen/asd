@@ -1,6 +1,6 @@
 //! Session registry: daemon-wide unique naming, create/list/kill.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -23,8 +23,11 @@ pub struct Registry {
     /// Scrollback depth (lines) applied to every session this registry spawns;
     /// comes from the daemon config, resolved once at startup.
     scrollback_lines: usize,
-    /// Where the live session list is persisted; rewritten on every mutation.
-    persist_path: PathBuf,
+    /// The registry-owned serialized writer for durable session state.
+    store: crate::store::SessionStore,
+    /// Restored records whose shells could not be recreated. They remain in
+    /// durable state for a later daemon start instead of being compacted away.
+    unrestored: Vec<crate::store::SessionState>,
     /// What every session this registry spawns needs from the daemon: its
     /// listener (handed to each child as `$ASD_SOCKET`, so an `asd` command run
     /// inside a session addresses the daemon hosting it) and the shared
@@ -33,7 +36,7 @@ pub struct Registry {
     /// Once set (at shutdown), `persist` is a no-op — so the SIGHUP-driven
     /// session removals during shutdown don't wipe the file before restart.
     persist_frozen: bool,
-    /// What was last written to `persist_path`, so the periodic cwd refresh can
+    /// What was last written to the store, so the periodic cwd refresh can
     /// skip the write when nothing moved.
     last_persisted: Vec<crate::store::SessionState>,
     /// The sampler's most recent reading and when it was taken. `None` until
@@ -42,15 +45,20 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Create an empty registry whose sessions each keep `scrollback_lines` lines
-    /// of scrollback, whose live set is persisted to `persist_path`, and whose
-    /// children are pointed at `socket_path`.
-    pub fn new(scrollback_lines: usize, persist_path: PathBuf, socket_path: PathBuf) -> Self {
+    /// Create a registry whose sessions each keep `scrollback_lines` lines of
+    /// scrollback and whose children are pointed at `socket_path`.
+    pub fn new(
+        scrollback_lines: usize,
+        store: crate::store::SessionStore,
+        unrestored: Vec<crate::store::SessionState>,
+        socket_path: PathBuf,
+    ) -> Self {
         Self {
             sessions: HashMap::new(),
             next_auto: 0,
             scrollback_lines,
-            persist_path,
+            store,
+            unrestored,
             context: SessionContext {
                 socket: socket_path,
                 // Loaded once per daemon: the rules are the same for every
@@ -90,6 +98,17 @@ impl Registry {
         command: Option<String>,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<String, (u32, String)> {
+        if let Some(path) = cwd.as_ref()
+            && !path.is_dir()
+        {
+            return Err((
+                code::INTERNAL,
+                format!(
+                    "failed to restore session '{name}': cwd {} is not a directory",
+                    path.display()
+                ),
+            ));
+        }
         Self::spawn(registry, Some(name), None, command, cwd)
     }
 
@@ -154,7 +173,8 @@ impl Registry {
     /// persistence/restore. Reads `/proc/<pid>/cwd` under the lock — a cheap
     /// readlink.
     pub fn snapshot(&self) -> Vec<crate::store::SessionState> {
-        self.sessions
+        let mut states: Vec<_> = self
+            .sessions
             .values()
             .map(|h| {
                 let name = h
@@ -170,7 +190,22 @@ impl Registry {
                     command: h.spawn_command.clone(),
                 }
             })
-            .collect()
+            .collect();
+        states.sort_by(|left, right| left.name.cmp(&right.name));
+        states
+    }
+
+    fn persisted_state(&self) -> Vec<crate::store::SessionState> {
+        let mut states: BTreeMap<String, crate::store::SessionState> = self
+            .unrestored
+            .iter()
+            .cloned()
+            .map(|state| (state.name.clone(), state))
+            .collect();
+        for state in self.snapshot() {
+            states.insert(state.name.clone(), state);
+        }
+        states.into_values().collect()
     }
 
     /// Rewrite the persisted session list from the live set (no-op while frozen).
@@ -180,24 +215,37 @@ impl Registry {
         if self.persist_frozen {
             return;
         }
-        let snap = self.snapshot();
+        let snap = self.persisted_state();
         // A session's cwd is read live, so most refreshes find nothing changed;
         // comparing first keeps the periodic sweep from rewriting the file every
         // few seconds for no reason.
         if snap == self.last_persisted {
+            if let Err(error) = self.store.retry_dirty(&snap) {
+                tracing::warn!(error = %error, "failed to retry session-store persistence");
+            }
             return;
         }
-        crate::store::write_atomic(&self.persist_path, &snap);
-        self.last_persisted = snap;
+        match self.store.commit(&snap) {
+            Ok(_) => self.last_persisted = snap,
+            Err(error) => {
+                self.store.mark_dirty();
+                tracing::warn!(error = %error, "failed to persist session store");
+            }
+        }
     }
 
     /// Final persist (capturing live cwds), then freeze so the shutdown SIGHUPs'
     /// session removals don't clobber the file. Called once on the way out.
     pub fn freeze_and_persist(&mut self) {
-        let snap = self.snapshot();
-        crate::store::write_atomic(&self.persist_path, &snap);
-        self.last_persisted = snap;
+        self.persist();
         self.persist_frozen = true;
+    }
+
+    /// Mark one loaded record as restored. Failed records remain in the next
+    /// commit, while a live snapshot with the same name replaces its old data.
+    pub fn mark_restored(&mut self, name: &str) {
+        self.unrestored.retain(|state| state.name != name);
+        self.persist();
     }
 
     pub fn get(&self, name: &str) -> Option<SessionHandle> {
@@ -359,9 +407,16 @@ mod identity_tests {
             tx,
             meta,
         };
+        let dir = std::env::temp_dir().join(format!("asd-registry-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store =
+            crate::store::SessionStore::open(dir.join("sessions.json"), dir.join("sessions.tsv"))
+                .unwrap()
+                .store;
         let mut registry = Registry::new(
             0,
-            std::env::temp_dir().join("unused-sessions.tsv"),
+            store,
+            Vec::new(),
             std::env::temp_dir().join("unused-asd.sock"),
         );
         registry.sessions.insert("current".to_string(), handle);
@@ -380,6 +435,7 @@ mod identity_tests {
             rx.recv_timeout(std::time::Duration::from_secs(1)),
             Ok(SessionMsg::Kill)
         ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
@@ -403,7 +459,11 @@ mod windows_tests {
             r"\\.\pipe\asd-windows-kill-test-{}-{unique}",
             std::process::id()
         ));
-        let registry = Arc::new(Mutex::new(Registry::new(0, dir.join("sessions.tsv"), pipe)));
+        let store =
+            crate::store::SessionStore::open(dir.join("sessions.json"), dir.join("sessions.tsv"))
+                .unwrap()
+                .store;
+        let registry = Arc::new(Mutex::new(Registry::new(0, store, Vec::new(), pipe)));
 
         Registry::create(&registry, Some("doomed".to_string()), None, None).unwrap();
         let handle = registry.lock().unwrap().get("doomed").unwrap();

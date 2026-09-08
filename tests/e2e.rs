@@ -35,6 +35,13 @@ struct Daemon {
 
 impl Daemon {
     fn start(tag: &str) -> Self {
+        Self::start_with_data(tag, |_| {})
+    }
+
+    /// Start an isolated daemon after preparing only this test's data home.
+    /// This lets migration and invalid-store tests exercise the real startup
+    /// path without reading or writing the user's daemon state.
+    fn start_with_data(tag: &str, prepare_data: impl FnOnce(&Path)) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "asd-e2e-{tag}-{}-{}",
             std::process::id(),
@@ -44,6 +51,7 @@ impl Daemon {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        prepare_data(&dir.join("data"));
         let socket = dir.join("asd.sock");
         let child = Command::new(cli_exe())
             .arg("daemon")
@@ -72,7 +80,7 @@ impl Daemon {
         cmd.arg("--socket").arg(&self.socket);
         // Match Daemon::start's data dir so CLI subcommands that spawn a daemon
         // (e.g. `asd restart` re-exec'ing a successor) use the test's isolated
-        // sessions.tsv, mirroring production where the daemon and CLI share the
+        // sessions.json, mirroring production where the daemon and CLI share the
         // shell's XDG_DATA_HOME.
         cmd.env("XDG_DATA_HOME", self.dir.join("data"));
         cmd
@@ -2178,11 +2186,11 @@ async fn restart_preserves_session_workspace() {
         std::thread::sleep(TICK);
     }
 
-    // The persisted session list records name + cwd (in the daemon's data dir).
-    let state = std::fs::read_to_string(daemon.dir.join("data/asd/sessions.tsv"))
-        .expect("session list written");
+    // The persisted session store records name + cwd in its data directory.
+    let state = std::fs::read_to_string(daemon.dir.join("data/asd/sessions.json"))
+        .expect("session store written");
     assert!(
-        state.contains(&format!("work\t{}", workdir.display())),
+        state.contains(r#""name": "work""#) && state.contains(&workdir.display().to_string()),
         "state should record work's cwd, got: {state:?}"
     );
 
@@ -2273,6 +2281,83 @@ async fn sessions_persist_across_a_full_stop() {
 
     unsafe { libc::kill(successor.id() as i32, libc::SIGTERM) };
     let _ = successor.wait();
+}
+
+/// A legacy list is imported once into the versioned store, then retained as a
+/// migrated backup so an operator can inspect the previous source.
+#[tokio::test]
+async fn daemon_migrates_legacy_session_list_to_versioned_store() {
+    let daemon = Daemon::start_with_data("legacy-store", |data_home| {
+        let state_dir = data_home.join("asd");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("sessions.tsv"), "legacy\t/tmp\n").unwrap();
+    });
+    let state_dir = daemon.dir.join("data/asd");
+    assert!(state_dir.join("sessions.json").is_file());
+    assert!(state_dir.join("sessions.tsv.migrated").is_file());
+}
+
+/// A record that cannot recreate a shell remains durable. Losing it here would
+/// turn a transient filesystem or spawn failure into permanent state loss.
+#[tokio::test]
+async fn failed_restore_record_remains_in_versioned_store() {
+    let missing_cwd = "/definitely/not/a/real/asd-restore-directory";
+    let daemon = Daemon::start_with_data("retain-restore", |data_home| {
+        let state_dir = data_home.join("asd");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("sessions.json"),
+            format!(
+                r#"{{"version":1,"sessions":[{{"name":"retry","cwd":"{missing_cwd}","command":null}}]}}"#
+            ),
+        )
+        .unwrap();
+    });
+    let saved = std::fs::read_to_string(daemon.dir.join("data/asd/sessions.json")).unwrap();
+    assert!(
+        saved.contains("retry"),
+        "failed restore was compacted away: {saved}"
+    );
+    assert!(
+        saved.contains(missing_cwd),
+        "failed restore cwd was lost: {saved}"
+    );
+}
+
+/// Corrupt and future-version JSON must fail before the daemon creates a
+/// writable replacement, preserving the exact bytes for repair or downgrade.
+#[test]
+fn corrupt_or_future_session_store_fails_startup_without_mutation() {
+    for (label, bytes) in [
+        ("corrupt", b"{not json".as_slice()),
+        ("future", br#"{"version":2,"sessions":[]}"#.as_slice()),
+    ] {
+        let dir =
+            std::env::temp_dir().join(format!("asd-invalid-store-{label}-{}", std::process::id()));
+        let data_home = dir.join("data");
+        let state_dir = data_home.join("asd");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let store_path = state_dir.join("sessions.json");
+        std::fs::write(&store_path, bytes).unwrap();
+        let socket = dir.join("asd.sock");
+        let status = Command::new(cli_exe())
+            .arg("daemon")
+            .arg("--socket")
+            .arg(&socket)
+            .env("XDG_DATA_HOME", &data_home)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "{label} store unexpectedly started");
+        assert_eq!(
+            std::fs::read(&store_path).unwrap(),
+            bytes,
+            "{label} store was changed"
+        );
+        assert!(!socket.exists(), "{label} store created a listener");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 /// Killing a session removes it from the persisted list, so a restart does not
@@ -2469,7 +2554,7 @@ async fn persisted_cwd_follows_the_session() {
             .success()
     );
 
-    let list = daemon.dir.join("data/asd/sessions.tsv");
+    let list = daemon.dir.join("data/asd/sessions.json");
     let recorded = |()| std::fs::read_to_string(&list).unwrap_or_default();
 
     // Converges on the shell's real directory without anything else happening.
@@ -2495,7 +2580,7 @@ async fn persisted_cwd_follows_the_session() {
             .success()
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while !recorded(()).contains("\t/tmp") {
+    while !recorded(()).contains(r#""cwd": "/tmp""#) {
         assert!(
             std::time::Instant::now() < deadline,
             "cwd did not follow the second move; file: {}",
@@ -2577,7 +2662,7 @@ async fn new_cwd_starts_the_session_there() {
     );
 
     // Recorded immediately — no waiting for the refresh sweep to correct it.
-    let list = daemon.dir.join("data/asd/sessions.tsv");
+    let list = daemon.dir.join("data/asd/sessions.json");
     let recorded = std::fs::read_to_string(&list).unwrap_or_default();
     assert!(
         recorded.contains(want.to_str().unwrap()),
@@ -3471,16 +3556,12 @@ async fn restart_stages_the_recorded_command_without_running_it() {
     // The create itself runs the command, as it always has.
     wait_for(|| marker.exists(), "the created session to run its command").await;
 
-    // The persisted list records the command as a third field, and records
-    // nothing there for the shell session.
-    let state_path = daemon.dir.join("data/asd/sessions.tsv");
+    // The persisted store records the command, and writes null for a shell.
+    let state_path = daemon.dir.join("data/asd/sessions.json");
     wait_for(
         || {
             std::fs::read_to_string(&state_path)
-                .map(|t| {
-                    t.lines()
-                        .any(|l| l.starts_with("job\t") && l.contains("touch"))
-                })
+                .map(|t| t.contains(r#""name": "job""#) && t.contains("touch"))
                 .unwrap_or(false)
         },
         "the command to reach the session list",
@@ -3488,12 +3569,15 @@ async fn restart_stages_the_recorded_command_without_running_it() {
     .await;
     let state = std::fs::read_to_string(&state_path).unwrap();
     let plain = state
-        .lines()
-        .find(|l| l.starts_with("plain\t"))
-        .expect("shell session missing from the list");
-    assert_eq!(
-        plain.splitn(3, '\t').nth(2),
-        Some(""),
+        .split(r#""name": "plain""#)
+        .nth(1)
+        .expect("shell session missing from the store");
+    assert!(
+        plain
+            .split('}')
+            .next()
+            .unwrap()
+            .contains(r#""command": null"#),
         "a shell session must record no command, got: {plain:?}"
     );
 
