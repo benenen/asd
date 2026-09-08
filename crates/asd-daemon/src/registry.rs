@@ -633,7 +633,7 @@ mod identity_tests {
         let identity = SessionIdentity { instance_id: 7 };
         let task = asd_proto::SessionTask {
             description: "Review login".into(),
-            directory: dir.to_str().unwrap().into(),
+            directory: dir.canonicalize().unwrap().to_str().unwrap().into(),
         };
         registry.set_task(identity, Some(task.clone())).unwrap();
         assert_eq!(registry.list()[0].task, Some(task.clone()));

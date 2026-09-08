@@ -155,7 +155,7 @@ function main() {
   if (!target) {
     fail(
       `no prebuilt binary for ${process.platform}/${process.arch}. ` +
-      `Available: linux & macOS (x64 + arm64) and windows x64. ` +
+      `Available: linux (x64 + arm64), macOS arm64, and windows x64. ` +
       `Build from source: https://github.com/${REPO}`
     );
   }

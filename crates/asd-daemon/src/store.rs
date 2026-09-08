@@ -383,10 +383,10 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Catches treating a path inspection error as an absent JSON store and
-    /// migrating stale TSV over a path the daemon cannot safely inspect.
+    /// An invalid parent must fail without consuming or changing legacy state.
+    /// Windows can report NotFound during inspection and reject it on creation.
     #[test]
-    fn only_not_found_json_path_allows_legacy_migration() {
+    fn invalid_json_parent_does_not_consume_legacy_state() {
         let dir = test_dir("metadata");
         let blocked = dir.join("not-a-directory");
         fs::write(&blocked, "not a directory").unwrap();
@@ -396,12 +396,11 @@ mod tests {
 
         assert!(matches!(
             SessionStore::open(json, legacy.clone()),
-            Err(StoreError::Io {
-                operation: "inspect session store",
-                ..
-            })
+            Err(StoreError::Io { .. })
         ));
-        assert!(legacy.is_file());
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), "from-tsv\t/tmp\n");
+        assert!(!legacy.with_extension("tsv.migrated").exists());
+        assert_eq!(fs::read_to_string(&blocked).unwrap(), "not a directory");
         fs::remove_dir_all(dir).unwrap();
     }
 
