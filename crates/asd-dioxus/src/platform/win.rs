@@ -3,6 +3,15 @@
 
 use crate::conn::{BoxRead, BoxWrite};
 
+pub(crate) fn notify(title: &str, body: &str) -> Result<(), String> {
+    notify_rust::Notification::new()
+        .summary(title)
+        .body(body)
+        .show()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Connect to the local daemon's named pipe and split it for the framed codec.
 pub(crate) async fn connect_local() -> anyhow::Result<(BoxRead, BoxWrite)> {
     use tokio::net::windows::named_pipe::ClientOptions;

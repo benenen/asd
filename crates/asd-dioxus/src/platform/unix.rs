@@ -3,6 +3,15 @@
 
 use crate::conn::{BoxRead, BoxWrite};
 
+pub(crate) fn notify(title: &str, body: &str) -> Result<(), String> {
+    notify_rust::Notification::new()
+        .summary(title)
+        .body(body)
+        .show()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Open the local daemon's Unix socket and box the halves.
 pub(crate) async fn connect_local() -> anyhow::Result<(BoxRead, BoxWrite)> {
     let socket = asd_proto::paths::socket_path();

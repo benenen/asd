@@ -11,6 +11,10 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum JsMessage {
+    #[serde(rename = "focus")]
+    Focus,
+    #[serde(rename = "snapshot_rendered")]
+    SnapshotRendered { token: u64 },
     #[serde(rename = "input")]
     Input { data: String },
     #[serde(rename = "resize")]

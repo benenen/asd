@@ -116,6 +116,9 @@ pub struct Model {
     pub hosts: Vec<Host>,
     /// The session being viewed: `(host, name)`.
     pub active: Option<(HostId, String)>,
+    pub attention: HashMap<HostId, asd_client::attention::AttentionEndpoint>,
+    viewed: Option<(HostId, asd_proto::SessionIdentity)>,
+    focused: bool,
     /// Kill requests that have been sent but are still present in the most
     /// recent list for their host.
     closing: HashMap<(HostId, String), ClosingSession>,
@@ -133,6 +136,9 @@ impl Model {
                 sessions: Vec::new(),
             }],
             active: None,
+            attention: HashMap::new(),
+            viewed: None,
+            focused: false,
             closing: HashMap::new(),
             next_id: 1,
         }
@@ -188,6 +194,7 @@ impl Model {
             return; // the local host is permanent
         }
         self.hosts.retain(|h| h.id != id);
+        self.attention.remove(&id);
         self.closing.retain(|(host, _), _| *host != id);
         if self.active.as_ref().is_some_and(|(h, _)| *h == id) {
             self.active = None;
@@ -196,6 +203,12 @@ impl Model {
 
     pub fn set_state(&mut self, id: HostId, state: HostState) {
         if !matches!(state, HostState::Up) {
+            if self.viewed.is_some_and(|(host, _)| host == id) {
+                self.leave_view();
+            }
+            if let Some(endpoint) = self.attention.get_mut(&id) {
+                endpoint.notification_lease = false;
+            }
             self.closing.retain(|(host, _), _| *host != id);
         }
         if let Some(h) = self.host_mut(id) {
@@ -206,6 +219,13 @@ impl Model {
     /// Replace a host's session list. If the active session vanished (killed or
     /// exited elsewhere), the selection is cleared.
     pub fn set_sessions(&mut self, id: HostId, sessions: Vec<SessionInfo>) {
+        if let Some((host, name)) = self.active.clone()
+            && host == id
+            && let Some(identity) = self.session_identity(host, &name)
+            && let Some(renamed) = sessions.iter().find(|s| s.identity() == identity)
+        {
+            self.rename_session(host, &name, &renamed.name);
+        }
         let now = Instant::now();
         let mut next = HashMap::new();
         for ((host, name), pending) in std::mem::take(&mut self.closing) {
@@ -233,10 +253,80 @@ impl Model {
         {
             self.active = None;
         }
+        self.converge_view();
     }
 
     pub fn select(&mut self, host: HostId, name: String) {
+        if !self.is_active(host, &name) {
+            self.leave_view();
+        }
         self.active = Some((host, name));
+    }
+
+    pub fn leave_view(&mut self) {
+        if let Some((host, identity)) = self.viewed.take()
+            && let Some(endpoint) = self.attention.get_mut(&host)
+        {
+            endpoint.tracker.view_left(identity);
+        }
+    }
+
+    pub fn set_focused(&mut self, focused: bool) {
+        if self.focused == focused {
+            return;
+        }
+        self.focused = focused;
+        if focused {
+            self.converge_view();
+            return;
+        }
+        if let Some((host, identity)) = self.viewed
+            && let Some(endpoint) = self.attention.get_mut(&host)
+        {
+            endpoint.tracker.view_left(identity);
+        }
+    }
+
+    /// Called only after the renderer acknowledges the exact Snapshot.
+    pub fn snapshot_converged(
+        &mut self,
+        host: HostId,
+        name: &str,
+        identity: asd_proto::SessionIdentity,
+    ) {
+        if !self.is_active(host, name) {
+            return;
+        }
+        self.leave_view();
+        self.viewed = Some((host, identity));
+        self.converge_view();
+    }
+
+    /// A renderer acknowledgement can precede the registration on the other
+    /// connection. Reconcile it when metadata arrives, still by exact identity.
+    fn converge_view(&mut self) {
+        if self.focused
+            && let Some((host, identity)) = self.viewed
+            && self.active.as_ref().is_some_and(|(selected, name)| {
+                *selected == host && self.session_identity(host, name) == Some(identity)
+            })
+        {
+            self.attention
+                .entry(host)
+                .or_default()
+                .tracker
+                .view_converged(identity);
+        }
+    }
+
+    pub fn unread(
+        &self,
+        host: HostId,
+        identity: asd_proto::SessionIdentity,
+    ) -> Option<asd_client::attention::AttentionKind> {
+        self.attention
+            .get(&host)
+            .and_then(|endpoint| endpoint.tracker.unread(identity))
     }
 
     pub fn mark_closing(
@@ -282,9 +372,7 @@ impl Model {
             })
     }
 
-    /// Optimistically rename a session locally so the sidebar (and the active
-    /// selection, if it was the renamed one) update immediately; the next list
-    /// poll confirms it, or reverts it if the daemon rejected the rename.
+    /// Apply an accepted identity-matched rename to the row and selection.
     pub fn rename_session(&mut self, host: HostId, old: &str, new: &str) {
         let pending = self.closing.remove(&(host, old.to_string()));
         if let Some(h) = self.host_mut(host)
@@ -423,6 +511,101 @@ pub fn short_reason(msg: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_exact_rendered_focused_snapshot_marks_seen_and_focus_loss_rearms() {
+        use asd_client::attention::AttentionKind;
+        use asd_client::events::EventFeedChange;
+        use asd_proto::{
+            AgentState, EventCursor, SessionEvent, SessionUpdateCause, SessionUpdatePatch,
+        };
+        let mut model = Model::with_local();
+        let s = info("agent", 42, 0);
+        model.set_sessions(LOCAL_ID, vec![s.clone()]);
+        let cursor = |sequence| EventCursor {
+            daemon_epoch: [1; 16],
+            sequence,
+        };
+        model.attention.entry(LOCAL_ID).or_default().accept(
+            cursor(0),
+            &EventFeedChange::Reset {
+                sessions: vec![s.clone()],
+                notification_lease: true,
+            },
+        );
+        let event = |state| EventFeedChange::Changed {
+            sessions: vec![s.clone()],
+            event: SessionEvent::Updated {
+                identity: s.identity(),
+                cause: SessionUpdateCause::ScreenDetection,
+                patch: SessionUpdatePatch {
+                    state: Some(state),
+                    command: None,
+                    title: None,
+                    status_line: None,
+                    idle_ms: None,
+                    running: None,
+                    attached_clients: None,
+                    pid: None,
+                    cols: None,
+                    rows: None,
+                },
+            },
+        };
+        model
+            .attention
+            .get_mut(&LOCAL_ID)
+            .unwrap()
+            .accept(cursor(1), &event(AgentState::Blocked));
+        model.select(LOCAL_ID, s.name.clone());
+        assert_eq!(
+            model.unread(LOCAL_ID, s.identity()),
+            Some(AttentionKind::NeedsAttention)
+        );
+        model.set_focused(true);
+        model.snapshot_converged(
+            LOCAL_ID,
+            &s.name,
+            asd_proto::SessionIdentity { instance_id: 99 },
+        );
+        assert_eq!(
+            model.unread(LOCAL_ID, s.identity()),
+            Some(AttentionKind::NeedsAttention)
+        );
+        model.set_focused(false);
+        model.snapshot_converged(LOCAL_ID, &s.name, s.identity());
+        assert_eq!(
+            model.unread(LOCAL_ID, s.identity()),
+            Some(AttentionKind::NeedsAttention)
+        );
+        model.set_focused(true);
+        assert_eq!(model.unread(LOCAL_ID, s.identity()), None);
+        model
+            .attention
+            .get_mut(&LOCAL_ID)
+            .unwrap()
+            .accept(cursor(2), &event(AgentState::Working));
+        model.set_focused(false);
+        assert_eq!(
+            model
+                .attention
+                .get_mut(&LOCAL_ID)
+                .unwrap()
+                .accept(cursor(3), &event(AgentState::Idle))
+                .len(),
+            1
+        );
+        assert_eq!(
+            model.unread(LOCAL_ID, s.identity()),
+            Some(AttentionKind::Done)
+        );
+        model.select(LOCAL_ID, "missing".into());
+        model.set_focused(true);
+        assert_eq!(
+            model.unread(LOCAL_ID, s.identity()),
+            Some(AttentionKind::Done)
+        );
+    }
+
     fn info(name: &str, created_ms: u64, clients: u32) -> SessionInfo {
         SessionInfo {
             name: name.to_string(),
@@ -528,10 +711,10 @@ mod tests {
     #[test]
     fn killing_the_active_session_clears_selection() {
         let mut m = Model::with_local();
-        m.set_sessions(LOCAL_ID, vec![info("web", 0, 1), info("logs", 0, 0)]);
+        m.set_sessions(LOCAL_ID, vec![info("web", 0, 1), info("logs", 1, 0)]);
         m.select(LOCAL_ID, "web".into());
         assert!(m.is_active(LOCAL_ID, "web"));
-        m.set_sessions(LOCAL_ID, vec![info("logs", 0, 0)]);
+        m.set_sessions(LOCAL_ID, vec![info("logs", 1, 0)]);
         assert_eq!(m.active, None);
     }
 

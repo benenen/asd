@@ -89,6 +89,11 @@ running. Open it again at any time:
 asd ui work
 ```
 
+The TUI and GUI keep unread `✓` Done and `!` NeedsAttention markers for
+background agents. The elected TUI rings a bell; the elected GUI shows a desktop
+notification. Viewing the exact terminal Snapshot clears the marker (the GUI
+window must also be focused). Initial loading and reconnect resets stay silent.
+
 You can also attach directly, without the sidebar:
 
 ```bash

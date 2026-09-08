@@ -21,6 +21,123 @@ const TICK: Duration = Duration::from_millis(50);
 const WAIT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
+async fn ui_attention_event_transport_reports_done_blocked_and_exact_snapshot_seen() {
+    use asd_client::attention::{AttentionEndpoint, AttentionKind};
+    use asd_client::events::EventFeedChange;
+    let daemon = Daemon::start("ui-attention");
+    let socket = daemon.socket.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let observer = tokio::spawn(async move {
+        asd_client::event_transport::watch(
+            || async {
+                UnixStream::connect(&socket)
+                    .await
+                    .map(UnixStream::into_split)
+                    .map_err(|e| e.to_string())
+            },
+            ClientKind::Tui,
+            |cursor, change| {
+                let _ = tx.send((cursor, change));
+            },
+        )
+        .await
+    });
+    let mut attention = AttentionEndpoint::default();
+    let (cursor, change) = timeout(WAIT, rx.recv()).await.unwrap().unwrap();
+    assert!(attention.accept(cursor, &change).is_empty());
+    assert!(attention.notification_lease);
+    let fake = daemon.dir.join("codex");
+    std::fs::copy("/bin/sh", &fake).unwrap();
+    let script = format!(
+        "exec {} -c 'read start; printf \"\\033[2J\\033[HEsc to interrupt\\r\\n\"; read finish; printf \"\\033[2J\\033[H› ready\\r\\n\"; read prompt; printf \"\\033[2J\\033[Hesc to cancel\\r\\nenter to confirm\\r\\n\"; read stop'",
+        fake.display()
+    );
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "agent", "--cmd", &script])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        daemon
+            .cli()
+            .args(["send", "agent", "--text", "go", "--enter"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    loop {
+        let (cursor, change) = timeout(WAIT, rx.recv()).await.unwrap().unwrap();
+        let working = matches!(&change, EventFeedChange::Changed { sessions, .. } if sessions.iter().any(|s| s.state == asd_proto::AgentState::Working));
+        assert!(attention.accept(cursor, &change).is_empty());
+        if working {
+            break;
+        }
+    }
+    assert!(
+        daemon
+            .cli()
+            .args(["send", "agent", "--text", "finish", "--enter"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let done = loop {
+        let (cursor, change) = timeout(WAIT, rx.recv()).await.unwrap().unwrap();
+        let effects = attention.accept(cursor, &change);
+        if let Some(effect) = effects.into_iter().next() {
+            break effect;
+        }
+    };
+    assert_eq!(done.kind, AttentionKind::Done);
+    assert_eq!(
+        attention.tracker.unread(done.identity),
+        Some(AttentionKind::Done)
+    );
+    assert!(
+        daemon
+            .cli()
+            .args(["send", "agent", "--text", "prompt", "--enter"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    loop {
+        let (cursor, change) = timeout(WAIT, rx.recv()).await.unwrap().unwrap();
+        let effects = attention.accept(cursor, &change);
+        if let Some(effect) = effects.first() {
+            assert_eq!(effect.kind, AttentionKind::NeedsAttention);
+            break;
+        }
+    }
+    let mut control = ProtoClient::connect_kind(&daemon.socket, ClientKind::Tui).await;
+    control
+        .send(Frame::Attach {
+            name: "agent".into(),
+            cols: 80,
+            rows: 24,
+            view_id: 1,
+            appearance: TerminalAppearance::default(),
+            read_only: false,
+        })
+        .await;
+    let Frame::Snapshot { identity, .. } = control.recv().await else {
+        panic!("exact snapshot required")
+    };
+    assert_eq!(identity, done.identity);
+    attention.tracker.view_converged(identity);
+    assert_eq!(attention.tracker.unread(identity), None);
+    observer.abort();
+    let _ = observer.await;
+}
+
+#[tokio::test]
 async fn session_events_order_replay_rename_idle_and_exit_without_attachment() {
     let daemon = Daemon::start("session-events");
     let mut events = ProtoClient::connect(&daemon.socket).await;

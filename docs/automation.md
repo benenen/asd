@@ -207,10 +207,24 @@ and neither overrides the other: `state` stays the daemon's reading, `says` is
 the session's own claim, and a display prefers the deliberate one — the status
 line, then the terminal title, then the command.
 
-The daemon keeps the first 512 bytes and drops the rest: every `list` carries
-this to every client, and the TUI polls the list every 1.5s. It is not
+The daemon keeps the first 512 bytes and drops the rest: `list` carries this
+metadata, and TUI/GUI sidebars receive status-line changes through the event feed. It is not
 persisted either — a restored session is a new process, which can say what it
 is doing when it knows.
+
+## Unread attention in clients
+
+TUI and GUI show client-local unread completion (`✓`) and attention (`!`)
+markers. A background Working session that later becomes Idle produces Done,
+including a transition through Unknown; entering Blocked produces NeedsAttention.
+The elected TUI notification connection rings BEL; the independently elected GUI
+connection shows a native desktop notification. Initial loading and reset never
+notify, and taking over a lease never replays existing unread markers.
+
+Opening a row clears its unread marker only after the exact terminal Snapshot
+has converged. GUI viewing additionally requires the window to be focused.
+Leaving a still-Working view arms its later completion. These presentation
+states do not change the daemon's factual `working/blocked/idle/unknown` states.
 
 ## Prompting another session
 

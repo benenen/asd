@@ -13,4 +13,4 @@ mod imp;
 #[path = "win.rs"]
 mod imp;
 
-pub(crate) use imp::connect_local;
+pub(crate) use imp::{connect_local, notify};

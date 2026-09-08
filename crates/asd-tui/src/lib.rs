@@ -19,6 +19,17 @@
 //! the mouse local, and Shift+PageUp/PageDown scroll too.
 
 use std::collections::HashMap;
+use std::io::Write;
+
+fn ring_attention(output: &mut impl Write, count: usize) -> std::io::Result<()> {
+    for _ in 0..count {
+        output.write_all(b"\x07")?;
+    }
+    if count > 0 {
+        output.flush()?;
+    }
+    Ok(())
+}
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -615,6 +626,7 @@ pub(crate) struct App {
     connection_generation: u64,
 
     pub sessions: Vec<SessionInfo>,
+    pub attention: asd_client::attention::AttentionEndpoint,
     /// Kill requests that have been sent but whose session is still present in
     /// the daemon's latest list. A stale immediate list must not erase this.
     closing_sessions: ClosingSessions,
@@ -955,6 +967,7 @@ fn event_loop(
         ev_tx,
         connection_generation,
         sessions: Vec::new(),
+        attention: asd_client::attention::AttentionEndpoint::default(),
         closing_sessions: ClosingSessions::default(),
         running_activity: RunningActivity::default(),
         host_links: HostLinkState::default(),
@@ -1372,6 +1385,9 @@ impl App {
             return;
         }
         // What's on screen right now, as the fallback hold frame.
+        if let Some(identity) = self.active_identity {
+            self.attention.tracker.view_left(identity);
+        }
         let old_frame = self.vt.as_mut().map(|vt| {
             vt.set_scroll(0);
             vt.render_snapshot()
@@ -1461,11 +1477,42 @@ impl App {
 
     fn on_conn_event(&mut self, ev: Ev) {
         match ev {
+            Ev::Events { cursor, change } => {
+                if self
+                    .attention
+                    .tracker
+                    .epoch()
+                    .is_some_and(|epoch| epoch != cursor.daemon_epoch)
+                {
+                    self.active_identity = None;
+                }
+                let effects = self.attention.accept(cursor, &change);
+                if let Err(error) = ring_attention(&mut std::io::stdout().lock(), effects.len()) {
+                    tracing::debug!(%error, "attention bell failed");
+                }
+                if let asd_client::events::EventFeedChange::Reset { sessions, .. }
+                | asd_client::events::EventFeedChange::Changed { sessions, .. } = change
+                {
+                    self.on_conn_event(Ev::Sessions(sessions));
+                    if let Some(identity) = self.active_identity
+                        && self.sessions.iter().any(|session| {
+                            session.identity() == identity
+                                && self.active.as_deref() == Some(&session.name)
+                        })
+                    {
+                        self.attention.tracker.view_converged(identity);
+                    }
+                }
+            }
             Ev::Up => {
                 self.daemon_up = true;
                 self.notice = None;
             }
             Ev::Down(reason) => {
+                if let Some(identity) = self.active_identity {
+                    self.attention.tracker.view_left(identity);
+                }
+                self.attention.notification_lease = false;
                 self.daemon_up = false;
                 self.notice = Some(reason);
                 self.closing_sessions.clear();
@@ -1623,6 +1670,7 @@ impl App {
                 }
                 if snapshot {
                     self.snapshot_pending = false;
+                    self.attention.tracker.view_converged(identity);
                     for paste in std::mem::take(&mut self.pending_pastes) {
                         let input = self.paste(&paste);
                         self.send(Cmd::Input(input));
@@ -1657,6 +1705,9 @@ impl App {
                     || self.active.as_deref() == Some(&name)
                 {
                     self.apply_rename(&previous_name, &name);
+                    if let Some(identity) = self.active_identity.take() {
+                        self.attention.tracker.view_left(identity);
+                    }
                     self.view_revoked = Some(name.clone());
                     self.notice = Some(format!("{name} — view opened in another asd ui"));
                     self.vt = None;
@@ -2327,6 +2378,14 @@ fn encode_sgr_mouse(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attention_bell_writes_one_bel_per_granted_effect() {
+        let mut output = Vec::new();
+        super::ring_attention(&mut output, 0).unwrap();
+        assert!(output.is_empty());
+        super::ring_attention(&mut output, 2).unwrap();
+        assert_eq!(output, b"\x07\x07");
+    }
     use super::*;
 
     #[test]

@@ -701,9 +701,8 @@ fn host_group(
                                                 Ok(()) => {
                                                     let newt = new.trim().to_string();
                                                     if newt != name_kbd {
-                                                        // Optimistic: update locally now; the
-                                                        // list poll confirms (or reverts).
-                                                        model.write().rename_session(id, &name_kbd, &newt);
+                                                        // The event projection owns names;
+                                                        // rejected requests leave the row intact.
                                                         let _ = tx_rename.send(AppCmd::Rename {
                                                             host: id,
                                                             name: name_kbd.clone(),
@@ -751,6 +750,11 @@ fn host_group(
                                     title: "waiting for you — this agent asked something",
                                     "!"
                                 }
+                            }
+                            if model.read().unread(id, s.identity()) == Some(asd_client::attention::AttentionKind::Done) {
+                                span { class: "attention-done", title: "Done — unread", "✓" }
+                            } else if !blocked && model.read().unread(id, s.identity()) == Some(asd_client::attention::AttentionKind::NeedsAttention) {
+                                span { class: crate::model::BLOCKED_BADGE_CLASS, title: "Needs attention — unread", "!" }
                             }
                             span { class: "session-age", "{age}" }
                             button {
@@ -1106,6 +1110,8 @@ async fn supervisor(
     // Snapshot identity binds later Output to the exact session instance that
     // populated the terminal, even when a name is reused after a fast restart.
     let mut active_identity: Option<(HostId, asd_proto::SessionIdentity)> = None;
+    let mut snapshot_token = 0u64;
+    let mut pending_snapshot: Option<(u64, HostId, String, asd_proto::SessionIdentity)> = None;
     let mut bridge_ready = false;
     // A session picked before the JS bridge was ready (auto-select on the
     // first local list): attached once the bridge reports in.
@@ -1134,6 +1140,14 @@ async fn supervisor(
                 };
                 bridge_seen = true;
                 match serde_json::from_value::<JsMessage>(val) {
+                    Ok(JsMessage::Focus) => { model.write().set_focused(desktop.window.is_focused()); }
+                    Ok(JsMessage::SnapshotRendered { token }) => {
+                        if pending_snapshot.as_ref().is_some_and(|(pending, ..)| *pending == token)
+                            && let Some((_, host, name, identity)) = pending_snapshot.take() {
+                            model.write().set_focused(desktop.window.is_focused());
+                            model.write().snapshot_converged(host, &name, identity);
+                        }
+                    }
                     Ok(JsMessage::Status { msg }) => {
                         tracing::info!("bridge: {msg}");
                         // The JS side rebuilt a wedged terminal: re-attach the
@@ -1180,14 +1194,34 @@ async fn supervisor(
                 // manual select cancels the pending "+ new" focus jump.
                 match &cmd {
                     AppCmd::Create { .. } => pending_create = true,
-                    AppCmd::SetActive { .. } => pending_create = false,
+                    AppCmd::SetActive { .. } => { pending_create = false; pending_snapshot = None; model.write().leave_view(); },
                     _ => {}
                 }
                 route(cmd, &ui_tx, &mut hosts, &mut kinds, &mut active);
             }
             ev = ui_rx.recv() => {
                 let Some(ev) = ev else { break };
+                let ev = if let UiEvent::Events { host, cursor, change } = ev {
+                    let new_epoch = model.read().attention.get(&host).and_then(|endpoint| endpoint.tracker.epoch()).is_some_and(|epoch| epoch != cursor.daemon_epoch);
+                    if new_epoch && active_identity.is_some_and(|(selected, _)| selected == host) {
+                        model.write().leave_view();
+                        active_identity = None;
+                        pending_snapshot = None;
+                    }
+                    model.write().set_focused(desktop.window.is_focused());
+                    let effects = model.write().attention.entry(host).or_default().accept(cursor, &change);
+                    if !effects.is_empty() {
+                        let label = model.read().host(host).map(|h| h.label()).unwrap_or_default();
+                        bg().spawn_blocking(move || crate::notification::deliver(&crate::notification::NativeNotificationAdapter, &label, effects));
+                    }
+                    match change {
+                        asd_client::events::EventFeedChange::Reset { sessions, .. }
+                        | asd_client::events::EventFeedChange::Changed { sessions, .. } => UiEvent::Sessions { host, sessions },
+                        asd_client::events::EventFeedChange::NotificationLease(_) => continue,
+                    }
+                } else { ev };
                 match ev {
+                    UiEvent::Events { .. } => unreachable!("events folded above"),
                     UiEvent::State { host, state } => {
                         // If the host of the session we're viewing dropped,
                         // reflect it in the terminal header.
@@ -1240,7 +1274,7 @@ async fn supervisor(
                     UiEvent::Created { host, name } => {
                         // Only jump to the new session if the user is still
                         // waiting for it — if they clicked another session after
-                        // "+ new", don't yank the view away. The list poll shows
+                        // "+ new", don't yank the view away. The event feed shows
                         // the new session either way. No reset here: the attach
                         // Snapshot resets before it repopulates the pane.
                         if pending_create {
@@ -1268,6 +1302,8 @@ async fn supervisor(
                         }
                         if snapshot {
                             active_identity = Some((host, identity));
+                            snapshot_token += 1;
+                            pending_snapshot = Some((snapshot_token, host, name.clone(), identity));
                         } else if active_identity != Some((host, identity)) {
                             continue;
                         }
@@ -1280,7 +1316,7 @@ async fn supervisor(
                         } else {
                             utf8.push(&data)
                         };
-                        if text.is_empty() {
+                        if text.is_empty() && !snapshot {
                             continue;
                         }
                         // A JSON string is a valid JS string literal
@@ -1291,7 +1327,7 @@ async fn supervisor(
                             .unwrap_or_else(|_| "\"\"".into());
                         let script = if snapshot {
                             format!(
-                                "window.__asdReset&&window.__asdReset();window.__asdWrite&&window.__asdWrite({json});"
+                                "if(window.__asdReset&&window.__asdReset()&&window.__asdWrite){{window.__asdWrite({json},{snapshot_token});}}"
                             )
                         } else {
                             format!("window.__asdWrite&&window.__asdWrite({json});")
@@ -1302,6 +1338,8 @@ async fn supervisor(
                     }
                     UiEvent::SessionEnded { host, name, msg } => {
                         if model.read().is_active(host, &name) {
+                            model.write().leave_view();
+                            pending_snapshot = None;
                             status.set(Status::Ended(msg));
                             // Blank the pane — the dead session's last frame
                             // must not linger under the "ended" note.
@@ -1413,7 +1451,7 @@ fn spawn_host(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<HostCmd>();
     let ev = ui_tx.clone();
     kinds.insert(id, kind.clone());
-    // On the bg runtime: the actor's list-poll ticker (and russh) need a
+    // On the bg runtime: the actor's event transport (and russh) need a
     // runtime that keeps running while the window is idle.
     bg().spawn(conn::run_host(id, kind, cmd_rx, ev));
     hosts.insert(id, HostHandle { cmd_tx });

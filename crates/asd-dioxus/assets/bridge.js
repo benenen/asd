@@ -46,6 +46,9 @@
     return;
   }
   window.__asdBridgeStarted = true;
+  window.addEventListener('focus', function() { send({type: 'focus'}); });
+  window.addEventListener('blur', function() { send({type: 'focus'}); });
+  document.addEventListener('visibilitychange', function() { send({type: 'focus'}); });
 
   window.addEventListener('error', function(e) {
     log('js error: ' + e.message);
@@ -317,8 +320,8 @@
     }).observe(el);
 
     // Rust → JS entry points (called via evaluate_script).
-    window.__asdWrite = function(data) {
-      if (!window.__asdTerm) return;
+    window.__asdWrite = function(data, snapshotToken) {
+      if (!window.__asdTerm) return false;
       try {
         var t = window.__asdTerm;
         var keepViewport = window.__asdUserScrolledBack && t.getViewportY() > 0
@@ -327,7 +330,11 @@
         var scrollbackBefore = typeof t.getScrollbackLength === 'function'
           ? t.getScrollbackLength()
           : 0;
-        t.write(data);
+        t.write(data, function() {
+          if (snapshotToken !== undefined) {
+            requestAnimationFrame(function() { send({type: 'snapshot_rendered', token: snapshotToken}); });
+          }
+        });
         if (keepViewport > 0) {
           var scrollbackAfter = typeof t.getScrollbackLength === 'function'
             ? t.getScrollbackLength()
@@ -337,16 +344,18 @@
           if (desired > 0) t.scrollToLine(desired);
         }
         window.__asdWriteErrors = 0;
+        return true;
       } catch (e) {
         window.__asdWriteErrors = (window.__asdWriteErrors || 0) + 1;
         log('write error #' + window.__asdWriteErrors + ': '
             + (e && e.message ? e.message : String(e)));
         // A wedged WASM terminal never recovers on its own; rebuild it.
         if (window.__asdWriteErrors >= 3) recreateTerm();
+        return false;
       }
     };
     window.__asdReset = function() {
-      if (!window.__asdTerm) return;
+      if (!window.__asdTerm) return false;
       try {
         window.__asdUserScrolledBack = false;
         if (typeof window.__asdTerm.reset === 'function') {
@@ -355,9 +364,11 @@
           // RIS: full reset for terminals without an xterm-style reset().
           window.__asdTerm.write('\x1bc');
         }
+        return true;
       } catch (e) {
         log('reset error: ' + (e && e.message ? e.message : String(e)));
         recreateTerm();
+        return false;
       }
     };
 

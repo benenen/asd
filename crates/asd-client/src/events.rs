@@ -10,7 +10,7 @@ pub struct EventFeed {
     sessions: HashMap<SessionIdentity, SessionInfo>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventFeedChange {
     Reset {
         sessions: Vec<SessionInfo>,

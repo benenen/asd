@@ -11,6 +11,8 @@
 //! drift apart on rules they must all observe identically.
 
 pub mod attach;
+pub mod attention;
+pub mod event_transport;
 pub mod events;
 mod platform;
 pub mod terminal;

@@ -2,7 +2,7 @@
 //! local-only): the TUI thread owns the `!Send` terminal, so only plain data
 //! crosses the two std channels here.
 //!
-//! The actor handshakes, polls `ListSessions` for the sidebar, and while
+//! The actor subscribes on a dedicated event transport for the sidebar, and while
 //! attached forwards raw Snapshot/Output bytes tagged with the session they
 //! belong to. The `pending_attach` counter drops frames of superseded attaches
 //! so a quick session switch can't paint stale content (same race as the GUI
@@ -15,8 +15,8 @@ use std::time::Duration;
 use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, TerminalAppearance, code};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-/// How often the session list is re-polled.
-const LIST_INTERVAL: Duration = Duration::from_millis(1500);
+/// Resource readings remain independent of the session event feed.
+const METRICS_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// Commands the TUI sends to the connection actor.
 #[derive(Debug, Clone)]
@@ -55,6 +55,10 @@ pub enum Ev {
     Up,
     Down(String),
     Sessions(Vec<asd_proto::SessionInfo>),
+    Events {
+        cursor: asd_proto::EventCursor,
+        change: asd_client::events::EventFeedChange,
+    },
     /// A `Create` completed; the TUI selects `name`.
     Created(String),
     /// PTY bytes for the session named `name`; `snapshot` marks the full
@@ -70,7 +74,7 @@ pub enum Ev {
         msg: String,
     },
     /// Another ratatui client took this session's exclusive view. The actor
-    /// stays connected for list polling and an explicit re-attach.
+    /// stays connected for session events and an explicit re-attach.
     ViewRevoked {
         previous_name: String,
         name: String,
@@ -103,11 +107,13 @@ struct EventSink {
 }
 
 impl EventSink {
-    fn send(&self, event: Ev) -> Result<(), SendError<ConnectionEvent>> {
-        self.tx.send(ConnectionEvent {
-            generation: self.generation,
-            event,
-        })
+    fn send(&self, event: Ev) -> Result<(), Box<SendError<ConnectionEvent>>> {
+        self.tx
+            .send(ConnectionEvent {
+                generation: self.generation,
+                event,
+            })
+            .map_err(Box::new)
     }
 }
 
@@ -173,29 +179,37 @@ async fn drive(
     let mut next_view_id = 1u64;
     let mut listed_sessions = Vec::new();
 
-    let mut ticker = tokio::time::interval(LIST_INTERVAL);
+    let (feed_tx, mut feed_rx) = unbounded_channel();
+    let event_loop = asd_client::event_transport::watch(
+        || crate::platform::connect_stream(socket),
+        ClientKind::Tui,
+        move |cursor, change| {
+            let _ = feed_tx.send((cursor, change));
+        },
+    );
+    tokio::pin!(event_loop);
+    let mut ticker = tokio::time::interval(METRICS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
-                if writer.write_frame(&Frame::ListSessions).await.is_err() {
-                    return Err("list write failed".to_string());
+            result = &mut event_loop => return result,
+            Some((cursor, change)) = feed_rx.recv() => {
+                use asd_client::events::EventFeedChange;
+                if let EventFeedChange::Reset { sessions, .. } | EventFeedChange::Changed { sessions, .. } = &change {
+                    if let Some((old_name, new_name)) = retag_from_session_list(&mut at, &listed_sessions, sessions) {
+                        let _ = ev_tx.send(Ev::ViewRenamed { old_name, new_name });
+                    }
+                    listed_sessions = sessions.clone();
                 }
+                let _ = ev_tx.send(Ev::Events { cursor, change });
+            }
+            _ = ticker.tick() => {
                 if writer.write_frame(&Frame::HostMetrics).await.is_err() {
                     return Err("metrics write failed".to_string());
                 }
             }
             frame = reader.read_frame() => match frame {
-                Ok(Some(Frame::SessionList { sessions })) => {
-                    if let Some((old_name, new_name)) =
-                        retag_from_session_list(&mut at, &listed_sessions, &sessions)
-                    {
-                        let _ = ev_tx.send(Ev::ViewRenamed { old_name, new_name });
-                    }
-                    listed_sessions = sessions.clone();
-                    let _ = ev_tx.send(Ev::Sessions(sessions));
-                }
                 Ok(Some(Frame::HostMetricsReply { sample })) => {
                     let _ = ev_tx.send(Ev::Metrics(sample));
                 }
@@ -231,7 +245,6 @@ async fn drive(
                 }
                 Ok(Some(Frame::Created { name })) => {
                     let _ = ev_tx.send(Ev::Created(name));
-                    let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 // The only `Ack` this client can receive is a Rename success.
                 Ok(Some(Frame::Ack)) => {
@@ -319,7 +332,6 @@ async fn drive(
                     if writer.write_frame(&Frame::Kill { name, identity }).await.is_err() {
                         return Err("kill write failed".to_string());
                     }
-                    let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(Cmd::Rename { name, new_name }) => {
                     // The daemon's ViewRenamed retags `at` after the rename is
@@ -329,8 +341,6 @@ async fn drive(
                     if writer.write_frame(&Frame::Rename { name, new_name }).await.is_err() {
                         return Err("rename write failed".to_string());
                     }
-                    // Refresh the list so the new name shows promptly.
-                    let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(Cmd::Shutdown) | None => {
                     if at.is_attached() {

@@ -131,6 +131,33 @@ mutation and exposes sorted identity-keyed projections and the accepted cursor.
 A replay start retains the local projection; a reset replaces it. CLI idle/state
 waits retain their target identity and original deadline across reconnects.
 
+TUI and GUI hosts use a separate handshaken event connection. The shared
+`asd-client::event_transport::watch` preserves its feed across EOF, resumes from
+the last accepted cursor, and requests a reset after invalid ordering. Failed
+reconnection marks the host Down. Session lists come only from event projections;
+control replies cannot overwrite them. TUI HostMetrics still uses its control
+connection every 1.5 seconds.
+
+`asd-client::attention::AttentionTracker` owns client presentation state per
+endpoint, epoch, and session identity. Initial/new identities seed silently;
+same-epoch reset retains presentation for survivors, while a new epoch clears it.
+Working arms a background completion, Unknown preserves the arm, and Idle emits
+Done once. Blocked emits NeedsAttention once; Working clears that stale warning.
+All DetectorReload changes, including Blocked, refresh facts silently without
+creating unread state or arming work; an Idle reload disarms completion.
+Rename retains attention and exit removes it. `AttentionEndpoint` gates returned
+effects by the GUI/TUI notification lease without replaying unread alerts when
+a lease is granted.
+
+Seen requires an accepted Snapshot for the displayed identity, never a row click.
+TUI marks it after feeding its VT; GUI waits for the ghostty-web write callback
+and a render-frame acknowledgement tagged with the Snapshot token. GUI Seen also
+requires actual native-window focus. Losing focus or leaving a Working view
+rearms completion. The TUI writes BEL and retains a glyph; GUI retains a badge
+and dispatches native notifications through its platform adapter. Only bounded,
+sanitized host/session metadata and the attention state enter native messages.
+Notification failure is logged without undoing unread state.
+
 ## Session membership
 
 Ordinary CLI attach and desktop GUI connections are shared: all may view and

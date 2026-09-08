@@ -251,6 +251,7 @@ mod tests {
             ev_tx,
             connection_generation: 1,
             sessions: Vec::new(),
+            attention: Default::default(),
             closing_sessions: Default::default(),
             running_activity: Default::default(),
             host_links: Default::default(),

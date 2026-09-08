@@ -66,6 +66,19 @@ fn blocked(session: &asd_proto::SessionInfo) -> bool {
     session.state == asd_proto::AgentState::Blocked
 }
 
+fn attention_marker(
+    unread: Option<asd_client::attention::AttentionKind>,
+    blocked: bool,
+) -> &'static str {
+    use asd_client::attention::AttentionKind;
+    match unread {
+        Some(AttentionKind::Done) => "✓ ",
+        Some(AttentionKind::NeedsAttention) => "! ",
+        None if blocked => "! ",
+        None => "",
+    }
+}
+
 /// What a sidebar row calls a session.
 ///
 /// Most deliberate first: what the session said about itself with `asd
@@ -148,18 +161,25 @@ fn draw_detail(buf: &mut Buffer, area: Rect, app: &App, session: &asd_proto::Ses
         // A marker as well as a colour: in a sidebar of twenty rows, colour
         // alone is easy to miss, and it is gone entirely for a colour-blind
         // reader.
-        if blocked(session) {
-            format!("! {label}")
-        } else {
-            label
-        }
+        format!(
+            "{}{label}",
+            attention_marker(
+                app.attention.tracker.unread(session.identity()),
+                blocked(session)
+            )
+        )
     };
     let cmd = truncate(&label, cmd_w);
     let cmd_fg = if closing {
         DIM
-    } else if blocked(session) {
+    } else if blocked(session)
+        || app.attention.tracker.unread(session.identity())
+            == Some(asd_client::attention::AttentionKind::NeedsAttention)
+    {
         ALERT
-    } else if session.running && !is_self {
+    } else if app.attention.tracker.unread(session.identity()).is_some()
+        || (session.running && !is_self)
+    {
         ACCENT
     } else {
         MUTED
@@ -219,6 +239,20 @@ fn short_age(created_ms: u64, now_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unread_and_factual_attention_have_noncolor_glyphs() {
+        use asd_client::attention::AttentionKind;
+        assert_eq!(
+            super::attention_marker(Some(AttentionKind::Done), false),
+            "✓ "
+        );
+        assert_eq!(
+            super::attention_marker(Some(AttentionKind::NeedsAttention), false),
+            "! "
+        );
+        assert_eq!(super::attention_marker(None, true), "! ");
+        assert_eq!(super::attention_marker(None, false), "");
+    }
     use super::*;
     use crate::ui::str_width;
 

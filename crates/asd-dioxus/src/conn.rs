@@ -3,7 +3,7 @@
 //! protocol and forwards bytes.
 //!
 //! Each host — the local daemon or an SSH remote — gets one actor that:
-//!   * handshakes, then polls `ListSessions` on an interval → the sidebar;
+//!   * handshakes, then subscribes on a dedicated event transport → the sidebar;
 //!   * while attached, forwards Snapshot/Output bytes tagged with the session
 //!     they belong to;
 //!   * obeys [`HostCmd`]s (attach/detach/input/resize/create/kill).
@@ -11,17 +11,12 @@
 //! The transport is boxed so one `drive` loop serves both the local platform
 //! stream and a remote russh `ChannelStream` (see [`crate::ssh`]).
 
-use std::time::Duration;
-
 use asd_client::attach::Attach;
 use asd_proto::{ClientKind, Frame, FrameReader, FrameWriter, code};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::model::{HostId, HostKind, HostState};
-
-/// How often each host re-polls its session list.
-const LIST_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// A boxed transport half, so local and SSH connections share one code path.
 pub type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
@@ -63,6 +58,11 @@ pub enum HostCmd {
 /// Events a host actor sends toward the app, tagged with its host id.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
+    Events {
+        host: HostId,
+        cursor: asd_proto::EventCursor,
+        change: asd_client::events::EventFeedChange,
+    },
     State {
         host: HostId,
         state: HostState,
@@ -116,7 +116,25 @@ pub async fn run_host(
             return;
         }
     };
-    if let Err(reason) = drive(id, reader, writer, cmd_rx, &ev_tx).await {
+    let (feed_tx, feed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let events = asd_client::event_transport::watch(
+        || async {
+            match &kind {
+                HostKind::Local => crate::platform::connect_local().await,
+                HostKind::Ssh(spec) => crate::ssh::open(spec).await,
+            }
+            .map_err(|e| e.to_string())
+        },
+        ClientKind::Gui,
+        |cursor, change| {
+            let _ = feed_tx.send((cursor, change));
+        },
+    );
+    let result = tokio::select! {
+        result = drive(id, reader, writer, cmd_rx, &ev_tx, feed_rx) => result,
+        result = events => result,
+    };
+    if let Err(reason) = result {
         let _ = ev_tx.send(UiEvent::State {
             host: id,
             state: HostState::Down(reason),
@@ -132,6 +150,7 @@ async fn drive(
     writer: BoxWrite,
     mut cmd_rx: UnboundedReceiver<HostCmd>,
     ev_tx: &UnboundedSender<UiEvent>,
+    mut feed_rx: UnboundedReceiver<(asd_proto::EventCursor, asd_client::events::EventFeedChange)>,
 ) -> Result<(), String> {
     let mut reader = FrameReader::new(reader);
     let mut writer = FrameWriter::new(writer);
@@ -148,20 +167,18 @@ async fn drive(
     // Attach state machine (shared with asd-tui; see asd_client::attach::Attach).
     let mut at = Attach::default();
 
-    let mut ticker = tokio::time::interval(LIST_INTERVAL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
-                if writer.write_frame(&Frame::ListSessions).await.is_err() {
-                    return Err("list write failed".to_string());
+            Some((cursor, change)) = feed_rx.recv() => {
+                if let asd_client::events::EventFeedChange::Reset { sessions, .. }
+                    | asd_client::events::EventFeedChange::Changed { sessions, .. } = &change
+                    && let Some(attached) = at.on_output()
+                    && let Some(info) = sessions.iter().find(|s| s.identity() == attached.identity) {
+                    at.on_rename(&attached.name, &info.name);
                 }
+                let _ = ev_tx.send(UiEvent::Events { host: id, cursor, change });
             }
             frame = reader.read_frame() => match frame {
-                Ok(Some(Frame::SessionList { sessions })) => {
-                    let _ = ev_tx.send(UiEvent::Sessions { host: id, sessions });
-                }
                 Ok(Some(Frame::Snapshot { identity, vt: dump })) => {
                     if let Some(attached) = at.on_snapshot(identity) {
                         let _ = ev_tx.send(UiEvent::Bytes {
@@ -186,8 +203,6 @@ async fn drive(
                 }
                 Ok(Some(Frame::Created { name })) => {
                     let _ = ev_tx.send(UiEvent::Created { host: id, name });
-                    // Refresh the list promptly so the new session shows up.
-                    let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Ok(Some(Frame::Error { code, msg })) => {
                     // SESSION_EXITED carries no session name: only pin it on
@@ -211,8 +226,7 @@ async fn drive(
                             let _ = ev_tx.send(UiEvent::SessionEnded { host: id, name, msg });
                         }
                     }
-                    // Other errors are logged and ignored; the next list poll
-                    // reconciles.
+                    // Other errors are logged; accepted events reconcile facts.
                     else {
                         tracing::debug!(host = id, code, %msg, "daemon error");
                     }
@@ -267,15 +281,11 @@ async fn drive(
                     if writer.write_frame(&Frame::Kill { name, identity }).await.is_err() {
                         return Err("kill write failed".to_string());
                     }
-                    let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(HostCmd::Rename { name, new_name }) => {
                     if writer.write_frame(&Frame::Rename { name, new_name }).await.is_err() {
                         return Err("rename write failed".to_string());
                     }
-                    // Refresh promptly so the new name shows even if the
-                    // optimistic local update was reverted.
-                    let _ = writer.write_frame(&Frame::ListSessions).await;
                 }
                 Some(HostCmd::Shutdown) | None => {
                     if at.is_attached() {
@@ -295,6 +305,126 @@ pub struct HostHandle {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn control_ignores_stale_lists_and_event_rename_retags_output() {
+        use asd_client::events::EventFeedChange;
+        use std::time::Duration;
+        let (client, server) = tokio::io::duplex(8192);
+        let (cr, cw) = tokio::io::split(client);
+        let (sr, sw) = tokio::io::split(server);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (feed_tx, feed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = tokio::spawn(async move {
+            drive(0, Box::new(cr), Box::new(cw), cmd_rx, &ev_tx, feed_rx).await
+        });
+        let mut reader = FrameReader::new(sr);
+        let mut writer = FrameWriter::new(sw);
+        assert!(matches!(
+            reader.read_frame().await.unwrap(),
+            Some(Frame::Hello {
+                kind: ClientKind::Gui,
+                ..
+            })
+        ));
+        writer
+            .write_frame(&Frame::HelloAck {
+                proto_version: asd_proto::PROTO_VERSION,
+                daemon_version: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            ev_rx.recv().await,
+            Some(UiEvent::State {
+                state: HostState::Up,
+                ..
+            })
+        ));
+        cmd_tx
+            .send(HostCmd::Attach {
+                name: "old".into(),
+                cols: 80,
+                rows: 24,
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_frame().await.unwrap(),
+            Some(Frame::Attach { .. })
+        ));
+        let identity = asd_proto::SessionIdentity { instance_id: 1 };
+        writer
+            .write_frame(&Frame::Snapshot {
+                identity,
+                vt: b"snapshot".to_vec(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            ev_rx.recv().await,
+            Some(UiEvent::Bytes { snapshot: true, .. })
+        ));
+        let info = asd_proto::SessionInfo {
+            name: "renamed".into(),
+            instance_id: 1,
+            command: "sh".into(),
+            title: String::new(),
+            status_line: String::new(),
+            created_ms: 0,
+            idle_ms: 0,
+            running: false,
+            state: asd_proto::AgentState::Unknown,
+            attached_clients: 1,
+            pid: 1,
+            cols: 80,
+            rows: 24,
+        };
+        feed_tx
+            .send((
+                asd_proto::EventCursor {
+                    daemon_epoch: [1; 16],
+                    sequence: 1,
+                },
+                EventFeedChange::Reset {
+                    sessions: vec![info],
+                    notification_lease: true,
+                },
+            ))
+            .unwrap();
+        assert!(matches!(ev_rx.recv().await, Some(UiEvent::Events { .. })));
+        writer
+            .write_frame(&Frame::SessionList { sessions: vec![] })
+            .await
+            .unwrap();
+        writer
+            .write_frame(&Frame::Output {
+                bytes: b"current".to_vec(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(ev_rx.recv().await, Some(UiEvent::Bytes { name, identity: id, snapshot: false, .. }) if name == "renamed" && id == identity)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), ev_rx.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), reader.read_frame())
+                .await
+                .is_err()
+        );
+        cmd_tx.send(HostCmd::Shutdown).unwrap();
+        assert!(matches!(
+            reader.read_frame().await.unwrap(),
+            Some(Frame::Detach)
+        ));
+        assert_eq!(actor.await.unwrap(), Ok(()));
+    }
+
     #[test]
     fn embedded_web_theme_reads_the_shared_css_properties() {
         let bridge = include_str!("../assets/bridge.js");

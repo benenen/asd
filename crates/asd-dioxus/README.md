@@ -30,7 +30,16 @@ This is a **library crate**: the root `asd` binary combines it via the `dioxus` 
 └────────────────────────────────────────────────────────────────┘
 ```
 
-Session semantics: one connection per host, polling `ListSessions` for the sidebar; only the viewed session is attached; switching sends `Detach`+`Attach` on the same connection. The `pending_attach` counter drops Snapshots/Output of superseded attaches so a quick A→B→A switch can't paint stale content, and every `UiEvent::Bytes` carries its session name so the app discards in-flight bytes from a session it just left.
+Session semantics: each host has a control connection and a dedicated event connection, both using the same local or SSH transport. The event feed supplies the sidebar without list polling and reconnects using its last accepted cursor; invalid ordering requests an authoritative reset. Only the viewed session is attached; switching sends `Detach`+`Attach` on the control connection. Attach convergence drops superseded Snapshots/Output, and every `UiEvent::Bytes` carries the exact session identity as well as its name.
+
+Unread Done (`✓`) and NeedsAttention (`!`) come from the shared client attention
+tracker, isolated per host and daemon epoch. They clear only after the exact
+Snapshot's ghostty-web write callback and render-frame acknowledgement, while
+the native window is focused. A background selected window still receives
+notifications. The GUI notification lease holder dispatches metadata-only native
+messages through `notification.rs` and `platform::notify`; desktop failures are
+logged without clearing unread state. Initial/reset snapshots and lease grants
+never replay old notifications.
 
 The local platform stream is a Unix socket on Linux/macOS and a named pipe on
 Windows. Saved connections use `asd_proto::paths::data_dir()`, so their exact
@@ -42,7 +51,8 @@ path follows the platform contract rather than a hard-coded Unix location.
 |---|---|
 | `src/lib.rs` | `run(session)` — Dioxus Desktop launch, embeds the vendor bundle + CSS |
 | `src/app.rs` | `App` component, supervisor loop, settings overlay, connect menu |
-| `src/conn.rs` | Per-host actor: handshake, list polling, attach/detach, raw PTY bytes |
+| `src/conn.rs` | Per-host actor: control and replaying event connections, attach/detach, raw PTY bytes |
+| `src/notification.rs` | Metadata-only native notification adapter and recording test adapter |
 | `src/ssh.rs` | russh transport: known_hosts check, password/key auth, `asd attach --stdio` exec |
 | `src/model.rs` | Hosts/sessions/selection model (+ unit tests) |
 | `src/settings.rs` | Saved SSH connections, config persistence, form validation (+ unit tests) |
