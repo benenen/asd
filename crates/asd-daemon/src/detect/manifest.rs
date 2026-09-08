@@ -217,7 +217,21 @@ impl Predicate {
                 return Err(format!("missing contains: {needle}"));
             }
             if folded.contains('\n') {
-                evidence.extend(0..region.lines.len());
+                // Include overlapping matches, but no unrelated region lines.
+                let extra_lines = folded
+                    .bytes()
+                    .take(folded.len() - 1)
+                    .filter(|b| *b == b'\n')
+                    .count();
+                let mut first = 0;
+                for (start, character) in region.joined.char_indices() {
+                    if region.joined[start..].starts_with(&folded) {
+                        evidence.extend(first..=first + extra_lines);
+                    }
+                    if character == '\n' {
+                        first += 1;
+                    }
+                }
             } else {
                 evidence.extend(
                     region
@@ -300,8 +314,8 @@ impl LinePredicate {
 }
 
 /// A region's text, lowercased once and kept in both shapes the predicates
-/// need: line by line, and joined. The join uses `\n` so a `contains` cannot
-/// match across a line break.
+/// need: line by line, and joined. The join uses `\n`, so matching across a
+/// line break requires an explicit newline in the `contains` predicate.
 #[derive(Debug)]
 pub struct RegionText {
     pub lines: Vec<String>,
@@ -313,5 +327,50 @@ impl RegionText {
         let lines: Vec<String> = lines.iter().map(|l| l.to_lowercase()).collect();
         let joined = lines.join("\n");
         Self { lines, joined }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiline_contains_evidence_only_includes_intersecting_lines() {
+        let region = RegionText::new(
+            [
+                "unrelated",
+                "前 START",
+                "END 后",
+                "unrelated",
+                "START",
+                "END",
+                "unrelated",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        );
+        let predicate = Predicate {
+            contains: vec!["START\nEND".into()],
+            ..Predicate::default()
+        };
+        assert_eq!(predicate.evaluate(&region).unwrap(), vec![1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn multiline_evidence_handles_unicode_overlaps_and_trailing_newlines() {
+        let region = RegionText::new(
+            ["unrelated", "甲", "甲", "甲", "unrelated"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+        for (needle, expected) in [("甲\n甲", vec![1, 2, 3]), ("甲\n", vec![1, 2, 3])] {
+            let predicate = Predicate {
+                contains: vec![needle.into()],
+                ..Predicate::default()
+            };
+            assert_eq!(predicate.evaluate(&region).unwrap(), expected);
+        }
     }
 }

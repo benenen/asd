@@ -67,11 +67,10 @@ impl StoreError {
     }
 }
 
-/// A durable writer plus its accepted in-memory state.
+/// A durable writer; the Registry owns the accepted session state.
 pub struct SessionStore {
     json_path: PathBuf,
     legacy_path: PathBuf,
-    accepted: Vec<SessionState>,
     generation: u64,
     dirty: bool,
 }
@@ -103,7 +102,6 @@ impl SessionStore {
                 store: Self {
                     json_path,
                     legacy_path,
-                    accepted: sessions.clone(),
                     generation: 0,
                     dirty: false,
                 },
@@ -127,7 +125,6 @@ impl SessionStore {
                 store: Self {
                     json_path,
                     legacy_path,
-                    accepted: Vec::new(),
                     generation: 0,
                     dirty: false,
                 },
@@ -144,7 +141,6 @@ impl SessionStore {
         let mut store = Self {
             json_path,
             legacy_path,
-            accepted: Vec::new(),
             generation: 0,
             dirty: false,
         };
@@ -201,6 +197,14 @@ impl SessionStore {
                     source,
                 }
             })?;
+            #[cfg(test)]
+            if FAIL_NEXT_PARENT_SYNC.with(|fail| fail.replace(false)) {
+                return Err(StoreError::Io {
+                    operation: "sync session-store directory",
+                    path: self.json_path.clone(),
+                    source: std::io::Error::other("injected parent-sync failure after replacement"),
+                });
+            }
             crate::platform::sync_parent(&self.json_path).map_err(|source| StoreError::Io {
                 operation: "sync session-store directory",
                 path: self.json_path.clone(),
@@ -212,7 +216,6 @@ impl SessionStore {
             return Err(error);
         }
         self.generation += 1;
-        self.accepted = states.to_vec();
         self.dirty = false;
         Ok(self.generation)
     }
@@ -237,6 +240,7 @@ impl SessionStore {
 #[cfg(test)]
 std::thread_local! {
     static READ_BACK_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_NEXT_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn read_authoritative(path: &Path) -> Result<Vec<SessionState>, StoreError> {

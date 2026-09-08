@@ -1384,8 +1384,23 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if matches!(self.child.try_wait(), Ok(None)) {
+            // The unreaped Child still owns this PID; let normal shutdown
+            // finish persistence, PTY cleanup, and coverage profile flushing.
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+            let deadline = std::time::Instant::now() + WAIT;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) if std::time::Instant::now() >= deadline => {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(TICK),
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -3735,7 +3750,6 @@ async fn screen_wait_observes_transient_literal_and_regex_without_attachment() {
                 .unwrap(),
         );
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let mut driver = ProtoClient::connect(&daemon.socket).await;
     driver
         .send(Frame::SendInput {
@@ -3750,6 +3764,28 @@ async fn screen_wait_observes_transient_literal_and_regex_without_attachment() {
         frame => panic!("{frame:?}"),
     };
     assert!(matches!(raw.recv().await, Frame::ScreenWaitMatched { identity } if identity == first));
+    // CLI startup has no registration acknowledgement. Replay the short-lived
+    // marker until both real CLI processes finish; the protocol clients above
+    // separately prove a single transient is caught after a channel barrier.
+    let deadline = std::time::Instant::now() + WAIT;
+    while cli_waits
+        .iter_mut()
+        .any(|child| child.try_wait().unwrap().is_none())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CLI screen wait did not finish"
+        );
+        driver
+            .send(Frame::SendInput {
+                name: "transient".into(),
+                bytes: b"go\n".to_vec(),
+                enter: false,
+            })
+            .await;
+        assert!(matches!(driver.recv().await, Frame::Ack));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     for child in cli_waits {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{out:?}");

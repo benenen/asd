@@ -397,9 +397,12 @@ impl Registry {
                 }
             })
             .collect();
-        self.store
-            .commit(&candidate)
-            .map_err(|error| (code::PERSISTENCE_FAILURE, error.to_string()))?;
+        if let Err(error) = self.store.commit(&candidate) {
+            // Replacement may have succeeded before directory sync failed.
+            // Reconcile disk with the still-accepted Registry state on retry.
+            self.store.mark_dirty();
+            return Err((code::PERSISTENCE_FAILURE, error.to_string()));
+        }
         match record {
             Some(record) => {
                 self.agent_records.insert(identity, record);
@@ -562,8 +565,11 @@ mod identity_tests {
     use super::*;
     use crate::agent_resume::AgentEvidence::{Observed, Unavailable};
 
-    #[test]
-    fn identity_and_agent_transactions_reject_stale_or_uncommitted_updates() {
+    fn test_registry() -> (
+        Registry,
+        std::sync::mpsc::Receiver<SessionMsg>,
+        std::path::PathBuf,
+    ) {
         let identity = SessionIdentity { instance_id: 7 };
         let (tx, rx) = std::sync::mpsc::channel();
         let meta = Arc::new(crate::session::SessionMeta {
@@ -588,7 +594,12 @@ mod identity_tests {
             tx,
             meta,
         };
-        let dir = std::env::temp_dir().join(format!("asd-registry-test-{}", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("asd-registry-test-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store =
             crate::store::SessionStore::open(dir.join("sessions.json"), dir.join("sessions.tsv"))
@@ -602,6 +613,79 @@ mod identity_tests {
         )
         .unwrap();
         registry.sessions.insert("current".to_string(), handle);
+        (registry, rx, dir)
+    }
+
+    #[test]
+    fn rejected_agent_replacement_is_reconciled_by_sweep_or_shutdown() {
+        use asd_proto::{AgentHookAction, AgentKind};
+        for clear in [false, true] {
+            for shutdown in [false, true] {
+                let (mut registry, _rx, dir) = test_registry();
+                let identity = SessionIdentity { instance_id: 7 };
+                let start = AgentHookAction::Start {
+                    source: "startup".into(),
+                };
+                registry
+                    .report_agent(
+                        identity,
+                        AgentKind::Codex,
+                        &start,
+                        "accepted-a",
+                        Observed(Some(AgentKind::Codex)),
+                    )
+                    .unwrap();
+                let accepted = registry.snapshot()[0].agent_resume.clone();
+                crate::store::FAIL_NEXT_PARENT_SYNC.with(|fail| fail.set(true));
+                let result = if clear {
+                    registry.clear_agent(identity)
+                } else {
+                    registry.report_agent(
+                        identity,
+                        AgentKind::Codex,
+                        &start,
+                        "rejected-b",
+                        Observed(Some(AgentKind::Codex)),
+                    )
+                };
+                let error = result.unwrap_err();
+                assert_eq!(error.0, code::PERSISTENCE_FAILURE);
+                assert!(error.1.contains("sync session-store directory"));
+                assert_eq!(registry.snapshot()[0].agent_resume, accepted);
+                let read_disk = || {
+                    let document: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(dir.join("sessions.json")).unwrap())
+                            .unwrap();
+                    document["sessions"][0]["agent_resume"]["session_ref"].clone()
+                };
+                assert_eq!(
+                    read_disk(),
+                    if clear {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!("rejected-b")
+                    }
+                );
+                if shutdown {
+                    registry.freeze_and_persist();
+                } else {
+                    registry.persist();
+                }
+                assert_eq!(
+                    read_disk(),
+                    "accepted-a",
+                    "clear={clear}, shutdown={shutdown}"
+                );
+                assert_eq!(registry.snapshot()[0].agent_resume, accepted);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn identity_and_agent_transactions_reject_stale_or_uncommitted_updates() {
+        let (mut registry, rx, dir) = test_registry();
+        let identity = SessionIdentity { instance_id: 7 };
 
         let error = registry
             .kill("current", SessionIdentity { instance_id: 8 })
