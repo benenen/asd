@@ -203,9 +203,42 @@ asd send-all --text '/compact' --enter
 The session running the command is skipped unless `--include-self` is set.
 Use `--dry-run` before a broad action when you want to inspect its targets.
 
+### Use coding agents safely
+
+`asd` can wait for the rendered result of an agent turn without polling:
+
+```bash
+asd wait agent --regex 'READY-[0-9]+' --timeout 2m
+asd wait agent --until blocked --timeout 10m
+asd agent explain agent --json
+asd agent reload --json
+```
+
+`--text` and `--regex` inspect the current **visible screen only**, never
+scrollback. The daemon checks a condition before registering it and after each
+subsequent terminal feed, so text that is rendered and immediately erased can
+still match. `--idle` and `--until` use the daemon event feed rather than a
+poll loop. See [Automation and observation semantics](docs/automation.md) for
+limits, exit codes, event replay/reset recovery, and detector manifests.
+
+The TUI and GUI keep unread `✓` Done and `!` NeedsAttention markers for
+background agents. A row click alone is not Seen: the marker clears only after
+the exact terminal snapshot is displayed (and, in the GUI, while its window is
+focused). One TUI and one GUI notification lease may alert at a time, avoiding
+duplicate bells or desktop notifications from multiple clients.
+
+To make an ordinary `asd restart` resume an existing Codex or Claude
+conversation, add the explicit synchronous lifecycle hooks shown in
+[Agent resume hooks](docs/automation.md#authoritative-agent-resume-hooks).
+`asd` never edits Codex or Claude settings for you. Restart still replaces the
+PTY process and its screen; the hook only lets `asd` stage a fixed `codex
+resume ID` or `claude --resume ID` command at the fresh shell prompt. The
+default is deliberately staged-without-Enter. See [Persistence, upgrades, and
+restart](#persistence-upgrades-and-restart) before enabling automatic restore.
+
 ### Tell people and tools what a session is doing
 
-Every session receives `ASD_SESSION` and `ASD_SOCKET`. A process inside the
+Every session receives `ASD_SESSION`, `ASD_SESSION_ID`, and `ASD_SOCKET`. A process inside the
 session can publish a one-line status without naming itself:
 
 ```bash
@@ -217,6 +250,10 @@ asd status --clear
 The line appears in `asd list`, `asd inspect`, and the TUI.
 `ASD_SESSION` keeps the name assigned at spawn time; after `asd rename`, pass
 the current session name explicitly when setting status.
+
+`ASD_SESSION_ID` is an opaque, rename-stable identity intended for the Codex
+and Claude lifecycle hooks. It changes whenever a session is restored or
+replaced; it is not a session-name substitute for ordinary commands.
 
 ## Terminal UI
 
@@ -326,6 +363,11 @@ Reload exits 1 if sessions are still pending after five seconds and prints
 their identities; the new rules remain active. See
 [Agent state](docs/architecture.md#agent-state) for the rule ownership model.
 
+For Codex/Claude conversation recovery, use the synchronous hook snippets in
+[Automation and observation semantics](docs/automation.md#authoritative-agent-resume-hooks).
+They record only an accepted, authoritative vendor session reference; no hook
+configuration is changed automatically.
+
 `config.toml` is read once at startup. Reopen `asd ui` after changing `[keys]`.
 Changing `[session]` requires a daemon restart, so read the warning below first.
 
@@ -337,7 +379,10 @@ does not replace a daemon that is already running.
 `asd restart` starts the new daemon and recreates saved session names, working
 directories, and start commands. **The live programs and their screen contents
 do not survive.** Restored commands are typed at fresh shell prompts but are
-not executed unless `run_restored_commands = true`.
+not executed unless `run_restored_commands = true`. `sessions.json` is the
+authoritative versioned store; a legacy `sessions.tsv` is imported only when
+JSON is absent, then retained as a `.tsv.migrated` backup. A corrupt or newer
+JSON file stops restore rather than silently falling back to stale TSV data.
 
 Client and daemon protocol versions must match. After an upgrade that changes
 the protocol, finish or otherwise preserve important work before restarting.

@@ -56,6 +56,39 @@ target, so the Windows daemon has no native E2E coverage. A real Windows
 terminal is still required for named pipes, console restoration, DLL
 packaging, and URL detection.
 
+When a change touches the desktop notification adapter, separately compile the
+real GUI target:
+
+```bash
+cargo check -p asd-dioxus --target x86_64-pc-windows-gnu
+```
+
+This checks that the Windows adapter remains behind `asd-dioxus/src/platform/`.
+It needs a usable MinGW C toolchain for native dependencies; if that local
+toolchain is unavailable, do not call GUI coverage passed. Require the native
+Windows full-GUI CI result instead. A successful cross-compile still does not
+prove that Windows displayed a notification; keep the adapter's behavioral
+tests and a real-machine smoke in the evidence.
+
+## Session identity, persistence, and foreground proof
+
+Every spawned child receives `ASD_SESSION_ID`, an opaque daemon-issued identity
+that is stable across rename and fresh on replacement or restore. It is used by
+the Codex/Claude hook command to locate its hosting session, not as evidence
+that the current foreground process is Codex or Claude. A Start hook requires
+foreground executable and argument proof. Where foreground lookup is
+unavailable, the daemon may use only a conservative recorded launch command;
+otherwise it rejects the report. Consequently, a coding agent launched manually
+from a plain Windows shell may not acquire resume metadata until Windows
+foreground lookup can prove it.
+
+The versioned session store uses platform-specific private temporary-file
+creation, replacement, and parent-directory synchronization. Preserve that
+interface in `asd-daemon/src/platform/`; do not emulate Unix rename behavior at
+call sites. Windows named pipes and session-store paths have different shapes,
+so derive the PID-file and persistence locations from the data-directory
+contract rather than by adding a file extension to a pipe name.
+
 ## macOS checks
 
 Foreground-command parsing on macOS uses `sysctl(KERN_PROCARGS2)` with a

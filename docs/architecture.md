@@ -220,10 +220,15 @@ sequence before removing its endpoint.
 Live processes, terminal cells, and scrollback are not persisted. Session name,
 working directory, original launch command, and optional authoritative agent
 resume metadata are stored in version 1 `sessions.json`. Registry serializes
-private atomic writes with file and parent-directory sync. Existing TSV state
-is imported only when JSON is absent; invalid JSON fails startup, and records
-that cannot restore are retained. An ordinary kill or shell exit removes the saved
-entry; a daemon restart or crash restores it.
+private atomic writes with file and parent-directory sync. `sessions.json` is
+strictly authoritative when present: a malformed, unsupported, or unreadable
+JSON document fails startup without mutation and never falls back to TSV.
+Only when JSON is absent does the daemon import valid `sessions.tsv` records,
+commit and read back JSON, then rename the untouched TSV to
+`sessions.tsv.migrated` as a backup. A failed backup rename is only a warning
+after JSON read-back; a failed read-back leaves TSV unrenamed and fails startup.
+Records that cannot restore are retained. An ordinary kill or shell exit removes
+the saved entry; a daemon restart or crash restores it.
 
 Daemon startup recreates each saved entry as a fresh default shell in its
 recorded directory. A recorded command is **staged, not run**: the daemon types
@@ -250,7 +255,9 @@ recorded invocation without shell operators, substitutions, or controls. A
 failed lookup on a supported platform is unproven and rejects Start. End matches the
 stored kind/reference even after the agent exits. Duplicate restore claims
 are reserved by newest daemon timestamp, then ascending session name. Losers
-stage their original command without Enter, including in opt-in execution mode.
+stage their original command without Enter, including in opt-in execution mode;
+they never start a fresh agent conversation implicitly. This duplicate-loser
+staging also retains the default control-character guard.
 
 Before intentional daemon shutdown, `freeze_and_persist` captures live working
 directories and freezes persistence. Otherwise the subsequent SIGHUP-driven

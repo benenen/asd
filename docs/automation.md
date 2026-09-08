@@ -294,6 +294,55 @@ asd agent hook claude end
 asd agent clear
 ```
 
+Use synchronous command hooks. A background hook can be cancelled or finish
+after a replacement session has begun, so it is not authoritative resume
+metadata. The following are complete user-level examples; they intentionally
+omit `async` (whose default is synchronous). Place the Codex form in either
+`~/.codex/hooks.json` or the corresponding trusted project `.codex/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "^(startup|resume|clear|compact)$",
+      "hooks": [{ "type": "command", "command": "asd agent hook codex start" }]
+    }],
+    "SessionEnd": [{
+      "matcher": "^other$",
+      "hooks": [{ "type": "command", "command": "asd agent hook codex end", "timeout": 3 }]
+    }]
+  }
+}
+```
+
+Use this Claude Code form in `~/.claude/settings.json`,
+`.claude/settings.json`, or `.claude/settings.local.json` as appropriate for
+the desired scope:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "^(startup|resume|clear|compact|fork)$",
+      "hooks": [{ "type": "command", "command": "asd agent hook claude start", "args": [] }]
+    }],
+    "SessionEnd": [{
+      "matcher": "^(clear|resume|logout|prompt_input_exit|other)$",
+      "hooks": [{ "type": "command", "command": "asd agent hook claude end", "args": [], "timeout": 3 }]
+    }]
+  }
+}
+```
+
+The commands consume the original JSON on stdin: do not pipe through `jq`,
+extract a session ID into a shell command, or add an asynchronous wrapper. The
+allowlists below are deliberate compatibility boundaries, not broad pattern
+matches. They must be expanded only in a tested `asd` update when a vendor
+introduces a new lifecycle value. Codex hook locations and lifecycle payloads
+are documented in the [official Codex hook reference](https://learn.chatgpt.com/docs/hooks);
+Claude Code configuration and lifecycle fields are documented in its
+[hook reference](https://code.claude.com/docs/en/hooks).
+
 Hooks use `ASD_SESSION_ID`, not the mutable session name. The daemon provides
 this variable in every session; it survives rename but changes on replacement
 or restore. `clear` explicitly removes the hosting session's resume metadata.
@@ -312,11 +361,13 @@ argument boundaries. Display strings and shell `-c` source never prove a live
 agent. On platforms without process lookup, the recorded launch is a fallback
 only when it is a conservative single invocation without quotes, operators,
 substitutions, or control characters; manually launched agents on Windows may
-therefore be rejected. A failed lookup on a supported platform rejects Start.
-End requires the exact stored kind/reference, even if the process has exited.
-Duplicate references owned by another live or retained session are rejected.
-A successful hook returns only after durable persistence; invalid, stale, or
-failed writes exit non-zero without changing in-memory resume metadata.
+therefore be rejected. `ASD_SESSION_ID` identifies the hosting session but
+cannot itself prove which process is in its foreground. A failed lookup on a
+supported platform rejects Start. End requires the exact stored kind/reference,
+even if the process has exited. Duplicate references owned by another live or
+retained session are rejected. A successful hook returns only after durable
+persistence; invalid, stale, or failed writes exit non-zero without changing
+in-memory resume metadata.
 
 Restart starts a fresh shell and stages `codex resume ID` or
 `claude --resume ID` without Enter. `--run-restored-commands` opts into execution
@@ -324,7 +375,8 @@ of the same validated command. Duplicate saved claims select the newest daemon
 timestamp, then ascending session name; every loser stages its original launch
 command without Enter, even with opt-in execution. Any unconfirmed original
 containing control characters (including TAB, CR, LF, and ESC) is left unstaged
-with a warning; its persisted bytes are retained. Printable commands stage
-exactly, and explicit execution opt-in retains the original command behavior.
+with a warning; its persisted bytes are retained. This protection applies to
+the default staged restore; explicit execution opt-in retains the original
+command behavior. Printable commands stage exactly.
 Missing agent executables
 remain visible shell errors rather than silently starting a fresh conversation.

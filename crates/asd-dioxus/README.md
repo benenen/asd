@@ -32,6 +32,14 @@ This is a **library crate**: the root `asd` binary combines it via the `dioxus` 
 
 Session semantics: each host has a control connection and a dedicated event connection, both using the same local or SSH transport. The event feed supplies the sidebar without list polling and reconnects using its last accepted cursor; invalid ordering requests an authoritative reset. Only the viewed session is attached; switching sends `Detach`+`Attach` on the control connection. Attach convergence drops superseded Snapshots/Output, and every `UiEvent::Bytes` carries the exact session identity as well as its name.
 
+The event connection never carries PTY output and is not an attachment, follower,
+viewer slot, or PTY-size participant. A recoverable reconnect replays only the
+bounded contiguous event suffix after the accepted cursor. A missing, expired,
+foreign-epoch, or invalid cursor instead replaces the host projection with the
+daemon's reset snapshot. Activity is sampled as one `idle_ms`/`running` age pair
+at that snapshot boundary; lifecycle, rename, and detected state remain
+cursor-ordered facts.
+
 Unread Done (`✓`) and NeedsAttention (`!`) come from the shared client attention
 tracker, isolated per host and daemon epoch. They clear only after the exact
 Snapshot's ghostty-web write callback and render-frame acknowledgement, while
@@ -49,6 +57,9 @@ rename during attach or between rendering and acknowledgement preserves Seen.
 The local platform stream is a Unix socket on Linux/macOS and a named pipe on
 Windows. Saved connections use `asd_proto::paths::data_dir()`, so their exact
 path follows the platform contract rather than a hard-coded Unix location.
+Native notification differences stay behind `src/platform/`; the host actor
+must not perform platform notification I/O directly or let a delivery failure
+roll back local Seen/unread state.
 
 ## Files
 
