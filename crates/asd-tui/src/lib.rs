@@ -628,6 +628,8 @@ pub(crate) struct App {
     host_links: HostLinkState,
     /// The attached session's name.
     pub active: Option<String>,
+    /// Exact instance confirmed by the most recent Snapshot for `active`.
+    active_identity: Option<SessionIdentity>,
     /// The active sidebar selection whose exclusive TUI view was taken by
     /// another `asd ui`. It stays selected so choosing it again is an explicit
     /// takeover, while the pane renders a placard instead of stale terminal
@@ -957,6 +959,7 @@ fn event_loop(
         running_activity: RunningActivity::default(),
         host_links: HostLinkState::default(),
         active: None,
+        active_identity: None,
         view_revoked: None,
         vt: None,
         scroll: 0,
@@ -1384,6 +1387,7 @@ impl App {
             }
         }
         self.active = Some(name.clone());
+        self.active_identity = None;
         self.view_revoked = None;
         self.ensure_active_sidebar_visible();
         // Hold a frame on screen while the new attach converges — never draw
@@ -1466,6 +1470,7 @@ impl App {
                 self.notice = Some(reason);
                 self.closing_sessions.clear();
                 self.active = None;
+                self.active_identity = None;
                 self.view_revoked = None;
                 self.vt = None;
                 self.snapshot_pending = false;
@@ -1525,6 +1530,7 @@ impl App {
                     && !self.sessions.iter().any(|s| &s.name == a)
                 {
                     self.active = None;
+                    self.active_identity = None;
                     self.view_revoked = None;
                     self.vt = None;
                     self.snapshot_pending = false;
@@ -1569,11 +1575,17 @@ impl App {
             Ev::Created(name) => self.select(name),
             Ev::Bytes {
                 name,
+                identity,
                 data,
                 snapshot,
             } => {
                 // Bytes from a session we already left can still be in flight.
                 if self.active.as_deref() != Some(&name) {
+                    return;
+                }
+                if snapshot {
+                    self.active_identity = Some(identity);
+                } else if self.active_identity != Some(identity) {
                     return;
                 }
                 if !snapshot {
@@ -2221,6 +2233,7 @@ impl App {
         );
         self.notice = None;
         self.active = None;
+        self.active_identity = None;
         self.vt = None;
         // A stale reading from the old daemon must not survive the reconnect
         // and be shown as if it were current.
@@ -2388,6 +2401,7 @@ mod tests {
                 generation: 6,
                 event: Ev::Bytes {
                     name: "active".to_string(),
+                    identity: SessionIdentity { instance_id: 1 },
                     data: b"stale output".to_vec(),
                     snapshot: false,
                 },

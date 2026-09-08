@@ -83,6 +83,7 @@ pub enum UiEvent {
     Bytes {
         host: HostId,
         name: String,
+        identity: asd_proto::SessionIdentity,
         data: Vec<u8>,
         snapshot: bool,
     },
@@ -161,21 +162,23 @@ async fn drive(
                 Ok(Some(Frame::SessionList { sessions })) => {
                     let _ = ev_tx.send(UiEvent::Sessions { host: id, sessions });
                 }
-                Ok(Some(Frame::Snapshot { vt: dump })) => {
-                    if let Some(name) = at.on_snapshot() {
+                Ok(Some(Frame::Snapshot { identity, vt: dump })) => {
+                    if let Some(attached) = at.on_snapshot(identity) {
                         let _ = ev_tx.send(UiEvent::Bytes {
                             host: id,
-                            name,
+                            name: attached.name,
+                            identity: attached.identity,
                             data: dump,
                             snapshot: true,
                         });
                     }
                 }
                 Ok(Some(Frame::Output { bytes })) => {
-                    if let Some(name) = at.on_output() {
+                    if let Some(attached) = at.on_output() {
                         let _ = ev_tx.send(UiEvent::Bytes {
                             host: id,
-                            name,
+                            name: attached.name,
+                            identity: attached.identity,
                             data: bytes,
                             snapshot: false,
                         });

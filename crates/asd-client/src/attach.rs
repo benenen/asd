@@ -29,7 +29,15 @@
 pub struct Attach {
     pending: usize,
     showing: Option<String>,
+    identity: Option<asd_proto::SessionIdentity>,
     view_id: u64,
+}
+
+/// The exact session instance whose frames have converged on a client view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedSession {
+    pub name: String,
+    pub identity: asd_proto::SessionIdentity,
 }
 
 impl Attach {
@@ -46,28 +54,35 @@ impl Attach {
         let was_attached = self.showing.is_some();
         self.pending += 1;
         self.showing = Some(name);
+        self.identity = None;
         self.view_id = view_id;
         was_attached
     }
 
-    /// A Snapshot arrived: the session name to tag it with, or `None` when it
-    /// belongs to a superseded attach and must be dropped.
-    pub fn on_snapshot(&mut self) -> Option<String> {
+    /// A Snapshot arrived: its converged session identity and name, or `None`
+    /// when it belongs to a superseded attach and must be dropped.
+    pub fn on_snapshot(&mut self, identity: asd_proto::SessionIdentity) -> Option<AttachedSession> {
         if self.pending > 1 {
             self.pending -= 1; // superseded attach — not our view
             return None;
         }
         self.pending = 0;
-        self.showing.clone()
+        let name = self.showing.clone()?;
+        self.identity = Some(identity);
+        Some(AttachedSession { name, identity })
     }
 
-    /// An Output arrived: the session name to tag it with, or `None` while a
-    /// switch is still converging (the bytes belong to a session we just left).
-    pub fn on_output(&self) -> Option<String> {
+    /// An Output arrived: the converged session identity and name to tag it
+    /// with, or `None` while a switch is still converging (the bytes belong to
+    /// the session we just left).
+    pub fn on_output(&self) -> Option<AttachedSession> {
         if self.pending > 0 {
             return None;
         }
-        self.showing.clone()
+        Some(AttachedSession {
+            name: self.showing.clone()?,
+            identity: self.identity?,
+        })
     }
 
     /// The attached session exited (`SESSION_EXITED` carries no name). Returns
@@ -78,6 +93,7 @@ impl Attach {
     pub fn on_session_exited(&mut self) -> Option<String> {
         if self.pending == 0 {
             self.view_id = 0;
+            self.identity = None;
             self.showing.take()
         } else {
             None
@@ -90,6 +106,7 @@ impl Attach {
     pub fn on_view_revoked(&mut self, view_id: u64) -> Option<String> {
         if self.pending == 0 && self.view_id == view_id {
             self.view_id = 0;
+            self.identity = None;
             self.showing.take()
         } else {
             None
@@ -122,6 +139,7 @@ impl Attach {
         self.pending -= 1;
         if self.pending == 0 {
             self.view_id = 0;
+            self.identity = None;
             self.showing.take()
         } else {
             None
@@ -150,6 +168,7 @@ impl Attach {
         // on_snapshot (showing is None, nothing is forwarded) so the count
         // stays aligned.
         self.view_id = 0;
+        self.identity = None;
         self.showing.take()
     }
 }
@@ -157,16 +176,21 @@ impl Attach {
 #[cfg(test)]
 mod tests {
     use super::Attach;
+    use asd_proto::SessionIdentity;
 
-    fn s(name: &str) -> Option<String> {
-        Some(name.to_string())
+    fn id(instance_id: u128) -> SessionIdentity {
+        SessionIdentity { instance_id }
+    }
+
+    fn tagged(value: Option<super::AttachedSession>) -> Option<(String, SessionIdentity)> {
+        value.map(|attached| (attached.name, attached.identity))
     }
 
     #[test]
     fn first_attach_needs_no_detach_switch_does() {
         let mut at = Attach::default();
         assert!(!at.begin("a".into()));
-        at.on_snapshot(); // converges
+        at.on_snapshot(id(1)); // converges
         assert!(at.begin("b".into()));
     }
 
@@ -174,8 +198,8 @@ mod tests {
     fn snapshot_then_output_tag_the_current_view() {
         let mut at = Attach::default();
         at.begin("a".into());
-        assert_eq!(at.on_snapshot(), s("a"));
-        assert_eq!(at.on_output(), s("a"));
+        assert_eq!(tagged(at.on_snapshot(id(1))), Some(("a".into(), id(1))));
+        assert_eq!(tagged(at.on_output()), Some(("a".into(), id(1))));
     }
 
     #[test]
@@ -183,8 +207,8 @@ mod tests {
         let mut at = Attach::default();
         at.begin("a".into());
         assert_eq!(at.on_output(), None);
-        assert_eq!(at.on_snapshot(), s("a"));
-        assert_eq!(at.on_output(), s("a"));
+        assert_eq!(tagged(at.on_snapshot(id(1))), Some(("a".into(), id(1))));
+        assert_eq!(tagged(at.on_output()), Some(("a".into(), id(1))));
     }
 
     #[test]
@@ -192,39 +216,39 @@ mod tests {
         let mut at = Attach::default();
         at.begin("a".into());
         at.begin("b".into());
-        assert_eq!(at.on_snapshot(), None); // a's snapshot — superseded
-        assert_eq!(at.on_snapshot(), s("b"));
-        assert_eq!(at.on_output(), s("b"));
+        assert_eq!(at.on_snapshot(id(1)), None); // a's snapshot — superseded
+        assert_eq!(tagged(at.on_snapshot(id(2))), Some(("b".into(), id(2))));
+        assert_eq!(tagged(at.on_output()), Some(("b".into(), id(2))));
     }
 
     #[test]
     fn session_exit_pins_the_name_only_when_settled() {
         let mut at = Attach::default();
         at.begin("a".into());
-        at.on_snapshot();
-        assert_eq!(at.on_session_exited(), s("a"));
+        at.on_snapshot(id(1));
+        assert_eq!(at.on_session_exited(), Some("a".into()));
         assert_eq!(at.on_output(), None);
 
         // Switch in flight: exit belongs to the session we left.
         let mut at = Attach::default();
         at.begin("a".into());
-        at.on_snapshot();
+        at.on_snapshot(id(1));
         at.begin("b".into());
         assert_eq!(at.on_session_exited(), None);
-        assert_eq!(at.on_snapshot(), s("b"));
+        assert_eq!(tagged(at.on_snapshot(id(2))), Some(("b".into(), id(2))));
     }
 
     #[test]
     fn failed_attach_drains_and_reports_only_the_newest() {
         let mut at = Attach::default();
         at.begin("gone".into());
-        assert_eq!(at.on_attach_failed(), s("gone"));
+        assert_eq!(at.on_attach_failed(), Some("gone".into()));
 
         let mut at = Attach::default();
         at.begin("a".into());
         at.begin("b".into());
         assert_eq!(at.on_attach_failed(), None); // a failed, b still pending
-        assert_eq!(at.on_snapshot(), s("b"));
+        assert_eq!(tagged(at.on_snapshot(id(2))), Some(("b".into(), id(2))));
     }
 
     /// Bug regression: renaming the session being viewed re-tags the view, so
@@ -236,16 +260,16 @@ mod tests {
     fn rename_of_the_shown_session_retags_the_view() {
         let mut at = Attach::default();
         at.begin("s0".into());
-        assert_eq!(at.on_snapshot(), s("s0"));
+        assert_eq!(tagged(at.on_snapshot(id(1))), Some(("s0".into(), id(1))));
         at.on_rename("s0", "zzz");
-        assert_eq!(at.on_output(), s("zzz"));
+        assert_eq!(tagged(at.on_output()), Some(("zzz".into(), id(1))));
 
         // Renaming a different session leaves the view alone.
         let mut at = Attach::default();
         at.begin("a".into());
-        at.on_snapshot();
+        at.on_snapshot(id(1));
         at.on_rename("other", "new");
-        assert_eq!(at.on_output(), s("a"));
+        assert_eq!(tagged(at.on_output()), Some(("a".into(), id(1))));
     }
 
     /// Bug regression (client side): after the attached session is killed and
@@ -256,31 +280,31 @@ mod tests {
     fn reattach_after_kill_routes_the_new_sessions_snapshot() {
         let mut at = Attach::default();
         at.begin("a".into());
-        assert_eq!(at.on_snapshot(), s("a"));
-        assert_eq!(at.on_session_exited(), s("a"));
+        assert_eq!(tagged(at.on_snapshot(id(1))), Some(("a".into(), id(1))));
+        assert_eq!(at.on_session_exited(), Some("a".into()));
         assert_eq!(at.showing, None);
         assert!(!at.begin("b".into()));
-        assert_eq!(at.on_snapshot(), s("b"));
-        assert_eq!(at.on_output(), s("b"));
+        assert_eq!(tagged(at.on_snapshot(id(2))), Some(("b".into(), id(2))));
+        assert_eq!(tagged(at.on_output()), Some(("b".into(), id(2))));
     }
 
     #[test]
     fn explicit_detach_drains_pending_snapshots() {
         let mut at = Attach::default();
         at.begin("a".into());
-        assert_eq!(at.detach(), s("a"));
+        assert_eq!(at.detach(), Some("a".into()));
         // Snapshot still in flight drains harmlessly — showing is None.
-        assert_eq!(at.on_snapshot(), None);
+        assert_eq!(at.on_snapshot(id(1)), None);
     }
 
     #[test]
     fn revoking_the_shown_view_detaches_it() {
         let mut at = Attach::default();
         at.begin_view("a".into(), 7);
-        at.on_snapshot();
+        at.on_snapshot(id(1));
         assert!(at.on_view_renamed(7, "a", "renamed"));
 
-        assert_eq!(at.on_view_revoked(7), s("renamed"));
+        assert_eq!(at.on_view_revoked(7), Some("renamed".into()));
         assert!(!at.is_attached());
     }
 
@@ -288,32 +312,32 @@ mod tests {
     fn stale_view_identity_cannot_rename_the_replacement_view() {
         let mut at = Attach::default();
         at.begin_view("replacement".into(), 8);
-        at.on_snapshot();
+        at.on_snapshot(id(1));
 
         assert!(!at.on_view_renamed(7, "replacement", "wrong"));
-        assert_eq!(at.on_output(), s("replacement"));
+        assert_eq!(tagged(at.on_output()), Some(("replacement".into(), id(1))));
     }
 
     #[test]
     fn duplicate_view_rename_is_not_forwarded_after_list_retag() {
         let mut at = Attach::default();
         at.begin_view("old".into(), 7);
-        at.on_snapshot();
+        at.on_snapshot(id(1));
         at.on_rename("old", "new");
 
         assert!(!at.on_view_renamed(7, "old", "new"));
-        assert_eq!(at.on_output(), s("new"));
+        assert_eq!(tagged(at.on_output()), Some(("new".into(), id(1))));
     }
 
     #[test]
     fn stale_revocation_does_not_cancel_a_pending_reattach() {
         let mut at = Attach::default();
         at.begin_view("a".into(), 7);
-        at.on_snapshot();
+        at.on_snapshot(id(1));
         at.begin_view("a".into(), 8);
 
         assert_eq!(at.on_view_revoked(7), None);
-        assert_eq!(at.on_snapshot(), s("a"));
+        assert_eq!(tagged(at.on_snapshot(id(2))), Some(("a".into(), id(2))));
         assert!(at.is_attached());
     }
 }

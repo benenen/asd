@@ -61,6 +61,7 @@ pub enum Ev {
     /// attach dump (the TUI resets its terminal before feeding it).
     Bytes {
         name: String,
+        identity: asd_proto::SessionIdentity,
         data: Vec<u8>,
         snapshot: bool,
     },
@@ -198,19 +199,21 @@ async fn drive(
                 Ok(Some(Frame::HostMetricsReply { sample })) => {
                     let _ = ev_tx.send(Ev::Metrics(sample));
                 }
-                Ok(Some(Frame::Snapshot { vt: dump })) => {
-                    if let Some(name) = at.on_snapshot() {
+                Ok(Some(Frame::Snapshot { identity, vt: dump })) => {
+                    if let Some(attached) = at.on_snapshot(identity) {
                         let _ = ev_tx.send(Ev::Bytes {
-                            name,
+                            name: attached.name,
+                            identity: attached.identity,
                             data: dump,
                             snapshot: true,
                         });
                     }
                 }
                 Ok(Some(Frame::Output { bytes })) => {
-                    if let Some(name) = at.on_output() {
+                    if let Some(attached) = at.on_output() {
                         let _ = ev_tx.send(Ev::Bytes {
-                            name,
+                            name: attached.name,
+                            identity: attached.identity,
                             data: bytes,
                             snapshot: false,
                         });
@@ -348,7 +351,7 @@ fn retag_from_session_list(
     previous: &[asd_proto::SessionInfo],
     current: &[asd_proto::SessionInfo],
 ) -> Option<(String, String)> {
-    let showing = attach.on_output()?;
+    let showing = attach.on_output()?.name;
     let renamed = super::renamed_active_session(Some(&showing), previous, current)?;
     attach.on_rename(&renamed.0, &renamed.1);
     Some(renamed)
@@ -380,7 +383,7 @@ mod tests {
     fn session_list_retags_the_actor_before_forwarding_more_output() {
         let mut attach = Attach::default();
         attach.begin("old".to_string());
-        attach.on_snapshot();
+        attach.on_snapshot(asd_proto::SessionIdentity { instance_id: 100 });
         let previous = vec![info("old", 42, 100)];
         let current = vec![info("new", 42, 100)];
 
@@ -388,6 +391,9 @@ mod tests {
             retag_from_session_list(&mut attach, &previous, &current),
             Some(("old".to_string(), "new".to_string()))
         );
-        assert_eq!(attach.on_output().as_deref(), Some("new"));
+        assert_eq!(
+            attach.on_output().map(|attached| attached.name),
+            Some("new".to_string())
+        );
     }
 }

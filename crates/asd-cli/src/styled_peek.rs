@@ -49,7 +49,7 @@ pub(crate) async fn print_json(
         })
         .await?;
     let snapshot_vt = match client.reader.read_frame().await? {
-        Some(Frame::Snapshot { vt }) => vt,
+        Some(Frame::Snapshot { vt, .. }) => vt,
         Some(Frame::Error { code, msg }) => {
             return Err(crate::exit::daemon("peek", code, &msg));
         }

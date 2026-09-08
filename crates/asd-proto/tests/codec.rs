@@ -2,8 +2,10 @@
 //! truncated/oversized frame error paths.
 
 use asd_proto::{
-    AgentState, ClientKind, Frame, FrameReader, FrameWriter, MAX_FRAME_LEN, ProtoError, Scrollback,
-    SessionExit, SessionIdentity, SessionInfo, TerminalAppearance, TerminalColor, decode_frame,
+    AgentHookAction, AgentKind, AgentState, ClientKind, DetectionReport, DetectionRuleReport,
+    EventCursor, Frame, FrameReader, FrameWriter, MAX_FRAME_LEN, ManifestDiagnostic, ProtoError,
+    ScreenMatcher, Scrollback, SessionEvent, SessionExit, SessionIdentity, SessionInfo,
+    SessionUpdateCause, SessionUpdatePatch, TerminalAppearance, TerminalColor, decode_frame,
     encode_frame,
 };
 
@@ -120,6 +122,9 @@ fn all_frames() -> Vec<Frame> {
             line: String::new(),
         },
         Frame::Snapshot {
+            identity: SessionIdentity {
+                instance_id: 0x1234,
+            },
             vt: b"\x1b[2J\x1b[Hhello".to_vec(),
         },
         Frame::Output {
@@ -252,12 +257,238 @@ fn all_frames() -> Vec<Frame> {
             }),
         },
         Frame::HostMetricsReply { sample: None },
+        Frame::SubscribeEvents {
+            after: Some(EventCursor {
+                daemon_epoch: [0xA5; 16],
+                sequence: 42,
+            }),
+            wants_notifications: true,
+        },
+        Frame::EventStreamStarted {
+            cursor: EventCursor {
+                daemon_epoch: [0x5A; 16],
+                sequence: 43,
+            },
+            sessions: vec![SessionInfo {
+                name: "build".into(),
+                instance_id: 0x1234,
+                command: "cargo test".into(),
+                title: "build".into(),
+                status_line: "testing".into(),
+                created_ms: 1_752_450_000_001,
+                idle_ms: 0,
+                running: true,
+                state: AgentState::Working,
+                attached_clients: 2,
+                pid: 4243,
+                cols: 120,
+                rows: 40,
+            }],
+            reset: false,
+            notification_lease: true,
+        },
+        Frame::SessionEvent {
+            cursor: EventCursor {
+                daemon_epoch: [0x5A; 16],
+                sequence: 44,
+            },
+            event: SessionEvent::Registered {
+                info: SessionInfo {
+                    name: "registered".into(),
+                    instance_id: 0xAAAA,
+                    command: "sh".into(),
+                    title: String::new(),
+                    status_line: String::new(),
+                    created_ms: 1,
+                    idle_ms: 0,
+                    running: true,
+                    state: AgentState::Unknown,
+                    attached_clients: 0,
+                    pid: 1,
+                    cols: 80,
+                    rows: 24,
+                },
+            },
+        },
+        Frame::SessionEvent {
+            cursor: EventCursor {
+                daemon_epoch: [0x5A; 16],
+                sequence: 45,
+            },
+            event: SessionEvent::Updated {
+                identity: SessionIdentity {
+                    instance_id: 0xAAAA,
+                },
+                patch: SessionUpdatePatch {
+                    command: Some("cargo clippy".into()),
+                    title: Some("checking".into()),
+                    status_line: Some("step 4".into()),
+                    idle_ms: Some(2500),
+                    running: Some(false),
+                    state: Some(AgentState::Idle),
+                    attached_clients: Some(3),
+                    pid: Some(99),
+                    cols: Some(100),
+                    rows: Some(30),
+                },
+                cause: SessionUpdateCause::StatusLineChanged,
+            },
+        },
+        Frame::SessionEvent {
+            cursor: EventCursor {
+                daemon_epoch: [0x5A; 16],
+                sequence: 46,
+            },
+            event: SessionEvent::Renamed {
+                old_name: "old".into(),
+                info: SessionInfo {
+                    name: "new".into(),
+                    instance_id: 0xAAAA,
+                    command: "sh".into(),
+                    title: String::new(),
+                    status_line: String::new(),
+                    created_ms: 1,
+                    idle_ms: 2500,
+                    running: false,
+                    state: AgentState::Idle,
+                    attached_clients: 0,
+                    pid: 1,
+                    cols: 80,
+                    rows: 24,
+                },
+            },
+        },
+        Frame::SessionEvent {
+            cursor: EventCursor {
+                daemon_epoch: [0x5A; 16],
+                sequence: 47,
+            },
+            event: SessionEvent::Exited {
+                identity: SessionIdentity {
+                    instance_id: 0xAAAA,
+                },
+                last_name: "new".into(),
+                exit: SessionExit {
+                    code: 0,
+                    signal: None,
+                },
+            },
+        },
+        Frame::NotificationLeaseChanged { granted: false },
+        Frame::WaitForScreen {
+            name: "build".into(),
+            matcher: ScreenMatcher::Literal("finished".into()),
+            timeout_ms: 5_000,
+        },
+        Frame::WaitForScreen {
+            name: "build".into(),
+            matcher: ScreenMatcher::Regex(r"finished\s+successfully".into()),
+            timeout_ms: 5_000,
+        },
+        Frame::ScreenWaitMatched {
+            identity: SessionIdentity {
+                instance_id: 0x1234,
+            },
+        },
+        Frame::AgentExplain {
+            name: "build".into(),
+        },
+        Frame::AgentExplainReply {
+            report: DetectionReport {
+                foreground_command: "codex".into(),
+                candidate_manifest_ids: vec!["codex".into()],
+                selected_manifest_id: Some("codex".into()),
+                state: AgentState::Working,
+                rules: vec![DetectionRuleReport {
+                    manifest_id: "codex".into(),
+                    rule_id: "working".into(),
+                    priority: 10,
+                    state: AgentState::Working,
+                    region: "screen".into(),
+                    matched: true,
+                    evidence: vec!["Working".into()],
+                    reason: None,
+                }],
+                generation: 7,
+            },
+        },
+        Frame::ReloadAgentManifests,
+        Frame::AgentManifestsReloaded {
+            generation: 8,
+            diagnostics: vec![ManifestDiagnostic {
+                path: "/etc/asd/agents/codex.toml".into(),
+                manifest_id: Some("codex".into()),
+                message: "loaded".into(),
+                retained_previous: false,
+            }],
+            pending_identities: vec![SessionIdentity {
+                instance_id: 0x1234,
+            }],
+        },
+        Frame::ReportAgentSession {
+            identity: SessionIdentity {
+                instance_id: 0x1234,
+            },
+            kind: AgentKind::Codex,
+            action: AgentHookAction::Start {
+                source: "hook".into(),
+            },
+            session_ref: "thread-123".into(),
+        },
+        Frame::ReportAgentSession {
+            identity: SessionIdentity {
+                instance_id: 0x1234,
+            },
+            kind: AgentKind::Claude,
+            action: AgentHookAction::End {
+                reason: "completed".into(),
+            },
+            session_ref: "conversation-456".into(),
+        },
+        Frame::AgentSessionReported,
+        Frame::ClearAgentSession {
+            identity: SessionIdentity {
+                instance_id: 0x1234,
+            },
+        },
+        Frame::AgentSessionCleared,
     ]
 }
 
 #[test]
-fn protocol_version_covers_kill_session_identity() {
-    assert_eq!(asd_proto::PROTO_VERSION, 19);
+fn protocol_version_covers_agent_operations_loop() {
+    assert_eq!(asd_proto::PROTO_VERSION, 20);
+}
+
+#[test]
+fn agent_kind_and_session_identity_use_stable_environment_text() {
+    assert_eq!(AgentKind::Codex.to_string(), "codex");
+    assert_eq!("CLAUDE".parse(), Ok(AgentKind::Claude));
+    assert!("other".parse::<AgentKind>().is_err());
+
+    let identity = SessionIdentity {
+        instance_id: 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF,
+    };
+    assert_eq!(identity.to_string(), "0123456789abcdef0123456789abcdef");
+    assert_eq!(identity.to_string().parse(), Ok(identity));
+    assert!("1234".parse::<SessionIdentity>().is_err());
+    assert!(
+        "0123456789abcdef0123456789abcdef0"
+            .parse::<SessionIdentity>()
+            .is_err()
+    );
+}
+
+#[test]
+fn agent_operations_limits_and_error_codes_are_stable() {
+    assert_eq!(asd_proto::MAX_SCREEN_PATTERN, 4096);
+    assert_eq!(asd_proto::MAX_SCREEN_WAITERS, 64);
+    assert_eq!(asd_proto::EVENT_RING_CAPACITY, 512);
+    assert_eq!(asd_proto::code::INVALID_MATCHER, 9);
+    assert_eq!(asd_proto::code::SCREEN_WAITER_LIMIT, 10);
+    assert_eq!(asd_proto::code::WAIT_TIMEOUT, 11);
+    assert_eq!(asd_proto::code::INVALID_AGENT_REPORT, 12);
+    assert_eq!(asd_proto::code::PERSISTENCE_FAILURE, 13);
 }
 
 #[test]

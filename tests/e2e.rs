@@ -280,7 +280,7 @@ impl ProtoClient {
         })
         .await;
         match self.recv().await {
-            Frame::Snapshot { vt } => vt,
+            Frame::Snapshot { vt, .. } => vt,
             other => panic!("expected Snapshot, got {other:?}"),
         }
     }
@@ -298,7 +298,7 @@ impl ProtoClient {
         })
         .await;
         match self.recv().await {
-            Frame::Snapshot { vt } => vt,
+            Frame::Snapshot { vt, .. } => vt,
             other => panic!("expected Snapshot, got {other:?}"),
         }
     }
@@ -1134,7 +1134,7 @@ async fn refresh_returns_fresh_snapshot() {
 
     a.send(Frame::Refresh).await;
     match a.recv_skipping_output().await {
-        Frame::Snapshot { vt } => {
+        Frame::Snapshot { vt, .. } => {
             assert!(
                 contains(&vt, b"REFRESH-MARK"),
                 "refresh snapshot missing recent output: {:?}",

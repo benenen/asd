@@ -1103,6 +1103,9 @@ async fn supervisor(
     // Remembered so a Down host can be respawned on Reconnect.
     let mut kinds: HashMap<HostId, HostKind> = HashMap::new();
     let mut active: Option<HostId> = None;
+    // Snapshot identity binds later Output to the exact session instance that
+    // populated the terminal, even when a name is reused after a fast restart.
+    let mut active_identity: Option<(HostId, asd_proto::SessionIdentity)> = None;
     let mut bridge_ready = false;
     // A session picked before the JS bridge was ready (auto-select on the
     // first local list): attached once the bridge reports in.
@@ -1192,6 +1195,7 @@ async fn supervisor(
                             && model.read().active.as_ref().is_some_and(|(h, _)| *h == host)
                         {
                             status.set(Status::Disconnected(msg.clone()));
+                            active_identity = None;
                         }
                         model.write().set_state(host, state);
                     }
@@ -1202,6 +1206,7 @@ async fn supervisor(
                         // → its selection was cleared; blank the pane so its
                         // last frame doesn't linger.
                         if had_active && model.read().active.is_none() {
+                            active_identity = None;
                             let _ = desktop.webview.evaluate_script("window.__asdReset&&window.__asdReset();");
                         }
                         // On the local host's first populate, auto-select
@@ -1249,10 +1254,21 @@ async fn supervisor(
                             );
                         }
                     }
-                    UiEvent::Bytes { host, name, data, snapshot } => {
+                    UiEvent::Bytes {
+                        host,
+                        name,
+                        identity,
+                        data,
+                        snapshot,
+                    } => {
                         // Gate on the session too: bytes from the one we just
                         // left can still be in flight right after a switch.
                         if !model.read().is_active(host, &name) {
+                            continue;
+                        }
+                        if snapshot {
+                            active_identity = Some((host, identity));
+                        } else if active_identity != Some((host, identity)) {
                             continue;
                         }
                         // A Snapshot starts a fresh screen. Drop any incomplete

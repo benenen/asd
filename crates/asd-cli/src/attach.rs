@@ -80,7 +80,7 @@ pub async fn run(mut client: Client, name: &str, read_only: bool) -> anyhow::Res
     // The first frame must be Snapshot (or an error); handle errors before
     // switching the terminal's mode so the message stays visible.
     let first = match client.reader.read_frame().await? {
-        Some(Frame::Snapshot { vt }) => vt,
+        Some(Frame::Snapshot { vt, .. }) => vt,
         Some(Frame::Error { code, msg }) => return Err(crate::exit::daemon("attach", code, &msg)),
         other => anyhow::bail!("expected Snapshot after Attach, got {other:?}"),
     };
@@ -133,7 +133,7 @@ pub async fn run(mut client: Client, name: &str, read_only: bool) -> anyhow::Res
         loop {
             let ev = match reader.read_frame().await {
                 Ok(Some(Frame::Output { bytes })) => Ev::Output(bytes),
-                Ok(Some(Frame::Snapshot { vt })) => Ev::Snapshot(vt),
+                Ok(Some(Frame::Snapshot { vt, .. })) => Ev::Snapshot(vt),
                 Ok(Some(Frame::Error { code, msg })) => Ev::Ended(Exit::SessionEnded(
                     if code == asd_proto::code::SESSION_EXITED {
                         msg

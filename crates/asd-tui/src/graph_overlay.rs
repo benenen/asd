@@ -255,6 +255,7 @@ mod tests {
             running_activity: Default::default(),
             host_links: Default::default(),
             active: None,
+            active_identity: None,
             view_revoked: None,
             vt: None,
             scroll: 0,
@@ -618,6 +619,7 @@ mod tests {
 
         app.on_conn_event(Ev::Bytes {
             name: "demo".to_string(),
+            identity: asd_proto::SessionIdentity { instance_id: 1 },
             data: b"\x1b[?2004h".to_vec(),
             snapshot: true,
         });
@@ -635,6 +637,7 @@ mod tests {
         assert!(matches!(cmds.try_recv(), Ok(Cmd::Attach { name, .. }) if name == "old"));
         app.on_conn_event(Ev::Bytes {
             name: "old".to_string(),
+            identity: asd_proto::SessionIdentity { instance_id: 1 },
             data: b"\x1b[?2004h".to_vec(),
             snapshot: true,
         });
@@ -649,6 +652,7 @@ mod tests {
 
         app.on_conn_event(Ev::Bytes {
             name: "new".to_string(),
+            identity: asd_proto::SessionIdentity { instance_id: 2 },
             data: Vec::new(),
             snapshot: true,
         });

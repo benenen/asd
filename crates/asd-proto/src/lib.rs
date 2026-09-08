@@ -44,7 +44,9 @@
 //! does not go through reading the screen; v19 adds the opaque
 //! `SessionInfo.instance_id` and carries it as [`SessionIdentity`] in `Kill`,
 //! so a delayed confirmation cannot terminate a newer session that reused the
-//! same name.
+//! same name; v20 adds agent-operation frames and includes the exact live
+//! [`SessionIdentity`] in each `Snapshot`, so a client can converge its view
+//! and later output on the same session instance.
 
 mod codec;
 pub mod paths;
@@ -55,7 +57,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 19;
+pub const PROTO_VERSION: u32 = 20;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -123,6 +125,13 @@ impl std::str::FromStr for AgentState {
 /// Per-frame cap: 4 MiB (postcard payload, excluding the 4-byte length prefix).
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
 
+/// Maximum bytes in a literal or regular-expression screen matcher.
+pub const MAX_SCREEN_PATTERN: usize = 4096;
+/// Maximum concurrent screen waiters in one session.
+pub const MAX_SCREEN_WAITERS: usize = 64;
+/// Number of committed session events retained for replay.
+pub const EVENT_RING_CAPACITY: usize = 512;
+
 /// Error codes for the `Error` frame.
 pub mod code {
     /// `proto_version` mismatch; daemon sends this error then disconnects.
@@ -141,6 +150,16 @@ pub mod code {
     pub const BAD_HANDSHAKE: u32 = 7;
     /// The named session exists, but it is not the instance the caller observed.
     pub const STALE_SESSION: u32 = 8;
+    /// A screen matcher is malformed or exceeds the protocol limit.
+    pub const INVALID_MATCHER: u32 = 9;
+    /// A session already has the maximum number of screen waiters.
+    pub const SCREEN_WAITER_LIMIT: u32 = 10;
+    /// A screen waiter reached its requested deadline.
+    pub const WAIT_TIMEOUT: u32 = 11;
+    /// An agent hook report is malformed or inconsistent with the session.
+    pub const INVALID_AGENT_REPORT: u32 = 12;
+    /// Session-state persistence failed.
+    pub const PERSISTENCE_FAILURE: u32 = 13;
     /// Daemon internal error (details in msg).
     pub const INTERNAL: u32 = 100;
 }
@@ -200,6 +219,166 @@ impl std::fmt::Display for SessionExit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionIdentity {
     pub instance_id: u128,
+}
+
+impl std::fmt::Display for SessionIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:032x}", self.instance_id)
+    }
+}
+
+impl std::str::FromStr for SessionIdentity {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("session identity must be exactly 32 hexadecimal characters".to_string());
+        }
+        u128::from_str_radix(value, 16)
+            .map(|instance_id| Self { instance_id })
+            .map_err(|error| format!("invalid session identity: {error}"))
+    }
+}
+
+/// Cursor into the daemon-local session-event stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCursor {
+    pub daemon_epoch: [u8; 16],
+    pub sequence: u64,
+}
+
+/// Why a session projection changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionUpdateCause {
+    Registered,
+    ActivityStarted,
+    ActivitySettled,
+    ForegroundChanged,
+    AttachmentChanged,
+    StatusLineChanged,
+    ScreenDetection,
+    DetectorReload,
+}
+
+/// A name-free subset of mutable session metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUpdatePatch {
+    pub command: Option<String>,
+    pub title: Option<String>,
+    pub status_line: Option<String>,
+    pub idle_ms: Option<u64>,
+    pub running: Option<bool>,
+    pub state: Option<AgentState>,
+    pub attached_clients: Option<u32>,
+    pub pid: Option<u32>,
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
+}
+
+/// A committed change in the daemon's session projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionEvent {
+    Registered {
+        info: SessionInfo,
+    },
+    Updated {
+        identity: SessionIdentity,
+        patch: SessionUpdatePatch,
+        cause: SessionUpdateCause,
+    },
+    Renamed {
+        old_name: String,
+        info: SessionInfo,
+    },
+    Exited {
+        identity: SessionIdentity,
+        last_name: String,
+        exit: SessionExit,
+    },
+}
+
+/// A string or regular-expression condition evaluated against a rendered screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScreenMatcher {
+    Literal(String),
+    Regex(String),
+}
+
+/// Supported agent hook producers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentKind {
+    Codex,
+    Claude,
+}
+
+impl AgentKind {
+    /// Lowercase name used by manifests and hook environment values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}
+
+impl std::fmt::Display for AgentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AgentKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "codex" => Ok(Self::Codex),
+            "claude" => Ok(Self::Claude),
+            other => Err(format!(
+                "unknown agent kind {other:?} (want codex or claude)"
+            )),
+        }
+    }
+}
+
+/// Lifecycle update supplied by an agent hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentHookAction {
+    Start { source: String },
+    End { reason: String },
+}
+
+/// One detection rule's outcome in an explanation response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectionRuleReport {
+    pub manifest_id: String,
+    pub rule_id: String,
+    pub priority: i32,
+    pub state: AgentState,
+    pub region: String,
+    pub matched: bool,
+    pub evidence: Vec<String>,
+    pub reason: Option<String>,
+}
+
+/// The daemon's detection reasoning for one session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectionReport {
+    pub foreground_command: String,
+    pub candidate_manifest_ids: Vec<String>,
+    pub selected_manifest_id: Option<String>,
+    pub state: AgentState,
+    pub rules: Vec<DetectionRuleReport>,
+    pub generation: u64,
+}
+
+/// One diagnostic emitted while reloading agent manifests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestDiagnostic {
+    pub path: String,
+    pub manifest_id: Option<String>,
+    pub message: String,
+    pub retained_previous: bool,
 }
 
 /// Metadata for a single session in `SessionList`.
@@ -392,6 +571,8 @@ pub enum Frame {
     },
     /// Formatter dump used for attach and flow-control recovery.
     Snapshot {
+        /// Exact session instance that produced this terminal dump.
+        identity: SessionIdentity,
         vt: Vec<u8>,
     },
     /// daemon → client, raw pty output.
@@ -559,6 +740,54 @@ pub enum Frame {
         name: String,
         line: String,
     },
+    SubscribeEvents {
+        after: Option<EventCursor>,
+        wants_notifications: bool,
+    },
+    EventStreamStarted {
+        cursor: EventCursor,
+        sessions: Vec<SessionInfo>,
+        reset: bool,
+        notification_lease: bool,
+    },
+    SessionEvent {
+        cursor: EventCursor,
+        event: SessionEvent,
+    },
+    NotificationLeaseChanged {
+        granted: bool,
+    },
+    WaitForScreen {
+        name: String,
+        matcher: ScreenMatcher,
+        timeout_ms: u64,
+    },
+    ScreenWaitMatched {
+        identity: SessionIdentity,
+    },
+    AgentExplain {
+        name: String,
+    },
+    AgentExplainReply {
+        report: DetectionReport,
+    },
+    ReloadAgentManifests,
+    AgentManifestsReloaded {
+        generation: u64,
+        diagnostics: Vec<ManifestDiagnostic>,
+        pending_identities: Vec<SessionIdentity>,
+    },
+    ReportAgentSession {
+        identity: SessionIdentity,
+        kind: AgentKind,
+        action: AgentHookAction,
+        session_ref: String,
+    },
+    AgentSessionReported,
+    ClearAgentSession {
+        identity: SessionIdentity,
+    },
+    AgentSessionCleared,
 }
 
 /// Protocol-layer error.

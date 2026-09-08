@@ -35,7 +35,7 @@ const SCRIPT_ENTER_DELAY: std::time::Duration = std::time::Duration::from_millis
 /// Queue element from connection tasks → the socket write loop.
 #[derive(Debug)]
 pub enum ConnItem {
-    Frame(Frame),
+    Frame(Box<Frame>),
     /// Forced disconnect (emitted by the sink on flow-control overflow or
     /// session death).
     Close,
@@ -78,7 +78,7 @@ impl ClientSink {
             return false;
         }
         self.queued.fetch_add(sz, Ordering::Relaxed);
-        self.tx.send(ConnItem::Frame(frame)).is_ok()
+        self.tx.send(ConnItem::Frame(Box::new(frame))).is_ok()
     }
 }
 
@@ -86,7 +86,7 @@ impl ClientSink {
 pub fn data_frame_size(frame: &Frame) -> usize {
     match frame {
         Frame::Output { bytes } | Frame::Input { bytes } => bytes.len(),
-        Frame::Snapshot { vt } => vt.len(),
+        Frame::Snapshot { vt, .. } => vt.len(),
         _ => 0,
     }
 }
@@ -539,12 +539,18 @@ pub struct SessionContext {
 /// would otherwise leave its children resolving the default path, so an `asd`
 /// command run *inside* a session would address a different daemon than the one
 /// hosting it.
-fn set_session_env(builder: &mut CommandBuilder, name: &str, socket: &std::path::Path) {
+fn set_session_env(
+    builder: &mut CommandBuilder,
+    name: &str,
+    identity: SessionIdentity,
+    socket: &std::path::Path,
+) {
     builder.env("TERM", "xterm-256color");
     // Which session a process runs inside (tmux's $TMUX idea): render clients
     // check it to refuse attaching the session that hosts them — attaching
     // yourself is a render feedback loop that floods the pty.
     builder.env("ASD_SESSION", name);
+    builder.env("ASD_SESSION_ID", identity.to_string());
     builder.env("ASD_SOCKET", socket);
 }
 
@@ -589,7 +595,7 @@ pub fn spawn_session(
         }
         None => CommandBuilder::new_default_prog(), // $SHELL
     };
-    set_session_env(&mut builder, &name, &context.socket);
+    set_session_env(&mut builder, &name, identity, &context.socket);
     // Working directory: the requested one (a restart workspace restore) when it
     // still exists, else the process default ($HOME). A stale/missing dir must
     // not fail the spawn — fall back rather than error.
@@ -666,8 +672,8 @@ pub fn spawn_session(
             .name(format!("session-{name}"))
             .spawn(move || {
                 session_thread(
-                    name, rx, master, pty_writer, child, cols, rows, scrollback, context, meta,
-                    registry,
+                    name, identity, rx, master, pty_writer, child, cols, rows, scrollback, context,
+                    meta, registry,
                 );
             })?;
     }
@@ -686,6 +692,7 @@ pub fn spawn_session(
 #[allow(clippy::too_many_arguments)]
 fn session_thread(
     name: String,
+    identity: SessionIdentity,
     rx: mpsc::Receiver<SessionMsg>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     mut pty_writer: Box<dyn Write + Send>,
@@ -950,7 +957,10 @@ fn session_thread(
                 let snapshot = vt.snapshot_vt();
                 // The Snapshot is enqueued before any subsequent Output (the
                 // single channel preserves order)
-                if sink.send(Frame::Snapshot { vt: snapshot }) {
+                if sink.send(Frame::Snapshot {
+                    identity,
+                    vt: snapshot,
+                }) {
                     clients.push(sink);
                     if class == AttachClass::ExclusiveTui {
                         tui_owner = Some(TuiOwner {
@@ -1050,15 +1060,16 @@ fn session_thread(
                 }
                 let snapshot = vt.snapshot_vt();
                 let client_id = sink.id;
-                if !sink.send(Frame::Snapshot { vt: snapshot })
-                    && remove_client_membership(
-                        client_id,
-                        &mut clients,
-                        &mut tui_owner,
-                        &mut client_sizes,
-                        &mut read_only_clients,
-                    )
-                {
+                if !sink.send(Frame::Snapshot {
+                    identity,
+                    vt: snapshot,
+                }) && remove_client_membership(
+                    client_id,
+                    &mut clients,
+                    &mut tui_owner,
+                    &mut client_sizes,
+                    &mut read_only_clients,
+                ) {
                     meta.attached_clients
                         .store(clients.len() as u32, Ordering::Relaxed);
                     resize_to_clients(&*master, &mut vt, &meta, &clients, &mut client_sizes);
@@ -1687,10 +1698,17 @@ mod session_env_tests {
         set_session_env(
             &mut builder,
             "web",
+            SessionIdentity {
+                instance_id: 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF,
+            },
             std::path::Path::new("/custom/asd.sock"),
         );
 
         assert_eq!(builder.get_env("ASD_SESSION").unwrap(), "web");
+        assert_eq!(
+            builder.get_env("ASD_SESSION_ID").unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
         assert_eq!(builder.get_env("ASD_SOCKET").unwrap(), "/custom/asd.sock");
         assert_eq!(builder.get_env("TERM").unwrap(), "xterm-256color");
     }

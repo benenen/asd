@@ -135,7 +135,7 @@ pub async fn handle_conn(
         // Control-plane replies go straight to the outbound queue (no
         // data-plane quota)
         let reply = |f: Frame| {
-            let _ = out_tx.send(ConnItem::Frame(f));
+            let _ = out_tx.send(ConnItem::Frame(Box::new(f)));
         };
 
         match frame {
