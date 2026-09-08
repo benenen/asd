@@ -186,3 +186,36 @@ Settling means `Idle` or `Blocked`. `Unknown` — a plain shell, or any program
 without detection rules — falls back to the activity rule `list` uses to print
 "idle": no bytes for the settle interval. `--until` overrides the whole thing
 and waits for exactly one state.
+
+## Image decode command generation
+
+`asd image-paste` is a local, daemon-independent command generator. It accepts
+one image file or `--clipboard`, emits a quoted POSIX heredoc running Python 3,
+and optionally copies it with `--copy`. The final delimiter has no trailing
+newline. All file creation happens in the generated Python body, after manual
+shell submission; no preparatory shell command runs before the heredoc.
+
+The source read is bounded to 1 MiB plus one overflow byte, and the generated
+text is additionally checked against `MAX_FRAME_LEN - 1024`. Base64 literals
+are wrapped at 76 characters to avoid large shell arguments and input lines.
+Only format signatures are inspected; image pixels are not decoded locally for
+file input. Source filenames are never interpolated. The destination directory
+is validated as text and encoded as a Python string literal inside the quoted
+heredoc, without local resolution or shell expansion.
+
+Remote decoding verifies byte count and SHA-256 before opening any destination.
+`tempfile.mkstemp` chooses a unique file with private permissions; write errors
+remove that invocation's partial file and do not print a successful path.
+An interrupted remote shell or machine can still leave a partial file. No
+automatic cleanup of successful images is performed.
+
+Clipboard helpers live in `asd-cli/src/platform/`, keep image output bounded,
+and have a timeout. They do not change the TUI input loop or query a remote
+clipboard through OSC 52. Clipboard ownership helpers may remain alive under
+X11/Wayland to serve the copied text; this is native clipboard behavior.
+
+Tests execute generated commands only in isolated temporary directories and
+must verify byte equality, non-overwrite, hostile filenames/directories,
+corruption rejection, and absence of file creation before the final Enter.
+Desktop clipboard tests require an isolated display or a real-machine manual
+check; do not overwrite a developer's shared clipboard during unit tests.

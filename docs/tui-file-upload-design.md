@@ -248,3 +248,14 @@ Linux模拟PTY测试只能验证指定输入字节序列，不能替代 Explorer
 - [G1] [Ghostty AppKit SurfaceView](https://github.com/ghostty-org/ghostty/blob/main/macos/Sources/Ghostty/Surface%20View/SurfaceView_AppKit.swift)：performDragOperation、sendText。
 - [G2] [Ghostty GTK surface](https://github.com/ghostty-org/ghostty/blob/main/src/apprt/gtk/class/surface.zig)：dtDrop、ShellEscapeWriter、Clipboard.paste。
 - [L1] [GNOME Terminal screen源码](https://github.com/GNOME/gnome-terminal/blob/master/src/terminal-screen.cc)：文件/URI处理、g_shell_quote、vte_terminal_paste_text。
+
+## 13. 后续简化路线：本机生成 Base64 解码命令
+
+用户后续选择先实现一个本机工具 `asd image-paste`：从文件或本机截图剪贴板读取图片，
+生成带引号的 Python 3 heredoc 命令，复制后在远端 POSIX shell 中粘贴并手动回车。
+命令生成时不传输文件、不发送终端输入、不改普通 TUI paste，也不实现本文前面的上传面板/新协议。
+远端解码成功后打印唯一文件的绝对路径，再由用户交给 Agent。
+
+这条路线要求在拥有图片的电脑上运行生成器；远端 `asd ui` 只转发已有的文本粘贴。
+源图片最多1MiB，最终文本受协议帧限制；不把直接粘贴Base64到Agent输入框算作图片附件。
+具体用法见根 README 的 image-paste 小节，契约见 [automation.md](automation.md#image-decode-command-generation)。
