@@ -84,7 +84,18 @@ pub struct StoreLoad {
 impl SessionStore {
     /// Open JSON if present, otherwise migrate legacy TSV exactly once.
     pub fn open(json_path: PathBuf, legacy_path: PathBuf) -> Result<StoreLoad, StoreError> {
-        if json_path.exists() {
+        let json_present = match fs::symlink_metadata(&json_path) {
+            Ok(_) => true,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => false,
+            Err(source) => {
+                return Err(StoreError::Io {
+                    operation: "inspect session store",
+                    path: json_path,
+                    source,
+                });
+            }
+        };
+        if json_present {
             let sessions = read_authoritative(&json_path)?;
             return Ok(StoreLoad {
                 store: Self {
@@ -98,7 +109,18 @@ impl SessionStore {
                 diagnostics: Vec::new(),
             });
         }
-        if !legacy_path.exists() {
+        let legacy_present = match fs::symlink_metadata(&legacy_path) {
+            Ok(_) => true,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => false,
+            Err(source) => {
+                return Err(StoreError::Io {
+                    operation: "inspect legacy session list",
+                    path: legacy_path,
+                    source,
+                });
+            }
+        };
+        if !legacy_present {
             return Ok(StoreLoad {
                 store: Self {
                     json_path,
@@ -281,6 +303,27 @@ mod tests {
         ));
     }
 
+    /// Catches accepting a record the registry would later reject or normalize.
+    #[test]
+    fn invalid_session_name_is_rejected_with_its_entry_index() {
+        let json = br#"{"version":1,"sessions":[{"name":"not valid","cwd":null,"command":null}]}"#;
+        assert!(matches!(
+            decode_document(json),
+            Err(StoreError::InvalidSession { index: 0, .. })
+        ));
+    }
+
+    /// Catches restoring two records into one registry entry and then writing a
+    /// normalized document that silently loses one of their distinct states.
+    #[test]
+    fn duplicate_session_name_is_rejected_with_the_later_entry_index() {
+        let json = br#"{"version":1,"sessions":[{"name":"same","cwd":null,"command":null},{"name":"same","cwd":"/tmp","command":"echo duplicate"}]}"#;
+        assert!(matches!(
+            decode_document(json),
+            Err(StoreError::InvalidSession { index: 1, .. })
+        ));
+    }
+
     #[test]
     fn json_is_authoritative_over_legacy_tsv() {
         let dir = test_dir("precedence");
@@ -292,6 +335,53 @@ mod tests {
             SessionStore::open(json, legacy),
             Err(StoreError::ReadDocument { .. })
         ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Catches treating a path inspection error as an absent JSON store and
+    /// migrating stale TSV over a path the daemon cannot safely inspect.
+    #[test]
+    fn only_not_found_json_path_allows_legacy_migration() {
+        let dir = test_dir("metadata");
+        let blocked = dir.join("not-a-directory");
+        fs::write(&blocked, "not a directory").unwrap();
+        let json = blocked.join("sessions.json");
+        let legacy = dir.join("sessions.tsv");
+        fs::write(&legacy, "from-tsv\t/tmp\n").unwrap();
+
+        assert!(matches!(
+            SessionStore::open(json, legacy.clone()),
+            Err(StoreError::Io {
+                operation: "inspect session store",
+                ..
+            })
+        ));
+        assert!(legacy.is_file());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A dangling authoritative symlink is present and must fail its JSON read;
+    /// it is not permission to import the legacy backup.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_json_symlink_does_not_fall_back_to_legacy_tsv() {
+        use std::os::unix::fs::symlink;
+
+        let dir = test_dir("dangling-json");
+        let json = dir.join("sessions.json");
+        let legacy = dir.join("sessions.tsv");
+        symlink(dir.join("missing-sessions.json"), &json).unwrap();
+        fs::write(&legacy, "from-tsv\t/tmp\n").unwrap();
+
+        assert!(matches!(
+            SessionStore::open(json, legacy.clone()),
+            Err(StoreError::Io {
+                operation: "read session store",
+                ..
+            })
+        ));
+        assert!(legacy.is_file());
+        assert!(!legacy.with_extension("tsv.migrated").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

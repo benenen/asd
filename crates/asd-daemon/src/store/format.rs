@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -57,15 +58,30 @@ pub(crate) fn decode_document(bytes: &[u8]) -> Result<Vec<SessionState>, StoreEr
             path: PathBuf::new(),
             detail: "document sessions must be an array".into(),
         })?;
-    sessions
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
+    let mut names = HashSet::with_capacity(sessions.len());
+    let mut decoded = Vec::with_capacity(sessions.len());
+    for (index, value) in sessions.iter().enumerate() {
+        let state: SessionState =
             serde_json::from_value(value.clone()).map_err(|error| StoreError::InvalidSession {
                 path: PathBuf::new(),
                 index,
                 detail: error.to_string(),
-            })
-        })
-        .collect()
+            })?;
+        if !asd_proto::paths::is_valid_session_name(&state.name) {
+            return Err(StoreError::InvalidSession {
+                path: PathBuf::new(),
+                index,
+                detail: format!("invalid session name '{}'", state.name),
+            });
+        }
+        if !names.insert(state.name.clone()) {
+            return Err(StoreError::InvalidSession {
+                path: PathBuf::new(),
+                index,
+                detail: format!("duplicate session name '{}'", state.name),
+            });
+        }
+        decoded.push(state);
+    }
+    Ok(decoded)
 }
