@@ -213,9 +213,12 @@ Codex accepts `startup`, `resume`, `clear`, `compact`; Claude also accepts
 ignored. References must match `[A-Za-z0-9][A-Za-z0-9_-]{0,127}` exactly; the
 CLI limits the full payload to 64 KiB.
 
-Start requires proof of the selected agent from the live foreground command.
-When the platform cannot resolve it, the recorded launch command is the only
-fallback; manually launched agents on Windows may therefore be rejected.
+Start requires proof from the foreground process's actual executable and raw
+argument boundaries. Display strings and shell `-c` source never prove a live
+agent. On platforms without process lookup, the recorded launch is a fallback
+only when it is a conservative single invocation without quotes, operators,
+substitutions, or control characters; manually launched agents on Windows may
+therefore be rejected. A failed lookup on a supported platform rejects Start.
 End requires the exact stored kind/reference, even if the process has exited.
 Duplicate references owned by another live or retained session are rejected.
 A successful hook returns only after durable persistence; invalid, stale, or

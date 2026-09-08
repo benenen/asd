@@ -22,9 +22,13 @@
 //!   persisted session list.
 //! - [`pty_master_fd`] — the pty master's raw fd, for foreground-process
 //!   lookups; `-1` where the platform has no fd to borrow.
+//! - [`foreground_agent`] — actual executable/argv proof for lifecycle hooks,
+//!   separate from display-oriented shell command formatting.
 //! - [`create_private_temp`] / [`replace_file`] / [`sync_parent`] — the
 //!   persistence store's private atomic-write primitive.
 
+#[cfg(unix)]
+mod foreground;
 #[cfg(unix)]
 #[path = "unix.rs"]
 mod imp;
@@ -33,7 +37,7 @@ mod imp;
 mod imp;
 
 pub(crate) use imp::{
-    create_private_temp, harden_dll_search, kill_child, prepare_socket_dir, pty_master_fd,
-    read_cwd, remove_stale_socket, replace_file, serve_connections, set_session_env, sync_parent,
-    watch_child_exit,
+    create_private_temp, foreground_agent, harden_dll_search, kill_child, prepare_socket_dir,
+    pty_master_fd, read_cwd, remove_stale_socket, replace_file, serve_connections, set_session_env,
+    sync_parent, watch_child_exit,
 };

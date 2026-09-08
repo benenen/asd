@@ -169,8 +169,11 @@ otherwise execute without the final Enter keypress.
 Validated Codex/Claude lifecycle hooks replace only the staged command with
 `codex resume ID` or `claude --resume ID`; the original command stays separate.
 Hook acknowledgement follows the durable commit, with in-memory metadata
-unchanged on failure. Start must agree with the live foreground command, or
-the recorded launch when foreground lookup is unavailable. End matches the
+unchanged on failure. Start must agree with the actual foreground executable
+and unflattened argv, never the display command (which may unwrap shell source).
+Only platforms without process lookup may fall back to a conservative single
+recorded invocation without shell operators, substitutions, or controls. A
+failed lookup on a supported platform is unproven and rejects Start. End matches the
 stored kind/reference even after the agent exits. Duplicate restore claims
 are reserved by newest daemon timestamp, then ascending session name. Losers
 stage their original command without Enter, including in opt-in execution mode.

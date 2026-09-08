@@ -13,6 +13,11 @@ use crate::conn;
 use crate::registry::Registry;
 use crate::session::SessionMsg;
 
+/// ConPTY does not currently expose foreground process evidence here.
+pub(crate) fn foreground_agent(_master_fd: i32) -> crate::agent_resume::AgentEvidence {
+    crate::agent_resume::AgentEvidence::Unavailable
+}
+
 /// Give every child the daemon address and its rename-stable session identity.
 pub(crate) fn set_session_env(
     builder: &mut portable_pty::CommandBuilder,

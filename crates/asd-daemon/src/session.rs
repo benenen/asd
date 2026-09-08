@@ -762,13 +762,14 @@ fn session_thread(
                 session_ref,
                 sink,
             } => {
-                let foreground = foreground_command(meta.pty_master_fd.load(Ordering::Relaxed));
+                let foreground =
+                    crate::platform::foreground_agent(meta.pty_master_fd.load(Ordering::Relaxed));
                 let result = registry.lock().unwrap().report_agent(
                     identity,
                     kind,
                     &action,
                     &session_ref,
-                    foreground.as_deref(),
+                    foreground,
                 );
                 sink.send(match result {
                     Ok(()) => Frame::AgentSessionReported,

@@ -223,6 +223,89 @@ async fn authoritative_agent_hooks_survive_rename_and_stage_resume() {
 }
 
 #[tokio::test]
+async fn exited_agent_in_live_shell_source_cannot_authorize_a_start_report() {
+    let daemon = Daemon::start("historical-agent-source");
+    let fake = daemon.dir.join("codex");
+    std::fs::copy("/bin/true", &fake).unwrap();
+    let identity_path = daemon.dir.join("identity");
+    let command = format!(
+        "{} --version; printf %s \"$ASD_SESSION_ID\" > {}; sleep 600; :",
+        fake.display(),
+        identity_path.display()
+    );
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "historical", "--cmd", &command])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    wait_for(
+        || std::fs::read_to_string(&identity_path).is_ok_and(|s| !s.is_empty()),
+        "fake agent exited before report",
+    )
+    .await;
+    let identity = std::fs::read_to_string(identity_path).unwrap();
+    let out = agent_hook(
+        &daemon,
+        &identity,
+        "codex",
+        "start",
+        r#"{"session_id":"not_running","hook_event_name":"SessionStart","source":"startup"}"#,
+    );
+    assert!(
+        !out.status.success(),
+        "historical shell source authorized a Start: {out:?}"
+    );
+    let saved = std::fs::read_to_string(daemon.dir.join("data/asd/sessions.json")).unwrap();
+    assert!(!saved.contains("not_running"));
+}
+
+#[tokio::test]
+async fn actual_interpreter_processes_authorize_agent_start_reports() {
+    let daemon = Daemon::start("interpreter-agent-proof");
+    for kind in ["codex", "claude"] {
+        let script = if kind == "codex" {
+            daemon.dir.join("codex")
+        } else {
+            daemon.dir.join("@anthropic-ai/claude-code/cli.js")
+        };
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        let identity_path = daemon.dir.join(format!("{kind}.identity"));
+        std::fs::write(&script, format!("require('fs').writeFileSync('{}', process.env.ASD_SESSION_ID); setInterval(() => {{}}, 1000);", identity_path.display())).unwrap();
+        let command = format!("exec node '{}'", script.display());
+        assert!(
+            daemon
+                .cli()
+                .args(["new", kind, "--cmd", &command])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        wait_for(
+            || std::fs::read_to_string(&identity_path).is_ok_and(|s| !s.is_empty()),
+            "actual interpreter agent running",
+        )
+        .await;
+        let identity = std::fs::read_to_string(identity_path).unwrap();
+        let out = agent_hook(
+            &daemon,
+            &identity,
+            kind,
+            "start",
+            r#"{"session_id":"live_interpreter","hook_event_name":"SessionStart","source":"startup"}"#,
+        );
+        assert!(
+            out.status.success(),
+            "actual interpreter proof rejected: {out:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn duplicate_resume_claim_never_auto_runs_its_original() {
     let daemon = Daemon::start_with_data("agent-duplicate", |data| {
         use std::os::unix::fs::PermissionsExt;

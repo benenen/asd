@@ -10,6 +10,7 @@ use anyhow::Context;
 use asd_proto::paths;
 use tracing::{error, info, warn};
 
+pub(crate) use super::foreground::foreground_agent;
 use crate::conn;
 use crate::registry::Registry;
 use crate::session::SessionMsg;

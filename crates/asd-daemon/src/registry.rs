@@ -286,9 +286,9 @@ impl Registry {
         kind: asd_proto::AgentKind,
         action: &asd_proto::AgentHookAction,
         reference: &str,
-        foreground: Option<&str>,
+        foreground: crate::agent_resume::AgentEvidence,
     ) -> Result<(), (u32, String)> {
-        use crate::agent_resume::{AgentResumeRecord, command_kind, validate_report};
+        use crate::agent_resume::{AgentResumeRecord, validate_report};
         let invalid = |message: String| (code::INVALID_AGENT_REPORT, message);
         validate_report(kind, action, reference).map_err(invalid)?;
         let handle = self.by_identity(identity).ok_or_else(|| {
@@ -300,8 +300,7 @@ impl Registry {
         let current = self.agent_records.get(&identity);
         match action {
             asd_proto::AgentHookAction::Start { .. } => {
-                let command = foreground.or(handle.spawn_command.as_deref());
-                if command.and_then(command_kind) != Some(kind) {
+                if foreground.proven_kind(handle.spawn_command.as_deref()) != Some(kind) {
                     return Err(invalid(
                         "foreground or recorded launch does not prove the reported agent kind"
                             .into(),
@@ -529,6 +528,7 @@ impl Registry {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    use crate::agent_resume::AgentEvidence::{Observed, Unavailable};
 
     #[test]
     fn identity_and_agent_transactions_reject_stale_or_uncommitted_updates() {
@@ -585,6 +585,7 @@ mod identity_tests {
             Ok(SessionMsg::Kill)
         ));
         use asd_proto::{AgentHookAction, AgentKind};
+        let codex = Observed(Some(AgentKind::Codex));
         let start = AgentHookAction::Start {
             source: "startup".into(),
         };
@@ -598,7 +599,7 @@ mod identity_tests {
                     AgentKind::Codex,
                     &start,
                     "one",
-                    Some("codex")
+                    codex
                 )
                 .unwrap_err()
                 .0,
@@ -606,31 +607,31 @@ mod identity_tests {
         );
         assert!(
             registry
-                .report_agent(identity, AgentKind::Codex, &start, "one", Some("claude"))
+                .report_agent(
+                    identity,
+                    AgentKind::Codex,
+                    &start,
+                    "one",
+                    Observed(Some(AgentKind::Claude))
+                )
                 .is_err()
         );
         assert!(
             registry
-                .report_agent(identity, AgentKind::Codex, &start, "one", None)
+                .report_agent(identity, AgentKind::Codex, &start, "one", Unavailable)
                 .is_err()
         );
         registry.sessions.get_mut("current").unwrap().spawn_command = Some("codex".into());
         registry
-            .report_agent(identity, AgentKind::Codex, &start, "fallback", None)
+            .report_agent(identity, AgentKind::Codex, &start, "fallback", Unavailable)
             .unwrap();
         assert!(
             registry
-                .report_agent(identity, AgentKind::Codex, &start, "wrong", Some("sh"))
+                .report_agent(identity, AgentKind::Codex, &start, "wrong", Observed(None))
                 .is_err()
         );
         registry
-            .report_agent(
-                identity,
-                AgentKind::Codex,
-                &start,
-                "one",
-                Some("codex --flag"),
-            )
+            .report_agent(identity, AgentKind::Codex, &start, "one", codex)
             .unwrap();
         let original = registry.snapshot()[0].agent_resume.clone().unwrap();
         registry.unrestored.push(crate::store::SessionState {
@@ -643,7 +644,7 @@ mod identity_tests {
             }),
         });
         registry
-            .report_agent(identity, AgentKind::Codex, &start, "one", Some("codex"))
+            .report_agent(identity, AgentKind::Codex, &start, "one", codex)
             .unwrap();
         registry.unrestored.clear();
         registry
@@ -654,18 +655,18 @@ mod identity_tests {
                     source: "compact".into(),
                 },
                 "one",
-                Some("codex"),
+                codex,
             )
             .unwrap();
         assert_eq!(registry.snapshot()[0].agent_resume, Some(original.clone()));
         assert!(
             registry
-                .report_agent(identity, AgentKind::Claude, &end, "one", None)
+                .report_agent(identity, AgentKind::Claude, &end, "one", Unavailable)
                 .is_err()
         );
         assert!(
             registry
-                .report_agent(identity, AgentKind::Codex, &end, "old", None)
+                .report_agent(identity, AgentKind::Codex, &end, "old", Unavailable)
                 .is_err()
         );
         assert_eq!(registry.snapshot()[0].agent_resume, Some(original.clone()));
@@ -680,14 +681,14 @@ mod identity_tests {
         });
         assert!(
             registry
-                .report_agent(identity, AgentKind::Codex, &start, "owned", Some("codex"))
+                .report_agent(identity, AgentKind::Codex, &start, "owned", codex)
                 .is_err()
         );
         std::fs::remove_file(dir.join("sessions.json")).unwrap();
         std::fs::create_dir(dir.join("sessions.json")).unwrap();
         assert_eq!(
             registry
-                .report_agent(identity, AgentKind::Codex, &start, "new", Some("codex"))
+                .report_agent(identity, AgentKind::Codex, &start, "new", codex)
                 .unwrap_err()
                 .0,
             code::PERSISTENCE_FAILURE
@@ -696,11 +697,11 @@ mod identity_tests {
         assert_eq!(registry.snapshot()[0].agent_resume, Some(original));
         std::fs::remove_dir(dir.join("sessions.json")).unwrap();
         registry
-            .report_agent(identity, AgentKind::Codex, &end, "one", None)
+            .report_agent(identity, AgentKind::Codex, &end, "one", Unavailable)
             .unwrap();
         assert!(registry.snapshot()[0].agent_resume.is_none());
         registry
-            .report_agent(identity, AgentKind::Codex, &start, "new", Some("codex"))
+            .report_agent(identity, AgentKind::Codex, &start, "new", codex)
             .unwrap();
         registry.clear_agent(identity).unwrap();
         assert!(registry.snapshot()[0].agent_resume.is_none());

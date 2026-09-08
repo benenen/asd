@@ -77,14 +77,43 @@ pub struct ResumePlan<'a> {
     argv: [&'a str; 2],
 }
 
+/// Evidence from the OS, never from a display-oriented command string.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Supported and unsupported platforms construct different variants.
+pub(crate) enum AgentEvidence {
+    Unavailable,
+    Observed(Option<AgentKind>),
+}
+
+impl AgentEvidence {
+    pub(crate) fn proven_kind(self, launch: Option<&str>) -> Option<AgentKind> {
+        match self {
+            Self::Unavailable => launch.and_then(command_kind),
+            Self::Observed(kind) => kind,
+        }
+    }
+}
+
+/// Conservative fallback for platforms without process evidence. Reject shell
+/// syntax rather than interpreting a stored command as a currently live agent.
 pub(crate) fn command_kind(command: &str) -> Option<AgentKind> {
-    let mut words = command.split_whitespace();
-    let mut executable = words.next()?;
+    if !command.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, ' ' | '_' | '-' | '.' | '/' | '\\' | ':' | '=' | '@')
+    }) {
+        return None;
+    }
+    let argv: Vec<_> = command.split_whitespace().collect();
+    process_kind(argv.first()?, &argv)
+}
+
+pub(crate) fn process_kind(executable: &str, argv: &[impl AsRef<str>]) -> Option<AgentKind> {
+    let mut executable = executable;
     if matches!(
         executable.rsplit(['/', '\\']).next()?,
         "node" | "nodejs" | "node.exe" | "bun" | "bun.exe"
     ) {
-        executable = words.next()?;
+        executable = argv.get(1)?.as_ref();
         // Evaluation flags and arbitrary interpreter options cannot prove a script.
         if executable.starts_with('-') {
             return None;
@@ -152,6 +181,53 @@ mod tests {
     use asd_proto::{AgentHookAction, AgentKind};
 
     #[test]
+    fn process_proof_uses_executable_and_preserves_argument_boundaries() {
+        assert_eq!(
+            process_kind("/opt/codex", &["codex", "--resume", "id"]),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            process_kind("/opt/claude", &["claude"]),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            process_kind("/usr/bin/node", &["node", "/opt/bin/codex"]),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            process_kind(
+                "/usr/bin/node",
+                &["node", "/opt/@anthropic-ai/claude-code/cli.js"]
+            ),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            process_kind("/bin/sh", &["codex", "-c", "codex --version; sleep 600"]),
+            None
+        );
+        assert_eq!(
+            process_kind("/usr/bin/node", &["node", "-e", "codex"]),
+            None
+        );
+        assert_eq!(
+            process_kind("/usr/bin/node", &["node", "/tmp/codex args.js"]),
+            None
+        );
+        assert_eq!(
+            AgentEvidence::Observed(None).proven_kind(Some("codex")),
+            None
+        );
+        assert_eq!(
+            AgentEvidence::Unavailable.proven_kind(Some("codex resume id")),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            AgentEvidence::Unavailable.proven_kind(Some("codex; sleep 600")),
+            None
+        );
+    }
+
+    #[test]
     fn recognized_interpreter_launches_do_not_accept_eval_or_arbitrary_scripts() {
         assert_eq!(
             command_kind("node /usr/local/bin/codex"),
@@ -162,6 +238,13 @@ mod tests {
             Some(AgentKind::Claude)
         );
         for command in [
+            "codex --version; sleep 600; :",
+            "codex --version && sleep 600",
+            "codex --version || sleep 600",
+            "codex --version\necho done",
+            "codex > output",
+            "codex $(echo args)",
+            "codex &",
             "node -e codex",
             "echo codex",
             "node /tmp/cli.js",
