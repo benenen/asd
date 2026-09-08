@@ -124,6 +124,9 @@ fn oversized_blob_is_rejected_from_header_before_body_decoding() {
     let id = fx.git(&["hash-object", "-w", "large.txt"]);
     let object = fx.path().join(".git/objects").join(&id[..2]).join(&id[2..]);
     let bytes = std::fs::read(&object).unwrap();
+    // Git stores loose objects read-only. Recreate this test-owned entry so
+    // corrupting the trailer works on Windows and for unprivileged users too.
+    std::fs::remove_file(&object).unwrap();
     // Preserve the header but corrupt the trailer: decoding the body must fail.
     std::fs::write(object, &bytes[..bytes.len() - 8]).unwrap();
     let repo = Repo::open(fx.path()).unwrap();
