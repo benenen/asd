@@ -64,13 +64,15 @@ fn stage_restored_command(
     command: String,
     run: bool,
 ) {
+    if !can_stage_restored_command(&command, run) {
+        warn!(session = %name, "restored command contains control characters; left unstaged without execution approval");
+        return;
+    }
+    // Capture the exact handle before delaying. Rename must not lose staging,
+    // and a same-name replacement must never receive the old resume command.
+    let handle = registry.lock().unwrap().get(&name);
     tokio::spawn(async move {
         tokio::time::sleep(STAGE_DELAY).await;
-        // Take the handle and drop the lock before awaiting anything.
-        let handle = {
-            let reg = registry.lock().unwrap();
-            reg.get(&name)
-        };
         let Some(handle) = handle else {
             return; // the session ended before it could be staged
         };
@@ -90,6 +92,10 @@ fn stage_restored_command(
             Err(_) => warn!(session = %name, "session ended while staging its command"),
         }
     });
+}
+
+fn can_stage_restored_command(command: &str, run: bool) -> bool {
+    run || !command.chars().any(char::is_control)
 }
 
 /// Common serve path: load config, build the registry, restore persisted
@@ -122,13 +128,40 @@ pub(super) async fn serve(socket_path: PathBuf, force_run_commands: bool) -> any
     // `cd`'d to its saved cwd, with the command it was created with typed at
     // that shell's prompt but not run. Each create re-persists the file.
     let run_commands = force_run_commands || config.run_restored_commands;
-    for st in restore_states {
-        match Registry::restore(&registry, st.name.clone(), st.command.clone(), st.cwd) {
+    for st in &restore_states {
+        let owner = st
+            .agent_resume
+            .as_ref()
+            .and_then(|record| crate::agent_resume::resume_owner(&restore_states, record));
+        let duplicate = owner.is_some_and(|owner| owner != st.name);
+        let command = if duplicate {
+            warn!(session = %st.name, owner = owner.unwrap(), "duplicate resume claim; original command will not run automatically");
+            st.command.clone()
+        } else if let Some(record) = &st.agent_resume {
+            Some(
+                crate::agent_resume::ResumePlan::for_record(record)
+                    .map_err(anyhow::Error::msg)?
+                    .display(),
+            )
+        } else {
+            st.command.clone()
+        };
+        match Registry::restore(
+            &registry,
+            st.name.clone(),
+            st.command.clone(),
+            st.cwd.clone(),
+        ) {
             Ok(name) => {
                 info!(session = %st.name, staged = st.command.is_some(), "session restored");
                 registry.lock().unwrap().mark_restored(&st.name);
-                if let Some(command) = st.command {
-                    stage_restored_command(Arc::clone(&registry), name, command, run_commands);
+                if let Some(command) = command {
+                    stage_restored_command(
+                        Arc::clone(&registry),
+                        name,
+                        command,
+                        run_commands && !duplicate,
+                    );
                 }
             }
             Err((code, msg)) => warn!(session = %st.name, code, %msg, "restore failed"),
@@ -145,4 +178,25 @@ pub(super) async fn serve(socket_path: PathBuf, force_run_commands: bool) -> any
     crate::platform::serve_connections(socket_path, registry).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod restore_safety_tests {
+    use super::*;
+
+    #[test]
+    fn unconfirmed_prompt_rejects_all_control_characters() {
+        for control in ['\0', '\t', '\r', '\n', '\u{1b}', '\u{7f}', '\u{85}'] {
+            assert!(!can_stage_restored_command(
+                &format!("echo before{control}after"),
+                false
+            ));
+            assert!(can_stage_restored_command(
+                &format!("echo before{control}after"),
+                true
+            ));
+        }
+        assert!(can_stage_restored_command("codex resume thr_123", false));
+        assert!(can_stage_restored_command("echo 你好", false));
+    }
 }

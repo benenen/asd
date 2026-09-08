@@ -17,6 +17,7 @@ const DEFAULT_SIZE: (u16, u16) = (80, 24);
 
 pub struct Registry {
     sessions: HashMap<String, SessionHandle>,
+    agent_records: HashMap<SessionIdentity, crate::agent_resume::AgentResumeRecord>,
     /// Auto-naming counter for `s0`, `s1`, ... — monotonically increasing
     /// (avoids reusing a name that just died).
     next_auto: u64,
@@ -55,6 +56,7 @@ impl Registry {
     ) -> Self {
         Self {
             sessions: HashMap::new(),
+            agent_records: HashMap::new(),
             next_auto: 0,
             scrollback_lines,
             store,
@@ -80,7 +82,7 @@ impl Registry {
         cmd: Option<String>,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<String, (u32, String)> {
-        Self::spawn(registry, name, cmd.clone(), cmd, cwd)
+        Self::spawn(registry, name, cmd.clone(), cmd, cwd, false)
     }
 
     /// Recreate a session the persisted list remembers, with its recorded
@@ -109,7 +111,7 @@ impl Registry {
                 ),
             ));
         }
-        Self::spawn(registry, Some(name), None, command, cwd)
+        Self::spawn(registry, Some(name), None, command, cwd, true)
     }
 
     /// The one spawn path. `run` is what the child executes (`None` = the
@@ -122,6 +124,7 @@ impl Registry {
         run: Option<String>,
         record: Option<String>,
         cwd: Option<std::path::PathBuf>,
+        restoring: bool,
     ) -> Result<String, (u32, String)> {
         let mut reg = registry.lock().unwrap();
         let name = match name {
@@ -163,7 +166,21 @@ impl Registry {
         )
         .map_err(|e| (code::INTERNAL, format!("failed to spawn session: {e}")))?;
         handle.spawn_command = record;
+        if restoring
+            && let Some(record) = reg
+                .unrestored
+                .iter()
+                .find(|state| state.name == name)
+                .and_then(|state| state.agent_resume.clone())
+        {
+            reg.agent_records.insert(handle.identity(), record);
+        }
         reg.sessions.insert(name.clone(), handle);
+        // A successful explicit create replaces a retained failed restore.
+        // Only restoration may transfer authoritative conversation metadata.
+        if !restoring {
+            reg.unrestored.retain(|state| state.name != name);
+        }
         reg.persist();
         info!(session = %name, "session created");
         Ok(name)
@@ -188,6 +205,7 @@ impl Registry {
                     name,
                     cwd: crate::store::read_cwd(pid),
                     command: h.spawn_command.clone(),
+                    agent_resume: self.agent_records.get(&h.identity()).cloned(),
                 }
             })
             .collect();
@@ -252,6 +270,135 @@ impl Registry {
         self.sessions.get(name).cloned()
     }
 
+    pub fn by_identity(&self, identity: SessionIdentity) -> Option<SessionHandle> {
+        self.sessions
+            .values()
+            .find(|h| {
+                h.identity() == identity && h.meta.alive.load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .cloned()
+    }
+
+    /// Called on the owning session thread with a freshly sampled foreground.
+    pub fn report_agent(
+        &mut self,
+        identity: SessionIdentity,
+        kind: asd_proto::AgentKind,
+        action: &asd_proto::AgentHookAction,
+        reference: &str,
+        foreground: Option<&str>,
+    ) -> Result<(), (u32, String)> {
+        use crate::agent_resume::{AgentResumeRecord, command_kind, validate_report};
+        let invalid = |message: String| (code::INVALID_AGENT_REPORT, message);
+        validate_report(kind, action, reference).map_err(invalid)?;
+        let handle = self.by_identity(identity).ok_or_else(|| {
+            (
+                code::STALE_SESSION,
+                "agent session identity is no longer live".into(),
+            )
+        })?;
+        let current = self.agent_records.get(&identity);
+        match action {
+            asd_proto::AgentHookAction::Start { .. } => {
+                let command = foreground.or(handle.spawn_command.as_deref());
+                if command.and_then(command_kind) != Some(kind) {
+                    return Err(invalid(
+                        "foreground or recorded launch does not prove the reported agent kind"
+                            .into(),
+                    ));
+                }
+                let name = handle.meta.name.lock().unwrap().clone();
+                let states = self.persisted_state();
+                if let Some(record) = states
+                    .iter()
+                    .filter_map(|state| state.agent_resume.as_ref())
+                    .find(|record| record.kind == kind && record.session_ref == reference)
+                    && crate::agent_resume::resume_owner(&states, record) != Some(name.as_str())
+                {
+                    return Err(invalid(
+                        "agent reference is already owned by another persisted session".into(),
+                    ));
+                }
+                if current.is_some_and(|r| r.kind == kind && r.session_ref == reference) {
+                    return Ok(());
+                }
+                let reported_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                self.commit_agent(
+                    identity,
+                    Some(AgentResumeRecord {
+                        kind,
+                        session_ref: reference.into(),
+                        reported_at_ms,
+                    }),
+                )
+            }
+            asd_proto::AgentHookAction::End { .. } => {
+                if !current.is_some_and(|r| r.kind == kind && r.session_ref == reference) {
+                    return Err(invalid(
+                        "agent end does not match the stored conversation".into(),
+                    ));
+                }
+                self.commit_agent(identity, None)
+            }
+        }
+    }
+
+    pub fn clear_agent(&mut self, identity: SessionIdentity) -> Result<(), (u32, String)> {
+        self.commit_agent(identity, None)
+    }
+
+    fn commit_agent(
+        &mut self,
+        identity: SessionIdentity,
+        record: Option<crate::agent_resume::AgentResumeRecord>,
+    ) -> Result<(), (u32, String)> {
+        let handle = self.by_identity(identity).ok_or_else(|| {
+            (
+                code::STALE_SESSION,
+                "agent session identity is no longer live".into(),
+            )
+        })?;
+        if self.persist_frozen {
+            return Err((
+                code::PERSISTENCE_FAILURE,
+                "session store is shutting down".into(),
+            ));
+        }
+        let name = handle.meta.name.lock().unwrap().clone();
+        let candidate: Vec<_> = self
+            .persisted_state()
+            .into_iter()
+            .map(|state| {
+                if state.name == name {
+                    crate::store::SessionState {
+                        agent_resume: record.clone(),
+                        ..state
+                    }
+                } else {
+                    state
+                }
+            })
+            .collect();
+        self.store
+            .commit(&candidate)
+            .map_err(|error| (code::PERSISTENCE_FAILURE, error.to_string()))?;
+        match record {
+            Some(record) => {
+                self.agent_records.insert(identity, record);
+            }
+            None => {
+                self.agent_records.remove(&identity);
+            }
+        }
+        self.last_persisted = candidate;
+        Ok(())
+    }
+
     pub fn list(&self) -> Vec<SessionInfo> {
         let mut infos: Vec<_> = self.sessions.values().map(SessionHandle::info).collect();
         infos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -262,7 +409,9 @@ impl Registry {
     /// killed or self-exited session drops off the list). A no-op on the file
     /// during shutdown, where `persist_frozen` is set.
     pub fn remove(&mut self, name: &str) {
-        self.sessions.remove(name);
+        if let Some(handle) = self.sessions.remove(name) {
+            self.agent_records.remove(&handle.identity());
+        }
         self.persist();
     }
 
@@ -382,7 +531,7 @@ mod identity_tests {
     use super::*;
 
     #[test]
-    fn stale_opaque_identity_cannot_signal_the_current_session() {
+    fn identity_and_agent_transactions_reject_stale_or_uncommitted_updates() {
         let identity = SessionIdentity { instance_id: 7 };
         let (tx, rx) = std::sync::mpsc::channel();
         let meta = Arc::new(crate::session::SessionMeta {
@@ -435,6 +584,126 @@ mod identity_tests {
             rx.recv_timeout(std::time::Duration::from_secs(1)),
             Ok(SessionMsg::Kill)
         ));
+        use asd_proto::{AgentHookAction, AgentKind};
+        let start = AgentHookAction::Start {
+            source: "startup".into(),
+        };
+        let end = AgentHookAction::End {
+            reason: "other".into(),
+        };
+        assert_eq!(
+            registry
+                .report_agent(
+                    SessionIdentity { instance_id: 8 },
+                    AgentKind::Codex,
+                    &start,
+                    "one",
+                    Some("codex")
+                )
+                .unwrap_err()
+                .0,
+            code::STALE_SESSION
+        );
+        assert!(
+            registry
+                .report_agent(identity, AgentKind::Codex, &start, "one", Some("claude"))
+                .is_err()
+        );
+        assert!(
+            registry
+                .report_agent(identity, AgentKind::Codex, &start, "one", None)
+                .is_err()
+        );
+        registry.sessions.get_mut("current").unwrap().spawn_command = Some("codex".into());
+        registry
+            .report_agent(identity, AgentKind::Codex, &start, "fallback", None)
+            .unwrap();
+        assert!(
+            registry
+                .report_agent(identity, AgentKind::Codex, &start, "wrong", Some("sh"))
+                .is_err()
+        );
+        registry
+            .report_agent(
+                identity,
+                AgentKind::Codex,
+                &start,
+                "one",
+                Some("codex --flag"),
+            )
+            .unwrap();
+        let original = registry.snapshot()[0].agent_resume.clone().unwrap();
+        registry.unrestored.push(crate::store::SessionState {
+            name: "duplicate-loser".into(),
+            cwd: None,
+            command: None,
+            agent_resume: Some(crate::agent_resume::AgentResumeRecord {
+                reported_at_ms: original.reported_at_ms.saturating_sub(1),
+                ..original.clone()
+            }),
+        });
+        registry
+            .report_agent(identity, AgentKind::Codex, &start, "one", Some("codex"))
+            .unwrap();
+        registry.unrestored.clear();
+        registry
+            .report_agent(
+                identity,
+                AgentKind::Codex,
+                &AgentHookAction::Start {
+                    source: "compact".into(),
+                },
+                "one",
+                Some("codex"),
+            )
+            .unwrap();
+        assert_eq!(registry.snapshot()[0].agent_resume, Some(original.clone()));
+        assert!(
+            registry
+                .report_agent(identity, AgentKind::Claude, &end, "one", None)
+                .is_err()
+        );
+        assert!(
+            registry
+                .report_agent(identity, AgentKind::Codex, &end, "old", None)
+                .is_err()
+        );
+        assert_eq!(registry.snapshot()[0].agent_resume, Some(original.clone()));
+        registry.unrestored.push(crate::store::SessionState {
+            name: "retained".into(),
+            cwd: None,
+            command: None,
+            agent_resume: Some(crate::agent_resume::AgentResumeRecord {
+                session_ref: "owned".into(),
+                ..original.clone()
+            }),
+        });
+        assert!(
+            registry
+                .report_agent(identity, AgentKind::Codex, &start, "owned", Some("codex"))
+                .is_err()
+        );
+        std::fs::remove_file(dir.join("sessions.json")).unwrap();
+        std::fs::create_dir(dir.join("sessions.json")).unwrap();
+        assert_eq!(
+            registry
+                .report_agent(identity, AgentKind::Codex, &start, "new", Some("codex"))
+                .unwrap_err()
+                .0,
+            code::PERSISTENCE_FAILURE
+        );
+        assert!(registry.clear_agent(identity).is_err());
+        assert_eq!(registry.snapshot()[0].agent_resume, Some(original));
+        std::fs::remove_dir(dir.join("sessions.json")).unwrap();
+        registry
+            .report_agent(identity, AgentKind::Codex, &end, "one", None)
+            .unwrap();
+        assert!(registry.snapshot()[0].agent_resume.is_none());
+        registry
+            .report_agent(identity, AgentKind::Codex, &start, "new", Some("codex"))
+            .unwrap();
+        registry.clear_agent(identity).unwrap();
+        assert!(registry.snapshot()[0].agent_resume.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -18,6 +18,7 @@ asd-proto = { workspace = true }
 asd-tui = { workspace = true }
 asd-vt = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
 # Column alignment for `asd list`: titles are arbitrary text, so the TITLE

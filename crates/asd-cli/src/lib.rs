@@ -4,6 +4,7 @@
 //! to the caller-provided [`GuiLauncher`] (the GUI lives in a separate crate to
 //! keep this one free of iced).
 
+mod agent;
 mod attach;
 mod card;
 mod client;
@@ -39,6 +40,11 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Agent lifecycle reporting and resume metadata.
+    Agent {
+        #[command(subcommand)]
+        cmd: agent::Command,
+    },
     /// List all sessions
     List {
         /// Emit a JSON array instead of the table (`[]` when there are none)
@@ -373,6 +379,7 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
         unreachable!("no-subcommand is dispatched before the runtime starts")
     };
     match cmd {
+        Cmd::Agent { cmd } => agent::run(&socket, cmd).await?,
         Cmd::List { json } => {
             let mut c = client::connect(&socket, ClientKind::Cli).await?;
             c.writer.write_frame(&Frame::ListSessions).await?;

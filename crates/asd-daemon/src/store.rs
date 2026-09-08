@@ -20,6 +20,8 @@ pub struct SessionState {
     pub name: String,
     pub cwd: Option<PathBuf>,
     pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_resume: Option<crate::agent_resume::AgentResumeRecord>,
 }
 
 /// The cwd of a live process, shared with the card command.
@@ -270,6 +272,7 @@ mod tests {
 
     fn one_state(name: &str) -> SessionState {
         SessionState {
+            agent_resume: None,
             name: name.into(),
             cwd: Some(PathBuf::from(r"C:\tools")),
             command: Some("printf 'a\tb\n'".into()),
@@ -291,6 +294,28 @@ mod tests {
             decode_document(br#"{"version":2,"sessions":[]}"#),
             Err(StoreError::FutureVersion(2))
         ));
+    }
+
+    #[test]
+    fn agent_metadata_uses_lowercase_kind_and_rejects_invalid_records() {
+        let valid = r#"{"version":1,"sessions":[{"name":"agent","cwd":null,"command":"codex","agent_resume":{"kind":"codex","session_ref":"thr_123","reported_at_ms":42}}]}"#;
+        let decoded = decode_document(valid.as_bytes()).unwrap();
+        assert_eq!(decoded[0].agent_resume.as_ref().unwrap().reported_at_ms, 42);
+        assert_eq!(
+            decode_document(&encode_document(&decoded).unwrap()).unwrap(),
+            decoded
+        );
+        for invalid in [
+            valid.replace("thr_123", "-bad"),
+            valid.replace("thr_123", "bad;cmd"),
+            valid.replace("\"kind\":\"codex\"", "\"kind\":\"unknown\""),
+            valid.replace("\"reported_at_ms\":42", "\"reported_at_ms\":-1"),
+        ] {
+            assert!(matches!(
+                decode_document(invalid.as_bytes()),
+                Err(StoreError::InvalidSession { index: 0, .. })
+            ));
+        }
     }
 
     #[test]
@@ -395,6 +420,7 @@ mod tests {
         assert_eq!(
             loaded.sessions,
             vec![SessionState {
+                agent_resume: None,
                 name: "keep".into(),
                 cwd: Some(PathBuf::from("/tmp")),
                 command: None
@@ -458,11 +484,13 @@ mod tests {
         let states = vec![
             SessionState {
                 name: "web".into(),
+                agent_resume: None,
                 cwd: Some(PathBuf::from("/home/me/proj")),
                 command: Some("npm run dev".into()),
             },
             SessionState {
                 name: "s0".into(),
+                agent_resume: None,
                 cwd: None,
                 command: None,
             },
@@ -473,6 +501,7 @@ mod tests {
     #[test]
     fn legacy_command_survives_tabs_newlines_and_backslashes() {
         let states = vec![SessionState {
+            agent_resume: None,
             name: "odd".into(),
             cwd: Some(PathBuf::from("/tmp")),
             command: Some("printf 'a\tb\n' && grep -E '\\d+' C:\\tools".into()),
@@ -489,11 +518,13 @@ mod tests {
             vec![
                 SessionState {
                     name: "web".into(),
+                    agent_resume: None,
                     cwd: Some(PathBuf::from("/home/me/proj")),
                     command: None
                 },
                 SessionState {
                     name: "win".into(),
+                    agent_resume: None,
                     cwd: Some(PathBuf::from("C:\\tools")),
                     command: None
                 }

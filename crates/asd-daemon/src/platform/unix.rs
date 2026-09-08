@@ -14,6 +14,19 @@ use crate::conn;
 use crate::registry::Registry;
 use crate::session::SessionMsg;
 
+/// Give every child the daemon address and its rename-stable session identity.
+pub(crate) fn set_session_env(
+    builder: &mut portable_pty::CommandBuilder,
+    name: &str,
+    socket: &Path,
+    identity: asd_proto::SessionIdentity,
+) {
+    builder.env("TERM", "xterm-256color");
+    builder.env("ASD_SESSION", name);
+    builder.env("ASD_SOCKET", socket);
+    builder.env("ASD_SESSION_ID", identity.to_string());
+}
+
 /// Create a unique, owner-only sibling temporary file for an atomic store
 /// replacement. The sibling location keeps rename on the same filesystem.
 pub(crate) fn create_private_temp(destination: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {

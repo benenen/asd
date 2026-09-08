@@ -9,6 +9,7 @@
 //! the data directory) is the spawner's responsibility (the self-healing
 //! path of `asd attach -A` / `asd new`).
 
+pub mod agent_resume;
 mod config;
 mod conn;
 mod detect;

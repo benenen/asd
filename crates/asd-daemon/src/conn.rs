@@ -139,6 +139,62 @@ pub async fn handle_conn(
         };
 
         match frame {
+            Frame::ReportAgentSession {
+                identity,
+                kind,
+                action,
+                session_ref,
+            } => {
+                if let Err(msg) = crate::agent_resume::validate_report(kind, &action, &session_ref)
+                {
+                    reply(Frame::Error {
+                        code: code::INVALID_AGENT_REPORT,
+                        msg,
+                    });
+                    continue;
+                }
+                let handle = registry.lock().unwrap().by_identity(identity);
+                if let Some(handle) = handle {
+                    let sink = ClientSink::new(conn_id, out_tx.clone(), Arc::clone(&queued));
+                    if handle
+                        .tx
+                        .send(SessionMsg::ReportAgent {
+                            kind,
+                            action,
+                            session_ref,
+                            sink,
+                        })
+                        .is_err()
+                    {
+                        reply(Frame::Error {
+                            code: code::STALE_SESSION,
+                            msg: "agent session has exited".into(),
+                        });
+                    }
+                } else {
+                    reply(Frame::Error {
+                        code: code::STALE_SESSION,
+                        msg: "agent session identity is no longer live".into(),
+                    });
+                }
+            }
+            Frame::ClearAgentSession { identity } => {
+                let handle = registry.lock().unwrap().by_identity(identity);
+                if let Some(handle) = handle {
+                    let sink = ClientSink::new(conn_id, out_tx.clone(), Arc::clone(&queued));
+                    if handle.tx.send(SessionMsg::ClearAgent { sink }).is_err() {
+                        reply(Frame::Error {
+                            code: code::STALE_SESSION,
+                            msg: "agent session has exited".into(),
+                        });
+                    }
+                } else {
+                    reply(Frame::Error {
+                        code: code::STALE_SESSION,
+                        msg: "agent session identity is no longer live".into(),
+                    });
+                }
+            }
             Frame::ListSessions => {
                 reply(Frame::SessionList {
                     sessions: registry.lock().unwrap().list(),

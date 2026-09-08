@@ -123,6 +123,16 @@ fn attach_view_rename(
 
 /// Messages sent to the session thread.
 pub enum SessionMsg {
+    /// Validate and durably report on the exact terminal owner thread.
+    ReportAgent {
+        kind: asd_proto::AgentKind,
+        action: asd_proto::AgentHookAction,
+        session_ref: String,
+        sink: ClientSink,
+    },
+    ClearAgent {
+        sink: ClientSink,
+    },
     /// Raw output fed in by the pty read thread.
     PtyOutput(Vec<u8>),
     /// The session's terminal condition, with what reported it (for the log).
@@ -531,23 +541,6 @@ pub struct SessionContext {
     pub detector: Arc<Detector>,
 }
 
-/// The environment a session's child gets on top of the daemon's own: what it
-/// is running in, and which daemon owns it.
-///
-/// `socket` is the listener this daemon actually serves, not
-/// [`asd_proto::paths::socket_path`]'s answer. A daemon started with `--socket`
-/// would otherwise leave its children resolving the default path, so an `asd`
-/// command run *inside* a session would address a different daemon than the one
-/// hosting it.
-fn set_session_env(builder: &mut CommandBuilder, name: &str, socket: &std::path::Path) {
-    builder.env("TERM", "xterm-256color");
-    // Which session a process runs inside (tmux's $TMUX idea): render clients
-    // check it to refuse attaching the session that hosts them — attaching
-    // yourself is a render feedback loop that floods the pty.
-    builder.env("ASD_SESSION", name);
-    builder.env("ASD_SOCKET", socket);
-}
-
 /// Create the pty, start the child process, and launch the session thread
 /// and pty read thread.
 #[allow(clippy::too_many_arguments)]
@@ -589,7 +582,7 @@ pub fn spawn_session(
         }
         None => CommandBuilder::new_default_prog(), // $SHELL
     };
-    set_session_env(&mut builder, &name, &context.socket);
+    crate::platform::set_session_env(&mut builder, &name, &context.socket, identity);
     // Working directory: the requested one (a restart workspace restore) when it
     // still exists, else the process default ($HOME). A stale/missing dir must
     // not fail the spawn — fall back rather than error.
@@ -763,6 +756,32 @@ fn session_thread(
             },
         };
         match msg {
+            SessionMsg::ReportAgent {
+                kind,
+                action,
+                session_ref,
+                sink,
+            } => {
+                let foreground = foreground_command(meta.pty_master_fd.load(Ordering::Relaxed));
+                let result = registry.lock().unwrap().report_agent(
+                    identity,
+                    kind,
+                    &action,
+                    &session_ref,
+                    foreground.as_deref(),
+                );
+                sink.send(match result {
+                    Ok(()) => Frame::AgentSessionReported,
+                    Err((code, msg)) => Frame::Error { code, msg },
+                });
+            }
+            SessionMsg::ClearAgent { sink } => {
+                let result = registry.lock().unwrap().clear_agent(identity);
+                sink.send(match result {
+                    Ok(()) => Frame::AgentSessionCleared,
+                    Err((code, msg)) => Frame::Error { code, msg },
+                });
+            }
             SessionMsg::PtyOutput(bytes) => {
                 // Clients render their own terminal models, some of which also
                 // answer OSC queries. Keep theme queries daemon-only so one
@@ -1686,18 +1705,22 @@ mod session_env_tests {
     /// The child is told which session and daemon own it, so `asd` run inside
     /// a session reaches that daemon even when it listens somewhere non-default.
     #[test]
-    fn session_env_contains_only_the_existing_session_contract() {
+    fn session_env_contains_rename_stable_identity() {
         let mut builder = CommandBuilder::new("/bin/sh");
 
-        set_session_env(
+        crate::platform::set_session_env(
             &mut builder,
             "web",
             std::path::Path::new("/custom/asd.sock"),
+            SessionIdentity { instance_id: 7 },
         );
 
         assert_eq!(builder.get_env("ASD_SESSION").unwrap(), "web");
         assert_eq!(builder.get_env("ASD_SOCKET").unwrap(), "/custom/asd.sock");
         assert_eq!(builder.get_env("TERM").unwrap(), "xterm-256color");
-        assert_eq!(builder.get_env("ASD_SESSION_ID"), None);
+        assert_eq!(
+            builder.get_env("ASD_SESSION_ID").unwrap(),
+            SessionIdentity { instance_id: 7 }.to_string().as_str()
+        );
     }
 }

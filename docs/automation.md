@@ -186,3 +186,48 @@ Settling means `Idle` or `Blocked`. `Unknown` — a plain shell, or any program
 without detection rules — falls back to the activity rule `list` uses to print
 "idle": no bytes for the settle interval. `--until` overrides the whole thing
 and waits for exactly one state.
+
+## Authoritative agent resume hooks
+
+Configure the agent's lifecycle hooks explicitly to invoke these commands;
+each command reads the vendor JSON payload directly from stdin:
+
+```bash
+asd agent hook codex start
+asd agent hook codex end
+asd agent hook claude start
+asd agent hook claude end
+asd agent clear
+```
+
+Hooks use `ASD_SESSION_ID`, not the mutable session name. The daemon provides
+this variable in every session; it survives rename but changes on replacement
+or restore. `clear` explicitly removes the hosting session's resume metadata.
+No command edits Codex or Claude configuration files.
+
+Payloads require string `session_id` and `hook_event_name` (`SessionStart` or
+`SessionEnd`, matching the requested phase). Start requires string `source`:
+Codex accepts `startup`, `resume`, `clear`, `compact`; Claude also accepts
+`fork`. End requires string `reason`: Codex accepts only `other`; Claude accepts
+`clear`, `resume`, `logout`, `prompt_input_exit`, `other`. Extra JSON fields are
+ignored. References must match `[A-Za-z0-9][A-Za-z0-9_-]{0,127}` exactly; the
+CLI limits the full payload to 64 KiB.
+
+Start requires proof of the selected agent from the live foreground command.
+When the platform cannot resolve it, the recorded launch command is the only
+fallback; manually launched agents on Windows may therefore be rejected.
+End requires the exact stored kind/reference, even if the process has exited.
+Duplicate references owned by another live or retained session are rejected.
+A successful hook returns only after durable persistence; invalid, stale, or
+failed writes exit non-zero without changing in-memory resume metadata.
+
+Restart starts a fresh shell and stages `codex resume ID` or
+`claude --resume ID` without Enter. `--run-restored-commands` opts into execution
+of the same validated command. Duplicate saved claims select the newest daemon
+timestamp, then ascending session name; every loser stages its original launch
+command without Enter, even with opt-in execution. Any unconfirmed original
+containing control characters (including TAB, CR, LF, and ESC) is left unstaged
+with a warning; its persisted bytes are retained. Printable commands stage
+exactly, and explicit execution opt-in retains the original command behavior.
+Missing agent executables
+remain visible shell errors rather than silently starting a fresh conversation.

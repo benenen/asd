@@ -34,5 +34,6 @@ mod imp;
 
 pub(crate) use imp::{
     create_private_temp, harden_dll_search, kill_child, prepare_socket_dir, pty_master_fd,
-    read_cwd, remove_stale_socket, replace_file, serve_connections, sync_parent, watch_child_exit,
+    read_cwd, remove_stale_socket, replace_file, serve_connections, set_session_env, sync_parent,
+    watch_child_exit,
 };

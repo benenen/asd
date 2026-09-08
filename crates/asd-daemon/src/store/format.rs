@@ -67,6 +67,15 @@ pub(crate) fn decode_document(bytes: &[u8]) -> Result<Vec<SessionState>, StoreEr
                 index,
                 detail: error.to_string(),
             })?;
+        if let Some(record) = &state.agent_resume {
+            crate::agent_resume::validate_reference(&record.session_ref).map_err(|detail| {
+                StoreError::InvalidSession {
+                    path: PathBuf::new(),
+                    index,
+                    detail,
+                }
+            })?;
+        }
         if !asd_proto::paths::is_valid_session_name(&state.name) {
             return Err(StoreError::InvalidSession {
                 path: PathBuf::new(),

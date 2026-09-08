@@ -144,9 +144,11 @@ target a replacement. Daemon shutdown applies the same graceful-then-hard
 sequence before removing its endpoint.
 
 Live processes, terminal cells, and scrollback are not persisted. Session name,
-working directory, and the command the session was created with are. Registry
-create, rename, and removal rewrite `sessions.tsv` atomically through a
-temporary file plus rename. An ordinary kill or shell exit removes the saved
+working directory, original launch command, and optional authoritative agent
+resume metadata are stored in version 1 `sessions.json`. Registry serializes
+private atomic writes with file and parent-directory sync. Existing TSV state
+is imported only when JSON is absent; invalid JSON fails startup, and records
+that cannot restore are retained. An ordinary kill or shell exit removes the saved
 entry; a daemon restart or crash restores it.
 
 Daemon startup recreates each saved entry as a fresh default shell in its
@@ -159,6 +161,19 @@ started with `--run-restored-commands`, or one whose config sets
 `session.run_restored_commands`, sends the newline too. The staging write is
 the ordinary scripted-input path (`SessionMsg::ScriptInput`), delayed briefly so
 the shell has drawn its prompt before the command lands on it.
+Without execution approval, a command containing control characters is left
+unstaged with a warning, not escaped or submitted; the stored original remains
+unchanged. This includes multiline commands whose embedded newline could
+otherwise execute without the final Enter keypress.
+
+Validated Codex/Claude lifecycle hooks replace only the staged command with
+`codex resume ID` or `claude --resume ID`; the original command stays separate.
+Hook acknowledgement follows the durable commit, with in-memory metadata
+unchanged on failure. Start must agree with the live foreground command, or
+the recorded launch when foreground lookup is unavailable. End matches the
+stored kind/reference even after the agent exits. Duplicate restore claims
+are reserved by newest daemon timestamp, then ascending session name. Losers
+stage their original command without Enter, including in opt-in execution mode.
 
 Before intentional daemon shutdown, `freeze_and_persist` captures live working
 directories and freezes persistence. Otherwise the subsequent SIGHUP-driven
@@ -209,9 +224,10 @@ use exactly the same contract.
 - User agent-detection manifests live in `<config_dir>/agents/*.toml`, beside
   but distinct from `config.toml`. Read once at daemon startup, like the config.
 - Each session's child process is spawned with `ASD_SESSION` (its name at spawn
-  time) and `ASD_SOCKET` (the listener the hosting daemon actually serves, which
+  time), `ASD_SESSION_ID` (opaque, rename-stable identity, new on restore), and
+  `ASD_SOCKET` (the listener the hosting daemon actually serves, which
   is not necessarily what `paths::socket_path` would resolve). The daemon owns
-  both; `spawn_session` receives the socket from the registry rather than
+  all three; `spawn_session` receives the socket from the registry rather than
   re-resolving it.
 - Unix config defaults to `~/.config/asd/config.toml`; Windows config defaults
   to `%APPDATA%\asd\config.toml`; `ASD_CONFIG` overrides both.

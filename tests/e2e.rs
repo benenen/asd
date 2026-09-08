@@ -25,6 +25,315 @@ fn cli_exe() -> &'static str {
     env!("CARGO_BIN_EXE_asd")
 }
 
+fn agent_hook(
+    daemon: &Daemon,
+    identity: &str,
+    kind: &str,
+    phase: &str,
+    payload: &str,
+) -> std::process::Output {
+    use std::io::Write;
+    let mut child = daemon
+        .cli()
+        .args(["agent", "hook", kind, phase])
+        .env("ASD_SESSION_ID", identity)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[tokio::test]
+async fn authoritative_agent_hooks_survive_rename_and_stage_resume() {
+    let daemon = Daemon::start("agent-hooks");
+    for kind in ["codex", "claude"] {
+        let fake = daemon.dir.join(kind);
+        std::fs::copy("/bin/sh", &fake).unwrap();
+        let identity_path = daemon.dir.join(format!("{kind}.identity"));
+        let command = format!(
+            "exec {} -c 'printf %s \"$ASD_SESSION_ID\" > {}; while read line; do :; done'",
+            fake.display(),
+            identity_path.display()
+        );
+        let out = daemon
+            .cli()
+            .args(["new", kind, "--cmd", &command])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        wait_for(
+            || std::fs::read_to_string(&identity_path).is_ok_and(|s| !s.is_empty()),
+            "session identity exported",
+        )
+        .await;
+        let identity = std::fs::read_to_string(&identity_path).unwrap();
+        assert!(identity.parse::<asd_proto::SessionIdentity>().is_ok());
+        let renamed = format!("{kind}-renamed");
+        assert!(
+            daemon
+                .cli()
+                .args(["rename", kind, &renamed])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let start = format!(
+            r#"{{"session_id":"{kind}_123","hook_event_name":"SessionStart","source":"startup","cwd":"/work"}}"#
+        );
+        let out = agent_hook(&daemon, &identity, kind, "start", &start);
+        assert!(out.status.success(), "{out:?}");
+        let mut raw = ProtoClient::connect(&daemon.socket).await;
+        raw.send(Frame::ReportAgentSession {
+            identity: identity.parse().unwrap(),
+            kind: kind.parse().unwrap(),
+            action: asd_proto::AgentHookAction::Start {
+                source: "unknown".into(),
+            },
+            session_ref: "valid".into(),
+        })
+        .await;
+        assert!(matches!(
+            raw.recv().await,
+            Frame::Error {
+                code: code::INVALID_AGENT_REPORT,
+                ..
+            }
+        ));
+        raw.send(Frame::ReportAgentSession {
+            identity: identity.parse().unwrap(),
+            kind: kind.parse().unwrap(),
+            action: asd_proto::AgentHookAction::Start {
+                source: "startup".into(),
+            },
+            session_ref: "bad;command".into(),
+        })
+        .await;
+        assert!(matches!(
+            raw.recv().await,
+            Frame::Error {
+                code: code::INVALID_AGENT_REPORT,
+                ..
+            }
+        ));
+        let end = format!(
+            r#"{{"session_id":"{kind}_123","hook_event_name":"SessionEnd","reason":"other","cwd":"/work"}}"#
+        );
+        let stale = end.replace("_123", "_old");
+        assert!(
+            !agent_hook(&daemon, &identity, kind, "end", &stale)
+                .status
+                .success()
+        );
+        assert!(
+            agent_hook(&daemon, &identity, kind, "end", &end)
+                .status
+                .success()
+        );
+        let cleared = std::fs::read_to_string(daemon.dir.join("data/asd/sessions.json")).unwrap();
+        assert!(!cleared.contains(&format!("{kind}_123")));
+        assert!(
+            agent_hook(&daemon, &identity, kind, "start", &start)
+                .status
+                .success()
+        );
+        let saved = std::fs::read_to_string(daemon.dir.join("data/asd/sessions.json")).unwrap();
+        assert!(saved.contains(&format!("\"kind\": \"{kind}\"")));
+        assert!(saved.contains(&format!("{kind}_123")));
+        assert!(
+            daemon
+                .cli()
+                .args(["agent", "clear"])
+                .env("ASD_SESSION_ID", &identity)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let cleared = std::fs::read_to_string(daemon.dir.join("data/asd/sessions.json")).unwrap();
+        assert!(!cleared.contains(&format!("{kind}_123")));
+        assert!(
+            agent_hook(&daemon, &identity, kind, "start", &start)
+                .status
+                .success()
+        );
+    }
+    daemon.stop_and_wait();
+    let mut successor = daemon.respawn_successor();
+    assert!(
+        daemon
+            .cli()
+            .args(["rename", "codex-renamed", "codex-restored"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    for (kind, expected) in [
+        ("codex", "codex resume codex_123"),
+        ("claude", "claude --resume claude_123"),
+    ] {
+        let renamed = if kind == "codex" {
+            "codex-restored".to_string()
+        } else {
+            format!("{kind}-renamed")
+        };
+        wait_for(
+            || {
+                let screen = daemon.cli().args(["peek", &renamed]).output().unwrap();
+                String::from_utf8_lossy(&screen.stdout).contains(expected)
+            },
+            "fixed resume staged",
+        )
+        .await;
+        let old_identity =
+            std::fs::read_to_string(daemon.dir.join(format!("{kind}.identity"))).unwrap();
+        assert!(
+            !daemon
+                .cli()
+                .args(["agent", "clear"])
+                .env("ASD_SESSION_ID", old_identity)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        // A staged shell remains the live foreground; a resume was not executed.
+        let out = daemon
+            .cli()
+            .args(["inspect", &renamed, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains(&format!("\"command\":\"{expected}\""))
+        );
+    }
+    unsafe {
+        libc::kill(successor.id() as i32, libc::SIGTERM);
+    }
+    successor.wait().unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_resume_claim_never_auto_runs_its_original() {
+    let daemon = Daemon::start_with_data("agent-duplicate", |data| {
+        use std::os::unix::fs::PermissionsExt;
+        let root = data.parent().unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("codex");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}/resume-argv'\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state_dir = data.join("asd");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let store = r#"{"version":1,"sessions":[{"name":"winner","cwd":"ROOT","command":null,"agent_resume":{"kind":"codex","session_ref":"unique_task3_test_ref","reported_at_ms":20}},{"name":"loser","cwd":"ROOT","command":"printf SHOULD_NOT_RUN > duplicate-ran","agent_resume":{"kind":"codex","session_ref":"unique_task3_test_ref","reported_at_ms":10}},{"name":"unsafe","cwd":"ROOT","command":"printf UNSAFE > unsafe-ran\n","agent_resume":{"kind":"codex","session_ref":"unique_task3_test_ref","reported_at_ms":5}}]}"#.replace("ROOT", &root.to_string_lossy());
+        std::fs::write(state_dir.join("sessions.json"), store).unwrap();
+    });
+    daemon.stop_and_wait();
+    let mut successor = daemon.respawn_successor_with(&["--run-restored-commands"]);
+    wait_for(
+        || daemon.dir.join("resume-argv").exists(),
+        "opt-in executes fixed resume",
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(daemon.dir.join("resume-argv")).unwrap(),
+        "resume unique_task3_test_ref\n"
+    );
+    wait_for(
+        || {
+            let screen = daemon.cli().args(["peek", "loser"]).output().unwrap();
+            String::from_utf8_lossy(&screen.stdout).contains("SHOULD_NOT_RUN")
+        },
+        "duplicate original staged without Enter",
+    )
+    .await;
+    let out = daemon
+        .cli()
+        .args(["inspect", "loser", "--json"])
+        .output()
+        .unwrap();
+    let info = String::from_utf8_lossy(&out.stdout);
+    assert!(!info.contains("\"command\":\"printf"));
+    assert!(!daemon.dir.join("duplicate-ran").exists());
+    assert!(
+        !daemon.dir.join("unsafe-ran").exists(),
+        "duplicate multiline original executed"
+    );
+    unsafe {
+        libc::kill(successor.id() as i32, libc::SIGTERM);
+    }
+    successor.wait().unwrap();
+}
+
+#[tokio::test]
+async fn default_restore_never_submits_embedded_control_characters() {
+    let daemon = Daemon::start_with_data("restore-controls", |data| {
+        let root = data.parent().unwrap();
+        let state_dir = data.join("asd");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let store = r#"{"version":1,"sessions":[{"name":"unsafe","cwd":"ROOT","command":"printf UNSAFE > unsafe-ran\n"},{"name":"ready","cwd":"ROOT","command":"printf RESTORE_READY"}]}"#.replace("ROOT", &root.to_string_lossy());
+        std::fs::write(state_dir.join("sessions.json"), store).unwrap();
+    });
+    wait_for(
+        || {
+            let out = daemon.cli().args(["peek", "ready"]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).contains("RESTORE_READY")
+        },
+        "printable restore staged",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !daemon.dir.join("unsafe-ran").exists(),
+        "default multiline restore executed"
+    );
+    let screen = daemon.cli().args(["peek", "unsafe"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&screen.stdout).contains("UNSAFE"));
+    let saved = std::fs::read_to_string(daemon.dir.join("data/asd/sessions.json")).unwrap();
+    assert!(saved.contains("printf UNSAFE > unsafe-ran\\n"));
+}
+
+#[tokio::test]
+async fn explicitly_created_session_does_not_inherit_retained_resume_metadata() {
+    let daemon = Daemon::start_with_data("retained-agent", |data| {
+        let state_dir = data.join("asd");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let missing = data.join("missing-cwd");
+        let store = r#"{"version":1,"sessions":[{"name":"retained","cwd":"MISSING","command":"codex","agent_resume":{"kind":"codex","session_ref":"old_conversation","reported_at_ms":42}}]}"#.replace("MISSING", &missing.to_string_lossy());
+        std::fs::write(state_dir.join("sessions.json"), store).unwrap();
+    });
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "retained"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let saved = std::fs::read_to_string(daemon.dir.join("data/asd/sessions.json")).unwrap();
+    assert!(
+        !saved.contains("old_conversation"),
+        "a new shell inherited an unreported conversation"
+    );
+}
+
 /// An isolated daemon instance: its own socket + data directory, reclaimed
 /// on Drop.
 struct Daemon {
@@ -58,6 +367,14 @@ impl Daemon {
             .arg("--socket")
             .arg(&socket)
             .env("XDG_DATA_HOME", dir.join("data"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -132,6 +449,14 @@ impl Daemon {
             .arg(&self.socket)
             .args(extra)
             .env("XDG_DATA_HOME", self.dir.join("data"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.dir.join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

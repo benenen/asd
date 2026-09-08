@@ -38,6 +38,7 @@ pub(super) fn parse_with_diagnostics(text: &str) -> (Vec<SessionState>, Vec<Stri
             continue;
         }
         states.push(SessionState {
+            agent_resume: None,
             name: name.to_string(),
             cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
             command: (!command.is_empty()).then(|| unescape(command)),
