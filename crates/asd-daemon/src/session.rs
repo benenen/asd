@@ -24,6 +24,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tracing::{debug, info, warn};
 
 use crate::registry::Registry;
+use crate::waiters::{CompiledMatcher, ScreenWaiters, WaitReply};
 
 /// Per-client Output send-queue cap (spec §5, M0-era flow control):
 /// a full queue means the client is dead → disconnect it; the session is
@@ -123,6 +124,14 @@ fn attach_view_rename(
 
 /// Messages sent to the session thread.
 pub enum SessionMsg {
+    /// The matcher is compiled before entering the terminal owner thread.
+    WaitForScreen {
+        matcher: CompiledMatcher,
+        deadline: std::time::Instant,
+        reply: WaitReply,
+    },
+    /// A disconnected connection closed its reply receivers.
+    PruneScreenWaiters,
     /// Validate and durably report on the exact terminal owner thread.
     ReportAgent {
         kind: asd_proto::AgentKind,
@@ -713,14 +722,13 @@ fn session_thread(
     // since that still needs one.
     let mut last_detect_ms = 0u64;
     let mut detect_pending = false;
+    let mut screen_waiters = ScreenWaiters::default();
     info!(session = %name, pid = meta.child_pid.load(Ordering::Relaxed), "session started");
 
     loop {
-        // Two things can become true with no message arriving: a quiet spell a
-        // follower is waiting to hear about, and a detection the throttle
-        // deferred. Each contributes a deadline, and the wait takes whichever
-        // comes first; with neither pending, block exactly as before, since
-        // nothing can change until the next message.
+        screen_waiters.expire(std::time::Instant::now());
+        // Follow idle, deferred detection, and screen-wait expiration each
+        // contribute a deadline. Block without a timer when none is pending.
         let until_idle = (!followers.is_empty() && !idle_announced).then(|| {
             let idle_ms = now_ms().saturating_sub(meta.last_output_ms.load(Ordering::Relaxed));
             IDLE_SETTLE_MS.saturating_sub(idle_ms).max(1)
@@ -734,15 +742,25 @@ fn session_thread(
             (Some(idle), Some(detect)) => Some(idle.min(detect)),
             (idle, detect) => idle.or(detect),
         };
+        let until_waiter = screen_waiters
+            .next_deadline()
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+        let deadline = deadline
+            .map(std::time::Duration::from_millis)
+            .into_iter()
+            .chain(until_waiter)
+            .min();
         let msg = match deadline {
             None => match rx.recv() {
                 Ok(msg) => msg,
                 Err(_) => break,
             },
-            Some(ms) => match rx.recv_timeout(std::time::Duration::from_millis(ms)) {
+            Some(duration) => match rx.recv_timeout(duration) {
                 Ok(msg) => msg,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if detect_pending {
+                    if detect_pending
+                        && now_ms().saturating_sub(last_detect_ms) >= DETECT_INTERVAL_MS
+                    {
                         update_agent_state(&context.detector, &mut vt, &meta);
                         last_detect_ms = now_ms();
                         detect_pending = false;
@@ -756,6 +774,17 @@ fn session_thread(
             },
         };
         match msg {
+            SessionMsg::WaitForScreen {
+                matcher,
+                deadline,
+                reply,
+            } => {
+                let screen = visible_screen(&mut vt);
+                let _ = screen_waiters.register(identity, matcher, deadline, &screen, reply);
+            }
+            SessionMsg::PruneScreenWaiters => {
+                screen_waiters.expire(std::time::Instant::now());
+            }
             SessionMsg::ReportAgent {
                 kind,
                 action,
@@ -789,6 +818,10 @@ fn session_thread(
                 // shared PTY receives exactly one response.
                 let client_bytes = client_output_filter.push(&bytes);
                 vt.feed(&bytes);
+                if screen_waiters.next_deadline().is_some() {
+                    let screen = visible_screen(&mut vt);
+                    screen_waiters.observe(&screen, std::time::Instant::now());
+                }
                 // Stamp the output time so the network side can report idle_ms
                 // (drives `asd wait --idle`).
                 meta.last_output_ms.store(now_ms(), Ordering::Relaxed);
@@ -1126,6 +1159,7 @@ fn session_thread(
         }
     }
 
+    screen_waiters.session_exited();
     // Endpoint: reap the child, deregister, broadcast the exit, and
     // disconnect all clients
     let exit = child.wait().map(session_exit).unwrap_or_else(|error| {
@@ -1337,6 +1371,14 @@ fn update_agent_state(detector: &Detector, vt: &mut GhosttyVt, meta: &SessionMet
         );
         *shared = state;
     }
+}
+
+/// Use exactly the visible-screen representation exposed by plain `peek`.
+fn visible_screen(vt: &mut GhosttyVt) -> String {
+    let Frame::PeekReply { screen, .. } = render_peek(vt, asd_proto::Scrollback::None) else {
+        unreachable!("render_peek always returns PeekReply");
+    };
+    String::from_utf8_lossy(&screen).into_owned()
 }
 
 /// Render the session's screen as a plain-text `PeekReply` (`asd peek`). The

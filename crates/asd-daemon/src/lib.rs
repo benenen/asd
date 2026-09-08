@@ -19,6 +19,7 @@ mod registry;
 mod server;
 mod session;
 mod store;
+pub mod waiters;
 
 pub use store::read_cwd;
 

@@ -45,9 +45,29 @@ The shared definition of activity is
 `SessionInfo.running`, `wait --idle`, TUI shimmer, and `FollowStatus` all derive
 from this constant.
 
-`wait --text` polls rendered screen content. `wait --idle` polls session
-metadata. `follow` is different: it subscribes once and receives Output and
-activity status in a single ordered stream.
+`wait --text` and `wait --regex` register session-local screen conditions using
+`WaitForScreen`. The owner checks the current visible screen and, if unmatched,
+registers the condition in the same session-thread turn. After every PTY feed,
+it checks all pending conditions against that observed post-feed screen before
+processing another PTY batch. A match survives a later erase. Bytes written and
+erased within a single feed are not separately observed. History is excluded,
+using the same plain-text rendering and trailing-blank trimming as `peek`
+without scrollback. Matches return the exact session identity, including after
+a rename.
+
+Regular expressions use Rust `regex` syntax. CLI validation happens before
+connection; daemon compilation runs outside the session thread. Both enforce
+4 KiB of pattern input and a 1 MiB compiled regex size limit; the regex DFA
+cache is also limited to 1 MiB. Each session allows 64 active screen waits.
+Match, timeout, exit, and disconnected reply receivers release registrations;
+disconnect cleanup explicitly wakes even a silent session. Waiters do not
+attach, affect PTY size, or consume a viewer slot. A current-screen match can
+succeed with a zero timeout; otherwise the nearest deadline wakes the session.
+CLI success remains exit 0, timeout exit 4, and missing session exit 3 with the
+same wording in every wait mode.
+
+`wait --idle` and `wait --until` poll session metadata. `follow` subscribes once
+and receives Output and activity status in a single ordered stream.
 
 Followers are stored separately from attached clients. They receive no
 Snapshot, do not contribute to `attached_clients`, do not affect PTY size, and
@@ -58,8 +78,9 @@ The transition to idle occurs because no bytes arrive. Computing `running`
 immediately after a PTY batch always yields true, so a session with followers
 must use `recv_timeout` for the remaining settle interval while idle has not
 yet been announced. On timeout it emits `running: false`; an `idle_announced`
-guard prevents duplicate notifications and busy loops. With no followers, the
-session returns to an ordinary blocking receive with no timer cost.
+guard prevents duplicate notifications and busy loops. The receive timeout is
+the earliest follow-idle, deferred detection, or screen-wait deadline. With no
+pending deadlines, the session returns to an ordinary blocking receive.
 
 Session exit sends both `FollowStatus { running: false }` and the session-exited
 error. Default follow may stop on the status transition; `--forever` ignores

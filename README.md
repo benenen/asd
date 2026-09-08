@@ -160,6 +160,7 @@ echo 'make test' | asd send build --enter
 asd peek build
 asd peek build --scrollback 200
 asd wait build --text PASS --timeout 2m
+asd wait build --regex 'PASS-[0-9]+' --timeout 2m
 asd wait build --idle
 asd follow build
 ```

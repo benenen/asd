@@ -572,66 +572,78 @@ pub async fn wait(
     socket: &Path,
     name: String,
     text: Option<String>,
+    regex: Option<String>,
     idle: bool,
     until: Option<AgentState>,
     timeout: String,
 ) -> anyhow::Result<()> {
-    let _ = idle; // clap guarantees exactly one of --text / --idle / --until
+    let _ = idle; // clap guarantees exactly one condition
     let timeout_ms = parse_duration(&timeout).ok_or_else(|| {
         anyhow::anyhow!("wait: bad duration '{timeout}' (use 500ms, 2s, 1m, 4h, 1d)")
     })?;
 
+    let matcher = text
+        .map(asd_proto::ScreenMatcher::Literal)
+        .or_else(|| regex.map(asd_proto::ScreenMatcher::Regex));
+    if let Some(matcher) = &matcher {
+        asd_daemon::waiters::CompiledMatcher::compile(matcher.clone())?;
+    }
     let mut c = client::connect(socket, ClientKind::Cli).await?;
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or_else(|| anyhow::anyhow!("wait: duration exceeds supported range"))?;
+    if let Some(matcher) = matcher {
+        c.writer
+            .write_frame(&Frame::WaitForScreen {
+                name,
+                matcher,
+                timeout_ms,
+            })
+            .await?;
+        match c.reader.read_frame().await? {
+            Some(Frame::ScreenWaitMatched { .. }) => return Ok(()),
+            Some(Frame::Error {
+                code: code::WAIT_TIMEOUT,
+                ..
+            }) => {
+                eprintln!("wait: timed out after {timeout}");
+                std::process::exit(exit::TIMEOUT);
+            }
+            Some(Frame::Error { code, msg }) => return Err(exit::daemon("wait", code, &msg)),
+            other => bail!("unexpected reply: {other:?}"),
+        }
+    }
     loop {
-        if let Some(needle) = &text {
-            c.writer
-                .write_frame(&Frame::Peek {
-                    name: name.clone(),
-                    scrollback: Scrollback::None,
-                })
-                .await?;
-            match c.reader.read_frame().await? {
-                Some(Frame::PeekReply { screen, .. }) => {
-                    if String::from_utf8_lossy(&screen).contains(needle.as_str()) {
+        c.writer.write_frame(&Frame::ListSessions).await?;
+        match c.reader.read_frame().await? {
+            Some(Frame::SessionList { sessions }) => {
+                match sessions.iter().find(|s| s.name == name) {
+                    // `--until` watches the screen-derived state; plain
+                    // `--idle` watches output activity. They are different
+                    // questions, so one never stands in for the other.
+                    Some(s) if until.is_some_and(|want| s.state == want) => return Ok(()),
+                    Some(s) if until.is_none() && s.idle_ms >= IDLE_SETTLE_MS => {
                         return Ok(());
                     }
-                }
-                Some(Frame::Error { code, msg }) => return Err(exit::daemon("wait", code, &msg)),
-                other => bail!("unexpected reply: {other:?}"),
-            }
-        } else {
-            c.writer.write_frame(&Frame::ListSessions).await?;
-            match c.reader.read_frame().await? {
-                Some(Frame::SessionList { sessions }) => {
-                    match sessions.iter().find(|s| s.name == name) {
-                        // `--until` watches the screen-derived state; plain
-                        // `--idle` watches output activity. They are different
-                        // questions, so one never stands in for the other.
-                        Some(s) if until.is_some_and(|want| s.state == want) => return Ok(()),
-                        Some(s) if until.is_none() && s.idle_ms >= IDLE_SETTLE_MS => {
-                            return Ok(());
-                        }
-                        Some(_) => {}
-                        // `ListSessions` cannot fail on a missing name — it just
-                        // returns a list without it — so the absence is detected
-                        // here. Report it exactly as the daemon would have, code
-                        // and wording included: `--text` reaches the same
-                        // condition through `Peek`, which *does* answer with
-                        // `Error{NO_SUCH_SESSION}`, and one command must not
-                        // describe one situation two ways.
-                        None => {
-                            return Err(exit::daemon(
-                                "wait",
-                                code::NO_SUCH_SESSION,
-                                &format!("no such session '{name}'"),
-                            ));
-                        }
+                    Some(_) => {}
+                    // `ListSessions` cannot fail on a missing name — it just
+                    // returns a list without it — so the absence is detected
+                    // here. Report it exactly as the daemon would have, code
+                    // and wording included: `--text` reaches the same
+                    // condition through `WaitForScreen`, which answers with
+                    // `Error{NO_SUCH_SESSION}`, and one command must not
+                    // describe one situation two ways.
+                    None => {
+                        return Err(exit::daemon(
+                            "wait",
+                            code::NO_SUCH_SESSION,
+                            &format!("no such session '{name}'"),
+                        ));
                     }
                 }
-                Some(Frame::Error { code, msg }) => return Err(exit::daemon("wait", code, &msg)),
-                other => bail!("unexpected reply: {other:?}"),
             }
+            Some(Frame::Error { code, msg }) => return Err(exit::daemon("wait", code, &msg)),
+            other => bail!("unexpected reply: {other:?}"),
         }
         if Instant::now() >= deadline {
             eprintln!("wait: timed out after {timeout}");

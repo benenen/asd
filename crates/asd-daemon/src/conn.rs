@@ -16,6 +16,33 @@ use tracing::{debug, warn};
 
 use crate::registry::Registry;
 use crate::session::{AttachClass, ClientSink, ConnItem, SessionMsg, data_frame_size};
+use crate::waiters::{CompiledMatcher, WaitError};
+
+/// Cancellation must close the reply before waking the session for cleanup.
+struct ScreenWaitRegistration {
+    reply: tokio::sync::oneshot::Receiver<Result<asd_proto::SessionIdentity, WaitError>>,
+    session_tx: std::sync::mpsc::Sender<SessionMsg>,
+}
+
+impl Drop for ScreenWaitRegistration {
+    fn drop(&mut self) {
+        self.reply.close();
+        let _ = self.session_tx.send(SessionMsg::PruneScreenWaiters);
+    }
+}
+
+fn screen_wait_error(error: WaitError) -> Frame {
+    let code = match &error {
+        WaitError::InvalidMatcher(_) => code::INVALID_MATCHER,
+        WaitError::Limit => code::SCREEN_WAITER_LIMIT,
+        WaitError::TimedOut => code::WAIT_TIMEOUT,
+        WaitError::SessionExited => code::SESSION_EXITED,
+    };
+    Frame::Error {
+        code,
+        msg: error.to_string(),
+    }
+}
 
 /// The client↔session association after attach.
 struct Attached {
@@ -123,7 +150,9 @@ pub async fn handle_conn(
     // `attached`: a connection may do either, and they mean different things to
     // the session thread.
     let mut following: Option<Attached> = None;
+    let mut screen_wait_tasks = tokio::task::JoinSet::new();
     loop {
+        while screen_wait_tasks.try_join_next().is_some() {}
         let frame = match reader.read_frame().await {
             Ok(Some(f)) => f,
             Ok(None) => break, // client disconnected normally
@@ -139,6 +168,74 @@ pub async fn handle_conn(
         };
 
         match frame {
+            Frame::WaitForScreen {
+                name,
+                matcher,
+                timeout_ms,
+            } => {
+                let Some(deadline) = std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_millis(timeout_ms))
+                else {
+                    reply(Frame::Error {
+                        code: code::INVALID_MATCHER,
+                        msg: "screen wait timeout exceeds supported duration".into(),
+                    });
+                    continue;
+                };
+                let matcher =
+                    match tokio::task::spawn_blocking(move || CompiledMatcher::compile(matcher))
+                        .await
+                    {
+                        Ok(Ok(matcher)) => matcher,
+                        Ok(Err(error)) => {
+                            reply(screen_wait_error(error));
+                            continue;
+                        }
+                        Err(error) => {
+                            reply(Frame::Error {
+                                code: code::INTERNAL,
+                                msg: format!("screen matcher compilation failed: {error}"),
+                            });
+                            continue;
+                        }
+                    };
+                let handle = registry.lock().unwrap().get(&name);
+                let Some(handle) = handle else {
+                    reply(Frame::Error {
+                        code: code::NO_SUCH_SESSION,
+                        msg: format!("no such session '{name}'"),
+                    });
+                    continue;
+                };
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if handle
+                    .tx
+                    .send(SessionMsg::WaitForScreen {
+                        matcher,
+                        deadline,
+                        reply: tx,
+                    })
+                    .is_err()
+                {
+                    reply(screen_wait_error(WaitError::SessionExited));
+                    continue;
+                }
+                let mut registration = ScreenWaitRegistration {
+                    reply: rx,
+                    session_tx: handle.tx.clone(),
+                };
+                let out_tx = out_tx.clone();
+                screen_wait_tasks.spawn(async move {
+                    let result = (&mut registration.reply)
+                        .await
+                        .unwrap_or(Err(WaitError::SessionExited));
+                    let frame = match result {
+                        Ok(identity) => Frame::ScreenWaitMatched { identity },
+                        Err(error) => screen_wait_error(error),
+                    };
+                    let _ = out_tx.send(ConnItem::Frame(Box::new(frame)));
+                });
+            }
             Frame::ReportAgentSession {
                 identity,
                 kind,
@@ -463,6 +560,10 @@ pub async fn handle_conn(
         }
     }
 
+    // Abort drops reply receivers and wakes the session, even when no output
+    // arrives. Keep reading frames while waits are pending: read_frame is not
+    // cancel-safe, so it must never share a select with waiter completions.
+    screen_wait_tasks.shutdown().await;
     // Connection loss means detach (spec §5: no explicit state)
     if let Some(a) = attached.take() {
         let _ = a.session_tx.send(SessionMsg::Detach {

@@ -226,13 +226,16 @@ enum Cmd {
     /// Block until the session's screen matches or its output settles, then
     /// exit 0 (4 on timeout, 3 if there is no such session). Replaces
     /// sleep-and-poll loops in scripts.
-    #[command(group(clap::ArgGroup::new("wait_cond").required(true).args(["text", "idle", "until"])))]
+    #[command(group(clap::ArgGroup::new("wait_cond").required(true).args(["text", "regex", "idle", "until"])))]
     Wait {
         /// Session name
         name: String,
         /// Until the rendered screen contains this text (plain substring)
         #[arg(long)]
         text: Option<String>,
+        /// Until the visible screen matches this Rust regular expression
+        #[arg(long, value_name = "PATTERN")]
+        regex: Option<String>,
         /// Until the session has produced no output for 2 seconds
         #[arg(long)]
         idle: bool,
@@ -645,10 +648,11 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
         Cmd::Wait {
             name,
             text,
+            regex,
             idle,
             until,
             timeout,
-        } => control::wait(&socket, name, text, idle, until, timeout).await?,
+        } => control::wait(&socket, name, text, regex, idle, until, timeout).await?,
         Cmd::Restart => {
             let c = client::restart(&socket).await?;
             println!(

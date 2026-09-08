@@ -12,6 +12,7 @@ asd-proto = { workspace = true }
 asd-vt = { workspace = true }
 getrandom = { workspace = true }
 portable-pty = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { version = "0.38.4", default-features = false, features = ["system", "network"] }

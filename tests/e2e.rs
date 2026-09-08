@@ -2899,8 +2899,209 @@ async fn list_json_is_an_array_of_sessions() {
     assert!(!text.contains(r#""session":"#), "table leaked json: {text}");
 }
 
+#[test]
+fn screen_wait_rejects_invalid_regex_before_connecting() {
+    let out = Command::new(cli_exe())
+        .args([
+            "--socket",
+            "/nonexistent/asd-screen-wait.sock",
+            "wait",
+            "ghost",
+            "--regex",
+            "[",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("invalid screen matcher"), "{err}");
+    assert!(!err.contains("connecting"), "{err}");
+}
+
+#[tokio::test]
+async fn screen_wait_observes_transient_literal_and_regex_without_attachment() {
+    let daemon = Daemon::start("screen-transient");
+    let out = daemon.cli().args(["new", "transient", "--cmd", r"stty -echo; printf READY; while read line; do printf '\033[2J\033[HMARK-42'; sleep 0.05; printf '\033[2J\033[HDONE'; done"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let ready = daemon
+        .cli()
+        .args(["wait", "transient", "--text", "READY", "--timeout", "5s"])
+        .output()
+        .unwrap();
+    assert!(ready.status.success(), "{ready:?}");
+    let mut raw = ProtoClient::connect(&daemon.socket).await;
+    for matcher in [
+        asd_proto::ScreenMatcher::Literal("MARK-42".into()),
+        asd_proto::ScreenMatcher::Regex("MARK-[0-9]+".into()),
+    ] {
+        raw.send(Frame::WaitForScreen {
+            name: "transient".into(),
+            matcher,
+            timeout_ms: 5000,
+        })
+        .await;
+    }
+    // This response is a session-channel barrier after both registrations.
+    raw.send(Frame::Peek {
+        name: "transient".into(),
+        scrollback: asd_proto::Scrollback::None,
+    })
+    .await;
+    assert!(matches!(raw.recv().await, Frame::PeekReply { .. }));
+    let mut cli_waits = Vec::new();
+    for (flag, pattern) in [("--text", "MARK-42"), ("--regex", "MARK-[0-9]+")] {
+        cli_waits.push(
+            daemon
+                .cli()
+                .args(["wait", "transient", flag, pattern, "--timeout", "5s"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut driver = ProtoClient::connect(&daemon.socket).await;
+    driver
+        .send(Frame::SendInput {
+            name: "transient".into(),
+            bytes: b"go\n".to_vec(),
+            enter: false,
+        })
+        .await;
+    assert!(matches!(driver.recv().await, Frame::Ack));
+    let first = match raw.recv().await {
+        Frame::ScreenWaitMatched { identity } => identity,
+        frame => panic!("{frame:?}"),
+    };
+    assert!(matches!(raw.recv().await, Frame::ScreenWaitMatched { identity } if identity == first));
+    for child in cli_waits {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let peek = daemon.cli().args(["peek", "transient"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&peek.stdout).contains("MARK-42"));
+    driver.send(Frame::ListSessions).await;
+    match driver.recv().await {
+        Frame::SessionList { sessions } => assert_eq!(sessions[0].attached_clients, 0),
+        frame => panic!("{frame:?}"),
+    }
+    let out = daemon
+        .cli()
+        .args([
+            "wait",
+            "transient",
+            "--regex",
+            "MARK-[0-9]+",
+            "--timeout",
+            "20ms",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4), "{out:?}");
+}
+
+#[tokio::test]
+async fn screen_wait_limits_validation_disconnect_and_session_exit() {
+    let daemon = Daemon::start("screen-limits");
+    assert!(
+        daemon
+            .cli()
+            .args(["new", "quiet", "--cmd", "sleep 60"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut raw = ProtoClient::connect(&daemon.socket).await;
+    for pattern in ["[".to_string(), "x".repeat(4097), "a{1000000}".into()] {
+        raw.send(Frame::WaitForScreen {
+            name: "quiet".into(),
+            matcher: asd_proto::ScreenMatcher::Regex(pattern),
+            timeout_ms: 5000,
+        })
+        .await;
+        assert!(matches!(
+            raw.recv().await,
+            Frame::Error {
+                code: code::INVALID_MATCHER,
+                ..
+            }
+        ));
+    }
+    for _ in 0..65 {
+        raw.send(Frame::WaitForScreen {
+            name: "quiet".into(),
+            matcher: asd_proto::ScreenMatcher::Literal("never".into()),
+            timeout_ms: 60000,
+        })
+        .await;
+    }
+    assert!(matches!(
+        raw.recv().await,
+        Frame::Error {
+            code: code::SCREEN_WAITER_LIMIT,
+            ..
+        }
+    ));
+    drop(raw);
+    let mut raw = ProtoClient::connect(&daemon.socket).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        raw.send(Frame::WaitForScreen {
+            name: "quiet".into(),
+            matcher: asd_proto::ScreenMatcher::Literal("never".into()),
+            timeout_ms: 10,
+        })
+        .await;
+        match raw.recv().await {
+            Frame::Error {
+                code: code::WAIT_TIMEOUT,
+                ..
+            } => break,
+            Frame::Error {
+                code: code::SCREEN_WAITER_LIMIT,
+                ..
+            } => {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(TICK).await;
+            }
+            frame => panic!("{frame:?}"),
+        }
+    }
+    raw.send(Frame::WaitForScreen {
+        name: "quiet".into(),
+        matcher: asd_proto::ScreenMatcher::Literal("never".into()),
+        timeout_ms: 60000,
+    })
+    .await;
+    raw.send(Frame::Peek {
+        name: "quiet".into(),
+        scrollback: asd_proto::Scrollback::None,
+    })
+    .await;
+    assert!(matches!(raw.recv().await, Frame::PeekReply { .. }));
+    assert!(
+        daemon
+            .cli()
+            .args(["kill", "quiet"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(matches!(
+        raw.recv().await,
+        Frame::Error {
+            code: code::SESSION_EXITED,
+            ..
+        }
+    ));
+}
+
 /// A missing session must read the same whichever way `wait` was asked to
-/// watch it. `--text` reaches the daemon through `Peek`, which answers
+/// watch it. `--text` reaches the daemon through `WaitForScreen`, which answers
 /// `Error{NO_SUCH_SESSION}`; `--idle` polls `ListSessions`, which cannot fail on
 /// a name it simply does not contain, so the CLI detects the absence itself —
 /// and used to word it differently and drop the protocol code, leaving scripts
@@ -2920,7 +3121,23 @@ async fn wait_reports_a_missing_session_the_same_way_in_both_modes() {
         .output()
         .unwrap();
 
-    for (label, out) in [("--text", &by_text), ("--idle", &by_idle)] {
+    let by_regex = daemon
+        .cli()
+        .args(["wait", "ghost", "--regex", "x+", "--timeout", "1s"])
+        .output()
+        .unwrap();
+    let by_until = daemon
+        .cli()
+        .args(["wait", "ghost", "--until", "idle", "--timeout", "1s"])
+        .output()
+        .unwrap();
+    for (label, out) in [
+        ("--text", &by_text),
+        ("--idle", &by_idle),
+        ("--regex", &by_regex),
+        ("--until", &by_until),
+    ] {
+        assert_eq!(out.status.code(), Some(3), "{label}: {out:?}");
         assert!(!out.status.success(), "{label} should fail: {out:?}");
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
