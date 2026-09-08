@@ -369,3 +369,19 @@ The actor model, pending-attach protection, webview bridge, and JavaScript
 bundle are documented in
 [`crates/asd-dioxus/README.md`](../crates/asd-dioxus/README.md). Keep those
 details there rather than duplicating them in repository-wide guidance.
+
+### Durable session tasks
+
+Task associations are registry-owned metadata, separate from ephemeral status
+lines and vendor conversation resume records. They bind a description to an
+absolute directory on the daemon host. The store retains them across restart and
+rename; setting/clearing uses exact session identity and commits durable state
+before exposing the accepted update. Session lists and event patches carry the
+association so all clients converge.
+
+Git review executes on the daemon host outside the registry lock. It reads the
+associated directory (or the session directory when unbound), derives current
+branch/worktree data, and returns bounded read-only status/diff text. Rendering
+clients never resolve remote PIDs or paths locally and do not own Git subprocesses.
+A review response is tied to the requested session identity; it must not be shown
+for a same-name replacement or a different selected session.

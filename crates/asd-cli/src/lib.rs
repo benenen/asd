@@ -13,6 +13,7 @@ mod exit;
 mod platform;
 mod render;
 mod styled_peek;
+mod task;
 
 use std::path::PathBuf;
 
@@ -40,6 +41,16 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Read, associate, or clear a session's durable task and worktree directory.
+    Task(task::TaskArgs),
+    /// Review the session's linked worktree, branch, and changes without modifying files.
+    Review {
+        /// Session name; omit inside a session to use its stable identity.
+        name: Option<String>,
+        /// Emit structured review metadata and diff as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Agent detection diagnostics, lifecycle reporting, and resume metadata.
     Agent {
         #[command(subcommand)]
@@ -575,6 +586,8 @@ async fn client_main(args: Args) -> anyhow::Result<()> {
             until,
             timeout,
         } => control::ask(&socket, name, text, until, timeout).await?,
+        Cmd::Task(args) => task::task(&socket, args).await?,
+        Cmd::Review { name, json } => task::review(&socket, name, json).await?,
         Cmd::Status { name, text, clear } => {
             // The common caller is a program inside the session describing
             // itself, which knows its name only through the environment.
@@ -800,6 +813,7 @@ mod tests {
                 command: "sh".to_string(),
                 title: String::new(),
                 status_line: String::new(),
+                task: None,
                 created_ms,
                 idle_ms: 0,
                 running: false,
@@ -850,6 +864,7 @@ mod tests {
             command: "sh".into(),
             title: "user@host: ~".into(),
             status_line: String::new(),
+            task: None,
             state: asd_proto::AgentState::Unknown,
             created_ms: 0,
             idle_ms: 0,

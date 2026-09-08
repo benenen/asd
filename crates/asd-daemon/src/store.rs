@@ -22,6 +22,8 @@ pub struct SessionState {
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_resume: Option<crate::agent_resume::AgentResumeRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<asd_proto::SessionTask>,
 }
 
 /// The cwd of a live process, shared with the card command.
@@ -276,11 +278,25 @@ mod tests {
 
     fn one_state(name: &str) -> SessionState {
         SessionState {
+            task: None,
             agent_resume: None,
             name: name.into(),
             cwd: Some(PathBuf::from(r"C:\tools")),
             command: Some("printf 'a\tb\n'".into()),
         }
+    }
+
+    #[test]
+    fn task_association_survives_store_round_trip() {
+        let json = br#"{"version":1,"sessions":[{"name":"work","cwd":null,"command":null,"task":{"description":"Review login changes","directory":"/srv/worktree"}}]}"#;
+        let states = decode_document(json).unwrap();
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&encode_document(&states).unwrap()).unwrap();
+        assert_eq!(
+            encoded["sessions"][0]["task"]["description"],
+            "Review login changes"
+        );
+        assert_eq!(encoded["sessions"][0]["task"]["directory"], "/srv/worktree");
     }
 
     #[test]
@@ -424,6 +440,7 @@ mod tests {
         assert_eq!(
             loaded.sessions,
             vec![SessionState {
+                task: None,
                 agent_resume: None,
                 name: "keep".into(),
                 cwd: Some(PathBuf::from("/tmp")),
@@ -488,12 +505,14 @@ mod tests {
         let states = vec![
             SessionState {
                 name: "web".into(),
+                task: None,
                 agent_resume: None,
                 cwd: Some(PathBuf::from("/home/me/proj")),
                 command: Some("npm run dev".into()),
             },
             SessionState {
                 name: "s0".into(),
+                task: None,
                 agent_resume: None,
                 cwd: None,
                 command: None,
@@ -505,6 +524,7 @@ mod tests {
     #[test]
     fn legacy_command_survives_tabs_newlines_and_backslashes() {
         let states = vec![SessionState {
+            task: None,
             agent_resume: None,
             name: "odd".into(),
             cwd: Some(PathBuf::from("/tmp")),
@@ -522,12 +542,14 @@ mod tests {
             vec![
                 SessionState {
                     name: "web".into(),
+                    task: None,
                     agent_resume: None,
                     cwd: Some(PathBuf::from("/home/me/proj")),
                     command: None
                 },
                 SessionState {
                     name: "win".into(),
+                    task: None,
                     agent_resume: None,
                     cwd: Some(PathBuf::from("C:\\tools")),
                     command: None

@@ -369,6 +369,36 @@ pub async fn handle_conn(
                     });
                 }
             }
+            Frame::SetSessionTask { identity, task } => {
+                match registry.lock().unwrap().set_task(identity, task) {
+                    Ok(()) => reply(Frame::Ack),
+                    Err((code, msg)) => reply(Frame::Error { code, msg }),
+                }
+            }
+            Frame::GetSessionReview { identity } => {
+                let target = registry.lock().unwrap().review_target(identity);
+                let frame = match target {
+                    Ok((task, directory)) => {
+                        match crate::review::collect(identity, task, directory).await {
+                            Ok(frame)
+                                if registry.lock().unwrap().by_identity(identity).is_some() =>
+                            {
+                                frame
+                            }
+                            Ok(_) => Frame::Error {
+                                code: code::STALE_SESSION,
+                                msg: "session exited while reading changes".into(),
+                            },
+                            Err(msg) => Frame::Error {
+                                code: code::REVIEW_FAILED,
+                                msg,
+                            },
+                        }
+                    }
+                    Err((code, msg)) => Frame::Error { code, msg },
+                };
+                reply(frame);
+            }
             Frame::ListSessions => {
                 reply(Frame::SessionList {
                     sessions: registry.lock().unwrap().list(),

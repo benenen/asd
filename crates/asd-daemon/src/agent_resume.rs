@@ -282,6 +282,7 @@ mod tests {
             name: name.into(),
             command: Some("original".into()),
             cwd: None,
+            task: None,
             agent_resume: Some(AgentResumeRecord {
                 kind: AgentKind::Codex,
                 session_ref: "same".into(),

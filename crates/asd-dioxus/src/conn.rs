@@ -475,6 +475,7 @@ mod tests {
             pid: 1,
             cols: 80,
             rows: 24,
+            task: None,
         };
         feed_tx
             .send((
@@ -484,10 +485,10 @@ mod tests {
                 },
                 EventFeedChange::Changed {
                     sessions: vec![info.clone()],
-                    event: asd_proto::SessionEvent::Renamed {
+                    event: Box::new(asd_proto::SessionEvent::Renamed {
                         old_name: "old".into(),
                         info,
-                    },
+                    }),
                 },
             ))
             .unwrap();

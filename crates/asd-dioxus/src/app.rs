@@ -132,7 +132,7 @@ fn now_ms() -> u64 {
 /// desktop embedded runtime (an 0.8-alpha moving target). Channel sends from
 /// these workers wake the UI coroutine reliably (the scheduler waker posts to
 /// the event-loop proxy), so events fold into signals promptly.
-fn bg() -> tokio::runtime::Handle {
+pub(crate) fn bg() -> tokio::runtime::Handle {
     use std::sync::OnceLock;
     static BG: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     BG.get_or_init(|| {
@@ -166,6 +166,7 @@ pub fn App() -> Element {
     let confirm_delete = use_signal(|| None::<u64>);
     // The session row (if any) whose name is being edited inline.
     let rename = use_signal(|| None::<Rename>);
+    let mut task_review = use_signal(|| None::<crate::task_review::Target>);
 
     // The command channel must be created ONCE and cached across renders
     // (use_hook): a per-render channel drops the previous sender on the first
@@ -352,7 +353,7 @@ pub fn App() -> Element {
                 }
                 div { class: "host-list",
                     for host in hosts_view.iter() {
-                        {host_group(host, &active, now, select_session.clone(), tx.clone(), model, status, confirm_kill, rename)}
+                        {host_group(host, &active, now, select_session.clone(), tx.clone(), model, status, confirm_kill, rename, task_review)}
                     }
                 }
                 div { class: "sidebar-footer",
@@ -463,6 +464,13 @@ pub fn App() -> Element {
                 }
             }
 
+            if let Some(target) = task_review.read().clone() {
+                crate::task_review::TaskReview {
+                    key: "review-{target.host}-{target.identity.instance_id}",
+                    target, model, onclose: move |_| task_review.set(None),
+                }
+            }
+
             // ── settings overlay ────────────────────────────────────
             if *settings_open.read() {
                 {settings_view(settings_page, form, saved_ssh, model, tx.clone(), settings_open, save_config, confirm_delete)}
@@ -531,6 +539,7 @@ fn host_group(
     _status: Signal<Status>,
     mut confirm_kill: Signal<Option<(HostId, String, asd_proto::SessionIdentity)>>,
     mut rename: Signal<Option<Rename>>,
+    mut task_review: Signal<Option<crate::task_review::Target>>,
 ) -> Element {
     let id = host.id;
     // Sibling names on this host, for the inline rename's dup check.
@@ -644,6 +653,10 @@ fn host_group(
             }
             for s in host.sessions.iter() {
                 {
+                    let review_target = crate::task_review::Target {
+                        host: id, kind: host.kind.clone(), identity: s.identity(),
+                        name: s.name.clone(), task: s.task.clone(),
+                    };
                     let name = s.name.clone();
                     let is_active = active
                         .as_ref()
@@ -769,6 +782,17 @@ fn host_group(
                             }
                             }
                             div { class: "session-cmd", if closing { "closing…" } else { "{cmd}" } }
+                            if let Some(task) = &s.task {
+                                div { class: "session-cmd", title: "{task.directory}", "{task.description}" }
+                            }
+                            button {
+                                class: "bar-btn session-review-button", disabled: closing,
+                                onclick: move |event| {
+                                    event.stop_propagation();
+                                    task_review.set(Some(review_target.clone()));
+                                },
+                                "Task / View changes"
+                            }
                         }
                     }
                 }
@@ -1579,7 +1603,7 @@ mod tests {
                 cursor,
                 change: EventFeedChange::Changed {
                     sessions: vec![],
-                    event: asd_proto::SessionEvent::Updated {
+                    event: Box::new(asd_proto::SessionEvent::Updated {
                         identity: asd_proto::SessionIdentity { instance_id: 1 },
                         cause: asd_proto::SessionUpdateCause::ScreenDetection,
                         patch: asd_proto::SessionUpdatePatch {
@@ -1593,8 +1617,9 @@ mod tests {
                             pid: None,
                             cols: None,
                             rows: None,
+                            task: None,
                         },
-                    },
+                    }),
                 },
             },
             UiEvent::Sessions {

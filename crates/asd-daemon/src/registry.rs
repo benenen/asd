@@ -16,6 +16,7 @@ use crate::session::{SessionContext, SessionHandle, SessionMsg, spawn_session};
 const DEFAULT_SIZE: (u16, u16) = (80, 24);
 
 mod reload;
+mod task;
 
 pub struct Registry {
     pub events: crate::event_hub::EventPublisher,
@@ -183,6 +184,14 @@ impl Registry {
         {
             reg.agent_records.insert(handle.identity(), record);
         }
+        if restoring {
+            let task = reg
+                .unrestored
+                .iter()
+                .find(|state| state.name == name)
+                .and_then(|state| state.task.clone());
+            *handle.meta.task.lock().unwrap() = task;
+        }
         let info = handle.info();
         reg.events
             .track_activity(handle.identity(), Arc::clone(&handle.meta));
@@ -220,6 +229,7 @@ impl Registry {
                     cwd: crate::store::read_cwd(pid),
                     command: h.spawn_command.clone(),
                     agent_resume: self.agent_records.get(&h.identity()).cloned(),
+                    task: h.meta.task.lock().unwrap().clone(),
                 }
             })
             .collect();
@@ -581,6 +591,7 @@ mod identity_tests {
             pty_master_fd: std::sync::atomic::AtomicI32::new(-1),
             title: Mutex::new(String::new()),
             status_line: Mutex::new(String::new()),
+            task: Mutex::new(None),
             state: Mutex::new(asd_proto::AgentState::Unknown),
             last_output_ms: std::sync::atomic::AtomicU64::new(100),
             name: Mutex::new("current".to_string()),
@@ -614,6 +625,81 @@ mod identity_tests {
         .unwrap();
         registry.sessions.insert("current".to_string(), handle);
         (registry, rx, dir)
+    }
+
+    #[test]
+    fn task_association_is_durable_rename_safe_and_clearable() {
+        let (mut registry, _rx, dir) = test_registry();
+        let identity = SessionIdentity { instance_id: 7 };
+        let task = asd_proto::SessionTask {
+            description: "Review login".into(),
+            directory: dir.to_str().unwrap().into(),
+        };
+        registry.set_task(identity, Some(task.clone())).unwrap();
+        assert_eq!(registry.list()[0].task, Some(task.clone()));
+        registry.rename("current", "renamed").unwrap();
+        let states =
+            crate::store::decode_document(&std::fs::read(dir.join("sessions.json")).unwrap())
+                .unwrap();
+        assert_eq!(states[0].name, "renamed");
+        assert_eq!(states[0].task, Some(task));
+        registry.set_task(identity, None).unwrap();
+        let states =
+            crate::store::decode_document(&std::fs::read(dir.join("sessions.json")).unwrap())
+                .unwrap();
+        assert!(states[0].task.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn task_write_rejects_stale_identity_and_failed_persistence() {
+        let (mut registry, _rx, dir) = test_registry();
+        let identity = SessionIdentity { instance_id: 7 };
+        let task = asd_proto::SessionTask {
+            description: "Review login".into(),
+            directory: dir.to_str().unwrap().into(),
+        };
+        assert_eq!(
+            registry
+                .set_task(SessionIdentity { instance_id: 8 }, Some(task.clone()))
+                .unwrap_err()
+                .0,
+            code::STALE_SESSION
+        );
+        std::fs::create_dir(dir.join("sessions.json")).unwrap();
+        assert_eq!(
+            registry.set_task(identity, Some(task)).unwrap_err().0,
+            code::PERSISTENCE_FAILURE
+        );
+        assert!(registry.list()[0].task.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn review_target_uses_associated_directory_over_live_process() {
+        let (mut registry, _rx, dir) = test_registry();
+        let identity = SessionIdentity { instance_id: 7 };
+        registry
+            .set_task(
+                identity,
+                Some(asd_proto::SessionTask {
+                    description: "Review login".into(),
+                    directory: dir.to_str().unwrap().into(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            registry.review_target(identity).unwrap().1,
+            dir.canonicalize().unwrap()
+        );
+        assert_eq!(
+            registry
+                .review_target(SessionIdentity { instance_id: 8 })
+                .unwrap_err()
+                .0,
+            code::STALE_SESSION
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -755,6 +841,7 @@ mod identity_tests {
             name: "duplicate-loser".into(),
             cwd: None,
             command: None,
+            task: None,
             agent_resume: Some(crate::agent_resume::AgentResumeRecord {
                 reported_at_ms: original.reported_at_ms.saturating_sub(1),
                 ..original.clone()
@@ -791,6 +878,7 @@ mod identity_tests {
             name: "retained".into(),
             cwd: None,
             command: None,
+            task: None,
             agent_resume: Some(crate::agent_resume::AgentResumeRecord {
                 session_ref: "owned".into(),
                 ..original.clone()

@@ -285,6 +285,7 @@ pub struct SessionMeta {
     /// side rather than the session thread — it is metadata about the session,
     /// not terminal state, so it never touches the VT the session thread owns.
     pub status_line: Mutex<String>,
+    pub task: Mutex<Option<asd_proto::SessionTask>>,
     /// What the program on the screen is doing, as the detection rules read it.
     /// Written by the session thread — the only owner of the terminal model —
     /// and read by the network side for `SessionInfo`.
@@ -336,6 +337,7 @@ impl SessionHandle {
             instance_id: self.identity.instance_id,
             command,
             status_line,
+            task: self.meta.task.lock().unwrap().clone(),
             title,
             pid: self.meta.child_pid.load(Ordering::Relaxed),
             created_ms: self.created_ms,
@@ -638,6 +640,7 @@ pub fn spawn_session(
         pty_master_fd: AtomicI32::new(master_fd),
         title: Mutex::new(String::new()),
         status_line: Mutex::new(String::new()),
+        task: Mutex::new(None),
         state: Mutex::new(AgentState::default()),
         last_output_ms: AtomicU64::new(created_ms),
         name: Mutex::new(name.clone()),

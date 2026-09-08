@@ -348,6 +348,7 @@ pub(crate) fn empty_patch() -> SessionUpdatePatch {
         command: None,
         title: None,
         status_line: None,
+        task: None,
         idle_ms: None,
         running: None,
         state: None,
@@ -361,7 +362,7 @@ pub(crate) fn empty_patch() -> SessionUpdatePatch {
 fn apply_patch(info: &mut SessionInfo, patch: &SessionUpdatePatch) {
     macro_rules! owned { ($($field:ident),*) => { $(if let Some(value) = &patch.$field { info.$field = value.clone(); })* }; }
     macro_rules! copied { ($($field:ident),*) => { $(if let Some(value) = patch.$field { info.$field = value; })* }; }
-    owned!(command, title, status_line);
+    owned!(command, title, status_line, task);
     copied!(idle_ms, running, state, attached_clients, pid, cols, rows);
 }
 
@@ -379,6 +380,7 @@ mod tests {
             command: "sh".into(),
             title: String::new(),
             status_line: String::new(),
+            task: None,
             created_ms: 0,
             idle_ms: 0,
             running: true,
@@ -427,6 +429,7 @@ mod tests {
             pty_master_fd: AtomicI32::new(-1),
             title: Mutex::new(String::new()),
             status_line: Mutex::new(String::new()),
+            task: Mutex::new(None),
             state: Mutex::new(AgentState::Unknown),
             last_output_ms: AtomicU64::new(crate::session::now_ms().saturating_sub(5000)),
             name: Mutex::new("s1".into()),

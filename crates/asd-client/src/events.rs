@@ -18,7 +18,7 @@ pub enum EventFeedChange {
     },
     Changed {
         sessions: Vec<SessionInfo>,
-        event: SessionEvent,
+        event: Box<SessionEvent>,
     },
     NotificationLease(bool),
 }
@@ -106,7 +106,7 @@ impl EventFeed {
         self.cursor = Some(cursor);
         Ok(EventFeedChange::Changed {
             sessions: self.sessions(),
-            event,
+            event: Box::new(event),
         })
     }
 
@@ -124,7 +124,7 @@ impl EventFeed {
 fn apply_patch(info: &mut SessionInfo, patch: &SessionUpdatePatch) {
     macro_rules! owned { ($($field:ident),*) => { $(if let Some(value) = &patch.$field { info.$field = value.clone(); })* }; }
     macro_rules! copied { ($($field:ident),*) => { $(if let Some(value) = patch.$field { info.$field = value; })* }; }
-    owned!(command, title, status_line);
+    owned!(command, title, status_line, task);
     copied!(idle_ms, running, state, attached_clients, pid, cols, rows);
 }
 
@@ -143,6 +143,7 @@ mod tests {
             command: "sh".into(),
             title: String::new(),
             status_line: String::new(),
+            task: None,
             created_ms: 0,
             idle_ms: 0,
             running: true,
@@ -167,6 +168,37 @@ mod tests {
             notification_lease: false,
         }
     }
+    #[test]
+    fn task_patch_distinguishes_unchanged_set_and_clear() {
+        let mut info = info(1, "work");
+        let task = asd_proto::SessionTask {
+            description: "Review changes".into(),
+            directory: "/srv/worktree".into(),
+        };
+        let mut patch = SessionUpdatePatch {
+            command: None,
+            title: None,
+            status_line: None,
+            task: Some(Some(task.clone())),
+            idle_ms: None,
+            running: None,
+            state: None,
+            attached_clients: None,
+            pid: None,
+            cols: None,
+            rows: None,
+        };
+        apply_patch(&mut info, &patch);
+        assert_eq!(info.task, Some(task.clone()));
+        patch.task = None;
+        patch.running = Some(false);
+        apply_patch(&mut info, &patch);
+        assert_eq!(info.task, Some(task));
+        patch.task = Some(None);
+        apply_patch(&mut info, &patch);
+        assert_eq!(info.task, None);
+    }
+
     #[test]
     fn rejects_bad_cursor_before_mutating_projection() {
         let mut feed = EventFeed::default();
@@ -219,6 +251,7 @@ mod tests {
             command: None,
             title: Some("title".into()),
             status_line: None,
+            task: None,
             idle_ms: None,
             running: None,
             state: None,

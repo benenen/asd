@@ -229,7 +229,7 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use crate::conn::{Cmd, Conn, Ev};
@@ -276,6 +276,8 @@ mod tests {
             notice: None,
             modal: None,
             git_graph: None,
+            review: None,
+            review_request: 0,
             git_graph_follow_pending: false,
             keymap: crate::keymap::Keymap::default(),
             now_ms: 0,
@@ -305,7 +307,7 @@ mod tests {
     /// `test_app()` with its command channel intercepted, so a test can ask
     /// what — if anything — was sent on to the session. The spawned actor's
     /// sender is dropped, which is how that thread learns to stop.
-    fn app_watching_commands() -> (App, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
+    pub(crate) fn app_watching_commands() -> (App, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
         let mut app = test_app();
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         app.conn = Conn { cmd_tx };
@@ -396,13 +398,14 @@ mod tests {
         (repo, app, cmds)
     }
 
-    fn session(name: &str, pid: u32) -> asd_proto::SessionInfo {
+    pub(crate) fn session(name: &str, pid: u32) -> asd_proto::SessionInfo {
         asd_proto::SessionInfo {
             name: name.to_string(),
             instance_id: u128::from(pid),
             command: "shell".to_string(),
             title: String::new(),
             status_line: String::new(),
+            task: None,
             created_ms: 0,
             idle_ms: 0,
             running: false,

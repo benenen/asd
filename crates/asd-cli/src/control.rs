@@ -320,6 +320,8 @@ pub async fn inspect(socket: &Path, name: String, json: bool) -> anyhow::Result<
         // "status", which is the daemon's reading of activity.
         s.push_str(r#","says":"#);
         json_string(&info.status_line, &mut s);
+        s.push_str(r#","task":"#);
+        s.push_str(&serde_json::to_string(&info.task).expect("task metadata serializes"));
         let modes = mouse_modes
             .iter()
             .map(u16::to_string)
@@ -353,6 +355,14 @@ pub async fn inspect(socket: &Path, name: String, json: bool) -> anyhow::Result<
         name = info.name,
         command = info.command,
     );
+    if let Some(task) = &info.task {
+        out.push_str(&format!(
+            "task       {}\ndirectory  {}\nreview     asd review {}\n",
+            crate::clean_title(&task.description),
+            crate::clean_title(&task.directory),
+            info.name
+        ));
+    }
     if !info.title.trim().is_empty() {
         out.push_str(&format!("title      {}\n", info.title));
     }
@@ -1255,6 +1265,8 @@ pub fn sessions_json(sessions: &[asd_proto::SessionInfo]) -> String {
         // "status", which is the daemon's reading of activity.
         s.push_str(r#","says":"#);
         json_string(&info.status_line, &mut s);
+        s.push_str(r#","task":"#);
+        s.push_str(&serde_json::to_string(&info.task).expect("task metadata serializes"));
         s.push_str(&format!(
             r#","pid":{pid},"cols":{cols},"rows":{rows},"created_ms":{created},"idle_ms":{idle},"running":{running},"attached_clients":{clients}}}"#,
             pid = info.pid,
@@ -1333,6 +1345,7 @@ mod tests {
             command: "bash".to_string(),
             title: String::new(),
             status_line: String::new(),
+            task: None,
             state: AgentState::Unknown,
             created_ms: 1_700_000_000_000,
             idle_ms: 42,

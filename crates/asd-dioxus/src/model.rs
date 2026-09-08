@@ -555,7 +555,7 @@ mod tests {
         );
         let event = |state| EventFeedChange::Changed {
             sessions: vec![s.clone()],
-            event: SessionEvent::Updated {
+            event: Box::new(SessionEvent::Updated {
                 identity: s.identity(),
                 cause: SessionUpdateCause::ScreenDetection,
                 patch: SessionUpdatePatch {
@@ -569,8 +569,9 @@ mod tests {
                     pid: None,
                     cols: None,
                     rows: None,
+                    task: None,
                 },
-            },
+            }),
         };
         model
             .attention
@@ -647,6 +648,7 @@ mod tests {
             pid: 0,
             cols: 80,
             rows: 24,
+            task: None,
         }
     }
 

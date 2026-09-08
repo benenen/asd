@@ -88,6 +88,19 @@ fn status(app: &App) -> (String, Style) {
         return (notice.clone(), Style::new().fg(ALERT).bg(RULE));
     }
     if app.daemon_up {
+        let ready_for_review = app.sessions.iter().any(|session| {
+            Some(&session.name) == app.active.as_ref()
+                && (session.task.is_some()
+                    || session.state == asd_proto::AgentState::Idle
+                    || app.attention.tracker.unread(session.identity())
+                        == Some(asd_client::attention::AttentionKind::Done))
+        });
+        if ready_for_review && let Some(hint) = app.keymap.invocation_hint(KeyAction::Review) {
+            return (
+                format!("{hint} review changes"),
+                Style::new().fg(OK).bg(RULE),
+            );
+        }
         let count = app
             .sessions
             .iter()

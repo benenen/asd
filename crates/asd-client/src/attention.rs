@@ -239,7 +239,7 @@ mod tests {
                     cursor(1),
                     &EventFeedChange::Changed {
                         sessions: vec![s.clone()],
-                        event
+                        event: Box::new(event)
                     }
                 )
                 .is_empty()
@@ -277,6 +277,7 @@ mod tests {
             command: "sh".into(),
             title: String::new(),
             status_line: String::new(),
+            task: None,
             created_ms: 0,
             idle_ms: 0,
             running: false,
@@ -296,6 +297,7 @@ mod tests {
                 command: None,
                 title: None,
                 status_line: None,
+                task: None,
                 idle_ms: None,
                 running: None,
                 attached_clients: None,

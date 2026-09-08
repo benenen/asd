@@ -278,6 +278,7 @@ mod tests {
             command: "claude".into(),
             title: "Refactor auth".into(),
             status_line: String::new(),
+            task: None,
             created_ms: 0,
             idle_ms: 0,
             running,

@@ -15,6 +15,7 @@ mod notification;
 mod platform;
 mod settings;
 mod ssh;
+mod task_review;
 mod theme;
 
 use std::sync::OnceLock;

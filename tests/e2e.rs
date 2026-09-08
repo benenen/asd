@@ -17,6 +17,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::time::timeout;
 
+#[path = "e2e/session_task.rs"]
+mod session_task;
+
 const TICK: Duration = Duration::from_millis(50);
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -356,6 +359,7 @@ fn event_wait_info(id: u128) -> asd_proto::SessionInfo {
         command: "codex".into(),
         title: String::new(),
         status_line: String::new(),
+        task: None,
         created_ms: 0,
         idle_ms: 0,
         running: true,
@@ -543,6 +547,7 @@ async fn event_wait_reconnects_with_cursor_and_follows_identity_through_rename()
         command: "codex".into(),
         title: String::new(),
         status_line: String::new(),
+        task: None,
         created_ms: 0,
         idle_ms: 0,
         running: true,
@@ -602,6 +607,7 @@ async fn event_wait_reconnects_with_cursor_and_follows_identity_through_rename()
         command: None,
         title: None,
         status_line: None,
+        task: None,
         idle_ms: None,
         running: None,
         state: Some(asd_proto::AgentState::Idle),
@@ -1611,6 +1617,7 @@ fn scripted_session(name: &str, instance_id: u128) -> asd_proto::SessionInfo {
         command: "sh".to_string(),
         title: String::new(),
         status_line: String::new(),
+        task: None,
         created_ms: 100,
         idle_ms: 0,
         running: false,

@@ -385,3 +385,34 @@ the default staged restore; explicit execution opt-in retains the original
 command behavior. Printable commands stage exactly.
 Missing agent executables
 remain visible shell errors rather than silently starting a fresh conversation.
+
+## Session tasks and change review
+
+`asd task NAME --description "Fix login" --directory /absolute/worktree` binds
+one durable task description and directory to the exact live session identity.
+The directory belongs to the daemon's machine, including for remote clients.
+Both fields are replaced together; `asd task NAME --clear` removes only the
+association. `asd task NAME --json` reads it (`null` when absent). With no name,
+the CLI uses `ASD_SESSION_ID`, so an in-session caller remains correct after a
+rename. Unlike `asd status`, this association survives daemon restarts.
+
+`asd review NAME` (or `--json`) requests a read-only Git review from the daemon.
+An associated directory remains fixed even if the shell changes its working
+directory. Without an association, review uses the session directory. The
+response includes the current branch, discovered worktree root, status (including
+untracked paths), and tracked staged/unstaged differences. Untracked file contents
+are not included. This is a worktree review, not attribution of individual edits
+to the agent: other processes may have edited the same files.
+
+Review does not stage, commit, merge, push, or send PTY input. Repository-defined
+external diff/text conversion helpers and clean/process filters are disabled.
+Submodule working-file changes are not traversed; review the submodule directly
+for those changes. Gitlink commit changes remain visible. Output and execution time are
+bounded; errors and truncation are shown rather than reported as a clean tree.
+Branch names are read live and are not persisted as task metadata.
+
+In the TUI, `Ctrl+A v` opens task/change review for the selected session, including
+completed sessions. The GUI's session row offers **Task / View changes**, including
+Done rows. The GUI form can save or clear the association. These actions open the
+same daemon-side review, so remote paths are never interpreted on the client.
+Native desktop notification action buttons are not added by this feature.

@@ -46,7 +46,8 @@
 //! so a delayed confirmation cannot terminate a newer session that reused the
 //! same name; v20 adds agent-operation frames and includes the exact live
 //! [`SessionIdentity`] in each `Snapshot`, so a client can converge its view
-//! and later output on the same session instance.
+//! and later output on the same session instance; v21 adds durable task
+//! associations and daemon-side worktree review frames.
 
 mod codec;
 pub mod paths;
@@ -57,7 +58,7 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Carried once in each direction via `Hello`/`HelloAck`;
 /// any inequality is rejected.
-pub const PROTO_VERSION: u32 = 20;
+pub const PROTO_VERSION: u32 = 21;
 
 /// Output-quiescence threshold, in milliseconds. A session is considered
 /// **idle** once its pty has produced no output for this long, and **running**
@@ -161,6 +162,8 @@ pub mod code {
     /// Session-state persistence failed.
     pub const PERSISTENCE_FAILURE: u32 = 13;
     /// Daemon internal error (details in msg).
+    pub const INVALID_TASK: u32 = 14;
+    pub const REVIEW_FAILED: u32 = 15;
     pub const INTERNAL: u32 = 100;
 }
 
@@ -256,6 +259,7 @@ pub enum SessionUpdateCause {
     ForegroundChanged,
     AttachmentChanged,
     StatusLineChanged,
+    TaskChanged,
     ScreenDetection,
     DetectorReload,
 }
@@ -266,6 +270,8 @@ pub struct SessionUpdatePatch {
     pub command: Option<String>,
     pub title: Option<String>,
     pub status_line: Option<String>,
+    /// None leaves the task unchanged; Some(None) clears it.
+    pub task: Option<Option<SessionTask>>,
     pub idle_ms: Option<u64>,
     pub running: Option<bool>,
     pub state: Option<AgentState>,
@@ -381,6 +387,38 @@ pub struct ManifestDiagnostic {
     pub retained_previous: bool,
 }
 
+/// A durable task association. The directory belongs to the daemon host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTask {
+    pub description: String,
+    pub directory: String,
+}
+
+impl SessionTask {
+    /// Validate portable text constraints; the daemon validates the filesystem.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.description.trim().is_empty() || self.description.len() > 4096 {
+            return Err("task description must contain 1 to 4096 bytes".into());
+        }
+        if self
+            .description
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err("task description contains unsupported control characters".into());
+        }
+        if self.directory.is_empty()
+            || self.directory.len() > 4096
+            || self.directory.chars().any(char::is_control)
+        {
+            return Err(
+                "task directory must contain 1 to 4096 bytes without control characters".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Metadata for a single session in `SessionList`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -405,6 +443,7 @@ pub struct SessionInfo {
     /// program speaks for itself, so it can say "step 3/7" — something no
     /// amount of screen-scraping can work out.
     pub status_line: String,
+    pub task: Option<SessionTask>,
     /// Creation time, Unix epoch milliseconds.
     pub created_ms: u64,
     /// Milliseconds since the session last produced pty output; 0 while it is
@@ -788,6 +827,24 @@ pub enum Frame {
         identity: SessionIdentity,
     },
     AgentSessionCleared,
+    /// Persist the task association for this exact live session.
+    SetSessionTask {
+        identity: SessionIdentity,
+        task: Option<SessionTask>,
+    },
+    /// Read changes in the associated worktree, or the daemon-side live cwd.
+    GetSessionReview {
+        identity: SessionIdentity,
+    },
+    SessionReview {
+        identity: SessionIdentity,
+        task: Option<SessionTask>,
+        directory: String,
+        branch: String,
+        status: String,
+        diff: String,
+        truncated: bool,
+    },
 }
 
 /// Protocol-layer error.

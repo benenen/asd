@@ -17,6 +17,7 @@ pub mod event_hub;
 mod metrics;
 mod platform;
 mod registry;
+mod review;
 mod server;
 mod session;
 mod store;

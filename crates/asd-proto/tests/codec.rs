@@ -30,6 +30,7 @@ fn all_frames() -> Vec<Frame> {
                     command: "/bin/bash".into(),
                     title: "user@host: ~".into(),
                     status_line: String::new(),
+                    task: None,
                     created_ms: 1_752_450_000_000,
                     idle_ms: 1500,
                     running: true,
@@ -45,6 +46,7 @@ fn all_frames() -> Vec<Frame> {
                     command: "htop".into(),
                     title: String::new(),
                     status_line: String::new(),
+                    task: None,
                     created_ms: 0,
                     idle_ms: 0,
                     running: false,
@@ -181,6 +183,7 @@ fn all_frames() -> Vec<Frame> {
                 command: "vim file".into(),
                 title: "vim".into(),
                 status_line: String::new(),
+                task: None,
                 created_ms: 1_752_450_000_000,
                 idle_ms: 42,
                 running: true,
@@ -275,6 +278,7 @@ fn all_frames() -> Vec<Frame> {
                 command: "cargo test".into(),
                 title: "build".into(),
                 status_line: "testing".into(),
+                task: None,
                 created_ms: 1_752_450_000_001,
                 idle_ms: 0,
                 running: true,
@@ -299,6 +303,7 @@ fn all_frames() -> Vec<Frame> {
                     command: "sh".into(),
                     title: String::new(),
                     status_line: String::new(),
+                    task: None,
                     created_ms: 1,
                     idle_ms: 0,
                     running: true,
@@ -323,6 +328,7 @@ fn all_frames() -> Vec<Frame> {
                     command: Some("cargo clippy".into()),
                     title: Some("checking".into()),
                     status_line: Some("step 4".into()),
+                    task: None,
                     idle_ms: Some(2500),
                     running: Some(false),
                     state: Some(AgentState::Idle),
@@ -347,6 +353,7 @@ fn all_frames() -> Vec<Frame> {
                     command: "sh".into(),
                     title: String::new(),
                     status_line: String::new(),
+                    task: None,
                     created_ms: 1,
                     idle_ms: 2500,
                     running: false,
@@ -452,12 +459,35 @@ fn all_frames() -> Vec<Frame> {
             },
         },
         Frame::AgentSessionCleared,
+        Frame::SetSessionTask {
+            identity: SessionIdentity { instance_id: 42 },
+            task: Some(asd_proto::SessionTask {
+                description: "Review changes".into(),
+                directory: "/srv/project".into(),
+            }),
+        },
+        Frame::SetSessionTask {
+            identity: SessionIdentity { instance_id: 42 },
+            task: None,
+        },
+        Frame::GetSessionReview {
+            identity: SessionIdentity { instance_id: 42 },
+        },
+        Frame::SessionReview {
+            identity: SessionIdentity { instance_id: 42 },
+            task: None,
+            directory: "/srv/project".into(),
+            branch: "main".into(),
+            status: " M src/main.rs".into(),
+            diff: "@@ -1 +1 @@".into(),
+            truncated: true,
+        },
     ]
 }
 
 #[test]
-fn protocol_version_covers_agent_operations_loop() {
-    assert_eq!(asd_proto::PROTO_VERSION, 20);
+fn protocol_version_covers_session_task_review() {
+    assert_eq!(asd_proto::PROTO_VERSION, 21);
 }
 
 #[test]
@@ -622,4 +652,71 @@ async fn a_cancelled_read_resumes_the_same_frame() {
 
     peer.write_all(&wire[6..]).await.unwrap();
     assert_eq!(reader.read_frame().await.unwrap(), Some(frame));
+}
+
+#[test]
+fn task_patch_round_trip_preserves_explicit_clear() {
+    for task in [
+        None,
+        Some(None),
+        Some(Some(asd_proto::SessionTask {
+            description: "Review".into(),
+            directory: "/srv/project".into(),
+        })),
+    ] {
+        let frame = Frame::SessionEvent {
+            cursor: EventCursor {
+                daemon_epoch: [1; 16],
+                sequence: 1,
+            },
+            event: SessionEvent::Updated {
+                identity: SessionIdentity { instance_id: 7 },
+                patch: SessionUpdatePatch {
+                    command: None,
+                    title: None,
+                    status_line: None,
+                    task,
+                    idle_ms: None,
+                    running: None,
+                    state: None,
+                    attached_clients: None,
+                    pid: None,
+                    cols: None,
+                    rows: None,
+                },
+                cause: SessionUpdateCause::TaskChanged,
+            },
+        };
+        let encoded = encode_frame(&frame).unwrap();
+        assert_eq!(decode_frame(&encoded[4..]).unwrap(), frame);
+    }
+}
+
+#[test]
+fn task_validation_rejects_empty_oversized_and_control_text() {
+    let valid = asd_proto::SessionTask {
+        description: "Review\nlogin changes".into(),
+        directory: "/srv/project".into(),
+    };
+    assert!(valid.validate().is_ok());
+    for description in [" ".into(), "x".repeat(4097), "unsafe\u{1b}".into()] {
+        assert!(
+            asd_proto::SessionTask {
+                description,
+                ..valid.clone()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    for directory in ["".into(), "x".repeat(4097), "/srv/unsafe\n".into()] {
+        assert!(
+            asd_proto::SessionTask {
+                directory,
+                ..valid.clone()
+            }
+            .validate()
+            .is_err()
+        );
+    }
 }

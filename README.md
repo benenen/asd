@@ -472,3 +472,24 @@ The documentation index is [`docs/README.md`](docs/README.md).
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Associate a task and review its changes
+
+```bash
+asd task my-session --description "Fix login" --directory /absolute/worktree
+asd task my-session --json
+asd review my-session
+asd review my-session --json
+asd task my-session --clear
+```
+
+The association survives rename and restart. The directory is on the daemon's
+machine and stays linked even when the session changes directory. Review shows
+the live branch, worktree, status and tracked changes; untracked files are listed
+without their contents. Review submodule working-file changes separately from
+the submodule directory. It never commits or merges. Changes are worktree-wide,
+so they can include edits made by other processes.
+
+Use **Ctrl+A v** in the TUI or **Task / View changes** on a GUI session row to
+review a session, including one that just completed. The GUI also edits the task
+association. See [task and review semantics](docs/automation.md#session-tasks-and-change-review).

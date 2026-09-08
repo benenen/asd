@@ -67,6 +67,14 @@ pub(crate) fn decode_document(bytes: &[u8]) -> Result<Vec<SessionState>, StoreEr
                 index,
                 detail: error.to_string(),
             })?;
+        if let Some(task) = &state.task {
+            task.validate()
+                .map_err(|detail| StoreError::InvalidSession {
+                    path: PathBuf::new(),
+                    index,
+                    detail,
+                })?;
+        }
         if let Some(record) = &state.agent_resume {
             crate::agent_resume::validate_reference(&record.session_ref).map_err(|detail| {
                 StoreError::InvalidSession {

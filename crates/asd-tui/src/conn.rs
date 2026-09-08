@@ -45,6 +45,10 @@ pub enum Cmd {
         name: String,
         new_name: String,
     },
+    Review {
+        identity: asd_proto::SessionIdentity,
+        request: u64,
+    },
     /// Disconnect and end the actor.
     Shutdown,
 }
@@ -52,6 +56,11 @@ pub enum Cmd {
 /// Events the actor sends toward the TUI thread.
 #[derive(Debug)]
 pub enum Ev {
+    Review {
+        identity: asd_proto::SessionIdentity,
+        request: u64,
+        result: Result<Box<Frame>, String>,
+    },
     Up,
     Down(String),
     Sessions(Vec<asd_proto::SessionInfo>),
@@ -178,6 +187,7 @@ async fn drive(
     let mut at = Attach::default();
     let mut next_view_id = 1u64;
     let mut listed_sessions = Vec::new();
+    let mut review_fetch: Option<tokio::task::JoinHandle<()>> = None;
 
     let (feed_tx, mut feed_rx) = unbounded_channel();
     let event_loop = asd_client::event_transport::watch(
@@ -342,6 +352,17 @@ async fn drive(
                         return Err("rename write failed".to_string());
                     }
                 }
+                Some(Cmd::Review { identity, request }) => {
+                    let socket = socket.to_path_buf();
+                    let sink = ev_tx.clone();
+                    if let Some(previous) = review_fetch.take() {
+                        previous.abort();
+                    }
+                    review_fetch = Some(tokio::spawn(async move {
+                        let result = crate::review::fetch(&socket, identity).await.map(Box::new);
+                        let _ = sink.send(Ev::Review { identity, request, result });
+                    }));
+                }
                 Some(Cmd::Shutdown) | None => {
                     if at.is_attached() {
                         let _ = writer.write_frame(&Frame::Detach).await;
@@ -378,6 +399,7 @@ mod tests {
             command: "shell".to_string(),
             title: String::new(),
             status_line: String::new(),
+            task: None,
             created_ms,
             idle_ms: 0,
             running: true,

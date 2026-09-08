@@ -103,6 +103,7 @@ mod tests {
                     pty_master_fd: AtomicI32::new(-1),
                     title: Mutex::new(String::new()),
                     status_line: Mutex::new(String::new()),
+                    task: Mutex::new(None),
                     state: Mutex::new(asd_proto::AgentState::Unknown),
                     last_output_ms: AtomicU64::new(0),
                     name: Mutex::new(format!("test{id}")),

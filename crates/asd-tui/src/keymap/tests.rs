@@ -350,3 +350,14 @@ fn the_leader_chord_is_recognized_whole_not_just_its_first_key() {
     );
     assert!(!map.leader_sequence(&g), "the prefix is spent again");
 }
+
+#[test]
+fn review_shortcut_is_discoverable_and_never_types_v() {
+    let mut map = Keymap::default();
+    map.resolve(&press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert!(map.current_hint().text.contains("review"));
+    assert_ne!(
+        map.resolve(&press(KeyCode::Char('v'), KeyModifiers::NONE)),
+        KeyResolution::PassThrough
+    );
+}
