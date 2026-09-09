@@ -3,12 +3,33 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: # manual trigger to verify the build without cutting a tag
+  workflow_dispatch: # build-only preflight; never creates or publishes a release
+  release:
+    types: [published]
 
 permissions:
   contents: write # create the release and upload assets
 
 jobs:
+  build-policy:
+    name: release build policy
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install workflow parser
+        run: python3 -m pip install 'PyYAML==6.0.2'
+      - name: Check portable CPU and draft publication contracts
+        run: |
+          python3 scripts/test_ghostty_cpu_baseline.py
+          python3 scripts/test_release_workflow.py
+
   # Create the release exactly once, before anything can attach to it. The four
   # build jobs each ran "create or find" against a brand-new tag, and on v0.1.12
   # they raced: three landed on one release, the macOS job's create call made a
@@ -23,13 +44,15 @@ jobs:
   # needs it, which would break the workflow_dispatch build check; the step
   # inside it is gated instead, so a manual run passes through in seconds.
   prepare:
-    name: create release
+    name: create draft release
+    needs: build-policy
+    if: github.event_name != 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Create the release if the tag has none yet
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -63,8 +86,12 @@ jobs:
               | sed '1d' | sed '/./,$!d' || return 0
           }
 
-          if gh release view "$REF_NAME" --repo "$REPO" >/dev/null 2>&1; then
-            echo "release $REF_NAME already exists; nothing to create"
+          if state="$(gh release view "$REF_NAME" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$state" != true ]; then
+              echo "Refusing to replace assets on a published release; cut a new version." >&2
+              exit 1
+            fi
+            echo "draft $REF_NAME already exists; continuing its build"
             exit 0
           fi
           # Seed the body from the tag annotation so a release is never empty,
@@ -73,11 +100,12 @@ jobs:
           # final text.
           annotation_body "$REF_NAME" > notes.md
           gh release create "$REF_NAME" --repo "$REPO" \
-            --title "$REF_NAME" --notes-file notes.md
+            --title "$REF_NAME" --notes-file notes.md --draft --verify-tag
 
   build:
     name: ${{ matrix.target }}
     needs: prepare
+    if: github.event_name != 'release'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -140,15 +168,23 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ steps.pkg.outputs.archive }}
-          fail_on_unmatched_files: true
-          # No generate_release_notes here: it APPENDS, and four build jobs
-          # attaching to one release appended four copies of the notes (eight
-          # once the tag was re-released). The `notes` job below writes them
-          # once instead.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          ARTIFACT_PATH: ${{ steps.pkg.outputs.archive }}
+        run: |
+          set -euo pipefail
+          test -s "$ARTIFACT_PATH"
+          # Recheck here: rerun-failed-jobs can bypass an earlier prepare job.
+          # Upload never creates a release or changes its publication state.
+          if [ "$(gh release view "$REF_NAME" --repo "$REPO" --json isDraft --jq .isDraft)" != true ]; then
+            echo "Refusing to upload to a published or unavailable release." >&2
+            exit 1
+          fi
+          gh release upload "$REF_NAME" "$ARTIFACT_PATH" --repo "$REPO" --clobber
 
   # Native Windows build — the full binary (CLI + daemon + TUI + GUI), same
   # deliverable as Linux and macOS. This used to ship GUI-only, back when the
@@ -159,6 +195,7 @@ jobs:
   windows:
     name: x86_64-pc-windows-msvc
     needs: prepare
+    if: github.event_name != 'release'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -227,15 +264,23 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ steps.pkg.outputs.archive }}
-          fail_on_unmatched_files: true
-          # No generate_release_notes here: it APPENDS, and four build jobs
-          # attaching to one release appended four copies of the notes (eight
-          # once the tag was re-released). The `notes` job below writes them
-          # once instead.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          ARTIFACT_PATH: ${{ steps.pkg.outputs.archive }}
+        run: |
+          set -euo pipefail
+          test -s "$ARTIFACT_PATH"
+          # Recheck here: rerun-failed-jobs can bypass an earlier prepare job.
+          # Upload never creates a release or changes its publication state.
+          if [ "$(gh release view "$REF_NAME" --repo "$REPO" --json isDraft --jq .isDraft)" != true ]; then
+            echo "Refusing to upload to a published or unavailable release." >&2
+            exit 1
+          fi
+          gh release upload "$REF_NAME" "$ARTIFACT_PATH" --repo "$REPO" --clobber
 
   # macOS — full binary (CLI + daemon + GUI); macOS is unix, so the daemon side
   # compiles. Apple Silicon (arm64) only, on a native runner; Zig builds the
@@ -244,6 +289,7 @@ jobs:
   macos:
     name: ${{ matrix.target }}
     needs: prepare
+    if: github.event_name != 'release'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -298,15 +344,23 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ steps.pkg.outputs.archive }}
-          fail_on_unmatched_files: true
-          # No generate_release_notes here: it APPENDS, and four build jobs
-          # attaching to one release appended four copies of the notes (eight
-          # once the tag was re-released). The `notes` job below writes them
-          # once instead.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          ARTIFACT_PATH: ${{ steps.pkg.outputs.archive }}
+        run: |
+          set -euo pipefail
+          test -s "$ARTIFACT_PATH"
+          # Recheck here: rerun-failed-jobs can bypass an earlier prepare job.
+          # Upload never creates a release or changes its publication state.
+          if [ "$(gh release view "$REF_NAME" --repo "$REPO" --json isDraft --jq .isDraft)" != true ]; then
+            echo "Refusing to upload to a published or unavailable release." >&2
+            exit 1
+          fi
+          gh release upload "$REF_NAME" "$ARTIFACT_PATH" --repo "$REPO" --clobber
 
   # Write the release notes exactly once, after every asset is attached. The
   # build jobs used to each pass generate_release_notes to action-gh-release,
@@ -345,7 +399,7 @@ jobs:
     # its marker, so running it on a partial release and again after the missing
     # platform is re-run produces the same result — there is nothing to lose by
     # writing it early.
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
+    if: ${{ !cancelled() && github.event_name != 'release' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -375,6 +429,10 @@ jobs:
               | sed '1d' | sed '/./,$!d' || return 0
           }
 
+          if [ "$(gh release view "$REF_NAME" --repo "$REPO" --json isDraft --jq .isDraft)" != true ]; then
+            echo "Release notes may only be assembled while the release is a draft." >&2
+            exit 1
+          fi
           gh release view "$REF_NAME" --repo "$REPO" --json body --jq .body > body.md || : > body.md
           # Keep what is above the marker. Without one the body is all human
           # (first run), so it is kept whole.
@@ -417,23 +475,21 @@ jobs:
 
           gh release edit "$REF_NAME" --repo "$REPO" --notes-file notes.md
 
-  # Publish the npm installer (@shibenenen/asd) to the public npm registry after
-  # every platform binary is attached to the release. The npm package ships no
-  # binary — its postinstall downloads the matching asset from this release — so
-  # it MUST publish only once the build jobs have uploaded their archives.
-  # Requires an `NPM_TOKEN` repo secret: an npm "Automation" access token for the
-  # shibenenen account (automation tokens bypass publish 2FA, as CI needs).
+  # Publishing a validated draft is a separate, authenticated operator action.
+  # The published event checks out the immutable release tag; it never rebuilds
+  # or depends on jobs intentionally skipped for this event.
   npm:
     name: npm publish
-    # Stays gated on every platform succeeding, unlike the notes job: the
-    # package ships no binary, so publishing while an asset is missing hands
-    # that platform's users a postinstall that 404s — and npm will not let the
-    # version be republished once the asset lands.
-    needs: [build, windows, macos]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'release' && github.event.action == 'published' && !github.event.release.draft && !github.event.release.prerelease
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      REF_NAME: ${{ github.event.release.tag_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Setup Node (npmjs registry)
         uses: actions/setup-node@v4
@@ -441,16 +497,27 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
-      - name: Sync package version to the release tag
-        working-directory: deploy/npm
+      - name: Verify the published release assets and package version
         env:
-          REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
+          [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           version="${REF_NAME#v}"
-          echo "publishing @shibenenen/asd@${version}"
-          # Keep the published version in lockstep with the release tag so the
-          # postinstall fetches the v<version> assets this workflow just built.
-          npm version --no-git-tag-version --allow-same-version "$version"
+          test "$(node -p "require('./deploy/npm/package.json').version")" = "$version"
+          gh release view "$REF_NAME" --repo "$REPO" \
+            --json tagName,isDraft,isPrerelease,assets > release.json
+          python3 - "$REF_NAME" <<'PYCODE'
+          import json, sys
+          release = json.load(open("release.json"))
+          tag = sys.argv[1]
+          assert release["tagName"] == tag and not release["isDraft"] and not release["isPrerelease"]
+          targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
+          expected = {f"asd-{tag[1:]}-{target}." + ("zip" if "windows" in target else "tar.gz") for target in targets}
+          actual = {asset["name"] for asset in release["assets"] if asset["size"] > 0}
+          assert expected <= actual, f"missing release assets: {expected - actual}"
+          PYCODE
 
       - name: Validate the package (syntax + offline URL mapping, no network)
         working-directory: deploy/npm
@@ -459,20 +526,30 @@ jobs:
       - name: Publish to npm
         working-directory: deploy/npm
         env:
-          # publishConfig in package.json pins access=public + the npmjs registry.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          version="$(node -p "require('./package.json').version")"
-          # npm refuses to overwrite a published version, so re-releasing a tag
-          # (moving it to rebuild a broken asset) would fail here. It doesn't
-          # need to publish: the package ships no binary, its postinstall
-          # downloads the release asset at install time, so replacing the
-          # asset on an existing tag already reaches everyone who installs
-          # that version. `npm view <pkg>@<ver>` prints nothing (exit 0) when
-          # the version is absent, so test the output, not the status.
+          set -euo pipefail
+          version="${REF_NAME#v}"
+          # npm versions are immutable. A retried published event is a no-op
+          # when this exact installer version has already been published.
           if [ -n "$(npm view "@shibenenen/asd@${version}" version 2>/dev/null)" ]; then
-            echo "@shibenenen/asd@${version} is already on npm; the rebuilt assets"
-            echo "reach its users via the postinstall download. Nothing to publish."
+            echo "@shibenenen/asd@${version} is already published."
             exit 0
           fi
           npm publish
+
+      - name: Deprecate the withdrawn 0.2.0 installer
+        if: github.event.release.tag_name == 'v0.2.1'
+        working-directory: deploy/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(npm view '@shibenenen/asd@0.2.1' version)" = 0.2.1
+          deprecated="$(npm view '@shibenenen/asd@0.2.0' deprecated)"
+          if [ -n "$deprecated" ]; then
+            echo "The withdrawn 0.2.0 installer is already deprecated."
+            exit 0
+          fi
+          npm deprecate '@shibenenen/asd@0.2.0' \
+            'Withdrawn: the Linux x64 binary can crash with SIGILL on other CPUs. Upgrade to 0.2.1 or later.'

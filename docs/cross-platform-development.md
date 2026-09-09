@@ -163,3 +163,74 @@ independent host terminals, select the same session, confirm the first shows the
 takeover placard, then select it again to reclaim. Keep an ordinary
 `asd attach` connected throughout to verify shared clients are not revoked and
 that PTY size recovers when either TUI exits.
+
+## Portable terminal-engine builds
+
+The repository patches `libghostty-vt-sys` locally to pass `-Dcpu=baseline` to
+Zig for native and cross builds. Without this override, native builds can emit
+instructions available only on the build runner's CPU, even when Rust uses a
+portable target. Keep `ReleaseFast` and the existing target/ABI handling; Rust
+`target-cpu` flags alone do not constrain the Zig library. The patch rationale
+and source provenance live in `vendor/libghostty-vt-sys/ASD-PATCH.md`. Release
+preflights and tag builds run `scripts/test_ghostty_cpu_baseline.py` and the
+workflow lifecycle contracts before draft creation. This argument-level gate
+complements the downloaded-binary smoke test on another CPU; it does not replace
+runtime validation.
+
+## Release lifecycle: build, verify, then publish
+
+A version tag now creates a **draft** GitHub Release. Linux x64/arm64, macOS
+arm64 and Windows x64 archives are attached while it remains a draft. Release
+notes are assembled without publishing it; no npm package is published on the
+tag push. A manual `Release` workflow dispatch is build-only, including when
+its selected ref is a tag.
+
+Before tagging, finish the checks above and the four-platform build preflight.
+Use an annotated tag with a version subject and Markdown notes, preserving
+headings with `git tag -a vX.Y.Z --cleanup=verbatim -F notes.md`. Never move a
+published version tag to repair an artifact: use a new patch version.
+
+After the tag workflow (including release notes) has finished successfully:
+
+1. Download the actual draft release archives with an authenticated `gh release
+   download vX.Y.Z`. Confirm all four archives, their layout, version output,
+   and the Windows `ghostty-vt.dll` sidecar.
+2. Run the downloaded binary through an isolated daemon, a real PTY session,
+   TUI attach/Snapshot, output, and resize. Exercise the new release's features.
+   Include another machine/CPU for native-library portability; `--version`
+   alone does not exercise the terminal engine.
+3. Only after validation, publish the draft using an authorized personal access
+   token or GitHub App token:
+
+   ```bash
+   gh release edit vX.Y.Z --draft=false --latest
+   ```
+
+4. The `release.published` event runs only the npm job. It checks out the release
+   tag, verifies the package version and four nonempty release assets, then
+   publishes `@shibenenen/asd` with `NPM_TOKEN`. Verify the npm version and a
+   clean installation before reporting the release complete.
+
+Do not publish with a workflow's `GITHUB_TOKEN`: GitHub normally suppresses
+follow-up workflow events produced by that token. Use the authenticated operator
+or App action above so npm publication is triggered. See GitHub's
+[workflow trigger rules](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
+and [release events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#release).
+
+Stable published releases alone enter the npm job; publishing a prerelease does
+not update npm. Draft creation and every individual upload recheck the release state, including
+when only failed platform jobs are rerun. Uploads use `gh release upload` and
+never create a release or change its draft state. This check and the upload are
+separate API operations, not an atomic publication lock. Retry failures while the
+release remains a draft, and never promote it while any build/upload/notes job
+is still running.
+
+For the 0.2.1 recovery only, after npm publication succeeds, the workflow marks
+`@shibenenen/asd@0.2.0` deprecated with the known Linux SIGILL warning. The step
+checks that 0.2.1 exists and skips an already-deprecated 0.2.0. Later versions do
+not run this recovery step.
+
+The offline workflow contracts can be checked with
+`python3 scripts/test_release_workflow.py` (PyYAML required). These tests cover
+event separation, draft-only asset uploads, refusal to rebuild public releases,
+notes that preserve publication state, and the ordering/scope of deprecation.
